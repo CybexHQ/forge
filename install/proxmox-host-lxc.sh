@@ -2,6 +2,7 @@
 set -euo pipefail
 
 FORGE_GIT_URL_DEFAULT="https://github.com/CybexHQ/forge.git"
+FORGE_REF_DEFAULT="main"
 FORGE_SOURCE_DIR_DEFAULT="/root/forge"
 LXC_INSTALLER_RELATIVE_PATH="install/cybex-boot-lxc-install.sh"
 
@@ -25,7 +26,13 @@ disk_gb="${CYBEX_BOOT_PROXMOX_DISK_GB:-32}"
 cpu_cores="${CYBEX_BOOT_PROXMOX_CPU_CORES:-2}"
 memory_mb="${CYBEX_BOOT_PROXMOX_MEMORY_MB:-4096}"
 forge_git_url="${CYBEX_BOOT_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
+forge_ref="${CYBEX_BOOT_FORGE_REF:-$FORGE_REF_DEFAULT}"
 forge_source_dir="${CYBEX_BOOT_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
+dry_run=0
+created_container=0
+started_container=0
+completed=0
+current_step="initialization"
 
 usage() {
   cat <<'EOF'
@@ -49,8 +56,8 @@ Generated resource options:
 
 Boot runtime options:
   --listen ADDR                  Local Boot address behind nginx (default: 127.0.0.1:8080)
-  --tftp-root PATH               TFTP root (default: /srv/cybex-boot/tftp)
-  --http-root PATH               HTTP asset root (default: /srv/cybex-boot/www)
+  --tftp-root PATH               TFTP root below /srv/cybex-boot (default: /srv/cybex-boot/tftp)
+  --http-root PATH               HTTP asset root below /srv/cybex-boot (default: /srv/cybex-boot/www)
   --bootloader NAME              UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS           Boot menu timeout (default: 8000)
 
@@ -62,12 +69,15 @@ Advanced Proxmox options:
   --bridge NAME                  Network bridge (default: vmbr0 or first vmbr*)
   --template TEMPLATE            Existing template path or storage:vztmpl/name
   --forge-git-url URL            Forge source repository (default: https://github.com/CybexHQ/forge.git)
+  --forge-ref REF                Branch, tag, or commit to install (default: main)
   --forge-source-dir PATH        Source checkout inside LXC (default: /root/forge)
+  --dry-run, --validate-only     Validate inputs/environment and print selections without creating the LXC
   -h, --help                     Show this help
 EOF
 }
 
 section() {
+  current_step="$1"
   printf '\n==> %s\n' "$1"
 }
 
@@ -83,6 +93,30 @@ die() {
   printf 'ERROR: %s\n' "$1" >&2
   exit 1
 }
+
+on_exit() {
+  local status="$?"
+  [ "$completed" -eq 0 ] || return
+  [ "$status" -eq 0 ] && return
+  if [ "$created_container" -eq 0 ] && [ "$current_step" = "initialization" ]; then
+    return
+  fi
+  printf '\nERROR: failed during %s (exit %s)\n' "$current_step" "$status" >&2
+  if [ -n "$vmid" ] && command -v pct >/dev/null 2>&1 && pct status "$vmid" >/dev/null 2>&1; then
+    pct status "$vmid" >&2 || true
+    if [ "$created_container" -eq 1 ]; then
+      printf 'Partial LXC VMID %s remains. Inspect it with: pct status %s; pct enter %s\n' "$vmid" "$vmid" "$vmid" >&2
+      if [ "$started_container" -eq 1 ]; then
+        printf 'The LXC was started before the failure; collect logs with: pct exec %s -- journalctl --no-pager -n 200\n' "$vmid" >&2
+      fi
+      printf 'Remove it after collecting evidence with: pct destroy %s\n' "$vmid" >&2
+    fi
+  elif [ "$created_container" -eq 1 ] && [ -n "$vmid" ]; then
+    printf 'LXC creation was attempted for VMID %s, but pct status is unavailable.\n' "$vmid" >&2
+  fi
+}
+
+trap on_exit EXIT
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -105,7 +139,9 @@ while [ "$#" -gt 0 ]; do
     --proxmox-cpu-cores) cpu_cores="${2:-}"; shift 2 ;;
     --proxmox-memory-mb) memory_mb="${2:-}"; shift 2 ;;
     --forge-git-url) forge_git_url="${2:-}"; shift 2 ;;
+    --forge-ref) forge_ref="${2:-}"; shift 2 ;;
     --forge-source-dir) forge_source_dir="${2:-}"; shift 2 ;;
+    --dry-run|--validate-only) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -211,6 +247,7 @@ validate_absolute_path() {
   [ "$value" != "/" ] || die "$name must not be /"
   case "$value" in
     *'//'*) die "$name must be normalized" ;;
+    */) die "$name must be normalized" ;;
   esac
   local old_ifs="$IFS"
   local part
@@ -229,6 +266,32 @@ validate_absolute_path() {
   IFS="$old_ifs"
 }
 
+validate_runtime_root() {
+  local name="$1"
+  local value="$2"
+  local allowed_root="/srv/cybex-boot"
+  validate_absolute_path "$name" "$value"
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
+    die "$name must not contain whitespace"
+  fi
+  case "$value" in
+    "$allowed_root"/*) ;;
+    "$allowed_root") die "$name must be below $allowed_root, not $allowed_root itself" ;;
+    *) die "$name must be under $allowed_root" ;;
+  esac
+}
+
+validate_runtime_roots() {
+  validate_runtime_root "--tftp-root" "$tftp_root"
+  validate_runtime_root "--http-root" "$http_root"
+  case "$http_root/" in
+    "$tftp_root/"*) die "--http-root must not be inside --tftp-root" ;;
+  esac
+  case "$tftp_root/" in
+    "$http_root/"*) die "--tftp-root must not be inside --http-root" ;;
+  esac
+}
+
 validate_bootloader_filename() {
   validate_plain_value "--bootloader" "$bootloader_filename"
   case "$bootloader_filename" in
@@ -236,6 +299,18 @@ validate_bootloader_filename() {
   esac
   printf '%s' "$bootloader_filename" | LC_ALL=C grep -Eq '^[A-Za-z0-9._-]+$' ||
     die "--bootloader must use only letters, numbers, dot, underscore, or hyphen"
+}
+
+validate_forge_ref() {
+  validate_plain_value "--forge-ref" "$forge_ref"
+  [ -n "$forge_ref" ] || die "--forge-ref is required"
+  printf '%s' "$forge_ref" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/@+-]+$' ||
+    die "--forge-ref must contain only letters, numbers, dot, underscore, slash, at, plus, or hyphen"
+  case "$forge_ref" in
+    -*|*..*|*//*|*/.|*.|*~*|*^*|*:*|*'?'*|*'['*|*\\*|*' '*|*$'\t'*)
+      die "--forge-ref is not a safe git ref"
+      ;;
+  esac
 }
 
 tooling_preflight() {
@@ -324,6 +399,10 @@ choose_template() {
     template="$cached"
     return
   fi
+  if [ "$dry_run" -eq 1 ]; then
+    template="will-download:debian-or-ubuntu-standard-template"
+    return
+  fi
   download_template "$template_storage"
 }
 
@@ -368,6 +447,8 @@ print_summary() {
   info "Organization: $organization_id"
   info "Public Boot URL: $public_base_url"
   info "Forge source: $forge_git_url"
+  info "Forge ref: $forge_ref"
+  info "Forge checkout: $forge_source_dir"
 }
 
 create_container() {
@@ -382,11 +463,13 @@ create_container() {
     --unprivileged 0 \
     --features nesting=1 \
     --onboot 1
+  created_container=1
 }
 
 start_container() {
   section "Start LXC"
   pct start "$vmid"
+  started_container=1
   info "Waiting for systemd and outbound network."
   # shellcheck disable=SC2016
   pct exec "$vmid" -- bash -lc '
@@ -415,16 +498,22 @@ prepare_forge_source() {
     set -euo pipefail
     source_dir="$1"
     git_url="$2"
+    forge_ref="$3"
     if [ -d "$source_dir/.git" ]; then
-      git -C "$source_dir" fetch --depth 1 origin main || true
-      git -C "$source_dir" checkout -f FETCH_HEAD || git -C "$source_dir" pull --ff-only || true
+      git -C "$source_dir" remote set-url origin "$git_url" || true
+      git -C "$source_dir" fetch --depth 1 origin "$forge_ref"
+      git -C "$source_dir" checkout --detach -f FETCH_HEAD
     else
       rm -rf "$source_dir"
-      git clone --depth 1 "$git_url" "$source_dir"
+      git init "$source_dir"
+      git -C "$source_dir" remote add origin "$git_url"
+      git -C "$source_dir" fetch --depth 1 origin "$forge_ref"
+      git -C "$source_dir" checkout --detach -f FETCH_HEAD
     fi
     test -f "$source_dir/install/cybex-boot-lxc-install.sh"
     chmod 0755 "$source_dir/install/cybex-boot-lxc-install.sh"
-  ' sh "$forge_source_dir" "$forge_git_url"
+    git -C "$source_dir" rev-parse HEAD > "$source_dir/.cybex-forge-revision"
+  ' sh "$forge_source_dir" "$forge_git_url" "$forge_ref"
 }
 
 run_lxc_installer() {
@@ -438,6 +527,7 @@ run_lxc_installer() {
     --public-base-url "$public_base_url" \
     --source-dir "$forge_source_dir" \
     --git-url "$forge_git_url" \
+    --forge-ref "$forge_ref" \
     --listen "$listen_addr" \
     --tftp-root "$tftp_root" \
     --http-root "$http_root" \
@@ -466,10 +556,10 @@ require_value "--public-base-url" "$public_base_url"
 validate_url "--api-url" "$api_url"
 validate_url "--public-base-url" "$public_base_url"
 validate_url "--forge-git-url" "$forge_git_url"
+validate_forge_ref
 validate_uuid
 validate_auth_code
-validate_absolute_path "--tftp-root" "$tftp_root"
-validate_absolute_path "--http-root" "$http_root"
+validate_runtime_roots
 validate_absolute_path "--forge-source-dir" "$forge_source_dir"
 validate_bootloader_filename
 validate_int_range "--menu-timeout-ms" "$menu_timeout_ms" 1000 600000
@@ -480,8 +570,15 @@ tooling_preflight
 validate_and_select_proxmox
 resource_warnings
 print_summary
+if [ "$dry_run" -eq 1 ]; then
+  completed=1
+  section "Validation complete"
+  info "Dry run completed without creating or modifying an LXC."
+  exit 0
+fi
 create_container
 start_container
 prepare_forge_source
 run_lxc_installer
 print_final
+completed=1

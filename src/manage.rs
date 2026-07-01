@@ -2040,7 +2040,7 @@ fn ensure_key_material(state: &mut ManagedState) -> Result<()> {
     };
     let public = signing.verifying_key().to_bytes();
     state.public_key_b64 = Some(STANDARD.encode(public));
-    state.public_key_fingerprint = Some(sha256_hex(&public));
+    state.public_key_fingerprint = Some(sha256_hex(public));
     Ok(())
 }
 
@@ -2072,8 +2072,7 @@ fn load_managed_state_from_config(config: &AppConfig) -> Result<ManagedState> {
         return Ok(ManagedState::default());
     }
     let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(serde_json::from_slice(&raw)
-        .with_context(|| format!("failed to parse {}", path.display()))?)
+    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn save_managed_state(state: &AppState, managed: &ManagedState) -> Result<()> {
@@ -2580,6 +2579,9 @@ fn normalize_managed_settings(
     if tftp_root == http_root {
         bail!("managed boot settings tftp_root and http_root must be different");
     }
+    if tftp_root.starts_with(&http_root) || http_root.starts_with(&tftp_root) {
+        bail!("managed boot settings tftp_root and http_root must not overlap");
+    }
     let bootloader_filename = if settings.bootloader_filename.trim().is_empty() {
         config.boot.bootloader_filename.clone()
     } else {
@@ -2696,6 +2698,13 @@ fn apply_runtime_settings_to_host(
     daemon_reload |= install_text_file(
         Path::new("/etc/systemd/system/tftpd-hpa.service.d/10-cybex-hardening.conf"),
         &render_tftpd_hardening_dropin(settings),
+        "0644",
+        "root",
+        "root",
+    )?;
+    daemon_reload |= install_text_file(
+        Path::new("/etc/systemd/system/cybex-boot-check.service"),
+        &render_check_service(settings),
         "0644",
         "root",
         "root",
@@ -2999,6 +3008,52 @@ fn render_tftpd_hardening_dropin(settings: &NormalizedManagedSettings) -> String
          UMask=0077\n",
         settings.http_root.display(),
         settings.tftp_root.display()
+    )
+}
+
+fn render_check_service(settings: &NormalizedManagedSettings) -> String {
+    format!(
+        r#"[Unit]
+Description=Cybex Boot local health check
+Wants=network-online.target
+After=network-online.target cybex-boot.service nginx.service tftpd-hpa.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cybex-boot-check --quiet
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx {tftp_root}
+ReadWritePaths=/run {http_root} /var/lib/cybex-boot /var/lib/nginx /var/log/nginx
+RemoveIPC=true
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0077
+"#,
+        tftp_root = settings.tftp_root.display(),
+        http_root = settings.http_root.display()
     )
 }
 
@@ -3578,13 +3633,13 @@ mod tests {
         BootAgentReportRequest, BootAgentSettingsReport, MAX_DEVICE_HOSTNAME_CHARS,
         MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
         MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
-        ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState, SyncOutcome,
-        append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
-        bounded_error_message, bounded_http_timeout_seconds, fit_boot_report_body,
-        has_unreported_known_profile_events, managed_profile_map, managed_sync_interval_seconds,
-        normalize_managed_settings, serialize_boot_report_body, sync_clients, sync_deleted_clients,
-        sync_deleted_profiles, sync_profiles, validate_boot_config, validate_profile,
-        write_secure_json,
+        ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
+        NormalizedManagedSettings, SyncOutcome, append_bounded_response_chunk_with_limit,
+        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
+        fit_boot_report_body, has_unreported_known_profile_events, managed_profile_map,
+        managed_sync_interval_seconds, normalize_managed_settings, render_check_service,
+        serialize_boot_report_body, sync_clients, sync_deleted_clients, sync_deleted_profiles,
+        sync_profiles, validate_boot_config, validate_profile, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -3860,6 +3915,57 @@ mod tests {
             app_config.boot.bootloader_filename
         );
         assert_eq!(normalized.menu_timeout_ms, app_config.boot.menu_timeout_ms);
+    }
+
+    #[test]
+    fn managed_settings_reject_overlapping_runtime_roots() {
+        let app_config = AppConfig::default();
+        let nested_http = ManagedBootSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: "/srv/cybex-boot/tftp".to_string(),
+            http_root: "/srv/cybex-boot/tftp/www".to_string(),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+        let nested_tftp = ManagedBootSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: "/srv/cybex-boot/www/tftp".to_string(),
+            http_root: "/srv/cybex-boot/www".to_string(),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        for settings in [nested_http, nested_tftp] {
+            assert!(
+                normalize_managed_settings(&settings, &app_config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not overlap")
+            );
+        }
+    }
+
+    #[test]
+    fn managed_check_service_uses_runtime_roots() {
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-boot/tftp-managed"),
+            http_root: PathBuf::from("/srv/cybex-boot/www-managed"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        let service = render_check_service(&settings);
+
+        assert!(service.contains(
+            "ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx /srv/cybex-boot/tftp-managed"
+        ));
+        assert!(service.contains(
+            "ReadWritePaths=/run /srv/cybex-boot/www-managed /var/lib/cybex-boot /var/lib/nginx /var/log/nginx"
+        ));
     }
 
     #[test]

@@ -64,7 +64,84 @@ cargo build --release
 sudo install -m 0755 target/release/cybex-boot /usr/local/bin/cybex-boot
 ```
 
-## Install In A Proxmox LXC
+## Production Proxmox LXC Install
+
+The production operator path starts in Cybex Manage. Open the Dashboard Forge
+card, choose `Proxmox Host LXC`, enter the Boot server public base URL, keep or
+adjust the LXC resource defaults, generate the one-time command, and run it as
+root on the Proxmox host.
+
+The generated command fetches `install/proxmox-host-lxc.sh` from the configured
+Forge ref, creates a Debian/Ubuntu LXC, clones Forge into `/root/forge` inside
+that LXC at the same ref, runs `install/cybex-boot-lxc-install.sh`, starts
+Cybex Boot behind nginx/TFTP, submits the one-time Boot install authorization,
+and leaves a pending `cybex-boot` enrollment in Manage. Adopt that pending
+enrollment in Manage before treating the server as managed infrastructure.
+
+Production installs should be pinned to a release tag such as `v0.1.0`, not to
+the floating `main` branch. The Manage control plane controls this with
+`CYBEX_FORGE_INSTALL_REF`; the generated command passes the value as
+`--forge-ref`. Forge is not production-ready until the Forge repository has
+been pushed and the referenced remote tag exists.
+
+Resource defaults are intentionally conservative for a small Boot server:
+
+- root disk: `32 GiB`
+- CPU cores: `2`
+- memory: `4096 MiB`
+
+The host helper needs root privileges on a Proxmox node and access to `pct`,
+`pvesm`, `pveam`, `pvesh`, and `ip`. It chooses the next available VMID, the
+first rootdir-capable storage, the first template-capable storage, `vmbr0` or
+the first `vmbr*` bridge, and the newest cached/listed Debian 12 or Ubuntu
+22.04/24.04 standard LXC template. Override those with `--vmid`, `--storage`,
+`--template-storage`, `--bridge`, or `--template` when the defaults do not
+match the host. The LXC uses DHCP on the selected bridge, so the network must
+provide an address, a default route, and outbound HTTPS access to Manage,
+GitHub, Debian/Ubuntu package mirrors, and rustup during install.
+
+`--public-base-url` must be the URL PXE clients will use to reach the Boot LXC,
+for example `http://10.10.0.239`. After adoption, configure DHCP option 66 to
+the LXC IP or DNS name and option 67 to the configured bootloader filename
+(`snponly.efi` by default). Cybex Boot does not run DHCP.
+
+Custom `--tftp-root` and `--http-root` values must be separate,
+non-overlapping paths below `/srv/cybex-boot`; this matches the managed runtime
+apply boundary.
+
+Both installers support non-mutating validation:
+
+```sh
+bash install/proxmox-host-lxc.sh --dry-run --api-url https://manage.example.com \
+  --organization-id 550e8400-e29b-41d4-a716-446655440000 \
+  --auth-code boot_redacted_one_time_code \
+  --public-base-url http://10.10.0.239 \
+  --forge-ref v0.1.0
+```
+
+The scripts do not print the one-time auth code in status output. It still
+appears in the generated command and process arguments while installation is
+running, so treat command transcripts as sensitive and redact secrets before
+sharing evidence.
+
+Useful post-install checks inside the LXC:
+
+```sh
+systemctl status cybex-boot nginx tftpd-hpa cybex-boot-runtime-apply.timer cybex-boot-check.timer
+journalctl -u cybex-boot --no-pager -n 100
+/usr/local/sbin/cybex-boot-check
+cat /root/forge/.cybex-forge-revision
+```
+
+If the host wrapper fails after creating the LXC, it reports the partial VMID
+and leaves it in place for inspection. Use `pct status <vmid>`,
+`pct enter <vmid>`, and `pct exec <vmid> -- journalctl --no-pager -n 200` to
+collect evidence before removing it with `pct destroy <vmid>`.
+
+The Cybex Boot ISO method shown in Manage is a placeholder for a future
+installer. It does not create supported production ISO media yet.
+
+## Manual Service Install In A Proxmox LXC
 
 Create a service user and directories:
 

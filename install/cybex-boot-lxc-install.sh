@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+FORGE_GIT_URL_DEFAULT="https://github.com/CybexHQ/forge.git"
+FORGE_REF_DEFAULT="main"
+FORGE_SOURCE_DIR_DEFAULT="/root/forge"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -15,20 +19,24 @@ Required:
   --public-base-url URL     URL PXE clients will use for this Boot server, for example http://10.10.0.239
 
 Options:
-  --source-dir PATH         Existing cybex-boot source directory (default: /root/cybex-boot)
+  --source-dir PATH         Existing Forge source directory (default: /root/forge)
   --git-url URL             Clone source when --source-dir is missing
+  --forge-ref REF           Branch, tag, or commit to install (default: main)
   --listen ADDR             Local loopback Cybex Boot address behind nginx (default: 127.0.0.1:8080)
-  --tftp-root PATH          TFTP root desired by Cybex Manage (default: /srv/cybex-boot/tftp)
-  --http-root PATH          HTTP asset root desired by Cybex Manage (default: /srv/cybex-boot/www)
+  --tftp-root PATH          TFTP root below /srv/cybex-boot (default: /srv/cybex-boot/tftp)
+  --http-root PATH          HTTP asset root below /srv/cybex-boot (default: /srv/cybex-boot/www)
   --bootloader NAME         UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage (default: 8000)
+  --dry-run, --validate-only
+                            Validate inputs/environment without installing or enrolling
   -h, --help                Show this help
 
 Environment alternatives:
   CYBEX_MANAGE_API_URL, CYBEX_ORGANIZATION_ID, CYBEX_BOOT_AUTH_CODE,
   CYBEX_BOOT_PUBLIC_BASE_URL, CYBEX_BOOT_SOURCE_DIR, CYBEX_BOOT_GIT_URL,
-  CYBEX_BOOT_LISTEN_ADDR, CYBEX_BOOT_TFTP_ROOT, CYBEX_BOOT_HTTP_ROOT,
-  CYBEX_BOOTLOADER_FILENAME, CYBEX_BOOT_MENU_TIMEOUT_MS
+  CYBEX_BOOT_FORGE_REF, CYBEX_BOOT_LISTEN_ADDR, CYBEX_BOOT_TFTP_ROOT,
+  CYBEX_BOOT_HTTP_ROOT, CYBEX_BOOTLOADER_FILENAME,
+  CYBEX_BOOT_MENU_TIMEOUT_MS
 EOF
 }
 
@@ -36,13 +44,15 @@ api_url="${CYBEX_MANAGE_API_URL:-}"
 organization_id="${CYBEX_ORGANIZATION_ID:-}"
 auth_code="${CYBEX_BOOT_AUTH_CODE:-}"
 public_base_url="${CYBEX_BOOT_PUBLIC_BASE_URL:-}"
-source_dir="${CYBEX_BOOT_SOURCE_DIR:-/root/cybex-boot}"
-git_url="${CYBEX_BOOT_GIT_URL:-}"
+source_dir="${CYBEX_BOOT_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
+git_url="${CYBEX_BOOT_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
+forge_ref="${CYBEX_BOOT_FORGE_REF:-$FORGE_REF_DEFAULT}"
 listen_addr="${CYBEX_BOOT_LISTEN_ADDR:-127.0.0.1:8080}"
 tftp_root="${CYBEX_BOOT_TFTP_ROOT:-/srv/cybex-boot/tftp}"
 http_root="${CYBEX_BOOT_HTTP_ROOT:-/srv/cybex-boot/www}"
 bootloader_filename="${CYBEX_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_BOOT_MENU_TIMEOUT_MS:-8000}"
+dry_run=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -52,11 +62,13 @@ while [ "$#" -gt 0 ]; do
     --public-base-url) public_base_url="${2:-}"; shift 2 ;;
     --source-dir) source_dir="${2:-}"; shift 2 ;;
     --git-url) git_url="${2:-}"; shift 2 ;;
+    --forge-ref) forge_ref="${2:-}"; shift 2 ;;
     --listen) listen_addr="${2:-}"; shift 2 ;;
     --tftp-root) tftp_root="${2:-}"; shift 2 ;;
     --http-root) http_root="${2:-}"; shift 2 ;;
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
+    --dry-run|--validate-only) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -177,6 +189,12 @@ validate_absolute_path() {
     echo "$name must be a normalized absolute path" >&2
     exit 2
   fi
+  case "$value" in
+    */)
+      echo "$name must be a normalized absolute path" >&2
+      exit 2
+      ;;
+  esac
   local old_ifs="$IFS"
   local part
   local has_backslash
@@ -193,6 +211,45 @@ validate_absolute_path() {
     fi
   done
   IFS="$old_ifs"
+}
+
+validate_runtime_root() {
+  local name="$1"
+  local value="$2"
+  local allowed_root="/srv/cybex-boot"
+  validate_absolute_path "$name" "$value"
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
+    echo "$name must not contain whitespace" >&2
+    exit 2
+  fi
+  case "$value" in
+    "$allowed_root"/*) ;;
+    "$allowed_root")
+      echo "$name must be below $allowed_root, not $allowed_root itself" >&2
+      exit 2
+      ;;
+    *)
+      echo "$name must be under $allowed_root" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_runtime_roots() {
+  validate_runtime_root "--tftp-root" "$tftp_root"
+  validate_runtime_root "--http-root" "$http_root"
+  case "$http_root/" in
+    "$tftp_root/"*)
+      echo "--http-root must not be inside --tftp-root" >&2
+      exit 2
+      ;;
+  esac
+  case "$tftp_root/" in
+    "$http_root/"*)
+      echo "--tftp-root must not be inside --http-root" >&2
+      exit 2
+      ;;
+  esac
 }
 
 validate_bootloader_filename() {
@@ -217,6 +274,41 @@ validate_menu_timeout() {
   if [ "$menu_timeout_ms" -lt 1000 ] || [ "$menu_timeout_ms" -gt 600000 ]; then
     echo "--menu-timeout-ms must be between 1000 and 600000" >&2
     exit 2
+  fi
+}
+
+validate_forge_ref() {
+  validate_plain_value "--forge-ref" "$forge_ref"
+  if [ -z "$forge_ref" ]; then
+    echo "--forge-ref is required" >&2
+    exit 2
+  fi
+  if ! printf '%s' "$forge_ref" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/@+-]+$'; then
+    echo "--forge-ref must contain only letters, numbers, dot, underscore, slash, at, plus, or hyphen" >&2
+    exit 2
+  fi
+  case "$forge_ref" in
+    -*|*..*|*//*|*/.|*.|*~*|*^*|*:*|*'?'*|*'['*|*\\*|*' '*|*$'\t'*)
+      echo "--forge-ref is not a safe git ref" >&2
+      exit 2
+      ;;
+  esac
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "required command not found: $1" >&2
+    exit 1
+  }
+}
+
+installer_preflight() {
+  require_root
+  require_command apt-get
+  require_command systemctl
+  if [ ! -d /run/systemd/system ]; then
+    echo "systemd is not running inside this LXC" >&2
+    exit 1
   fi
 }
 
@@ -263,14 +355,27 @@ ensure_rust() {
 }
 
 prepare_source() {
-  if [ -d "$source_dir/.git" ] || [ -f "$source_dir/Cargo.toml" ]; then
+  if [ -d "$source_dir/.git" ]; then
+    git -C "$source_dir" remote set-url origin "$git_url" || true
+    git -C "$source_dir" fetch --depth 1 origin "$forge_ref"
+    git -C "$source_dir" checkout --detach -f FETCH_HEAD
+    git -C "$source_dir" rev-parse HEAD > "$source_dir/.cybex-forge-revision"
+    return
+  fi
+  if [ -f "$source_dir/Cargo.toml" ]; then
+    echo "using existing non-git source directory $source_dir; --forge-ref cannot be verified" >&2
     return
   fi
   if [ -z "$git_url" ]; then
     echo "source directory $source_dir is missing; pass --git-url or pre-stage the source" >&2
     exit 1
   fi
-  git clone "$git_url" "$source_dir"
+  rm -rf "$source_dir"
+  git init "$source_dir"
+  git -C "$source_dir" remote add origin "$git_url"
+  git -C "$source_dir" fetch --depth 1 origin "$forge_ref"
+  git -C "$source_dir" checkout --detach -f FETCH_HEAD
+  git -C "$source_dir" rev-parse HEAD > "$source_dir/.cybex-forge-revision"
 }
 
 require_source_file_contains() {
@@ -922,17 +1027,19 @@ check_nginx_public_listen_config() {
 
 check_service_asset_root_boundary() {
   local bad_entries
-  bad_entries="$(find /srv/cybex-boot -mindepth 1 -maxdepth 1 ! -name www \( -user cybex-boot -o -group cybex-boot -o -perm -020 -o -perm -002 \) -printf '%M %u:%g %p\n' 2>/dev/null || true)"
+  local http_top
+  http_top="$(runtime_top_entry "$http_root" "$runtime_root")"
+  bad_entries="$(find "$runtime_root" -mindepth 1 -maxdepth 1 ! -name "$http_top" \( -user cybex-boot -o -group cybex-boot -o -perm -020 -o -perm -002 \) -printf '%M %u:%g %p\n' 2>/dev/null || true)"
   if [ -z "$bad_entries" ]; then
-    ok "service asset root has no service-writable top-level entries outside www"
+    ok "service asset root has no service-writable top-level entries outside $http_top"
   else
-    fail "service asset root has service-writable top-level entries outside www: $bad_entries"
+    fail "service asset root has service-writable top-level entries outside $http_top: $bad_entries"
   fi
 }
 
 check_public_asset_tree_permissions() {
   local bad_entries
-  bad_entries="$(find /srv/cybex-boot/www -xdev \( -type f -o -type d \) \( -perm -020 -o -perm -002 \) -printf '%M %u:%g %p\n' 2>/dev/null || true)"
+  bad_entries="$(find "$http_root" -xdev \( -type f -o -type d \) \( -perm -020 -o -perm -002 \) -printf '%M %u:%g %p\n' 2>/dev/null || true)"
   if [ -z "$bad_entries" ]; then
     ok "public asset tree has no group/world-writable files or directories"
   else
@@ -1015,6 +1122,26 @@ config_string_value() {
   awk -v key="$key" -F '"' '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print $2; exit }' /etc/cybex-boot/config.toml 2>/dev/null
 }
 
+config_path_value() {
+  local key="$1"
+  local fallback="$2"
+  local value
+  value="$(config_string_value "$key")"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+runtime_top_entry() {
+  local path="$1"
+  local root="$2"
+  local rel
+  rel="${path#"$root"/}"
+  printf '%s\n' "${rel%%/*}"
+}
+
 check_local_management_routes_unavailable() {
   check_http_code "local /login" 404 "http://127.0.0.1/login"
   check_http_code "local /api/health" 404 "http://127.0.0.1/api/health"
@@ -1022,12 +1149,7 @@ check_local_management_routes_unavailable() {
 
 boot_event_user_agent_count() {
   local user_agent="$1"
-  local db_path
-  db_path="$(config_string_value database_path)"
-  if [ -z "$db_path" ]; then
-    db_path="/var/lib/cybex-boot/cybex-boot.sqlite"
-  fi
-  python3 - "$db_path" "$user_agent" <<'PY'
+  python3 - "$database_path" "$user_agent" <<'PY'
 import sqlite3
 import sys
 
@@ -1114,15 +1236,15 @@ check_no_udp_listener() {
 }
 
 cleanup_stale_http_check_assets() {
-  find /srv/cybex-boot/www -maxdepth 1 \( -type f -o -type l \) -name '.cybex-check.*' -mmin +15 -delete 2>/dev/null || true
+  find "$http_root" -maxdepth 1 \( -type f -o -type l \) -name '.cybex-check.*' -mmin +15 -delete 2>/dev/null || true
 }
 
 create_http_check_asset() {
-  http_check_asset_path="$(mktemp /srv/cybex-boot/www/.cybex-check.XXXXXX)"
+  http_check_asset_path="$(mktemp "$http_root/.cybex-check.XXXXXX")"
   track_tmp_file "$http_check_asset_path"
   printf 'Cybex Boot checker asset\n%s\n' "$(date +%s)" > "$http_check_asset_path"
   chmod 0644 "$http_check_asset_path"
-  http_check_asset_rel="${http_check_asset_path#/srv/cybex-boot/www/}"
+  http_check_asset_rel="${http_check_asset_path#"$http_root"/}"
 }
 
 remove_http_check_asset() {
@@ -1141,14 +1263,14 @@ check_file_symlink_rejected() {
     fail "file symlink rejection probe has no target asset"
     return
   fi
-  link_path="$(mktemp /srv/cybex-boot/www/.cybex-check-link.XXXXXX)"
+  link_path="$(mktemp "$http_root/.cybex-check-link.XXXXXX")"
   rm -f "$link_path"
   if ! ln -s "$http_check_asset_path" "$link_path"; then
     fail "file symlink rejection probe setup failed"
     return
   fi
   track_tmp_file "$link_path"
-  link_rel="${link_path#/srv/cybex-boot/www/}"
+  link_rel="${link_path#"$http_root"/}"
   check_http_code "file symlink rejected" 403 "http://127.0.0.1/files/$link_rel"
   rm -f "$link_path"
   untrack_tmp_file "$link_path"
@@ -1402,18 +1524,18 @@ check_spoofed_forwarded_for_marker_non_mutating() {
 
 check_tftp_permissions() {
   local bad_entries=""
-  if [ "$(stat -c '%U:%G %a' /srv/cybex-boot/tftp 2>/dev/null || true)" = "root:root 555" ]; then
+  if [ "$(stat -c '%U:%G %a' "$tftp_root" 2>/dev/null || true)" = "root:root 555" ]; then
     ok "TFTP directory is root-owned read-only"
   else
     fail "TFTP directory is not root:root 0555"
   fi
-  bad_entries="$(find /srv/cybex-boot/tftp -mindepth 1 -maxdepth 1 ! -type f -printf '%y %p\n' 2>/dev/null || true)"
+  bad_entries="$(find "$tftp_root" -mindepth 1 -maxdepth 1 ! -type f -printf '%y %p\n' 2>/dev/null || true)"
   if [ -z "$bad_entries" ]; then
     ok "TFTP root contains only regular files"
   else
     fail "TFTP root contains non-regular entries: $bad_entries"
   fi
-  bad_entries="$(find /srv/cybex-boot/tftp -maxdepth 1 -type f \( ! -user root -o ! -group root -o ! -perm 0444 \) -print 2>/dev/null || true)"
+  bad_entries="$(find "$tftp_root" -maxdepth 1 -type f \( ! -user root -o ! -group root -o ! -perm 0444 \) -print 2>/dev/null || true)"
   if [ -z "$bad_entries" ]; then
     ok "TFTP files are root-owned read-only"
   else
@@ -1422,11 +1544,11 @@ check_tftp_permissions() {
 }
 
 check_tftp_checksum_file() {
-  if [ ! -f /srv/cybex-boot/tftp/SHA256SUMS ]; then
+  if [ ! -f "$tftp_root/SHA256SUMS" ]; then
     fail "TFTP SHA256SUMS is missing"
     return
   fi
-  if (cd /srv/cybex-boot/tftp && sha256sum -c SHA256SUMS >/dev/null); then
+  if (cd "$tftp_root" && sha256sum -c SHA256SUMS >/dev/null); then
     ok "TFTP SHA256SUMS verifies"
   else
     fail "TFTP SHA256SUMS verification failed"
@@ -1450,7 +1572,7 @@ check_tftp_artifact_allowlist() {
         ;;
       *) bad_entries="${bad_entries}${bad_entries:+, }$name" ;;
     esac
-  done < <(find /srv/cybex-boot/tftp -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' 2>/dev/null | sort)
+  done < <(find "$tftp_root" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' 2>/dev/null | sort)
   if [ -z "$bad_entries" ]; then
     ok "TFTP root contains only regular managed artifacts"
   else
@@ -1460,7 +1582,7 @@ check_tftp_artifact_allowlist() {
 
 check_tftp_transfer() {
   local bootloader="${1:-snponly.efi}"
-  local source_file="/srv/cybex-boot/tftp/$bootloader"
+  local source_file="$tftp_root/$bootloader"
   local tmp_file
   if [ ! -f "$source_file" ]; then
     fail "TFTP bootloader $bootloader is missing"
@@ -1507,7 +1629,7 @@ bootloader_requires_embedded_script() {
 
 check_tftp_embedded_chain() {
   local bootloader="${1:-snponly.efi}"
-  local source_file="/srv/cybex-boot/tftp/$bootloader"
+  local source_file="$tftp_root/$bootloader"
   local public_base_url
   if ! bootloader_requires_embedded_script "$bootloader"; then
     ok "TFTP bootloader $bootloader is operator-managed"
@@ -1532,8 +1654,17 @@ check_tftp_embedded_chain() {
 }
 
 bootloader_filename() {
-  awk -F '"' '/^[[:space:]]*bootloader_filename[[:space:]]*=/ { print $2; exit }' /etc/cybex-boot/config.toml 2>/dev/null
+  config_string_value bootloader_filename
 }
+
+data_dir="$(config_path_value data_dir /var/lib/cybex-boot)"
+database_path="$(config_path_value database_path "$data_dir/cybex-boot.sqlite")"
+http_root="$(config_path_value boot_assets_dir /srv/cybex-boot/www)"
+iso_dir="$(config_path_value iso_dir "$http_root/isos")"
+static_dir="$(config_path_value static_dir "$http_root/assets")"
+tftp_root="$(config_path_value tftp_dir /srv/cybex-boot/tftp)"
+state_path="$(config_path_value state_path "$data_dir/manage-state.json")"
+runtime_root="/srv/cybex-boot"
 
 require_root
 
@@ -1583,8 +1714,8 @@ check_systemd_value cybex-boot-check.service RestrictNamespaces yes
 check_systemd_value cybex-boot-check.service RestrictRealtime yes
 check_systemd_value cybex-boot-check.service RestrictSUIDSGID yes
 check_systemd_value cybex-boot-check.service SystemCallArchitectures native
-check_systemd_exact_set cybex-boot-check.service ReadOnlyPaths "/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx /srv/cybex-boot/tftp"
-check_systemd_exact_set cybex-boot-check.service ReadWritePaths "/run /srv/cybex-boot/www /var/lib/cybex-boot /var/lib/nginx /var/log/nginx"
+check_systemd_exact_set cybex-boot-check.service ReadOnlyPaths "/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx $tftp_root"
+check_systemd_exact_set cybex-boot-check.service ReadWritePaths "/run $http_root /var/lib/cybex-boot /var/lib/nginx /var/log/nginx"
 check_systemd_exact_set cybex-boot-check.service RestrictAddressFamilies "AF_INET AF_NETLINK AF_UNIX"
 check_systemd_value cybex-boot-check.service UMask 0077
 check_systemd_contains cybex-boot-check.service Wants network-online.target
@@ -1623,7 +1754,7 @@ check_systemd_value cybex-boot RestrictRealtime yes
 check_systemd_value cybex-boot RestrictSUIDSGID yes
 check_systemd_value cybex-boot SystemCallArchitectures native
 check_cybex_boot_address_families
-check_systemd_exact_paths cybex-boot ReadWritePaths "/var/lib/cybex-boot /srv/cybex-boot/www"
+check_systemd_exact_paths cybex-boot ReadWritePaths "/var/lib/cybex-boot $http_root"
 check_systemd_contains cybex-boot ExecStart "cybex-boot --config /etc/cybex-boot/config.toml serve"
 check_systemd_contains cybex-boot ExecStartPre "cybex-boot --config /etc/cybex-boot/config.toml migrate"
 check_systemd_value cybex-boot WorkingDirectory /var/lib/cybex-boot
@@ -1644,8 +1775,8 @@ check_systemd_value nginx RestrictRealtime yes
 check_systemd_value nginx RestrictSUIDSGID yes
 check_systemd_value nginx UMask 0027
 check_nginx_capabilities
-check_systemd_exact_set nginx InaccessiblePaths "/etc/cybex-boot /var/lib/cybex-boot /srv/cybex-boot/tftp"
-check_systemd_exact_set nginx ReadOnlyPaths "/srv/cybex-boot/www"
+check_systemd_exact_set nginx InaccessiblePaths "/etc/cybex-boot /var/lib/cybex-boot $tftp_root"
+check_systemd_exact_set nginx ReadOnlyPaths "$http_root"
 check_systemd_exact_set nginx ReadWritePaths "/run /var/lib/nginx /var/log/nginx"
 check_systemd_exact_set nginx RestrictAddressFamilies "AF_INET AF_UNIX"
 check_systemd_value tftpd-hpa NoNewPrivileges yes
@@ -1654,14 +1785,14 @@ check_systemd_value tftpd-hpa ProcSubset pid
 check_systemd_value tftpd-hpa UMask 0077
 check_tftpd_capabilities
 check_tftpd_address_families
-check_systemd_contains tftpd-hpa ReadOnlyPaths /srv/cybex-boot/tftp
+check_systemd_contains tftpd-hpa ReadOnlyPaths "$tftp_root"
 check_systemd_contains tftpd-hpa InaccessiblePaths /etc/cybex-boot
 check_systemd_contains tftpd-hpa InaccessiblePaths /var/lib/cybex-boot
-check_systemd_contains tftpd-hpa InaccessiblePaths /srv/cybex-boot/www
+check_systemd_contains tftpd-hpa InaccessiblePaths "$http_root"
 check_systemd_contains tftpd-hpa EnvironmentFiles /etc/default/tftpd-hpa
 check_systemd_contains tftpd-hpa ExecStart 'in.tftpd --listen --user $TFTP_USERNAME --address $TFTP_ADDRESS $TFTP_OPTIONS $TFTP_DIRECTORY'
 check_file_contains "TFTP uses Cybex service user" /etc/default/tftpd-hpa 'TFTP_USERNAME="cybex-boot"'
-check_file_contains "TFTP serves managed root" /etc/default/tftpd-hpa 'TFTP_DIRECTORY="/srv/cybex-boot/tftp"'
+check_file_contains "TFTP serves managed root" /etc/default/tftpd-hpa "TFTP_DIRECTORY=\"$tftp_root\""
 check_file_contains "TFTP listens on IPv4 wildcard" /etc/default/tftpd-hpa 'TFTP_ADDRESS="0.0.0.0:69"'
 check_file_contains "TFTP uses secure IPv4 options" /etc/default/tftpd-hpa 'TFTP_OPTIONS="--ipv4 --secure"'
 check_path_stat "Boot binary permissions" /usr/local/bin/cybex-boot "root:root 755"
@@ -1686,19 +1817,19 @@ check_path_stat "runtime apply timer unit permissions" /etc/systemd/system/cybex
 check_path_stat "config directory permissions" /etc/cybex-boot "root:cybex-boot 750"
 check_path_stat "config file permissions" /etc/cybex-boot/config.toml "root:cybex-boot 640"
 check_local_management_routes_unavailable
-check_path_stat "state directory permissions" /var/lib/cybex-boot "cybex-boot:cybex-boot 700"
-check_path_stat "service asset root permissions" /srv/cybex-boot "root:cybex-boot 755"
+check_path_stat "state directory permissions" "$data_dir" "cybex-boot:cybex-boot 700"
+check_path_stat "service asset root permissions" "$runtime_root" "root:cybex-boot 755"
 check_service_asset_root_boundary
-check_path_stat "public asset root permissions" /srv/cybex-boot/www "cybex-boot:cybex-boot 755"
-check_path_stat "public ISO directory permissions" /srv/cybex-boot/www/isos "cybex-boot:cybex-boot 755"
-check_path_stat "public static asset directory permissions" /srv/cybex-boot/www/assets "cybex-boot:cybex-boot 755"
+check_path_stat "public asset root permissions" "$http_root" "cybex-boot:cybex-boot 755"
+check_path_stat "public ISO directory permissions" "$iso_dir" "cybex-boot:cybex-boot 755"
+check_path_stat "public static asset directory permissions" "$static_dir" "cybex-boot:cybex-boot 755"
 check_public_asset_tree_permissions
-check_path_absent "stale static boot script" /srv/cybex-boot/www/boot.ipxe
+check_path_absent "stale static boot script" "$http_root/boot.ipxe"
 cleanup_stale_http_check_assets
-check_path_stat "managed state permissions" /var/lib/cybex-boot/manage-state.json "cybex-boot:cybex-boot 600"
-check_path_stat "SQLite database permissions" /var/lib/cybex-boot/cybex-boot.sqlite "cybex-boot:cybex-boot 600"
-check_optional_path_stat "SQLite WAL permissions" /var/lib/cybex-boot/cybex-boot.sqlite-wal "cybex-boot:cybex-boot 600"
-check_optional_path_stat "SQLite SHM permissions" /var/lib/cybex-boot/cybex-boot.sqlite-shm "cybex-boot:cybex-boot 600"
+check_path_stat "managed state permissions" "$state_path" "cybex-boot:cybex-boot 600"
+check_path_stat "SQLite database permissions" "$database_path" "cybex-boot:cybex-boot 600"
+check_optional_path_stat "SQLite WAL permissions" "$database_path-wal" "cybex-boot:cybex-boot 600"
+check_optional_path_stat "SQLite SHM permissions" "$database_path-shm" "cybex-boot:cybex-boot 600"
 check_nginx_config_contains "nginx hides server tokens" "server_tokens off;"
 check_nginx_config_contains "nginx enforces method gate" "if (\$request_method !~ ^(GET|HEAD)\$)"
 check_nginx_config_contains "nginx limits request bodies" "client_max_body_size 1k;"
@@ -1769,10 +1900,10 @@ if [ "$skip_managed_sync" -eq 1 ]; then
   ok "managed sync-once skipped"
 elif /usr/local/sbin/cybex-boot-sync-once >/dev/null; then
   ok "managed sync-once completed"
-  check_path_stat "managed state permissions after sync" /var/lib/cybex-boot/manage-state.json "cybex-boot:cybex-boot 600"
-  check_path_stat "SQLite database permissions after sync" /var/lib/cybex-boot/cybex-boot.sqlite "cybex-boot:cybex-boot 600"
-  check_optional_path_stat "SQLite WAL permissions after sync" /var/lib/cybex-boot/cybex-boot.sqlite-wal "cybex-boot:cybex-boot 600"
-  check_optional_path_stat "SQLite SHM permissions after sync" /var/lib/cybex-boot/cybex-boot.sqlite-shm "cybex-boot:cybex-boot 600"
+  check_path_stat "managed state permissions after sync" "$state_path" "cybex-boot:cybex-boot 600"
+  check_path_stat "SQLite database permissions after sync" "$database_path" "cybex-boot:cybex-boot 600"
+  check_optional_path_stat "SQLite WAL permissions after sync" "$database_path-wal" "cybex-boot:cybex-boot 600"
+  check_optional_path_stat "SQLite SHM permissions after sync" "$database_path-shm" "cybex-boot:cybex-boot 600"
 else
   fail "managed sync-once failed"
 fi
@@ -1789,7 +1920,7 @@ EOF
   chown root:root /usr/local/sbin/cybex-boot-check
   chmod 0755 /usr/local/sbin/cybex-boot-check
 
-  cat > /etc/systemd/system/cybex-boot-check.service <<'EOF'
+  cat > /etc/systemd/system/cybex-boot-check.service <<EOF
 [Unit]
 Description=Cybex Boot local health check
 Wants=network-online.target
@@ -1818,8 +1949,8 @@ ProtectKernelTunables=true
 ProtectProc=invisible
 ProtectSystem=strict
 ProcSubset=pid
-ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx /srv/cybex-boot/tftp
-ReadWritePaths=/run /srv/cybex-boot/www /var/lib/cybex-boot /var/lib/nginx /var/log/nginx
+ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx $tftp_root
+ReadWritePaths=/run $http_root /var/lib/cybex-boot /var/lib/nginx /var/log/nginx
 RemoveIPC=true
 RestrictAddressFamilies=
 RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
@@ -2209,20 +2340,32 @@ verify_installation() {
   echo "Cybex Boot post-install check passed."
 }
 
-require_root
+installer_preflight
 require_value "--api-url" "$api_url"
 require_value "--organization-id" "$organization_id"
 require_value "--auth-code" "$auth_code"
 require_value "--public-base-url" "$public_base_url"
 validate_url "--api-url" "$api_url"
 validate_url "--public-base-url" "$public_base_url"
+validate_url "--git-url" "$git_url"
 validate_organization_id
 validate_auth_code
 validate_listen_addr
-validate_absolute_path "--tftp-root" "$tftp_root"
-validate_absolute_path "--http-root" "$http_root"
+validate_absolute_path "--source-dir" "$source_dir"
+validate_runtime_roots
 validate_bootloader_filename
 validate_menu_timeout
+validate_forge_ref
+if [ "$dry_run" -eq 1 ]; then
+  echo "Cybex Boot LXC installer validation passed."
+  echo "Source: $git_url"
+  echo "Forge ref: $forge_ref"
+  echo "Checkout: $source_dir"
+  echo "Manage API: $api_url"
+  echo "Organization: $organization_id"
+  echo "Public Boot URL: $public_base_url"
+  exit 0
+fi
 install_packages
 ensure_rust
 prepare_source
