@@ -36,17 +36,22 @@ use crate::{
         normalize_http_url, normalize_listen_addr, validate_menu_timeout_ms,
     },
     db,
-    models::{BootProfileType, clean_tags, normalize_mac},
+    models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
 };
 
-const CAPABILITY_BOOT_V1: &str = "cybex_boot_v1";
+const CAPABILITY_BOOT_V1: &str = "boot_v1";
+const CAPABILITY_BUILDER_V1: &str = "builder_v1";
+const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const MAX_MANAGED_PROFILES: usize = 1_000;
 const MAX_DELETED_MANAGED_PROFILES: usize = 2_000;
 const MAX_MANAGED_CLIENTS: usize = 2_000;
 const MAX_DELETED_MANAGED_CLIENTS: usize = 2_000;
+const MAX_MANAGED_BUILD_JOBS: usize = 500;
 const MAX_REPORT_CLIENTS: usize = 2_000;
 const MAX_REPORT_ASSETS: usize = 2_000;
 const MAX_REPORT_EVENTS: i64 = 500;
+const MAX_REPORT_BUILD_JOBS: usize = 500;
+const MAX_REPORT_CACHE_ARTIFACTS: usize = 2_000;
 const MAX_MANAGED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
 const MAX_DEVICE_HOSTNAME_CHARS: usize = 253;
@@ -101,6 +106,32 @@ struct AgentBootConfigResponse {
     deleted_client_ids: Vec<String>,
     #[serde(default)]
     clients_complete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentForgeConfigResponse {
+    #[serde(default)]
+    build_jobs: Vec<ManagedBuildJob>,
+    #[serde(default)]
+    deleted_build_job_ids: Vec<String>,
+    #[serde(default)]
+    build_jobs_complete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedBuildJob {
+    id: String,
+    requested_artifact_type: String,
+    #[serde(default)]
+    build_spec: Option<Value>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    system: Option<String>,
+    input_revision: String,
+    input_config_hash: String,
+    #[serde(default)]
+    cache_metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +267,118 @@ struct BootAgentProfileSyncReport {
     failed_at: Option<chrono::DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ForgeAgentReportRequest {
+    capabilities: Vec<&'static str>,
+    cache: crate::cache::CacheStatusReport,
+    build_jobs: Vec<ForgeBuildJobReport>,
+    cache_artifacts: Vec<ForgeCacheArtifactReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForgeBuildJobReport {
+    local_id: i64,
+    managed_job_id: Option<String>,
+    requested_artifact_type: String,
+    build_spec: Value,
+    target: String,
+    system: String,
+    input_revision: String,
+    input_config_hash: String,
+    status: String,
+    logs: String,
+    error: String,
+    output_path: String,
+    output_sha256: String,
+    output_size_bytes: i64,
+    exit_code: Option<i64>,
+    cache_metadata: Value,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    cancel_requested_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForgeCacheArtifactReport {
+    local_id: i64,
+    managed_artifact_id: Option<String>,
+    artifact_type: String,
+    hash: String,
+    size_bytes: i64,
+    path: String,
+    store_path: String,
+    narinfo_path: String,
+    nar_url: String,
+    file_hash: String,
+    nar_hash: String,
+    nar_size_bytes: i64,
+    closure_size_bytes: i64,
+    compression: String,
+    references: Value,
+    serving_url: String,
+    source_build_job_id: Option<String>,
+    cache_metadata: Value,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<BuildJob> for ForgeBuildJobReport {
+    fn from(job: BuildJob) -> Self {
+        Self {
+            local_id: job.id,
+            managed_job_id: job.managed_job_id,
+            requested_artifact_type: job.requested_artifact_type,
+            build_spec: job.build_spec,
+            target: job.target,
+            system: job.system,
+            input_revision: job.input_revision,
+            input_config_hash: job.input_config_hash,
+            status: job.status,
+            logs: job.logs,
+            error: job.error,
+            output_path: job.output_path,
+            output_sha256: job.output_sha256,
+            output_size_bytes: job.output_size_bytes,
+            exit_code: job.exit_code,
+            cache_metadata: job.cache_metadata,
+            started_at: job.started_at,
+            completed_at: job.completed_at,
+            cancel_requested_at: job.cancel_requested_at,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        }
+    }
+}
+
+impl From<CacheArtifact> for ForgeCacheArtifactReport {
+    fn from(artifact: CacheArtifact) -> Self {
+        Self {
+            local_id: artifact.id,
+            managed_artifact_id: artifact.managed_artifact_id,
+            artifact_type: artifact.artifact_type,
+            hash: artifact.hash,
+            size_bytes: artifact.size_bytes,
+            path: artifact.path,
+            store_path: artifact.store_path,
+            narinfo_path: artifact.narinfo_path,
+            nar_url: artifact.nar_url,
+            file_hash: artifact.file_hash,
+            nar_hash: artifact.nar_hash,
+            nar_size_bytes: artifact.nar_size_bytes,
+            closure_size_bytes: artifact.closure_size_bytes,
+            compression: artifact.compression,
+            references: artifact.references,
+            serving_url: artifact.serving_url,
+            source_build_job_id: artifact.source_build_job_id,
+            cache_metadata: artifact.cache_metadata,
+            created_at: artifact.created_at,
+            updated_at: artifact.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct BootEventReportRow {
     id: i64,
@@ -355,6 +498,7 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     apply_boot_config(state, &config).await?;
     let profile_sync = sync_desired_profile_isos(state, &managed).await?;
     report_boot_state(state, &mut managed, profile_sync).await?;
+    sync_forge_foundation(state, &managed).await?;
     save_managed_state(state, &managed)?;
     Ok(SyncOutcome::Synced)
 }
@@ -565,6 +709,90 @@ async fn report_boot_state(
         managed.last_reported_event_id = Some(max_event_id);
     }
     Ok(())
+}
+
+async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Result<()> {
+    let desired = fetch_forge_config(state, managed).await?;
+    if desired.build_jobs.len() > MAX_MANAGED_BUILD_JOBS {
+        bail!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs");
+    }
+
+    let mut retained_job_ids = Vec::with_capacity(desired.build_jobs.len());
+    for job in desired.build_jobs {
+        retained_job_ids.push(job.id.clone());
+        db::upsert_managed_build_job(
+            &state.db,
+            &job.id,
+            &job.requested_artifact_type,
+            job.build_spec,
+            job.target.as_deref(),
+            job.system.as_deref(),
+            &job.input_revision,
+            &job.input_config_hash,
+            job.cache_metadata,
+        )
+        .await
+        .with_context(|| format!("sync managed build job {}", job.id))?;
+    }
+    if desired.build_jobs_complete {
+        db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await?;
+    }
+    db::cancel_managed_build_jobs(&state.db, &desired.deleted_build_job_ids).await?;
+
+    report_forge_state(state, managed).await
+}
+
+async fn fetch_forge_config(
+    state: &AppState,
+    managed: &ManagedState,
+) -> Result<AgentForgeConfigResponse> {
+    let device_id = managed_device_id(managed)?;
+    let path = format!("/v1/agent/devices/{device_id}/forge/config");
+    let response = signed_request(state, managed, Method::GET, &path, Vec::new())
+        .await?
+        .send()
+        .await
+        .context("fetch managed forge config request failed")?;
+    parse_success_json(response, "fetch managed forge config").await
+}
+
+async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<()> {
+    let build_jobs = db::list_build_jobs(&state.db).await?;
+    let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
+    let cache = crate::cache::status_report(&state.config, &state.db).await;
+    let body = ForgeAgentReportRequest {
+        capabilities: forge_capabilities(),
+        cache,
+        build_jobs: build_jobs
+            .into_iter()
+            .take(MAX_REPORT_BUILD_JOBS)
+            .map(ForgeBuildJobReport::from)
+            .collect(),
+        cache_artifacts: cache_artifacts
+            .into_iter()
+            .take(MAX_REPORT_CACHE_ARTIFACTS)
+            .map(ForgeCacheArtifactReport::from)
+            .collect(),
+    };
+    let body_bytes = serialize_forge_report_body(&body)?;
+    let device_id = managed_device_id(managed)?;
+    let path = format!("/v1/agent/devices/{device_id}/forge/report");
+    let response = signed_request(state, managed, Method::POST, &path, body_bytes)
+        .await?
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .context("report managed forge state request failed")?;
+    parse_success_json::<Value>(response, "report managed forge state").await?;
+    Ok(())
+}
+
+fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
+    let body = serde_json::to_vec(body).context("serialize managed forge report")?;
+    if body.len() > MAX_REPORT_BODY_BYTES {
+        bail!("managed forge report exceeded {MAX_REPORT_BODY_BYTES} bytes");
+    }
+    Ok(body)
 }
 
 fn fit_boot_report_body(
@@ -1085,7 +1313,7 @@ fn render_nixos_netboot_script(
     if manifest.netboot_cpio_path.trim().is_empty() {
         return Ok(format!(
             "#!ipxe\n\
-             echo Cybex Boot: Default Enrollment\n\
+             echo Cybex Forge: Default Enrollment\n\
              kernel {kernel_url} {cmdline}\n\
              initrd {initrd_url}\n\
              boot\n",
@@ -1095,7 +1323,7 @@ fn render_nixos_netboot_script(
     let cpio_url = assets::asset_url(public_base_url, &manifest.netboot_cpio_path)?;
     Ok(format!(
         "#!ipxe\n\
-         echo Cybex Boot: Default Enrollment\n\
+         echo Cybex Forge: Default Enrollment\n\
          kernel {kernel_url} initrd=initrd {cmdline}\n\
          initrd --name initrd {initrd_url} initrd\n\
          initrd --name nixos-netboot.cpio {cpio_url} nixos-netboot.cpio\n\
@@ -1996,16 +2224,16 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
     let machine_id_hash = machine_id_hash(&hostname);
     Ok(json!({
         "organization_id": organization_id(&state.config)?,
-        "boot_install_code": boot_install_code(&state.config)?,
+        "forge_install_code": forge_install_code(&state.config)?,
         "hostname": hostname,
         "machine_id_hash": machine_id_hash,
         "agent_version": env!("CARGO_PKG_VERSION"),
-        "os_name": "Cybex Boot",
+        "os_name": "Cybex Forge",
         "os_version": env!("CARGO_PKG_VERSION"),
         "kernel_version": kernel_version(),
         "virtualization": virtualization(),
-        "device_kind": "cybex-boot",
-        "capabilities": [CAPABILITY_BOOT_V1],
+        "device_kind": "cybex-forge",
+        "capabilities": forge_capabilities(),
         "unsupported_capabilities": [],
         "public_key": public_key,
         "public_key_fingerprint": public_key_fingerprint,
@@ -2016,16 +2244,24 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
             "public_key_fingerprint": public_key_fingerprint,
         },
         "facts": {
-            "service": "cybex-boot",
+            "service": "cybex-forge",
             "public_base_url": state.config.public_base_url(),
             "listen_addr": state.config.server.listen_addr.clone(),
             "tftp_root": state.config.paths.tftp_dir.display().to_string(),
             "http_root": state.config.paths.boot_assets_dir.display().to_string(),
             "bootloader_filename": state.config.boot.bootloader_filename.clone(),
             "menu_timeout_ms": state.config.boot.menu_timeout_ms,
-            "capabilities": [CAPABILITY_BOOT_V1],
+            "capabilities": forge_capabilities(),
         }
     }))
+}
+
+fn forge_capabilities() -> Vec<&'static str> {
+    vec![
+        CAPABILITY_BOOT_V1,
+        CAPABILITY_BUILDER_V1,
+        CAPABILITY_CACHE_V1,
+    ]
 }
 
 fn ensure_key_material(state: &mut ManagedState) -> Result<()> {
@@ -2281,15 +2517,15 @@ fn organization_header(config: &AppConfig) -> Result<String> {
 fn organization_id(config: &AppConfig) -> Result<String> {
     let organization_id = config.manage.organization_id.trim();
     if organization_id.is_empty() {
-        bail!("manage.organization_id is required for Boot install enrollment");
+        bail!("manage.organization_id is required for Forge install enrollment");
     }
     Ok(organization_id.to_string())
 }
 
-fn boot_install_code(config: &AppConfig) -> Result<String> {
-    let code = config.manage.boot_install_code.trim();
+fn forge_install_code(config: &AppConfig) -> Result<String> {
+    let code = config.manage.forge_install_code.trim();
     if code.is_empty() {
-        bail!("manage.boot_install_code is required for Boot install enrollment");
+        bail!("manage.forge_install_code is required for Forge install enrollment");
     }
     Ok(code.to_string())
 }
@@ -2347,7 +2583,7 @@ fn hostname() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "cybex-boot".to_string())
+        .unwrap_or_else(|| "cybex-forge".to_string())
 }
 
 fn machine_id_hash(hostname: &str) -> String {
@@ -2629,9 +2865,21 @@ fn normalize_managed_runtime_root(field: &str, value: &str, fallback: &Path) -> 
     {
         bail!("{field} must not contain whitespace");
     }
-    let allowed_root = Path::new("/srv/cybex-boot");
-    if path == allowed_root || !path.starts_with(allowed_root) {
-        bail!("{field} must be under /srv/cybex-boot");
+    let forge_root = Path::new("/srv/cybex-forge");
+    let legacy_boot_root = Path::new("/srv/cybex-boot");
+    let allowed_root = if path.starts_with(forge_root) {
+        forge_root
+    } else if path.starts_with(legacy_boot_root) {
+        legacy_boot_root
+    } else {
+        bail!("{field} must be under /srv/cybex-forge or legacy /srv/cybex-boot");
+    };
+    if path == allowed_root {
+        bail!(
+            "{field} must be below {}, not {} itself",
+            allowed_root.display(),
+            allowed_root.display()
+        );
     }
     Ok(path)
 }
@@ -2653,21 +2901,21 @@ fn apply_runtime_settings_to_host(
     config: &AppConfig,
     settings: &NormalizedManagedSettings,
 ) -> Result<()> {
-    ensure_runtime_directories(settings)?;
+    ensure_runtime_directories(config, settings)?;
     let mut boot_changed = false;
     let mut nginx_changed = false;
     let mut tftp_changed = false;
     let mut daemon_reload = false;
 
     boot_changed |= install_text_file(
-        Path::new("/etc/cybex-boot/config.toml"),
+        Path::new("/etc/cybex-forge/config.toml"),
         &render_managed_config(config, settings)?,
         "0640",
         "root",
-        "cybex-boot",
+        "cybex-forge",
     )?;
     nginx_changed |= install_text_file(
-        Path::new("/etc/nginx/sites-available/cybex-boot"),
+        Path::new("/etc/nginx/sites-available/cybex-forge"),
         &render_nginx_config(settings),
         "0644",
         "root",
@@ -2682,7 +2930,7 @@ fn apply_runtime_settings_to_host(
     )?;
 
     daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/cybex-boot.service.d/40-write-paths.conf"),
+        Path::new("/etc/systemd/system/cybex-forge.service.d/40-write-paths.conf"),
         &render_boot_write_paths_dropin(settings),
         "0644",
         "root",
@@ -2703,7 +2951,7 @@ fn apply_runtime_settings_to_host(
         "root",
     )?;
     daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/cybex-boot-check.service"),
+        Path::new("/etc/systemd/system/cybex-forge-check.service"),
         &render_check_service(settings),
         "0644",
         "root",
@@ -2722,7 +2970,7 @@ fn apply_runtime_settings_to_host(
         run_command("nginx", ["-t"])?;
     }
     if boot_changed {
-        run_command("systemctl", ["restart", "cybex-boot.service"])?;
+        run_command("systemctl", ["restart", "cybex-forge.service"])?;
     }
     if nginx_changed {
         run_command("systemctl", ["restart", "nginx.service"])?;
@@ -2733,31 +2981,50 @@ fn apply_runtime_settings_to_host(
     Ok(())
 }
 
-fn ensure_runtime_directories(settings: &NormalizedManagedSettings) -> Result<()> {
-    install_dir(Path::new("/etc/cybex-boot"), "0750", "root", "cybex-boot")?;
+fn ensure_runtime_directories(
+    config: &AppConfig,
+    settings: &NormalizedManagedSettings,
+) -> Result<()> {
+    install_dir(Path::new("/etc/cybex-forge"), "0750", "root", "cybex-forge")?;
     install_dir(
-        Path::new("/var/lib/cybex-boot"),
+        Path::new("/var/lib/cybex-forge"),
         "0700",
-        "cybex-boot",
-        "cybex-boot",
+        "cybex-forge",
+        "cybex-forge",
     )?;
-    install_dir(Path::new("/srv/cybex-boot"), "0755", "root", "cybex-boot")?;
-    install_dir(&settings.http_root, "0755", "cybex-boot", "cybex-boot")?;
+    install_dir(Path::new("/srv/cybex-forge"), "0755", "root", "cybex-forge")?;
+    install_dir(&settings.http_root, "0755", "cybex-forge", "cybex-forge")?;
     install_dir(
         &settings.http_root.join("isos"),
         "0755",
-        "cybex-boot",
-        "cybex-boot",
+        "cybex-forge",
+        "cybex-forge",
     )?;
     install_dir(
         &settings.http_root.join("assets"),
         "0755",
-        "cybex-boot",
-        "cybex-boot",
+        "cybex-forge",
+        "cybex-forge",
     )?;
+    install_dir(
+        &settings.http_root.join("cache"),
+        "0755",
+        "cybex-forge",
+        "cybex-forge",
+    )?;
+    install_dir(&config.build.work_dir, "0700", "cybex-forge", "cybex-forge")?;
+    install_dir(
+        &config.build.output_dir,
+        "0700",
+        "cybex-forge",
+        "cybex-forge",
+    )?;
+    if let Some(parent) = config.cache.private_key_path.parent() {
+        install_dir(parent, "0700", "cybex-forge", "cybex-forge")?;
+    }
     install_dir(&settings.tftp_root, "0555", "root", "root")?;
     install_dir(
-        Path::new("/etc/systemd/system/cybex-boot.service.d"),
+        Path::new("/etc/systemd/system/cybex-forge.service.d"),
         "0755",
         "root",
         "root",
@@ -2783,6 +3050,8 @@ fn render_managed_config(
 ) -> Result<String> {
     let http_root = settings.http_root.display().to_string();
     let tftp_root = settings.tftp_root.display().to_string();
+    let cache_root = settings.http_root.join("cache").display().to_string();
+    let build_targets = render_build_target_config(&config.build.targets)?;
     Ok(format!(
         "[server]\n\
          listen_addr = {listen_addr}\n\
@@ -2797,6 +3066,26 @@ fn render_managed_config(
          [boot]\n\
          bootloader_filename = {bootloader_filename}\n\
          menu_timeout_ms = {menu_timeout_ms}\n\n\
+         [build]\n\
+         enabled = {build_enabled}\n\
+         max_concurrent_builds = {max_concurrent_builds}\n\
+         timeout_seconds = {build_timeout_seconds}\n\
+         cancel_grace_seconds = {cancel_grace_seconds}\n\
+         max_log_bytes = {max_log_bytes}\n\
+         max_artifact_size_bytes = {max_artifact_size_bytes}\n\
+         allowed_systems = {allowed_systems}\n\
+         work_dir = {build_work_dir}\n\
+         output_dir = {build_output_dir}\n\
+         nix_binary = {nix_binary}\n\
+         {build_targets}\n\
+         [cache]\n\
+         enabled = {cache_enabled}\n\
+         root_dir = {cache_root}\n\
+         signing_key_name = {signing_key_name}\n\
+         private_key_path = {cache_private_key_path}\n\
+         public_key_path = {cache_public_key_path}\n\
+         max_bytes = {cache_max_bytes}\n\
+         retain_recent_builds = {cache_retain_recent_builds}\n\n\
          [manage]\n\
          enabled = true\n\
          api_url = {api_url}\n\
@@ -2815,6 +3104,24 @@ fn render_managed_config(
         tftp_root = toml_string(&tftp_root)?,
         bootloader_filename = toml_string(&settings.bootloader_filename)?,
         menu_timeout_ms = settings.menu_timeout_ms,
+        build_enabled = config.build.enabled,
+        max_concurrent_builds = config.build.max_concurrent_builds,
+        build_timeout_seconds = config.build.timeout_seconds,
+        cancel_grace_seconds = config.build.cancel_grace_seconds,
+        max_log_bytes = config.build.max_log_bytes,
+        max_artifact_size_bytes = config.build.max_artifact_size_bytes,
+        allowed_systems = toml_string_array(&config.build.allowed_systems)?,
+        build_work_dir = toml_string(&config.build.work_dir.display().to_string())?,
+        build_output_dir = toml_string(&config.build.output_dir.display().to_string())?,
+        nix_binary = toml_string(&config.build.nix_binary)?,
+        build_targets = build_targets,
+        cache_enabled = config.cache.enabled,
+        cache_root = toml_string(&cache_root)?,
+        signing_key_name = toml_string(&config.cache.signing_key_name)?,
+        cache_private_key_path = toml_string(&config.cache.private_key_path.display().to_string())?,
+        cache_public_key_path = toml_string(&config.cache.public_key_path.display().to_string())?,
+        cache_max_bytes = config.cache.max_bytes,
+        cache_retain_recent_builds = config.cache.retain_recent_builds,
         api_url = toml_string(&config.manage.api_url)?,
         organization_id = toml_string(&organization_id(config)?)?,
         state_path = toml_string(&config.manage.state_path.display().to_string())?,
@@ -2828,7 +3135,7 @@ fn render_nginx_config(settings: &NormalizedManagedSettings) -> String {
     let listen_addr = &settings.listen_addr;
     let http_root = settings.http_root.display();
     format!(
-        r#"log_format cybex_boot_safe '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+        r#"log_format cybex_forge_safe '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
 
 server {{
     listen 80 default_server;
@@ -2836,8 +3143,8 @@ server {{
 
     root {http_root};
 
-    access_log /var/log/nginx/cybex-boot.access.log cybex_boot_safe;
-    error_log  /var/log/nginx/cybex-boot.error.log crit;
+    access_log /var/log/nginx/cybex-forge.access.log cybex_forge_safe;
+    error_log  /var/log/nginx/cybex-forge.error.log crit;
 
     server_tokens off;
     add_header X-Content-Type-Options nosniff always;
@@ -2927,6 +3234,21 @@ server {{
         proxy_buffering off;
     }}
 
+    location /cache/ {{
+        proxy_pass http://{listen_addr};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header Referrer-Policy;
+        proxy_hide_header Content-Security-Policy;
+        proxy_connect_timeout 2s;
+        proxy_send_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+    }}
+
     location = / {{
         return 204;
     }}
@@ -2941,7 +3263,7 @@ server {{
 
 fn render_tftpd_defaults(settings: &NormalizedManagedSettings) -> String {
     format!(
-        "TFTP_USERNAME=\"cybex-boot\"\n\
+        "TFTP_USERNAME=\"cybex-forge\"\n\
          TFTP_DIRECTORY=\"{}\"\n\
          TFTP_ADDRESS=\"0.0.0.0:69\"\n\
          TFTP_OPTIONS=\"--ipv4 --secure\"\n",
@@ -2951,7 +3273,7 @@ fn render_tftpd_defaults(settings: &NormalizedManagedSettings) -> String {
 
 fn render_boot_write_paths_dropin(settings: &NormalizedManagedSettings) -> String {
     format!(
-        "[Service]\nReadWritePaths=\nReadWritePaths=/var/lib/cybex-boot {}\n",
+        "[Service]\nReadWritePaths=\nReadWritePaths=/var/lib/cybex-forge {}\n",
         settings.http_root.display()
     )
 }
@@ -2961,7 +3283,7 @@ fn render_nginx_hardening_dropin(settings: &NormalizedManagedSettings) -> String
         "[Service]\n\
          AmbientCapabilities=\n\
          CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL\n\
-         InaccessiblePaths=/etc/cybex-boot /var/lib/cybex-boot {}\n\
+         InaccessiblePaths=/etc/cybex-forge /var/lib/cybex-forge {}\n\
          LockPersonality=true\n\
          NoNewPrivileges=true\n\
          PrivateDevices=true\n\
@@ -2992,7 +3314,7 @@ fn render_tftpd_hardening_dropin(settings: &NormalizedManagedSettings) -> String
         "[Service]\n\
          AmbientCapabilities=\n\
          CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT\n\
-         InaccessiblePaths=/etc/cybex-boot /var/lib/cybex-boot {}\n\
+         InaccessiblePaths=/etc/cybex-forge /var/lib/cybex-forge {}\n\
          LockPersonality=true\n\
          MemoryDenyWriteExecute=true\n\
          NoNewPrivileges=true\n\
@@ -3014,13 +3336,13 @@ fn render_tftpd_hardening_dropin(settings: &NormalizedManagedSettings) -> String
 fn render_check_service(settings: &NormalizedManagedSettings) -> String {
     format!(
         r#"[Unit]
-Description=Cybex Boot local health check
+Description=Cybex Forge local health check
 Wants=network-online.target
-After=network-online.target cybex-boot.service nginx.service tftpd-hpa.service
+After=network-online.target cybex-forge.service nginx.service tftpd-hpa.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/cybex-boot-check --quiet
+ExecStart=/usr/local/sbin/cybex-forge-check --quiet
 Nice=5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -3041,8 +3363,8 @@ ProtectKernelTunables=true
 ProtectProc=invisible
 ProtectSystem=strict
 ProcSubset=pid
-ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx {tftp_root}
-ReadWritePaths=/run {http_root} /var/lib/cybex-boot /var/lib/nginx /var/log/nginx
+ReadOnlyPaths=/etc/cybex-forge /etc/default/tftpd-hpa /etc/nginx {tftp_root}
+ReadWritePaths=/run {http_root} /var/lib/cybex-forge /var/lib/nginx /var/log/nginx
 RemoveIPC=true
 RestrictAddressFamilies=
 RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
@@ -3158,7 +3480,7 @@ fn build_embedded_ipxe_loader(settings: &NormalizedManagedSettings) -> Result<bo
             ],
         )?;
     }
-    let embed_script = temp_path(Path::new("/tmp"), "cybex-boot-embed.ipxe")?;
+    let embed_script = temp_path(Path::new("/tmp"), "cybex-forge-embed.ipxe")?;
     fs::write(
         &embed_script,
         render_embedded_ipxe_script(&settings.public_base_url),
@@ -3198,12 +3520,12 @@ fn build_embedded_ipxe_loader(settings: &NormalizedManagedSettings) -> Result<bo
 fn render_embedded_ipxe_script(public_base_url: &str) -> String {
     format!(
         "#!ipxe\n\
-         # Embedded chainloader for Cybex Boot UEFI PXE clients.\n\
+         # Embedded chainloader for Cybex Forge UEFI PXE clients.\n\
          isset ${{net0/ip}} || dhcp || goto failed\n\
          set boot-url {public_base_url}\n\
          chain --autofree ${{boot-url}}/boot.ipxe || goto failed\n\n\
          :failed\n\
-         echo Cybex Boot: failed to load ${{boot-url}}/boot.ipxe\n\
+         echo Cybex Forge: failed to load ${{boot-url}}/boot.ipxe\n\
          echo Dropping to iPXE shell.\n\
          shell\n"
     )
@@ -3342,6 +3664,31 @@ fn temp_path(parent: &Path, label: &str) -> Result<PathBuf> {
 
 fn toml_string(value: &str) -> Result<String> {
     serde_json::to_string(value).context("serialize TOML string")
+}
+
+fn toml_string_array(values: &[String]) -> Result<String> {
+    let encoded = values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(format!("[{encoded}]"))
+}
+
+fn render_build_target_config(targets: &[crate::config::BuildTargetConfig]) -> Result<String> {
+    let mut rendered = String::new();
+    for target in targets {
+        rendered.push_str("\n[[build.targets]]\n");
+        rendered.push_str(&format!(
+            "artifact_type = {}\n",
+            toml_string(&target.artifact_type)?
+        ));
+        rendered.push_str(&format!("target = {}\n", toml_string(&target.target)?));
+        rendered.push_str(&format!("system = {}\n", toml_string(&target.system)?));
+        rendered.push_str(&format!("flake = {}\n", toml_string(&target.flake)?));
+        rendered.push_str(&format!("attr = {}\n", toml_string(&target.attr)?));
+    }
+    Ok(rendered)
 }
 
 fn run_command<const N: usize>(program: &str, args: [&str; N]) -> Result<()> {
@@ -3636,10 +3983,11 @@ mod tests {
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
         NormalizedManagedSettings, SyncOutcome, append_bounded_response_chunk_with_limit,
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
-        fit_boot_report_body, has_unreported_known_profile_events, managed_profile_map,
-        managed_sync_interval_seconds, normalize_managed_settings, render_check_service,
-        serialize_boot_report_body, sync_clients, sync_deleted_clients, sync_deleted_profiles,
-        sync_profiles, validate_boot_config, validate_profile, write_secure_json,
+        fit_boot_report_body, forge_capabilities, has_unreported_known_profile_events,
+        managed_profile_map, managed_sync_interval_seconds, normalize_managed_settings,
+        render_check_service, serialize_boot_report_body, sync_clients, sync_deleted_clients,
+        sync_deleted_profiles, sync_profiles, validate_boot_config, validate_profile,
+        write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -3723,8 +4071,8 @@ mod tests {
         let settings = BootAgentSettingsReport {
             public_base_url: "http://127.0.0.1".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 8000,
             version: "test".to_string(),
@@ -3869,8 +4217,8 @@ mod tests {
         let settings = ManagedBootSettings {
             public_base_url: " http://boot.example/// ".to_string(),
             listen_addr: "127.0.0.1:9080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp-managed".to_string(),
-            http_root: "/srv/cybex-boot/www-managed".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp-managed".to_string(),
+            http_root: "/srv/cybex-forge/www-managed".to_string(),
             bootloader_filename: " ipxe.efi ".to_string(),
             menu_timeout_ms: 1_000,
         };
@@ -3881,14 +4229,32 @@ mod tests {
         assert_eq!(normalized.listen_addr, "127.0.0.1:9080");
         assert_eq!(
             normalized.tftp_root,
-            PathBuf::from("/srv/cybex-boot/tftp-managed")
+            PathBuf::from("/srv/cybex-forge/tftp-managed")
         );
         assert_eq!(
             normalized.http_root,
-            PathBuf::from("/srv/cybex-boot/www-managed")
+            PathBuf::from("/srv/cybex-forge/www-managed")
         );
         assert_eq!(normalized.bootloader_filename, "ipxe.efi");
         assert_eq!(normalized.menu_timeout_ms, 1_000);
+    }
+
+    #[test]
+    fn managed_settings_accept_legacy_boot_roots_during_rename() {
+        let app_config = AppConfig::default();
+        let settings = ManagedBootSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: "/srv/cybex-boot/tftp".to_string(),
+            http_root: "/srv/cybex-boot/www".to_string(),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        let normalized = normalize_managed_settings(&settings, &app_config).unwrap();
+
+        assert_eq!(normalized.tftp_root, PathBuf::from("/srv/cybex-boot/tftp"));
+        assert_eq!(normalized.http_root, PathBuf::from("/srv/cybex-boot/www"));
     }
 
     #[test]
@@ -3923,16 +4289,16 @@ mod tests {
         let nested_http = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/tftp/www".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/tftp/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
         let nested_tftp = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/www/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            tftp_root: "/srv/cybex-forge/www/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -3952,8 +4318,8 @@ mod tests {
         let settings = NormalizedManagedSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: PathBuf::from("/srv/cybex-boot/tftp-managed"),
-            http_root: PathBuf::from("/srv/cybex-boot/www-managed"),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp-managed"),
+            http_root: PathBuf::from("/srv/cybex-forge/www-managed"),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -3961,10 +4327,10 @@ mod tests {
         let service = render_check_service(&settings);
 
         assert!(service.contains(
-            "ReadOnlyPaths=/etc/cybex-boot /etc/default/tftpd-hpa /etc/nginx /srv/cybex-boot/tftp-managed"
+            "ReadOnlyPaths=/etc/cybex-forge /etc/default/tftpd-hpa /etc/nginx /srv/cybex-forge/tftp-managed"
         ));
         assert!(service.contains(
-            "ReadWritePaths=/run /srv/cybex-boot/www-managed /var/lib/cybex-boot /var/lib/nginx /var/log/nginx"
+            "ReadWritePaths=/run /srv/cybex-forge/www-managed /var/lib/cybex-forge /var/lib/nginx /var/log/nginx"
         ));
     }
 
@@ -3974,16 +4340,16 @@ mod tests {
         let invalid_url = ManagedBootSettings {
             public_base_url: "http://boot.example/path?debug=true".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
         let invalid_loader = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "../snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -3991,15 +4357,15 @@ mod tests {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
             tftp_root: "/tmp/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
         let invalid_listener = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "0.0.0.0:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -4609,6 +4975,14 @@ mod tests {
     }
 
     #[test]
+    fn forge_capabilities_report_build_and_cache() {
+        assert_eq!(
+            forge_capabilities(),
+            vec!["boot_v1", "builder_v1", "cache_v1"]
+        );
+    }
+
+    #[test]
     fn pending_enrollment_uses_poll_interval() {
         let config = ManageConfig {
             sync_interval_seconds: 60,
@@ -4700,8 +5074,8 @@ mod tests {
             settings: ManagedBootSettings {
                 public_base_url: "http://127.0.0.1".to_string(),
                 listen_addr: "127.0.0.1:8080".to_string(),
-                tftp_root: "/srv/cybex-boot/tftp".to_string(),
-                http_root: "/srv/cybex-boot/www".to_string(),
+                tftp_root: "/srv/cybex-forge/tftp".to_string(),
+                http_root: "/srv/cybex-forge/www".to_string(),
                 bootloader_filename: "ipxe.efi".to_string(),
                 menu_timeout_ms: 10_000,
             },
@@ -4724,7 +5098,7 @@ mod tests {
         let mut random = [0u8; 8];
         OsRng.fill_bytes(&mut random);
         let path = std::env::temp_dir().join(format!(
-            "cybex-boot-managed-state-{}-{}",
+            "cybex-forge-managed-state-{}-{}",
             std::process::id(),
             hex::encode(random)
         ));

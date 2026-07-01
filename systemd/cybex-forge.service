@@ -1,18 +1,18 @@
 [Unit]
-Description=Cybex Boot iPXE control service
+Description=Cybex Forge iPXE control service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=cybex-boot
-Group=cybex-boot
-ExecStart=/usr/local/bin/cybex-boot --config /etc/cybex-boot/config.toml serve
-WorkingDirectory=/var/lib/cybex-boot
+User=cybex-forge
+Group=cybex-forge
+ExecStart=/usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml serve
+WorkingDirectory=/var/lib/cybex-forge
 Restart=on-failure
 RestartSec=3
-StateDirectory=cybex-boot
-ReadWritePaths=/var/lib/cybex-boot /srv/cybex-boot
+StateDirectory=cybex-forge
+ReadWritePaths=/var/lib/cybex-forge /srv/cybex-forge
 UMask=0077
 CapabilityBoundingSet=
 AmbientCapabilities=

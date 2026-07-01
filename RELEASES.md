@@ -14,8 +14,8 @@ Release checklist:
 - The Cybex Manage deployment that generated production commands is configured
   with `CYBEX_FORGE_INSTALL_REF=v0.1.0` or the selected production tag.
 - A disposable Proxmox host/LXC install has verified that the generated command
-  clones Forge into `/root/forge`, builds and starts Cybex Boot, submits the
-  one-time enrollment, and appears as pending `cybex-boot` in Manage.
+  clones Forge into `/root/forge`, builds and starts Cybex Forge, submits the
+  one-time enrollment, and appears as pending `cybex-forge` in Manage.
 - The pending enrollment has been adopted and Boot health, nginx, TFTP,
   runtime apply services, and installer ISO/source serving have been verified.
 - Install output has been captured with one-time auth codes and other secrets

@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::AppError;
 
@@ -100,6 +101,98 @@ pub struct IsoAsset {
     pub last_scanned_at: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BuildJob {
+    pub id: i64,
+    pub managed_job_id: Option<String>,
+    pub requested_artifact_type: String,
+    pub build_spec: Value,
+    pub target: String,
+    pub system: String,
+    pub input_revision: String,
+    pub input_config_hash: String,
+    pub status: String,
+    pub logs: String,
+    pub error: String,
+    pub output_path: String,
+    pub output_sha256: String,
+    pub output_size_bytes: i64,
+    pub exit_code: Option<i64>,
+    pub cache_metadata: Value,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub cancel_requested_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheArtifact {
+    pub id: i64,
+    pub managed_artifact_id: Option<String>,
+    pub artifact_type: String,
+    pub hash: String,
+    pub size_bytes: i64,
+    pub path: String,
+    pub store_path: String,
+    pub narinfo_path: String,
+    pub nar_url: String,
+    pub file_hash: String,
+    pub nar_hash: String,
+    pub nar_size_bytes: i64,
+    pub closure_size_bytes: i64,
+    pub compression: String,
+    pub references: Value,
+    pub serving_url: String,
+    pub source_build_job_id: Option<String>,
+    pub cache_metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBuildJobRequest {
+    pub requested_artifact_type: String,
+    #[serde(default)]
+    pub build_spec: Option<Value>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub system: Option<String>,
+    pub input_revision: String,
+    pub input_config_hash: String,
+    pub cache_metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCacheArtifactRequest {
+    pub artifact_type: String,
+    pub hash: String,
+    pub size_bytes: i64,
+    pub path: String,
+    #[serde(default)]
+    pub store_path: Option<String>,
+    #[serde(default)]
+    pub narinfo_path: Option<String>,
+    #[serde(default)]
+    pub nar_url: Option<String>,
+    #[serde(default)]
+    pub file_hash: Option<String>,
+    #[serde(default)]
+    pub nar_hash: Option<String>,
+    #[serde(default)]
+    pub nar_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub closure_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub compression: Option<String>,
+    #[serde(default)]
+    pub references: Option<Value>,
+    pub serving_url: Option<String>,
+    pub source_build_job_id: Option<String>,
+    pub cache_metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

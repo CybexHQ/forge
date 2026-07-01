@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/boot/by-serial/:serial", get(boot::boot_serial))
         .route("/boot/select/:profile_id", get(boot::boot_select_profile))
         .route("/files/*path", get(files::boot_file))
+        .route("/cache/*path", get(files::cache_file))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(add_security_headers))
         .layer(TraceLayer::new_for_http().make_span_with(request_trace_span))
@@ -198,7 +199,7 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        let root = temp_test_dir("cybex-boot-router");
+        let root = temp_test_dir("cybex-forge-router");
         let config_path = root.join("config.toml");
         let www = root.join("www");
         fs::create_dir_all(&www).unwrap();
@@ -213,7 +214,7 @@ public_base_url = "http://boot.example"
 
 [paths]
 data_dir = "{root}/data"
-database_path = "{root}/data/cybex-boot.sqlite"
+database_path = "{root}/data/cybex-forge.sqlite"
 boot_assets_dir = "{root}/www"
 iso_dir = "{root}/www/isos"
 static_dir = "{root}/www/assets"

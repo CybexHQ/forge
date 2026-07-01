@@ -159,13 +159,13 @@ pub fn render_login(error: Option<&str>) -> Html<String> {
                 head {
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
-                    title { "Cybex Boot" }
+                    title { "Cybex Forge" }
                     style { (PreEscaped(CSS)) }
                 }
                 body {
                     main class="login" {
                         section class="login-box" {
-                            h1 { "Cybex Boot" }
+                            h1 { "Cybex Forge" }
                             @if let Some(error) = error {
                                 p class="error" { (error) }
                             }
@@ -537,13 +537,13 @@ fn layout(title: &str, active: &str, content: Markup) -> Html<String> {
                 head {
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
-                    title { (title) " - Cybex Boot" }
+                    title { (title) " - Cybex Forge" }
                     style { (PreEscaped(CSS)) }
                 }
                 body {
                     div class="shell" {
                         aside class="sidebar" {
-                            div class="brand" { "Cybex Boot" }
+                            div class="brand" { "Cybex Forge" }
                             nav class="nav" {
                                 (nav_link("/", "Dashboard", active == "dashboard"))
                                 (nav_link("/devices", "Devices", active == "devices"))

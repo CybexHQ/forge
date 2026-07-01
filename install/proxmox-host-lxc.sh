@@ -4,30 +4,30 @@ set -euo pipefail
 FORGE_GIT_URL_DEFAULT="https://github.com/CybexHQ/forge.git"
 FORGE_REF_DEFAULT="main"
 FORGE_SOURCE_DIR_DEFAULT="/root/forge"
-LXC_INSTALLER_RELATIVE_PATH="install/cybex-boot-lxc-install.sh"
+LXC_INSTALLER_RELATIVE_PATH="install/cybex-forge-lxc-install.sh"
 
 api_url="${CYBEX_MANAGE_API_URL:-}"
 organization_id="${CYBEX_ORGANIZATION_ID:-}"
-auth_code="${CYBEX_BOOT_AUTH_CODE:-}"
-public_base_url="${CYBEX_BOOT_PUBLIC_BASE_URL:-}"
-listen_addr="${CYBEX_BOOT_LISTEN_ADDR:-127.0.0.1:8080}"
-tftp_root="${CYBEX_BOOT_TFTP_ROOT:-/srv/cybex-boot/tftp}"
-http_root="${CYBEX_BOOT_HTTP_ROOT:-/srv/cybex-boot/www}"
-bootloader_filename="${CYBEX_BOOTLOADER_FILENAME:-snponly.efi}"
-menu_timeout_ms="${CYBEX_BOOT_MENU_TIMEOUT_MS:-8000}"
+auth_code="${CYBEX_FORGE_AUTH_CODE:-}"
+public_base_url="${CYBEX_FORGE_PUBLIC_BASE_URL:-}"
+listen_addr="${CYBEX_FORGE_LISTEN_ADDR:-127.0.0.1:8080}"
+tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
+http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
+bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
+menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-8000}"
 
-vmid="${CYBEX_BOOT_PROXMOX_VMID:-}"
-hostname="${CYBEX_BOOT_PROXMOX_HOSTNAME:-cybex-boot}"
-storage="${CYBEX_BOOT_PROXMOX_STORAGE:-}"
-template_storage="${CYBEX_BOOT_PROXMOX_TEMPLATE_STORAGE:-}"
-bridge="${CYBEX_BOOT_PROXMOX_BRIDGE:-}"
-template="${CYBEX_BOOT_PROXMOX_TEMPLATE:-}"
-disk_gb="${CYBEX_BOOT_PROXMOX_DISK_GB:-32}"
-cpu_cores="${CYBEX_BOOT_PROXMOX_CPU_CORES:-2}"
-memory_mb="${CYBEX_BOOT_PROXMOX_MEMORY_MB:-4096}"
-forge_git_url="${CYBEX_BOOT_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
-forge_ref="${CYBEX_BOOT_FORGE_REF:-$FORGE_REF_DEFAULT}"
-forge_source_dir="${CYBEX_BOOT_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
+vmid="${CYBEX_FORGE_PROXMOX_VMID:-}"
+hostname="${CYBEX_FORGE_PROXMOX_HOSTNAME:-cybex-forge}"
+storage="${CYBEX_FORGE_PROXMOX_STORAGE:-}"
+template_storage="${CYBEX_FORGE_PROXMOX_TEMPLATE_STORAGE:-}"
+bridge="${CYBEX_FORGE_PROXMOX_BRIDGE:-}"
+template="${CYBEX_FORGE_PROXMOX_TEMPLATE:-}"
+disk_gb="${CYBEX_FORGE_PROXMOX_DISK_GB:-32}"
+cpu_cores="${CYBEX_FORGE_PROXMOX_CPU_CORES:-2}"
+memory_mb="${CYBEX_FORGE_PROXMOX_MEMORY_MB:-4096}"
+forge_git_url="${CYBEX_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
+forge_ref="${CYBEX_FORGE_REF:-$FORGE_REF_DEFAULT}"
+forge_source_dir="${CYBEX_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
 dry_run=0
 created_container=0
 started_container=0
@@ -40,14 +40,14 @@ Usage:
   proxmox-host-lxc.sh --api-url URL --organization-id UUID --auth-code CODE --public-base-url URL [options]
 
 Run this on a Proxmox host as root. It creates a Debian/Ubuntu LXC, clones
-Forge inside it, installs Cybex Boot, submits the one-time install code, and
-leaves a pending cybex-boot enrollment in Cybex Manage.
+Forge inside it, installs Cybex Forge, submits the one-time install code, and
+leaves a pending cybex-forge enrollment in Cybex Manage.
 
 Required:
   --api-url URL                  Cybex Manage public API URL
   --organization-id UUID         Cybex organization UUID
-  --auth-code CODE               One-time Boot install authorization code
-  --public-base-url URL          URL PXE clients use for this Boot server
+  --auth-code CODE               One-time Forge install authorization code
+  --public-base-url URL          URL PXE clients use for this Forge node
 
 Generated resource options:
   --proxmox-disk-gb GiB          Root disk size (default/recommended: 32)
@@ -56,14 +56,14 @@ Generated resource options:
 
 Boot runtime options:
   --listen ADDR                  Local Boot address behind nginx (default: 127.0.0.1:8080)
-  --tftp-root PATH               TFTP root below /srv/cybex-boot (default: /srv/cybex-boot/tftp)
-  --http-root PATH               HTTP asset root below /srv/cybex-boot (default: /srv/cybex-boot/www)
+  --tftp-root PATH               TFTP root below /srv/cybex-forge (default: /srv/cybex-forge/tftp)
+  --http-root PATH               HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME              UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS           Boot menu timeout (default: 8000)
 
 Advanced Proxmox options:
   --vmid ID                      Container VMID (default: next cluster id)
-  --hostname NAME                Container hostname (default: cybex-boot)
+  --hostname NAME                Container hostname (default: cybex-forge)
   --storage NAME                 Rootfs storage (default: first rootdir-capable storage)
   --template-storage NAME        Template storage (default: first vztmpl-capable storage)
   --bridge NAME                  Network bridge (default: vmbr0 or first vmbr*)
@@ -269,15 +269,18 @@ validate_absolute_path() {
 validate_runtime_root() {
   local name="$1"
   local value="$2"
-  local allowed_root="/srv/cybex-boot"
+  local allowed_root="/srv/cybex-forge"
+  local legacy_root="/srv/cybex-boot"
   validate_absolute_path "$name" "$value"
   if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
     die "$name must not contain whitespace"
   fi
   case "$value" in
     "$allowed_root"/*) ;;
+    "$legacy_root"/*) ;;
     "$allowed_root") die "$name must be below $allowed_root, not $allowed_root itself" ;;
-    *) die "$name must be under $allowed_root" ;;
+    "$legacy_root") die "$name must be below $legacy_root, not $legacy_root itself" ;;
+    *) die "$name must be under $allowed_root or legacy $legacy_root" ;;
   esac
 }
 
@@ -510,14 +513,14 @@ prepare_forge_source() {
       git -C "$source_dir" fetch --depth 1 origin "$forge_ref"
       git -C "$source_dir" checkout --detach -f FETCH_HEAD
     fi
-    test -f "$source_dir/install/cybex-boot-lxc-install.sh"
-    chmod 0755 "$source_dir/install/cybex-boot-lxc-install.sh"
+    test -f "$source_dir/install/cybex-forge-lxc-install.sh"
+    chmod 0755 "$source_dir/install/cybex-forge-lxc-install.sh"
     git -C "$source_dir" rev-parse HEAD > "$source_dir/.cybex-forge-revision"
   ' sh "$forge_source_dir" "$forge_git_url" "$forge_ref"
 }
 
 run_lxc_installer() {
-  section "Install Cybex Boot"
+  section "Install Cybex Forge"
   info "Running the LXC installer. The one-time code is passed to the installer but not printed."
   local installer="${forge_source_dir}/${LXC_INSTALLER_RELATIVE_PATH}"
   pct exec "$vmid" -- "$installer" \
@@ -539,12 +542,12 @@ print_final() {
   local container_ip
   container_ip="$(pct exec "$vmid" -- hostname -I 2>/dev/null | awk '{ print $1 }' || true)"
   section "Next"
-  info "A pending cybex-boot enrollment has been submitted to Cybex Manage."
+  info "A pending cybex-forge enrollment has been submitted to Cybex Manage."
   if [ -n "$container_ip" ]; then
     info "Detected LXC address: $container_ip"
-    info "Open Enrollments, adopt the Cybex Boot server, then configure DHCP option 66 to $container_ip and option 67 to $bootloader_filename."
+    info "Open Enrollments, adopt the Cybex Forge server, then configure DHCP option 66 to $container_ip and option 67 to $bootloader_filename."
   else
-    info "Open Enrollments, adopt the Cybex Boot server, then configure DHCP option 66 to the LXC address and option 67 to $bootloader_filename."
+    info "Open Enrollments, adopt the Cybex Forge server, then configure DHCP option 66 to the LXC address and option 67 to $bootloader_filename."
   fi
   info "Container VMID $vmid is running as $hostname."
 }

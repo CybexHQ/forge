@@ -19,10 +19,10 @@ pub struct ProfileSelection<'a> {
 }
 
 const IPXE_MENU_TITLE: &str = "CYBEX";
-const IPXE_MENU_SUBTITLE: &str = "PXE BOOT - CYBEX BOOT - X86_64 - UEFI";
+const IPXE_MENU_SUBTITLE: &str = "PXE BOOT - FORGE BOOT - X86_64 - UEFI";
 const IPXE_MENU_TIMEOUT_COPY: &str =
     "Booting the highlighted entry automatically - press any key to pause";
-const IPXE_MENU_FOOTER: &str = "cybex-boot - pxe - x86_64 - uefi";
+const IPXE_MENU_FOOTER: &str = "cybex-forge - pxe - x86_64 - uefi";
 
 pub fn choose_profile<'a>(
     device: Option<&Device>,
@@ -131,7 +131,7 @@ pub fn render_menu(
     script.push_str(":local\n");
     script.push_str(&render_local_body());
     script.push_str("\n:failed\n");
-    script.push_str("echo Cybex Boot failed to load the selected profile\n");
+    script.push_str("echo Cybex Forge failed to load the selected profile\n");
     script.push_str("sleep 5\n");
     script.push_str("goto local\n\n");
     script.push_str(":end\n");
@@ -196,7 +196,7 @@ pub fn render_profile_script(profile: &BootProfile, public_base_url: &str) -> Ap
 
     let mut script = String::new();
     script.push_str("#!ipxe\n");
-    script.push_str(&format!("echo Cybex Boot: {}\n", ipxe_text(&profile.name)));
+    script.push_str(&format!("echo Cybex Forge: {}\n", ipxe_text(&profile.name)));
 
     match profile.profile_type {
         BootProfileType::LocalDisk => {
@@ -441,13 +441,13 @@ mod tests {
         let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
 
         assert!(script.contains("set cybex-title CYBEX"));
-        assert!(script.contains("set cybex-subtitle PXE BOOT - CYBEX BOOT - X86_64 - UEFI"));
+        assert!(script.contains("set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI"));
         assert!(script.contains("colour --basic 0 --rgb 0x0e0f12 0"));
         assert!(script.contains("colour --basic 3 --rgb 0xeb9b46 1"));
         assert!(script.contains("cpair --foreground 1 --background 4 2"));
         assert!(script.contains("item --gap ${cybex-subtitle}"));
         assert!(script.contains("item --gap ${cybex-timeout-copy}"));
-        assert!(script.contains("item --gap cybex-boot - pxe - x86_64 - uefi"));
+        assert!(script.contains("item --gap cybex-forge - pxe - x86_64 - uefi"));
     }
 
     #[test]

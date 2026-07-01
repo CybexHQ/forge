@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{AppState, assets::redirect_to, error::AppError, ui};
 
-const ADMIN_SESSION_CONTEXT: &[u8] = b"cybex-boot-admin-session-v1\0";
+const ADMIN_SESSION_CONTEXT: &[u8] = b"cybex-forge-admin-session-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdminTokenSource {

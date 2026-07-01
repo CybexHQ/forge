@@ -444,7 +444,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "cybex-boot-assets-test-{}-{unique}",
+            "cybex-forge-assets-test-{}-{unique}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);

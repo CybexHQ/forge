@@ -43,10 +43,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
 
       - name: Bash syntax
-        run: bash -n install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
+        run: bash -n install/proxmox-host-lxc.sh install/cybex-forge-lxc-install.sh
 
       - name: Shellcheck
-        run: shellcheck install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
+        run: shellcheck install/proxmox-host-lxc.sh install/cybex-forge-lxc-install.sh
 
   security:
     name: Dependency Audit

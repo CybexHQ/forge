@@ -21,3 +21,11 @@ pub async fn static_file(
 ) -> AppResult<Response> {
     assets::serve_file_from_root(&state.config.paths.static_dir, &path, &headers).await
 }
+
+pub async fn cache_file(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    assets::serve_file_from_root(&state.config.cache.root_dir, &path, &headers).await
+}

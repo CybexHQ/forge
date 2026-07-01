@@ -427,7 +427,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cybex-boot"
+name = "cybex-forge"
 version = "0.1.0"
 dependencies = [
  "anyhow",

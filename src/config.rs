@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "cybex-boot")]
+#[command(name = "cybex-forge")]
 #[command(about = "UEFI-only PXE/iPXE boot control service")]
 pub struct Cli {
     #[arg(
         short,
         long,
-        default_value = "/etc/cybex-boot/config.toml",
-        env = "CYBEX_BOOT_CONFIG"
+        default_value = "/etc/cybex-forge/config.toml",
+        env = "CYBEX_FORGE_CONFIG"
     )]
     pub config: PathBuf,
 
@@ -44,6 +44,8 @@ pub struct AppConfig {
     pub paths: PathsConfig,
     pub auth: AuthConfig,
     pub boot: BootConfig,
+    pub build: BuildConfig,
+    pub cache: CacheConfig,
     pub manage: ManageConfig,
 }
 
@@ -81,12 +83,51 @@ pub struct BootConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
+pub struct BuildConfig {
+    pub enabled: bool,
+    pub max_concurrent_builds: usize,
+    pub timeout_seconds: u64,
+    pub cancel_grace_seconds: u64,
+    pub max_log_bytes: usize,
+    pub max_artifact_size_bytes: u64,
+    pub allowed_systems: Vec<String>,
+    pub work_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub nix_binary: String,
+    pub targets: Vec<BuildTargetConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BuildTargetConfig {
+    pub artifact_type: String,
+    pub target: String,
+    pub system: String,
+    pub flake: String,
+    pub attr: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub root_dir: PathBuf,
+    pub signing_key_name: String,
+    pub private_key_path: PathBuf,
+    pub public_key_path: PathBuf,
+    pub max_bytes: u64,
+    pub retain_recent_builds: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ManageConfig {
     pub enabled: bool,
     pub api_url: String,
     pub organization_id: String,
     #[serde(default)]
-    pub boot_install_code: String,
+    #[serde(alias = "boot_install_code")]
+    pub forge_install_code: String,
     #[serde(default)]
     pub organization_slug: String,
     pub state_path: PathBuf,
@@ -137,14 +178,45 @@ impl AppConfig {
         self.boot.bootloader_filename =
             normalize_bootloader_filename(&self.boot.bootloader_filename)?;
         validate_menu_timeout_ms(self.boot.menu_timeout_ms)?;
+        self.build.max_concurrent_builds = self.build.max_concurrent_builds.clamp(1, 16);
+        self.build.timeout_seconds = self.build.timeout_seconds.clamp(30, 24 * 60 * 60);
+        self.build.cancel_grace_seconds = self.build.cancel_grace_seconds.clamp(1, 300);
+        self.build.max_log_bytes = self.build.max_log_bytes.clamp(1024, 8 * 1024 * 1024);
+        self.build.max_artifact_size_bytes = self
+            .build
+            .max_artifact_size_bytes
+            .clamp(1024 * 1024, 10 * 1024 * 1024 * 1024);
+        self.build.work_dir =
+            normalize_absolute_config_path("build.work_dir", &self.build.work_dir)?;
+        self.build.output_dir =
+            normalize_absolute_config_path("build.output_dir", &self.build.output_dir)?;
+        self.build.nix_binary = normalize_program_name("build.nix_binary", &self.build.nix_binary)?;
+        self.build.allowed_systems =
+            normalize_allowed_systems(&self.build.allowed_systems, "build.allowed_systems")?;
+        for target in &mut self.build.targets {
+            normalize_build_target_config(target)?;
+        }
+        self.cache.root_dir =
+            normalize_absolute_config_path("cache.root_dir", &self.cache.root_dir)?;
+        self.cache.private_key_path =
+            normalize_absolute_config_path("cache.private_key_path", &self.cache.private_key_path)?;
+        self.cache.public_key_path =
+            normalize_absolute_config_path("cache.public_key_path", &self.cache.public_key_path)?;
+        self.cache.signing_key_name =
+            normalize_cache_key_name("cache.signing_key_name", &self.cache.signing_key_name)?;
+        self.cache.max_bytes = self
+            .cache
+            .max_bytes
+            .clamp(16 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
+        self.cache.retain_recent_builds = self.cache.retain_recent_builds.clamp(1, 10_000);
         self.manage.api_url = if self.manage.api_url.trim().is_empty() {
             String::new()
         } else {
             normalize_http_url("manage.api_url", &self.manage.api_url)?
         };
         self.manage.organization_id = normalize_organization_id(&self.manage.organization_id)?;
-        self.manage.boot_install_code =
-            normalize_boot_install_code(&self.manage.boot_install_code)?;
+        self.manage.forge_install_code =
+            normalize_forge_install_code(&self.manage.forge_install_code)?;
         self.manage.organization_slug =
             normalize_optional_organization_slug(&self.manage.organization_slug)?;
         self.manage.state_path =
@@ -303,7 +375,7 @@ fn normalize_organization_id(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn normalize_boot_install_code(value: &str) -> anyhow::Result<String> {
+fn normalize_forge_install_code(value: &str) -> anyhow::Result<String> {
     let code = value.trim();
     if code.is_empty() {
         return Ok(String::new());
@@ -313,16 +385,136 @@ fn normalize_boot_install_code(value: &str) -> anyhow::Result<String> {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
     {
-        bail!("manage.boot_install_code contains unsupported characters");
+        bail!("manage.forge_install_code contains unsupported characters");
     }
     Ok(code.to_string())
+}
+
+fn normalize_build_target_config(target: &mut BuildTargetConfig) -> anyhow::Result<()> {
+    target.artifact_type = normalize_build_artifact_type(&target.artifact_type)?;
+    target.target = normalize_safe_identifier("build.targets.target", &target.target, 64)?;
+    target.system = normalize_build_system("build.targets.system", &target.system)?;
+    target.flake = normalize_build_flake("build.targets.flake", &target.flake)?;
+    target.attr = normalize_build_attr("build.targets.attr", &target.attr)?;
+    Ok(())
+}
+
+fn normalize_allowed_systems(values: &[String], field: &str) -> anyhow::Result<Vec<String>> {
+    if values.is_empty() {
+        bail!("{field} must include at least one system");
+    }
+    let mut systems = Vec::with_capacity(values.len());
+    for value in values {
+        let system = normalize_build_system(field, value)?;
+        if !systems.contains(&system) {
+            systems.push(system);
+        }
+    }
+    Ok(systems)
+}
+
+fn normalize_build_artifact_type(value: &str) -> anyhow::Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation" => Ok(value),
+        _ => bail!(
+            "build artifact type must be one of nixos_closure, netboot_artifact, desktop_image, system_generation"
+        ),
+    }
+}
+
+fn normalize_safe_identifier(field: &str, value: &str, max_len: usize) -> anyhow::Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > max_len
+        || value.starts_with(['-', '.', '_'])
+        || value.ends_with(['-', '.', '_'])
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+    {
+        bail!("{field} must be a safe identifier");
+    }
+    Ok(value)
+}
+
+fn normalize_build_system(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("{field} must be a safe Nix system name such as x86_64-linux");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_build_flake(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 1024
+        || value.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '\\'
+        })
+    {
+        bail!("{field} contains unsupported characters");
+    }
+    Ok(value.trim_end_matches('#').to_string())
+}
+
+fn normalize_build_attr(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim().trim_start_matches('#');
+    if value.is_empty()
+        || value.len() > 512
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("{field} must be a safe Nix attribute path");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_program_name(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 512
+        || value.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '\\'
+        })
+    {
+        bail!("{field} contains unsupported characters");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_cache_key_name(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 120
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("{field} must be a safe Nix binary cache key name");
+    }
+    Ok(value.to_string())
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:8080".to_string(),
-            public_base_url: "http://CYBEX_BOOT_IP".to_string(),
+            public_base_url: "http://CYBEX_FORGE_IP".to_string(),
         }
     }
 }
@@ -330,12 +522,12 @@ impl Default for ServerConfig {
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from("/var/lib/cybex-boot"),
-            database_path: PathBuf::from("/var/lib/cybex-boot/cybex-boot.sqlite"),
-            boot_assets_dir: PathBuf::from("/srv/cybex-boot/www"),
-            iso_dir: PathBuf::from("/srv/cybex-boot/www/isos"),
-            static_dir: PathBuf::from("/srv/cybex-boot/www/assets"),
-            tftp_dir: PathBuf::from("/srv/cybex-boot/tftp"),
+            data_dir: PathBuf::from("/var/lib/cybex-forge"),
+            database_path: PathBuf::from("/var/lib/cybex-forge/cybex-forge.sqlite"),
+            boot_assets_dir: PathBuf::from("/srv/cybex-forge/www"),
+            iso_dir: PathBuf::from("/srv/cybex-forge/www/isos"),
+            static_dir: PathBuf::from("/srv/cybex-forge/www/assets"),
+            tftp_dir: PathBuf::from("/srv/cybex-forge/tftp"),
         }
     }
 }
@@ -358,15 +550,59 @@ impl Default for BootConfig {
     }
 }
 
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent_builds: 1,
+            timeout_seconds: 60 * 60,
+            cancel_grace_seconds: 10,
+            max_log_bytes: 64 * 1024,
+            max_artifact_size_bytes: 8 * 1024 * 1024 * 1024,
+            allowed_systems: vec!["x86_64-linux".to_string()],
+            work_dir: PathBuf::from("/var/lib/cybex-forge/build"),
+            output_dir: PathBuf::from("/var/lib/cybex-forge/build-outputs"),
+            nix_binary: "nix".to_string(),
+            targets: Vec::new(),
+        }
+    }
+}
+
+impl Default for BuildTargetConfig {
+    fn default() -> Self {
+        Self {
+            artifact_type: String::new(),
+            target: String::new(),
+            system: String::new(),
+            flake: String::new(),
+            attr: String::new(),
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            root_dir: PathBuf::from("/srv/cybex-forge/www/cache"),
+            signing_key_name: "cybex-forge-cache".to_string(),
+            private_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-priv-key.pem"),
+            public_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-pub-key.pem"),
+            max_bytes: 64 * 1024 * 1024 * 1024,
+            retain_recent_builds: 50,
+        }
+    }
+}
+
 impl Default for ManageConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             api_url: String::new(),
             organization_id: String::new(),
-            boot_install_code: String::new(),
+            forge_install_code: String::new(),
             organization_slug: String::new(),
-            state_path: PathBuf::from("/var/lib/cybex-boot/manage-state.json"),
+            state_path: PathBuf::from("/var/lib/cybex-forge/manage-state.json"),
             sync_interval_seconds: 30,
             enrollment_poll_seconds: 10,
             http_timeout_seconds: 30,
@@ -404,27 +640,30 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.server.listen_addr, "127.0.0.1:8080");
-        assert_eq!(config.server.public_base_url, "http://CYBEX_BOOT_IP");
+        assert_eq!(config.server.public_base_url, "http://CYBEX_FORGE_IP");
         assert_eq!(
             config.paths.boot_assets_dir,
-            PathBuf::from("/srv/cybex-boot/www")
+            PathBuf::from("/srv/cybex-forge/www")
         );
         assert_eq!(
             config.paths.iso_dir,
-            PathBuf::from("/srv/cybex-boot/www/isos")
+            PathBuf::from("/srv/cybex-forge/www/isos")
         );
         assert_eq!(
             config.paths.static_dir,
-            PathBuf::from("/srv/cybex-boot/www/assets")
+            PathBuf::from("/srv/cybex-forge/www/assets")
         );
-        assert_eq!(config.paths.tftp_dir, PathBuf::from("/srv/cybex-boot/tftp"));
+        assert_eq!(
+            config.paths.tftp_dir,
+            PathBuf::from("/srv/cybex-forge/tftp")
+        );
         assert_eq!(config.manage.http_timeout_seconds, 30);
     }
 
     #[test]
     fn missing_config_loads_normalized_defaults() {
         let path = std::env::temp_dir().join(format!(
-            "cybex-boot-missing-config-test-{}-{}.toml",
+            "cybex-forge-missing-config-test-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -450,7 +689,7 @@ public_base_url = " http://boot.example/// "
 enabled = true
 api_url = " https://manage.example/api/// "
 organization_id = "550e8400-e29b-41d4-a716-446655440000"
-boot_install_code = " boot_test "
+forge_install_code = " boot_test "
 organization_slug = " Default "
 "#,
         );
@@ -464,8 +703,29 @@ organization_slug = " Default "
             config.manage.organization_id,
             "550e8400-e29b-41d4-a716-446655440000"
         );
-        assert_eq!(config.manage.boot_install_code, "boot_test");
+        assert_eq!(config.manage.forge_install_code, "boot_test");
         assert_eq!(config.manage.organization_slug, "default");
+    }
+
+    #[test]
+    fn config_load_accepts_legacy_boot_install_code_alias() {
+        let path = write_temp_config(
+            r#"
+[server]
+public_base_url = "http://boot.example"
+
+[manage]
+enabled = true
+api_url = "https://manage.example"
+organization_id = "550e8400-e29b-41d4-a716-446655440000"
+boot_install_code = " legacy_boot_code "
+"#,
+        );
+
+        let config = AppConfig::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.manage.forge_install_code, "legacy_boot_code");
     }
 
     #[test]
@@ -590,7 +850,7 @@ bootloader_filename = "{bootloader_filename}"
 public_base_url = "http://boot.example"
 
 [paths]
-data_dir = "../var/lib/cybex-boot"
+data_dir = "../var/lib/cybex-forge"
 "#,
             ),
             (
@@ -600,7 +860,7 @@ data_dir = "../var/lib/cybex-boot"
 public_base_url = "http://boot.example"
 
 [paths]
-database_path = "/var/lib/../cybex-boot.sqlite"
+database_path = "/var/lib/../cybex-forge.sqlite"
 "#,
             ),
             (
@@ -610,7 +870,7 @@ database_path = "/var/lib/../cybex-boot.sqlite"
 public_base_url = "http://boot.example"
 
 [paths]
-boot_assets_dir = "/srv/cybex-boot//www"
+boot_assets_dir = "/srv/cybex-forge//www"
 "#,
             ),
             (
@@ -630,7 +890,7 @@ tftp_dir = "/"
 public_base_url = "http://boot.example"
 
 [manage]
-state_path = "/var/lib/cybex-boot/../manage-state.json"
+state_path = "/var/lib/cybex-forge/../manage-state.json"
 "#,
             ),
         ] {
@@ -669,7 +929,7 @@ menu_timeout_ms = 0
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-boot-config-test-{}-{unique}.toml",
+            "cybex-forge-config-test-{}-{unique}.toml",
             std::process::id()
         ));
         fs::write(&path, contents).unwrap();

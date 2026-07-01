@@ -17,7 +17,7 @@ opening public issues. Include the affected release tag or commit, a concise
 reproduction path, and whether the issue can expose credentials, enrollment
 codes, managed device identities, or boot artifacts.
 
-Do not include one-time Boot install codes, private keys, database passwords,
+Do not include one-time Forge install codes, private keys, database passwords,
 API tokens, or other secret material in public reports, logs, examples, or
 screenshots.
 
@@ -29,8 +29,8 @@ Before publishing a production tag, run:
 cargo fmt --check
 cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
-bash -n install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
-shellcheck install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
+bash -n install/proxmox-host-lxc.sh install/cybex-forge-lxc-install.sh
+shellcheck install/proxmox-host-lxc.sh install/cybex-forge-lxc-install.sh
 cargo tree -i sqlx-mysql
 cargo audit --ignore RUSTSEC-2023-0071
 cargo package --allow-dirty --no-verify

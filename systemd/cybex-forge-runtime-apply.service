@@ -1,12 +1,12 @@
 [Unit]
-Description=Cybex Boot managed runtime apply
+Description=Cybex Forge managed runtime apply
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/cybex-boot --config /etc/cybex-boot/config.toml apply-runtime-config
-WorkingDirectory=/var/lib/cybex-boot
+ExecStart=/usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml apply-runtime-config
+WorkingDirectory=/var/lib/cybex-forge
 UMask=0077
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID CAP_SYS_ADMIN
 NoNewPrivileges=true
@@ -14,7 +14,7 @@ PrivateDevices=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/etc/cybex-boot /etc/default /etc/nginx /etc/systemd/system /srv/cybex-boot /usr/local/src /var/lib/cybex-boot /run /tmp
+ReadWritePaths=/etc/cybex-forge /etc/default /etc/nginx /etc/systemd/system /srv/cybex-forge /usr/local/src /var/lib/cybex-forge /run /tmp
 RestrictAddressFamilies=AF_INET AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, bail};
 use axum::serve as axum_serve;
 use clap::Parser;
-use cybex_boot::{
+use cybex_forge::{
     AppState, assets,
     config::{Cli, Command},
     db, router,
@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let config = cybex_boot::config::AppConfig::load(&cli.config)
+    let config = cybex_forge::config::AppConfig::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     let command = cli.command.clone().unwrap_or(Command::Serve);
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     ensure_managed_command_is_not_root(&config, &command)?;
 
     if matches!(command, Command::ApplyRuntimeConfig) {
-        return cybex_boot::manage::apply_runtime_config_once(&config).await;
+        return cybex_forge::manage::apply_runtime_config_once(&config).await;
     }
 
     if !config.manage.enabled && config.auth.admin_token == "change-me" {
@@ -74,14 +74,14 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("database migration failed")?;
             let state = AppState::new(config, pool);
-            cybex_boot::manage::enroll_once(&state).await
+            cybex_forge::manage::enroll_once(&state).await
         }
         Command::SyncOnce => {
             db::migrate(&pool)
                 .await
                 .context("database migration failed")?;
             let state = AppState::new(config, pool);
-            cybex_boot::manage::sync_once(&state).await
+            cybex_forge::manage::sync_once(&state).await
         }
         Command::ApplyRuntimeConfig => {
             unreachable!("apply-runtime-config exits before database setup")
@@ -91,14 +91,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn ensure_managed_command_is_not_root(
-    config: &cybex_boot::config::AppConfig,
+    config: &cybex_forge::config::AppConfig,
     command: &Command,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if managed_command_requires_service_user(config, command) && effective_uid() == 0 {
             bail!(
-                "managed Cybex Boot stateful commands must not run as root; use systemctl for the service or cybex-boot-sync-once for manual sync checks"
+                "managed Cybex Forge stateful commands must not run as root; use systemctl for the service or cybex-forge-sync-once for manual sync checks"
             );
         }
     }
@@ -107,7 +107,7 @@ fn ensure_managed_command_is_not_root(
 }
 
 fn managed_command_requires_service_user(
-    config: &cybex_boot::config::AppConfig,
+    config: &cybex_forge::config::AppConfig,
     command: &Command,
 ) -> bool {
     config.manage.enabled && !matches!(command, Command::PrintConfig | Command::ApplyRuntimeConfig)
@@ -119,7 +119,7 @@ fn effective_uid() -> u32 {
 }
 
 async fn run_server(
-    config: cybex_boot::config::AppConfig,
+    config: cybex_forge::config::AppConfig,
     pool: sqlx::SqlitePool,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config
@@ -128,15 +128,16 @@ async fn run_server(
         .parse()
         .with_context(|| format!("invalid listen address {}", config.server.listen_addr))?;
     let state = AppState::new(config, pool);
+    cybex_forge::build::spawn(state.clone());
     if state.config.manage.enabled {
-        cybex_boot::manage::spawn(state.clone());
+        cybex_forge::manage::spawn(state.clone());
     }
     let app = router(state);
 
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
-    info!(%listen_addr, "cybex-boot listening");
+    info!(%listen_addr, "cybex-forge listening");
 
     axum_serve(
         listener,
@@ -173,7 +174,7 @@ async fn shutdown_signal() {
 
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("cybex_boot=info,tower_http=info"));
+        .unwrap_or_else(|_| EnvFilter::new("cybex_forge=info,tower_http=info"));
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -182,7 +183,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use cybex_boot::config::AppConfig;
+    use cybex_forge::config::AppConfig;
 
     use super::{Command, managed_command_requires_service_user};
 
