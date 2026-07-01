@@ -1,21 +1,64 @@
-MIT License
+Cybex Source Available License 1.0
 
 Copyright (c) 2026 CybexHQ
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license applies to the Cybex Boot source code in this repository.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Purpose
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Cybex publishes this source code for transparency, auditability, and trust in
+the local software that connects customer infrastructure to the Cybex commercial
+SaaS platform.
+
+2. Permitted Use
+
+You may view, inspect, audit, compile, run, and modify this software solely for
+use with Cybex-operated services, including Cybex Manage at manage.cybex.net,
+and solely for your own Cybex-connected deployments.
+
+You may copy this software within your organization as reasonably necessary for
+those permitted Cybex-connected deployments.
+
+3. Restrictions
+
+You may not:
+
+- use this software with a non-Cybex control plane, management service, or SaaS
+  product;
+- offer this software, modified versions of this software, or substantially
+  similar functionality as a hosted, managed, or commercial service;
+- redistribute this software or modified versions except as necessary within
+  your organization for permitted Cybex-connected deployments;
+- remove copyright, license, or attribution notices;
+- use Cybex names, logos, or trademarks except as required to identify this
+  software or a Cybex-connected deployment.
+
+4. Contributions
+
+If you submit a patch, issue, pull request, or other contribution to Cybex, you
+grant Cybex a perpetual, worldwide, irrevocable, royalty-free license to use,
+copy, modify, distribute, sublicense, and commercialize that contribution as
+part of Cybex products and services.
+
+5. Commercial Service
+
+This license does not grant access to Cybex SaaS products or services. Access to
+Cybex services is governed by separate commercial terms with Cybex.
+
+6. No Warranty
+
+This software is provided "as is", without warranties or conditions of any kind,
+whether express, implied, statutory, or otherwise, including warranties of
+merchantability, fitness for a particular purpose, title, and non-infringement.
+
+7. Limitation Of Liability
+
+To the maximum extent permitted by law, Cybex and its contributors will not be
+liable for any indirect, incidental, special, consequential, exemplary, or
+punitive damages, or for lost profits, revenue, data, goodwill, or business
+interruption, arising from or relating to this software or this license.
+
+8. Termination
+
+If you violate this license, your rights under it terminate automatically. Cybex
+may reinstate those rights in writing.
