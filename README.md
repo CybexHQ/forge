@@ -81,8 +81,8 @@ enrollment in Manage before treating the server as managed infrastructure.
 Production installs should be pinned to a release tag such as `v0.1.0`, not to
 the floating `main` branch. The Manage control plane controls this with
 `CYBEX_FORGE_INSTALL_REF`; the generated command passes the value as
-`--forge-ref`. Forge is not production-ready until the Forge repository has
-been pushed and the referenced remote tag exists.
+`--forge-ref`. Production install commands that reference a tag require the
+Forge repository to be pushed and the referenced remote tag to exist.
 
 Resource defaults are intentionally conservative for a small Boot server:
 

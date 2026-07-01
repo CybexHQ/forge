@@ -1,4 +1,8 @@
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -234,10 +238,7 @@ pub(crate) fn normalize_bootloader_filename(value: &str) -> anyhow::Result<Strin
     Ok(filename.to_string())
 }
 
-pub(crate) fn normalize_absolute_config_path(
-    field: &str,
-    path: &PathBuf,
-) -> anyhow::Result<PathBuf> {
+pub(crate) fn normalize_absolute_config_path(field: &str, path: &Path) -> anyhow::Result<PathBuf> {
     let raw = path.as_os_str().to_string_lossy();
     if raw.is_empty() {
         bail!("{field} must not be empty");

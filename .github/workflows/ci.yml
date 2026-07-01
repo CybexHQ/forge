@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  scripts:
+    name: Installer Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Bash syntax
+        run: bash -n install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
+
+      - name: Shellcheck
+        run: shellcheck install/proxmox-host-lxc.sh install/cybex-boot-lxc-install.sh
+
+  security:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Check sqlx MySQL feature is inactive
+        run: |
+          cargo tree -i sqlx-mysql 2>&1 | tee /tmp/sqlx-mysql-tree.txt
+          grep -q "nothing to print" /tmp/sqlx-mysql-tree.txt
+
+      - name: Audit dependencies
+        run: cargo audit --ignore RUSTSEC-2023-0071

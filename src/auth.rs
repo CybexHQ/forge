@@ -31,10 +31,11 @@ pub async fn require_admin(
     next: Next,
 ) -> Response {
     if let Some(source) = admin_token_source(&state, req.headers()) {
-        if source == AdminTokenSource::Cookie && method_requires_origin(req.method()) {
-            if !same_origin_admin_request(req.headers()) {
-                return AppError::Forbidden.into_response();
-            }
+        if source == AdminTokenSource::Cookie
+            && method_requires_origin(req.method())
+            && !same_origin_admin_request(req.headers())
+        {
+            return AppError::Forbidden.into_response();
         }
         return next.run(req).await;
     }

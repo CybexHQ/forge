@@ -1,5 +1,13 @@
 /target
 /.env
+/.env.*
+!/.env.example
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite-journal
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
