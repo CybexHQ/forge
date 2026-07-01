@@ -1,0 +1,28 @@
+[server]
+listen_addr = "127.0.0.1:8080"
+public_base_url = "http://CYBEX_BOOT_IP"
+
+[paths]
+data_dir = "/var/lib/cybex-boot"
+database_path = "/var/lib/cybex-boot/cybex-boot.sqlite"
+boot_assets_dir = "/srv/cybex-boot/www"
+iso_dir = "/srv/cybex-boot/www/isos"
+static_dir = "/srv/cybex-boot/www/assets"
+tftp_dir = "/srv/cybex-boot/tftp"
+
+[auth]
+admin_token = "replace-with-a-long-random-token"
+cookie_name = "cybex_admin"
+
+[boot]
+bootloader_filename = "snponly.efi"
+menu_timeout_ms = 8000
+
+[manage]
+enabled = false
+api_url = "https://manage.example.com"
+organization_slug = "default"
+state_path = "/var/lib/cybex-boot/manage-state.json"
+sync_interval_seconds = 30
+enrollment_poll_seconds = 10
+http_timeout_seconds = 30

@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply Cybex Boot managed runtime config periodically
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=15s
+Persistent=true
+Unit=cybex-boot-runtime-apply.service
+
+[Install]
+WantedBy=timers.target
