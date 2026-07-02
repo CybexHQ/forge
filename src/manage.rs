@@ -1324,9 +1324,9 @@ fn render_nixos_netboot_script(
     Ok(format!(
         "#!ipxe\n\
          echo Cybex Forge: Default Enrollment\n\
-         kernel {kernel_url} initrd=initrd {cmdline}\n\
-         initrd --name initrd {initrd_url} initrd\n\
-         initrd --name nixos-netboot.cpio {cpio_url} nixos-netboot.cpio\n\
+         kernel {kernel_url} initrd=initrd initrd=nixos-netboot.cpio {cmdline}\n\
+         initrd --name initrd {initrd_url}\n\
+         initrd --name nixos-netboot.cpio {cpio_url}\n\
          boot\n",
         cmdline = manifest.cmdline
     ))
@@ -1840,12 +1840,13 @@ async fn sync_profiles(
             .map_err(|err| anyhow!("invalid managed profile type: {err}"))?;
         let now = db::now_rfc3339();
         let iso_path = managed_profile_iso_path(profile)?;
-        let existing: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM boot_profiles WHERE managed_profile_id = ?")
+        let existing: Option<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, raw_script FROM boot_profiles WHERE managed_profile_id = ?")
                 .bind(&profile.id)
                 .fetch_optional(&mut **tx)
                 .await?;
-        if let Some(id) = existing {
+        if let Some((id, existing_raw_script)) = existing {
+            let raw_script = managed_profile_raw_script(profile, existing_raw_script.as_deref());
             sqlx::query(
                 "UPDATE boot_profiles
                  SET name = ?, description = ?, profile_type = ?, installer_iso_source = ?,
@@ -1869,7 +1870,7 @@ async fn sync_profiles(
             .bind(clean_optional(profile.initrd_path.clone()))
             .bind(iso_path.clone())
             .bind(clean_optional(profile.cmdline.clone()))
-            .bind(clean_optional(profile.raw_script.clone()))
+            .bind(raw_script)
             .bind(clean_string(&profile.desired_iso_artifact_id))
             .bind(clean_string(&profile.desired_iso_filename))
             .bind(profile.desired_iso_size_bytes.max(0))
@@ -1905,7 +1906,7 @@ async fn sync_profiles(
             .bind(clean_optional(profile.initrd_path.clone()))
             .bind(iso_path)
             .bind(clean_optional(profile.cmdline.clone()))
-            .bind(clean_optional(profile.raw_script.clone()))
+            .bind(managed_profile_raw_script(profile, None))
             .bind(clean_string(&profile.desired_iso_artifact_id))
             .bind(clean_string(&profile.desired_iso_filename))
             .bind(profile.desired_iso_size_bytes.max(0))
@@ -3878,6 +3879,33 @@ fn managed_profile_iso_path(profile: &ManagedBootProfile) -> Result<Option<Strin
     )?)))
 }
 
+fn managed_profile_raw_script(
+    profile: &ManagedBootProfile,
+    existing_raw_script: Option<&str>,
+) -> Option<String> {
+    if let Some(raw_script) = clean_optional(profile.raw_script.clone()) {
+        return Some(raw_script);
+    }
+    if managed_profile_needs_iso_sync(profile) {
+        return existing_raw_script.and_then(|value| clean_optional(Some(value.to_string())));
+    }
+    None
+}
+
+fn managed_profile_needs_iso_sync(profile: &ManagedBootProfile) -> bool {
+    !profile.desired_iso_artifact_id.trim().is_empty()
+        && !profile.desired_iso_filename.trim().is_empty()
+        && profile.desired_iso_size_bytes > 0
+        && !profile.desired_iso_sha256.trim().is_empty()
+        && !profile.desired_iso_download_url.trim().is_empty()
+        && (normalized_installer_iso_source(&profile.installer_iso_source)
+            == BOOT_PROFILE_ISO_SOURCE_ENROLLMENT
+            || matches!(
+                profile.profile_type.as_str(),
+                "linux_installer" | "iso_live"
+            ))
+}
+
 fn valid_sha256(value: &str) -> Option<String> {
     let checksum = value.trim().to_ascii_lowercase();
     if checksum.len() == 64 && checksum.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -3976,13 +4004,14 @@ mod tests {
         MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
         MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
-        NormalizedManagedSettings, SyncOutcome, append_bounded_response_chunk_with_limit,
-        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
-        fit_boot_report_body, forge_capabilities, has_unreported_known_profile_events,
-        managed_profile_map, managed_sync_interval_seconds, normalize_managed_settings,
-        render_check_service, serialize_boot_report_body, sync_clients, sync_deleted_clients,
-        sync_deleted_profiles, sync_profiles, validate_boot_config, validate_profile,
-        write_secure_json,
+        NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
+        append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
+        bounded_error_message, bounded_http_timeout_seconds, fit_boot_report_body,
+        forge_capabilities, has_unreported_known_profile_events, managed_profile_map,
+        managed_sync_interval_seconds, normalize_managed_settings, render_check_service,
+        render_nixos_netboot_script, serialize_boot_report_body, sync_clients,
+        sync_deleted_clients, sync_deleted_profiles, sync_profiles, validate_boot_config,
+        validate_profile, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -4039,6 +4068,65 @@ mod tests {
         assert_eq!(bounded.chars().count(), 243);
         assert!(bounded.ends_with("..."));
         assert!(!bounded.contains('\n'));
+    }
+
+    #[test]
+    fn nixos_netboot_script_declares_each_initrd_for_uefi() {
+        let script = render_nixos_netboot_script(
+            &NixosNetbootManifest {
+                iso_sha256: "a".repeat(64),
+                kernel_iso_path: "/boot/kernel".to_string(),
+                initrd_iso_path: "/boot/initrd".to_string(),
+                initrd_fstab_path: "nix/store/example-initrd-fstab".to_string(),
+                cmdline: "root=fstab quiet".to_string(),
+                kernel_path: "installers/example/bzImage".to_string(),
+                initrd_path: "installers/example/initrd".to_string(),
+                netboot_cpio_path: "installers/example/nixos-netboot.cpio".to_string(),
+            },
+            "http://boot.example",
+        )
+        .unwrap();
+
+        assert!(script.contains(
+            "kernel http://boot.example/files/installers/example/bzImage initrd=initrd initrd=nixos-netboot.cpio root=fstab quiet"
+        ));
+        assert!(
+            script.contains(
+                "initrd --name initrd http://boot.example/files/installers/example/initrd"
+            )
+        );
+        assert!(script.contains(
+            "initrd --name nixos-netboot.cpio http://boot.example/files/installers/example/nixos-netboot.cpio"
+        ));
+        assert!(!script.contains("/initrd initrd"));
+        assert!(!script.contains("/nixos-netboot.cpio nixos-netboot.cpio"));
+    }
+
+    #[test]
+    fn prebuilt_nixos_netboot_script_keeps_single_initrd() {
+        let script = render_nixos_netboot_script(
+            &NixosNetbootManifest {
+                iso_sha256: "a".repeat(64),
+                kernel_iso_path: String::new(),
+                initrd_iso_path: String::new(),
+                initrd_fstab_path: String::new(),
+                cmdline: "root=fstab quiet".to_string(),
+                kernel_path: "installers/example-nix-netboot/bzImage".to_string(),
+                initrd_path: "installers/example-nix-netboot/initrd".to_string(),
+                netboot_cpio_path: String::new(),
+            },
+            "http://boot.example",
+        )
+        .unwrap();
+
+        assert!(script.contains(
+            "kernel http://boot.example/files/installers/example-nix-netboot/bzImage root=fstab quiet"
+        ));
+        assert!(
+            script
+                .contains("initrd http://boot.example/files/installers/example-nix-netboot/initrd")
+        );
+        assert!(!script.contains("initrd=nixos-netboot.cpio"));
     }
 
     #[test]
@@ -4654,6 +4742,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_sync_preserves_generated_iso_raw_script_until_resync() {
+        let pool = managed_test_pool().await;
+        let profile = sample_iso_sync_profile("profile-1");
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_iso_sync_profile("profile-1")], true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let generated_script = "#!ipxe\necho generated\nboot";
+        sqlx::query("UPDATE boot_profiles SET raw_script = ? WHERE managed_profile_id = ?")
+            .bind(generated_script)
+            .bind("profile-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[profile], true).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let raw_script: Option<String> = sqlx::query_scalar(
+            "SELECT raw_script FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(raw_script.as_deref(), Some(generated_script));
+    }
+
+    #[tokio::test]
+    async fn managed_sync_clears_raw_script_when_iso_sync_no_longer_applies() {
+        let pool = managed_test_pool().await;
+        let mut profile = sample_iso_sync_profile("profile-1");
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_iso_sync_profile("profile-1")], true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        sqlx::query("UPDATE boot_profiles SET raw_script = ? WHERE managed_profile_id = ?")
+            .bind("#!ipxe\necho generated\nboot\n")
+            .bind("profile-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        profile.desired_iso_artifact_id.clear();
+        profile.desired_iso_filename.clear();
+        profile.desired_iso_size_bytes = 0;
+        profile.desired_iso_sha256.clear();
+        profile.desired_iso_download_url.clear();
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[profile], true).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let raw_script: Option<String> = sqlx::query_scalar(
+            "SELECT raw_script FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(raw_script.is_none());
+    }
+
+    #[tokio::test]
     async fn managed_sync_preserves_omitted_profiles_when_window_incomplete() {
         let pool = managed_test_pool().await;
         let profiles = vec![sample_profile("profile-1"), sample_profile("profile-2")];
@@ -5106,6 +5265,21 @@ mod tests {
             desired_iso_url: String::new(),
             desired_iso_download_url: String::new(),
         }
+    }
+
+    fn sample_iso_sync_profile(id: &str) -> ManagedBootProfile {
+        let mut profile = sample_profile(id);
+        profile.profile_type = "iso_live".to_string();
+        profile.installer_iso_source = "enrollment".to_string();
+        profile.kernel_path = None;
+        profile.cmdline = None;
+        profile.desired_iso_artifact_id = "artifact-1".to_string();
+        profile.desired_iso_filename = "installer.iso".to_string();
+        profile.desired_iso_size_bytes = 1024;
+        profile.desired_iso_sha256 = "a".repeat(64);
+        profile.desired_iso_download_url =
+            format!("/v1/agent/devices/dev_1/boot/profiles/{id}/iso/download");
+        profile
     }
 
     fn sample_local_disk_profile(id: &str) -> ManagedBootProfile {

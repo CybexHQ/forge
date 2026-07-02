@@ -1506,6 +1506,28 @@ check_ipxe_profile_response() {
   else
     fail "$label is empty"
   fi
+  if grep -F "nixos-netboot.cpio" "$body_file" >/dev/null; then
+    if grep -Eq '^kernel .+ initrd=initrd initrd=nixos-netboot\.cpio .+' "$body_file"; then
+      ok "$label declares all NixOS netboot initrds on the kernel line"
+    else
+      fail "$label does not declare all NixOS netboot initrds on the kernel line"
+    fi
+    if grep -Eq '^initrd --name initrd [^ ]+/initrd$' "$body_file"; then
+      ok "$label passes the NixOS initrd as a raw named initrd"
+    else
+      fail "$label does not pass the NixOS initrd as a raw named initrd"
+    fi
+    if grep -Eq '^initrd --name nixos-netboot\.cpio [^ ]+/nixos-netboot\.cpio$' "$body_file"; then
+      ok "$label passes the NixOS netboot cpio as a raw named initrd"
+    else
+      fail "$label does not pass the NixOS netboot cpio as a raw named initrd"
+    fi
+    if grep -Eq '/initrd initrd$|/nixos-netboot\.cpio nixos-netboot\.cpio$' "$body_file"; then
+      fail "$label uses iPXE cpio-wrapping syntax for a raw initrd image"
+    else
+      ok "$label avoids iPXE cpio-wrapping syntax for raw initrd images"
+    fi
+  fi
 }
 
 check_marked_boot_probe_non_mutating() {
