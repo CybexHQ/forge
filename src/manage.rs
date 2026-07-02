@@ -2866,19 +2866,14 @@ fn normalize_managed_runtime_root(field: &str, value: &str, fallback: &Path) -> 
         bail!("{field} must not contain whitespace");
     }
     let forge_root = Path::new("/srv/cybex-forge");
-    let legacy_boot_root = Path::new("/srv/cybex-boot");
-    let allowed_root = if path.starts_with(forge_root) {
-        forge_root
-    } else if path.starts_with(legacy_boot_root) {
-        legacy_boot_root
-    } else {
-        bail!("{field} must be under /srv/cybex-forge or legacy /srv/cybex-boot");
-    };
-    if path == allowed_root {
+    if !path.starts_with(forge_root) {
+        bail!("{field} must be under /srv/cybex-forge");
+    }
+    if path == forge_root {
         bail!(
             "{field} must be below {}, not {} itself",
-            allowed_root.display(),
-            allowed_root.display()
+            forge_root.display(),
+            forge_root.display()
         );
     }
     Ok(path)
@@ -4237,24 +4232,6 @@ mod tests {
         );
         assert_eq!(normalized.bootloader_filename, "ipxe.efi");
         assert_eq!(normalized.menu_timeout_ms, 1_000);
-    }
-
-    #[test]
-    fn managed_settings_accept_legacy_boot_roots_during_rename() {
-        let app_config = AppConfig::default();
-        let settings = ManagedBootSettings {
-            public_base_url: "http://boot.example".to_string(),
-            listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-boot/tftp".to_string(),
-            http_root: "/srv/cybex-boot/www".to_string(),
-            bootloader_filename: "snponly.efi".to_string(),
-            menu_timeout_ms: 10_000,
-        };
-
-        let normalized = normalize_managed_settings(&settings, &app_config).unwrap();
-
-        assert_eq!(normalized.tftp_root, PathBuf::from("/srv/cybex-boot/tftp"));
-        assert_eq!(normalized.http_root, PathBuf::from("/srv/cybex-boot/www"));
     }
 
     #[test]

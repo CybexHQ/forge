@@ -126,7 +126,6 @@ pub struct ManageConfig {
     pub api_url: String,
     pub organization_id: String,
     #[serde(default)]
-    #[serde(alias = "boot_install_code")]
     pub forge_install_code: String,
     #[serde(default)]
     pub organization_slug: String,
@@ -705,27 +704,6 @@ organization_slug = " Default "
         );
         assert_eq!(config.manage.forge_install_code, "boot_test");
         assert_eq!(config.manage.organization_slug, "default");
-    }
-
-    #[test]
-    fn config_load_accepts_legacy_boot_install_code_alias() {
-        let path = write_temp_config(
-            r#"
-[server]
-public_base_url = "http://boot.example"
-
-[manage]
-enabled = true
-api_url = "https://manage.example"
-organization_id = "550e8400-e29b-41d4-a716-446655440000"
-boot_install_code = " legacy_boot_code "
-"#,
-        );
-
-        let config = AppConfig::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(config.manage.forge_install_code, "legacy_boot_code");
     }
 
     #[test]

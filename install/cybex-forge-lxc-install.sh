@@ -217,7 +217,6 @@ validate_runtime_root() {
   local name="$1"
   local value="$2"
   local allowed_root="/srv/cybex-forge"
-  local legacy_root="/srv/cybex-boot"
   validate_absolute_path "$name" "$value"
   if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
     echo "$name must not contain whitespace" >&2
@@ -225,17 +224,12 @@ validate_runtime_root() {
   fi
   case "$value" in
     "$allowed_root"/*) ;;
-    "$legacy_root"/*) ;;
     "$allowed_root")
       echo "$name must be below $allowed_root, not $allowed_root itself" >&2
       exit 2
       ;;
-    "$legacy_root")
-      echo "$name must be below $legacy_root, not $legacy_root itself" >&2
-      exit 2
-      ;;
     *)
-      echo "$name must be under $allowed_root or legacy $legacy_root" >&2
+      echo "$name must be under $allowed_root" >&2
       exit 2
       ;;
   esac
@@ -532,50 +526,6 @@ install_binary() {
   install -m 0755 -o root -g root "$source_dir/target/release/cybex-forge" /usr/local/bin/cybex-forge
 }
 
-migrate_legacy_file_if_missing() {
-  local source="$1"
-  local target="$2"
-  local mode="$3"
-  local owner="$4"
-  local group="$5"
-  if [ -f "$source" ] && [ ! -e "$target" ]; then
-    install -m "$mode" -o "$owner" -g "$group" "$source" "$target"
-  fi
-}
-
-migrate_legacy_tree_if_empty() {
-  local source="$1"
-  local target="$2"
-  if [ -d "$source" ] && [ -d "$target" ] && [ -z "$(find "$target" -mindepth 1 -print -quit)" ]; then
-    cp -a "$source"/. "$target"/
-  fi
-}
-
-migrate_legacy_boot_install() {
-  if [ ! -d /etc/cybex-boot ] && [ ! -d /var/lib/cybex-boot ] && [ ! -d /srv/cybex-boot ]; then
-    return
-  fi
-
-  echo "Detected legacy cybex-boot state; migrating local files for cybex-forge compatibility."
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop cybex-boot.service cybex-boot-runtime-apply.timer cybex-boot-runtime-apply.service 2>/dev/null || true
-    systemctl disable cybex-boot.service cybex-boot-runtime-apply.timer 2>/dev/null || true
-  fi
-
-  migrate_legacy_file_if_missing /var/lib/cybex-boot/manage-state.json /var/lib/cybex-forge/manage-state.json 0600 cybex-forge cybex-forge
-  migrate_legacy_file_if_missing /var/lib/cybex-boot/cybex-boot.sqlite /var/lib/cybex-forge/cybex-forge.sqlite 0600 cybex-forge cybex-forge
-  migrate_legacy_file_if_missing /var/lib/cybex-boot/cybex-boot.sqlite-wal /var/lib/cybex-forge/cybex-forge.sqlite-wal 0600 cybex-forge cybex-forge
-  migrate_legacy_file_if_missing /var/lib/cybex-boot/cybex-boot.sqlite-shm /var/lib/cybex-forge/cybex-forge.sqlite-shm 0600 cybex-forge cybex-forge
-  migrate_legacy_file_if_missing /etc/cybex-boot/config.toml /etc/cybex-forge/config.toml.legacy-cybex-boot 0640 root cybex-forge
-
-  if [ "$http_root" = "/srv/cybex-forge/www" ]; then
-    migrate_legacy_tree_if_empty /srv/cybex-boot/www "$http_root"
-  fi
-  if [ "$tftp_root" = "/srv/cybex-forge/tftp" ]; then
-    migrate_legacy_tree_if_empty /srv/cybex-boot/tftp "$tftp_root"
-  fi
-}
-
 prepare_user_and_dirs() {
   if ! id cybex-forge >/dev/null 2>&1; then
     useradd --system --home /var/lib/cybex-forge --shell /usr/sbin/nologin cybex-forge
@@ -589,7 +539,6 @@ prepare_user_and_dirs() {
   install -m 0755 -o root -g cybex-forge -d /srv/cybex-forge
   install -m 0755 -o cybex-forge -g cybex-forge -d "$http_root" "$http_root/isos" "$http_root/assets" "$http_root/cache"
   install -m 0555 -o root -g root -d "$tftp_root"
-  migrate_legacy_boot_install
   chown -R cybex-forge:cybex-forge /var/lib/cybex-forge "$http_root"
   chmod 0700 /var/lib/cybex-forge
   chmod 0755 "$http_root" "$http_root/isos" "$http_root/assets" "$http_root/cache"

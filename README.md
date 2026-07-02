@@ -32,11 +32,6 @@ inside Cybex Manage:
 3. Choose the Proxmox installer.
 4. Run the generated command on your Proxmox host.
 
-The old `install/cybex-boot-lxc-install.sh` entry point is kept as a wrapper for
-previously generated commands. When the Forge installer is rerun inside an old
-`cybex-boot` LXC, it disables the old units and copies legacy state, SQLite, and
-boot asset files into Forge-owned paths only when the new targets are empty.
-
 The installer creates and configures the Cybex Forge service, installs the
 local Nix toolchain used by Forge Build/Cache, grants the service account Nix
 daemon access, auto-detects the LXC LAN address for the initial Boot URL,

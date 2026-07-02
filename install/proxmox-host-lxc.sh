@@ -270,17 +270,14 @@ validate_runtime_root() {
   local name="$1"
   local value="$2"
   local allowed_root="/srv/cybex-forge"
-  local legacy_root="/srv/cybex-boot"
   validate_absolute_path "$name" "$value"
   if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
     die "$name must not contain whitespace"
   fi
   case "$value" in
     "$allowed_root"/*) ;;
-    "$legacy_root"/*) ;;
     "$allowed_root") die "$name must be below $allowed_root, not $allowed_root itself" ;;
-    "$legacy_root") die "$name must be below $legacy_root, not $legacy_root itself" ;;
-    *) die "$name must be under $allowed_root or legacy $legacy_root" ;;
+    *) die "$name must be under $allowed_root" ;;
   esac
 }
 
