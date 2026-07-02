@@ -184,7 +184,7 @@ impl AppConfig {
         self.build.max_artifact_size_bytes = self
             .build
             .max_artifact_size_bytes
-            .clamp(1024 * 1024, 10 * 1024 * 1024 * 1024);
+            .clamp(1024 * 1024, 64 * 1024 * 1024 * 1024);
         self.build.work_dir =
             normalize_absolute_config_path("build.work_dir", &self.build.work_dir)?;
         self.build.output_dir =
@@ -557,7 +557,7 @@ impl Default for BuildConfig {
             timeout_seconds: 60 * 60,
             cancel_grace_seconds: 10,
             max_log_bytes: 64 * 1024,
-            max_artifact_size_bytes: 8 * 1024 * 1024 * 1024,
+            max_artifact_size_bytes: 16 * 1024 * 1024 * 1024,
             allowed_systems: vec!["x86_64-linux".to_string()],
             work_dir: PathBuf::from("/var/lib/cybex-forge/build"),
             output_dir: PathBuf::from("/var/lib/cybex-forge/build-outputs"),

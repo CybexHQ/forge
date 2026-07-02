@@ -24,18 +24,20 @@ max_concurrent_builds = 1
 timeout_seconds = 3600
 cancel_grace_seconds = 10
 max_log_bytes = 65536
-max_artifact_size_bytes = 8589934592
+max_artifact_size_bytes = 17179869184
 allowed_systems = ["x86_64-linux"]
 work_dir = "/var/lib/cybex-forge/build"
 output_dir = "/var/lib/cybex-forge/build-outputs"
 nix_binary = "nix"
 
-# Add one or more allowlisted local Nix targets before queueing production jobs.
+# Add one or more allowlisted Nix targets before queueing production jobs.
+# For generated Desktop Experience closure builds, flake is the nixpkgs input
+# used for evaluation; pin it to the same revision used by installer media.
 # [[build.targets]]
 # artifact_type = "nixos_closure"
 # target = "desktop_experience"
 # system = "x86_64-linux"
-# flake = "/srv/cybex-forge/build-inputs/cybex"
+# flake = "github:NixOS/nixpkgs/567a49d1913ce81ac6e9582e3553dd90a955875f"
 # attr = "packages.x86_64-linux.desktop-experience"
 
 [cache]

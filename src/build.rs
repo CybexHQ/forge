@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -23,6 +24,9 @@ use crate::{
     models::BuildJob,
 };
 
+const DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
+const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildSpec {
@@ -37,6 +41,21 @@ pub struct BuildSpec {
     pub desktop_experience_id: Option<String>,
     #[serde(default)]
     pub desktop_experience_revision_id: Option<String>,
+    #[serde(default)]
+    pub desktop_experience_revision_config_hash: Option<String>,
+    #[serde(default)]
+    pub build_input: Option<DesktopExperienceBuildInput>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopExperienceBuildInput {
+    pub kind: String,
+    pub generated_nix: String,
+    #[serde(default)]
+    pub desktop_experience_name: Option<String>,
+    #[serde(default)]
+    pub desktop_experience_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +67,15 @@ struct ValidatedBuildSpec {
     input_config_hash: String,
     desktop_experience_id: Option<String>,
     desktop_experience_revision_id: Option<String>,
+    desktop_experience_revision_config_hash: Option<String>,
+    build_input: Option<ValidatedDesktopExperienceBuildInput>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedDesktopExperienceBuildInput {
+    generated_nix: String,
+    desktop_experience_name: Option<String>,
+    desktop_experience_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +283,8 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     "input_config_hash": spec.input_config_hash,
                     "desktop_experience_id": spec.desktop_experience_id,
                     "desktop_experience_revision_id": spec.desktop_experience_revision_id,
+                    "desktop_experience_revision_config_hash": spec.desktop_experience_revision_config_hash,
+                    "build_input_kind": spec.build_input.as_ref().map(|_| DESKTOP_EXPERIENCE_BUILD_INPUT_KIND),
                     "cache": "exported"
                 })),
             )
@@ -345,6 +375,17 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         .desktop_experience_revision_id
         .map(|value| normalize_optional_uuidish("desktop_experience_revision_id", &value))
         .transpose()?;
+    let desktop_experience_revision_config_hash = spec
+        .desktop_experience_revision_config_hash
+        .map(|value| normalize_sha256(&value))
+        .transpose()?;
+    let build_input = spec
+        .build_input
+        .map(validate_desktop_experience_build_input)
+        .transpose()?;
+    if build_input.is_some() && artifact_type != "nixos_closure" {
+        bail!("desktop_experience build_input requires artifact_type nixos_closure");
+    }
     Ok(ValidatedBuildSpec {
         artifact_type,
         target,
@@ -353,6 +394,34 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         input_config_hash,
         desktop_experience_id,
         desktop_experience_revision_id,
+        desktop_experience_revision_config_hash,
+        build_input,
+    })
+}
+
+fn validate_desktop_experience_build_input(
+    input: DesktopExperienceBuildInput,
+) -> Result<ValidatedDesktopExperienceBuildInput> {
+    let kind = input.kind.trim();
+    if kind != DESKTOP_EXPERIENCE_BUILD_INPUT_KIND {
+        bail!("unsupported build_input kind");
+    }
+    if input.generated_nix.trim().is_empty() {
+        bail!("build_input.generated_nix is required");
+    }
+    if input.generated_nix.len() > MAX_GENERATED_NIX_BYTES {
+        bail!("build_input.generated_nix is too large");
+    }
+    if input.generated_nix.bytes().any(|byte| byte == 0) {
+        bail!("build_input.generated_nix must not contain NUL bytes");
+    }
+    Ok(ValidatedDesktopExperienceBuildInput {
+        generated_nix: input.generated_nix,
+        desktop_experience_name: input
+            .desktop_experience_name
+            .map(|value| bounded_metadata_text(&value, 200))
+            .filter(|value| !value.is_empty()),
+        desktop_experience_revision: input.desktop_experience_revision.filter(|value| *value > 0),
     })
 }
 
@@ -380,6 +449,9 @@ fn nix_build_command(
     spec: &ValidatedBuildSpec,
     job_id: i64,
 ) -> Result<NixBuildCommand> {
+    if let Some(build_input) = spec.build_input.as_ref() {
+        return desktop_experience_nix_build_command(config, target, spec, build_input, job_id);
+    }
     let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
     let out_link = job_dir.join("result");
     let installable = format!("{}#{}", target.flake, target.attr);
@@ -397,6 +469,134 @@ fn nix_build_command(
         ],
         out_link,
     })
+}
+
+fn desktop_experience_nix_build_command(
+    config: &AppConfig,
+    target: &BuildTargetConfig,
+    spec: &ValidatedBuildSpec,
+    build_input: &ValidatedDesktopExperienceBuildInput,
+    job_id: i64,
+) -> Result<NixBuildCommand> {
+    let input_dir = config.build.work_dir.join(format!("job-{job_id}-input"));
+    fs::create_dir_all(&input_dir)
+        .with_context(|| format!("create build input directory {}", input_dir.display()))?;
+    write_job_input_file(
+        input_dir.join("desktop-experience.nix"),
+        &build_input.generated_nix,
+    )?;
+    write_job_input_file(
+        input_dir.join("cybex-compat-options.nix"),
+        desktop_experience_compat_module(),
+    )?;
+    write_job_input_file(
+        input_dir.join("configuration.nix"),
+        forge_nixos_configuration(),
+    )?;
+    write_job_input_file(
+        input_dir.join("flake.nix"),
+        &forge_nixos_flake(&target.flake, &spec.system, build_input),
+    )?;
+
+    let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
+    let out_link = job_dir.join("result");
+    let installable = format!("{}#{}", input_dir.display(), target.attr);
+    Ok(NixBuildCommand {
+        program: config.build.nix_binary.clone(),
+        args: vec![
+            "build".to_string(),
+            installable,
+            "--out-link".to_string(),
+            out_link.display().to_string(),
+            "--print-build-logs".to_string(),
+            "--no-write-lock-file".to_string(),
+        ],
+        out_link,
+    })
+}
+
+fn write_job_input_file(path: PathBuf, contents: &str) -> Result<()> {
+    fs::write(&path, contents).with_context(|| format!("write build input {}", path.display()))
+}
+
+fn forge_nixos_flake(
+    nixpkgs_flake: &str,
+    system: &str,
+    build_input: &ValidatedDesktopExperienceBuildInput,
+) -> String {
+    let name = build_input
+        .desktop_experience_name
+        .as_deref()
+        .unwrap_or("Desktop Experience");
+    let revision = build_input
+        .desktop_experience_revision
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let description = serde_json::to_string(&format!(
+        "Cybex Forge Desktop Experience build: {name} rev {revision}"
+    ))
+    .unwrap_or_else(|_| "\"Cybex Forge Desktop Experience build\"".to_string());
+    let nixpkgs_flake =
+        serde_json::to_string(nixpkgs_flake).unwrap_or_else(|_| "\"nixpkgs\"".to_string());
+    format!(
+        r#"{{
+  description = {description};
+
+  inputs.nixpkgs.url = {nixpkgs_flake};
+
+  outputs = {{ self, nixpkgs }}:
+    let
+      system = "{system}";
+    in {{
+      packages.${{system}}.desktop-experience =
+        (nixpkgs.lib.nixosSystem {{
+          inherit system;
+          modules = [
+            ./configuration.nix
+          ];
+        }}).config.system.build.toplevel;
+    }};
+}}
+"#
+    )
+}
+
+fn forge_nixos_configuration() -> &'static str {
+    r#"{ lib, modulesPath, ... }:
+
+{
+  imports = [
+    ./cybex-compat-options.nix
+    ./desktop-experience.nix
+  ];
+
+  system.stateVersion = lib.mkDefault lib.trivial.release;
+  networking.hostName = lib.mkDefault "cybex-forge-build";
+  networking.useDHCP = lib.mkDefault true;
+
+  fileSystems."/" = {
+    device = "none";
+    fsType = "tmpfs";
+  };
+
+  boot.loader.grub.enable = lib.mkDefault false;
+  boot.loader.systemd-boot.enable = lib.mkDefault false;
+  boot.initrd.systemd.enable = lib.mkDefault false;
+}
+"#
+}
+
+fn desktop_experience_compat_module() -> &'static str {
+    r#"{ lib, ... }:
+
+{
+  options.cybex = lib.mkOption {
+    type = lib.types.attrsOf lib.types.anything;
+    default = {};
+    description = "Cybex Desktop Experience metadata accepted while Forge prebuilds a generic NixOS closure.";
+  };
+}
+"#
 }
 
 async fn run_nix_build(
@@ -730,6 +930,16 @@ fn normalize_optional_uuidish(field: &str, value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+fn bounded_metadata_text(value: &str, max_chars: usize) -> String {
+    value
+        .replace(['\n', '\r', '\t'], " ")
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 fn default_schema_version() -> u32 {
     1
 }
@@ -766,6 +976,29 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_accepts_desktop_experience_build_input() {
+        let value = json!({
+            "schema_version": 1,
+            "artifact_type": "nixos_closure",
+            "target": "desktop_experience",
+            "system": "x86_64-linux",
+            "input_revision": "rev",
+            "input_config_hash": "a".repeat(64),
+            "build_input": {
+                "kind": "desktop_experience_nixos_module",
+                "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
+                "desktop_experience_name": "Standard Workstation",
+                "desktop_experience_revision": 8
+            }
+        });
+        let parsed = serde_json::from_value::<BuildSpec>(value).unwrap();
+        assert_eq!(
+            parsed.build_input.unwrap().kind,
+            DESKTOP_EXPERIENCE_BUILD_INPUT_KIND
+        );
+    }
+
+    #[test]
     fn nix_build_command_uses_allowlisted_attr() {
         let mut config = AppConfig::default();
         config.build.output_dir = PathBuf::from("/tmp/cybex-forge-test-builds");
@@ -785,6 +1018,8 @@ mod tests {
             input_config_hash: "a".repeat(64),
             desktop_experience_id: None,
             desktop_experience_revision_id: None,
+            desktop_experience_revision_config_hash: None,
+            build_input: None,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
@@ -798,6 +1033,62 @@ mod tests {
             )
         );
         assert!(command.args.contains(&"--out-link".to_string()));
+    }
+
+    #[test]
+    fn nix_build_command_writes_desktop_experience_flake_input() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-build-input-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = AppConfig::default();
+        config.build.work_dir = root.join("work");
+        config.build.output_dir = root.join("out");
+        config.build.nix_binary = "nix".to_string();
+        let target = BuildTargetConfig {
+            artifact_type: "nixos_closure".to_string(),
+            target: "desktop_experience".to_string(),
+            system: "x86_64-linux".to_string(),
+            flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
+            attr: "packages.x86_64-linux.desktop-experience".to_string(),
+        };
+        let spec = ValidatedBuildSpec {
+            artifact_type: "nixos_closure".to_string(),
+            target: "desktop_experience".to_string(),
+            system: "x86_64-linux".to_string(),
+            input_revision: "rev".to_string(),
+            input_config_hash: "a".repeat(64),
+            desktop_experience_id: None,
+            desktop_experience_revision_id: None,
+            desktop_experience_revision_config_hash: None,
+            build_input: Some(ValidatedDesktopExperienceBuildInput {
+                generated_nix: "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }"
+                    .to_string(),
+                desktop_experience_name: Some("Standard Workstation".to_string()),
+                desktop_experience_revision: Some(8),
+            }),
+        };
+
+        let command = nix_build_command(&config, &target, &spec, 42).unwrap();
+
+        assert_eq!(command.program, "nix");
+        assert_eq!(command.args[0], "build");
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg.ends_with("#packages.x86_64-linux.desktop-experience"))
+        );
+        assert!(root.join("work/job-42-input/flake.nix").is_file());
+        assert!(
+            root.join("work/job-42-input/desktop-experience.nix")
+                .is_file()
+        );
+        let flake = std::fs::read_to_string(root.join("work/job-42-input/flake.nix")).unwrap();
+        assert!(flake.contains(r#"inputs.nixpkgs.url = "/srv/cybex-forge/build-inputs/cybex";"#));
+        assert!(!flake.contains("nixos-26.05"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

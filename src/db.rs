@@ -30,7 +30,7 @@ const MAX_PROFILE_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_PROFILE_RAW_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_BUILD_LOG_BYTES: usize = 64 * 1024;
 const MAX_BUILD_ERROR_CHARS: usize = 2_000;
-const MAX_CACHE_METADATA_BYTES: usize = 16 * 1024;
+const MAX_CACHE_METADATA_BYTES: usize = 1024 * 1024;
 const ALLOWED_BUILD_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "cancelled"];
 
 pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
@@ -1737,9 +1737,9 @@ fn build_spec_to_string(
     let encoded =
         serde_json::to_string(&value).map_err(|err| AppError::Validation(err.to_string()))?;
     if encoded.len() > MAX_CACHE_METADATA_BYTES {
-        return Err(AppError::Validation(
-            "build_spec must be 16384 bytes or fewer".to_string(),
-        ));
+        return Err(AppError::Validation(format!(
+            "build_spec must be {MAX_CACHE_METADATA_BYTES} bytes or fewer"
+        )));
     }
     Ok(encoded)
 }

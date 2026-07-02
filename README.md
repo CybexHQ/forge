@@ -42,8 +42,11 @@ LXC has enough CPU, memory, disk, and Nix privileges for the configured targets.
 Serious NixOS closure/image building may need larger LXC resources, a VM, or
 dedicated hardware. Build targets are disabled until configured in
 `[[build.targets]]`; the default installer creates the worker and cache
-directories but no broad build allowlist. Manual standalone installation is not
-currently supported.
+directories but no broad build allowlist. For generated Desktop Experience
+closure jobs, pin the target `flake` to the same nixpkgs revision used by the
+installer media, and keep `attr` at the generated
+`packages.<system>.desktop-experience` output. Manual standalone installation is
+not currently supported.
 
 ## Source And License
 
