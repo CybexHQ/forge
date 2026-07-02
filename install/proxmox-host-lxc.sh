@@ -37,7 +37,7 @@ current_step="initialization"
 usage() {
   cat <<'EOF'
 Usage:
-  proxmox-host-lxc.sh --api-url URL --organization-id UUID --auth-code CODE --public-base-url URL [options]
+  proxmox-host-lxc.sh --api-url URL --organization-id UUID --auth-code CODE [options]
 
 Run this on a Proxmox host as root. It creates a Debian/Ubuntu LXC, clones
 Forge inside it, installs Cybex Forge, submits the one-time install code, and
@@ -47,7 +47,6 @@ Required:
   --api-url URL                  Cybex Manage public API URL
   --organization-id UUID         Cybex organization UUID
   --auth-code CODE               One-time Forge install authorization code
-  --public-base-url URL          URL PXE clients use for this Forge node
 
 Generated resource options:
   --proxmox-disk-gb GiB          Root disk size (default/recommended: 32)
@@ -55,6 +54,7 @@ Generated resource options:
   --proxmox-memory-mb MiB        Memory (default/recommended: 4096)
 
 Boot runtime options:
+  --public-base-url URL          Override the auto-detected URL PXE clients use for this Forge node
   --listen ADDR                  Local Boot address behind nginx (default: 127.0.0.1:8080)
   --tftp-root PATH               TFTP root below /srv/cybex-forge (default: /srv/cybex-forge/tftp)
   --http-root PATH               HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
@@ -448,7 +448,11 @@ print_summary() {
   info "Memory: ${memory_mb} MiB"
   info "Manage API: $api_url"
   info "Organization: $organization_id"
-  info "Public Boot URL: $public_base_url"
+  if [ -n "$public_base_url" ]; then
+    info "Public Boot URL: $public_base_url"
+  else
+    info "Public Boot URL: auto-detect from the LXC address"
+  fi
   info "Forge source: $forge_git_url"
   info "Forge ref: $forge_ref"
   info "Forge checkout: $forge_source_dir"
@@ -485,6 +489,29 @@ start_container() {
     done
     exit 1
   ' || die "container did not become network-ready"
+}
+
+detect_container_ip() {
+  local ip_address
+  ip_address="$(pct exec "$vmid" -- sh -c "ip -4 -o addr show scope global up 2>/dev/null | awk '{ split(\$4, a, \"/\"); if (a[1] !~ /^127\\./) { print a[1]; exit } }'" 2>/dev/null || true)"
+  if [ -z "$ip_address" ]; then
+    ip_address="$(pct exec "$vmid" -- hostname -I 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) { print $i; exit } }' || true)"
+  fi
+  printf '%s\n' "$ip_address"
+}
+
+ensure_public_base_url() {
+  if [ -n "$public_base_url" ]; then
+    validate_url "--public-base-url" "$public_base_url"
+    return
+  fi
+  local container_ip
+  container_ip="$(detect_container_ip | head -n 1)"
+  [ -n "$container_ip" ] || die "could not auto-detect LXC IPv4 address; pass --public-base-url"
+  public_base_url="http://$container_ip"
+  validate_url "--public-base-url" "$public_base_url"
+  section "Detected Forge URL"
+  info "Public Boot URL: $public_base_url"
 }
 
 prepare_forge_source() {
@@ -555,9 +582,10 @@ print_final() {
 require_value "--api-url" "$api_url"
 require_value "--organization-id" "$organization_id"
 require_value "--auth-code" "$auth_code"
-require_value "--public-base-url" "$public_base_url"
 validate_url "--api-url" "$api_url"
-validate_url "--public-base-url" "$public_base_url"
+if [ -n "$public_base_url" ]; then
+  validate_url "--public-base-url" "$public_base_url"
+fi
 validate_url "--forge-git-url" "$forge_git_url"
 validate_forge_ref
 validate_uuid
@@ -581,6 +609,7 @@ if [ "$dry_run" -eq 1 ]; then
 fi
 create_container
 start_container
+ensure_public_base_url
 prepare_forge_source
 run_lxc_installer
 print_final

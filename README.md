@@ -39,8 +39,8 @@ boot asset files into Forge-owned paths only when the new targets are empty.
 
 The installer creates and configures the Cybex Forge service, installs the
 local Nix toolchain used by Forge Build/Cache, grants the service account Nix
-daemon access, enrolls it with Cybex Manage, and keeps the local Forge node
-managed by Cybex.
+daemon access, auto-detects the LXC LAN address for the initial Boot URL,
+enrolls it with Cybex Manage, and keeps the local Forge node managed by Cybex.
 
 Proxmox LXC is fine for Forge Boot and small Build/Cache deployments when the
 LXC has enough CPU, memory, disk, and Nix privileges for the configured targets.

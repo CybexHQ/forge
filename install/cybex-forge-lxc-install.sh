@@ -8,7 +8,7 @@ FORGE_SOURCE_DIR_DEFAULT="/root/forge"
 usage() {
   cat <<'EOF'
 Usage:
-  cybex-forge-lxc-install.sh --api-url URL --organization-id UUID --auth-code CODE --public-base-url URL [options]
+  cybex-forge-lxc-install.sh --api-url URL --organization-id UUID --auth-code CODE [options]
 
 Run this inside a Debian/Ubuntu Proxmox LXC that will host Cybex Forge.
 
@@ -16,9 +16,9 @@ Required:
   --api-url URL             Cybex Manage public API URL, for example https://manage.example.com
   --organization-id UUID    Cybex organization UUID from the install authorization
   --auth-code CODE          One-time Cybex Forge install authorization code
-  --public-base-url URL     URL PXE clients will use for this Forge node, for example http://10.10.0.239
 
 Options:
+  --public-base-url URL     Override the auto-detected URL PXE clients use for this Forge node
   --source-dir PATH         Existing Forge source directory (default: /root/forge)
   --git-url URL             Clone source when --source-dir is missing
   --forge-ref REF           Branch, tag, or commit to install (default: main)
@@ -316,6 +316,32 @@ installer_preflight() {
     echo "systemd is not running inside this LXC" >&2
     exit 1
   fi
+}
+
+detect_local_ipv4() {
+  local ip_address
+  if command -v ip >/dev/null 2>&1; then
+    ip_address="$(ip -4 -o addr show scope global up 2>/dev/null | awk '{ split($4, a, "/"); if (a[1] !~ /^127\./) { print a[1]; exit } }' || true)"
+  fi
+  if [ -z "${ip_address:-}" ]; then
+    ip_address="$(hostname -I 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) { print $i; exit } }' || true)"
+  fi
+  printf '%s\n' "${ip_address:-}"
+}
+
+ensure_public_base_url() {
+  if [ -n "$public_base_url" ]; then
+    validate_url "--public-base-url" "$public_base_url"
+    return
+  fi
+  local local_ip
+  local_ip="$(detect_local_ipv4 | head -n 1)"
+  if [ -z "$local_ip" ]; then
+    echo "could not auto-detect this LXC's IPv4 address; pass --public-base-url" >&2
+    exit 2
+  fi
+  public_base_url="http://$local_ip"
+  validate_url "--public-base-url" "$public_base_url"
 }
 
 bootloader_supports_embedded_script() {
@@ -2551,9 +2577,8 @@ installer_preflight
 require_value "--api-url" "$api_url"
 require_value "--organization-id" "$organization_id"
 require_value "--auth-code" "$auth_code"
-require_value "--public-base-url" "$public_base_url"
 validate_url "--api-url" "$api_url"
-validate_url "--public-base-url" "$public_base_url"
+ensure_public_base_url
 validate_url "--git-url" "$git_url"
 validate_organization_id
 validate_auth_code
