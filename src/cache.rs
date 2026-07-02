@@ -78,10 +78,9 @@ pub async fn status_report(config: &AppConfig, pool: &SqlitePool) -> CacheStatus
         };
     }
     let artifacts = db::list_cache_artifacts(pool).await.unwrap_or_default();
-    let total_size_bytes = artifacts
-        .iter()
-        .map(|artifact| artifact.size_bytes.max(0) as u64)
-        .sum();
+    // Artifact rows only record each export's top-level NAR; the closure NARs
+    // written by `nix copy` dominate disk usage, so measure the cache root itself.
+    let total_size_bytes = cache_disk_usage(config).await;
     match ensure_signing_key(config).await {
         Ok(public_key) => CacheStatusReport {
             enabled: true,
@@ -233,11 +232,9 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     if config.cache.max_bytes == 0 {
         return Ok(());
     }
-    let artifacts = db::list_cache_artifacts(pool).await?;
-    let mut total: u64 = artifacts
-        .iter()
-        .map(|artifact| artifact.size_bytes.max(0) as u64)
-        .sum();
+    // Artifact rows only track top-level NARs while `nix copy` stores whole
+    // closures, so both the threshold and the reclaim must work on disk state.
+    let mut total = cache_disk_usage(config).await;
     if total <= config.cache.max_bytes {
         return Ok(());
     }
@@ -252,12 +249,14 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
             protected_sources.insert(managed_job_id.to_string());
         }
     }
-    let mut candidates = artifacts;
+    let mut candidates = db::list_cache_artifacts(pool).await?;
     candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    for artifact in candidates {
+    let mut evicted_ids: HashSet<i64> = HashSet::new();
+    for index in 0..candidates.len() {
         if total <= config.cache.max_bytes {
             break;
         }
+        let artifact = &candidates[index];
         if artifact
             .source_build_job_id
             .as_deref()
@@ -265,16 +264,178 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
         {
             continue;
         }
-        let bytes = artifact.size_bytes.max(0) as u64;
-        remove_cache_artifact_files(config, &artifact.path, &artifact.narinfo_path)?;
         db::delete_cache_artifact(pool, artifact.id).await?;
-        total = total.saturating_sub(bytes);
+        evicted_ids.insert(artifact.id);
+        let retained = candidates
+            .iter()
+            .filter(|candidate| !evicted_ids.contains(&candidate.id))
+            .map(RetainedArtifactFiles::from)
+            .collect::<Vec<_>>();
+        let freed = sweep_unreachable(config, retained).await?;
+        total = total.saturating_sub(freed);
     }
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct RetainedArtifactFiles {
+    store_path: String,
+    nar_path: PathBuf,
+    narinfo_path: PathBuf,
+    nar_url: String,
+}
+
+impl From<&crate::models::CacheArtifact> for RetainedArtifactFiles {
+    fn from(artifact: &crate::models::CacheArtifact) -> Self {
+        Self {
+            store_path: artifact.store_path.clone(),
+            nar_path: PathBuf::from(&artifact.path),
+            narinfo_path: PathBuf::from(&artifact.narinfo_path),
+            nar_url: artifact.nar_url.trim_start_matches('/').to_string(),
+        }
+    }
+}
+
+async fn sweep_unreachable(
+    config: &AppConfig,
+    retained: Vec<RetainedArtifactFiles>,
+) -> Result<u64> {
+    let cache_root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || sweep_unreachable_blocking(&cache_root, &retained))
+        .await
+        .context("join cache sweep task")?
+}
+
+/// Mark-and-sweep over the binary cache directory: walk the narinfo reference
+/// graph from every retained artifact's store path, then delete root-level
+/// `*.narinfo` files and direct `nar/` members that are no longer reachable.
+/// Returns the number of bytes freed.
+fn sweep_unreachable_blocking(
+    cache_root: &Path,
+    retained: &[RetainedArtifactFiles],
+) -> Result<u64> {
+    let mut live_files: HashSet<PathBuf> = HashSet::new();
+    let mut live_nar_urls: HashSet<String> = HashSet::new();
+    let mut live_narinfo_hashes: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for artifact in retained {
+        live_files.insert(artifact.nar_path.clone());
+        live_files.insert(artifact.narinfo_path.clone());
+        if !artifact.nar_url.is_empty() {
+            live_nar_urls.insert(artifact.nar_url.clone());
+        }
+        if let Some(hash) = store_path_hash(&artifact.store_path) {
+            queue.push(hash);
+        }
+    }
+    while let Some(hash) = queue.pop() {
+        if !live_narinfo_hashes.insert(hash.clone()) {
+            continue;
+        }
+        let narinfo_path = cache_root.join(format!("{hash}.narinfo"));
+        let Ok(contents) = fs::read_to_string(&narinfo_path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            if let Some(url) = line.strip_prefix("URL:") {
+                live_nar_urls.insert(url.trim().trim_start_matches('/').to_string());
+            } else if let Some(references) = line.strip_prefix("References:") {
+                for reference in references.split_whitespace() {
+                    if let Some(reference_hash) = store_basename_hash(reference) {
+                        if !live_narinfo_hashes.contains(&reference_hash) {
+                            queue.push(reference_hash);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut freed = 0u64;
+    if let Ok(entries) = fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".narinfo") else {
+                continue;
+            };
+            if live_narinfo_hashes.contains(&stem.to_ascii_lowercase())
+                || live_files.contains(&entry.path())
+            {
+                continue;
+            }
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove narinfo {}", entry.path().display()))?;
+            freed = freed.saturating_add(metadata.len());
+        }
+    }
+    if let Ok(entries) = fs::read_dir(cache_root.join("nar")) {
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let relative_url = format!("nar/{}", entry.file_name().to_string_lossy());
+            if live_nar_urls.contains(&relative_url) || live_files.contains(&entry.path()) {
+                continue;
+            }
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove nar {}", entry.path().display()))?;
+            freed = freed.saturating_add(metadata.len());
+        }
+    }
+    Ok(freed)
+}
+
+fn store_path_hash(store_path: &str) -> Option<String> {
+    store_basename_hash(store_path.rsplit('/').next().unwrap_or(store_path))
+}
+
+fn store_basename_hash(basename: &str) -> Option<String> {
+    let hash = basename.split('-').next()?;
+    (hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then(|| hash.to_ascii_lowercase())
+}
+
 pub fn cache_base_url(config: &AppConfig) -> String {
     format!("{}/cache", config.public_base_url())
+}
+
+async fn cache_disk_usage(config: &AppConfig) -> u64 {
+    let root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || directory_size_bytes(&root))
+        .await
+        .unwrap_or(0)
+}
+
+fn directory_size_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.file_type().is_dir() {
+                stack.push(entry.path());
+            } else if metadata.file_type().is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 async fn ensure_signing_key(config: &AppConfig) -> Result<String> {
@@ -498,58 +659,6 @@ fn safe_cache_member_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn remove_cache_artifact_files(
-    config: &AppConfig,
-    nar_path: &str,
-    narinfo_path: &str,
-) -> Result<()> {
-    for path in [nar_path, narinfo_path] {
-        let path = Path::new(path);
-        if path.as_os_str().is_empty() {
-            continue;
-        }
-        ensure_cache_path(config, path)?;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!(
-                    "refusing to delete symlinked cache artifact {}",
-                    path.display()
-                );
-            }
-            Ok(metadata) if metadata.is_file() => {
-                fs::remove_file(path)
-                    .with_context(|| format!("remove cache artifact {}", path.display()))?;
-            }
-            Ok(_) => bail!(
-                "refusing to delete non-file cache artifact {}",
-                path.display()
-            ),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("stat cache artifact {}", path.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_cache_path(config: &AppConfig, path: &Path) -> Result<()> {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        bail!("cache artifact path is not normalized");
-    }
-    if !path.starts_with(&config.cache.root_dir) {
-        bail!("cache artifact path is outside cache root");
-    }
-    Ok(())
-}
-
 fn public_key_fingerprint(public_key: &str) -> String {
     sha256_hex(public_key.as_bytes()).chars().take(24).collect()
 }
@@ -673,23 +782,24 @@ mod tests {
     }
 
     #[test]
+    fn directory_size_counts_nested_files_and_missing_root_is_zero() {
+        let root = test_temp_dir("disk-usage");
+        fs::create_dir_all(root.join("nar/deep")).unwrap();
+        fs::write(root.join("top.narinfo"), vec![0u8; 10]).unwrap();
+        fs::write(root.join("nar/member.nar.xz"), vec![0u8; 100]).unwrap();
+        fs::write(root.join("nar/deep/other.nar.xz"), vec![0u8; 1000]).unwrap();
+
+        assert_eq!(directory_size_bytes(&root), 1110);
+        assert_eq!(directory_size_bytes(&root.join("does-not-exist")), 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn cache_member_paths_reject_traversal() {
         let root = Path::new("/tmp/cache");
         assert!(safe_cache_member_path(root, "nar/abc.nar.xz").is_ok());
         assert!(safe_cache_member_path(root, "../abc.nar.xz").is_err());
         assert!(safe_cache_member_path(root, "/nar/abc.nar.xz").is_err());
-    }
-
-    #[test]
-    fn cache_delete_paths_must_stay_under_root() {
-        let mut config = AppConfig::default();
-        config.cache.root_dir = PathBuf::from("/srv/cybex-forge/www/cache");
-
-        assert!(ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/cache/nar/a")).is_ok());
-        assert!(
-            ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/cache/../secret")).is_err()
-        );
-        assert!(ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/other")).is_err());
     }
 
     #[tokio::test]
@@ -698,6 +808,14 @@ mod tests {
         db::migrate(&pool).await.unwrap();
         let root = test_temp_dir("status-report");
         let mut config = AppConfig::default();
+        config.cache.root_dir = root.join("cache");
+        fs::create_dir_all(config.cache.root_dir.join("nar")).unwrap();
+        fs::write(config.cache.root_dir.join("nix-cache-info"), vec![0u8; 40]).unwrap();
+        fs::write(
+            config.cache.root_dir.join("nar/closure-member.nar.xz"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
         config.cache.private_key_path = root.join("cache-priv-key.pem");
         config.cache.public_key_path = root.join("cache-pub-key.pem");
         fs::write(&config.cache.private_key_path, "private").unwrap();
@@ -715,6 +833,7 @@ mod tests {
         let report = status_report(&config, &pool).await;
 
         assert_eq!(report.status, "ready");
+        assert_eq!(report.total_size_bytes, 4136);
         assert!(report.public_key.starts_with("cybex-forge-cache:"));
         assert_eq!(report.public_key_fingerprint.len(), 24);
         assert_eq!(
@@ -724,6 +843,121 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn retention_sweeps_unreachable_closure_members_and_keeps_shared_ones() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("closure-gc");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.max_bytes = 1;
+        config.cache.retain_recent_builds = 1;
+
+        let hash_a = "a".repeat(32);
+        let hash_b = "b".repeat(32);
+        let hash_shared = "d".repeat(32);
+        let hash_unique = "e".repeat(32);
+        fs::write(
+            cache_root.join(format!("{hash_a}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_a}-root-a\nURL: nar/root-a.nar.xz\nReferences: {hash_shared}-shared {hash_unique}-unique\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cache_root.join(format!("{hash_b}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_b}-root-b\nURL: nar/root-b.nar.xz\nReferences: {hash_shared}-shared\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cache_root.join(format!("{hash_shared}.narinfo")),
+            format!("StorePath: /nix/store/{hash_shared}-shared\nURL: nar/shared.nar.xz\n"),
+        )
+        .unwrap();
+        fs::write(
+            cache_root.join(format!("{hash_unique}.narinfo")),
+            format!("StorePath: /nix/store/{hash_unique}-unique\nURL: nar/unique.nar.xz\n"),
+        )
+        .unwrap();
+        for nar in ["root-a", "root-b", "shared", "unique"] {
+            fs::write(cache_root.join(format!("nar/{nar}.nar.xz")), vec![0u8; 64]).unwrap();
+        }
+
+        db::upsert_managed_build_job(
+            &pool,
+            "active-job",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "revision-1",
+            &"a".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (hash, name, source) in [
+            (&hash_a, "root-a", None),
+            (&hash_b, "root-b", Some("active-job".to_string())),
+        ] {
+            db::create_cache_artifact(
+                &pool,
+                crate::models::CreateCacheArtifactRequest {
+                    artifact_type: "nixos_closure".to_string(),
+                    hash: hash.repeat(2),
+                    size_bytes: 64,
+                    path: cache_root
+                        .join(format!("nar/{name}.nar.xz"))
+                        .display()
+                        .to_string(),
+                    store_path: Some(format!("/nix/store/{hash}-{name}")),
+                    narinfo_path: Some(
+                        cache_root
+                            .join(format!("{hash}.narinfo"))
+                            .display()
+                            .to_string(),
+                    ),
+                    nar_url: Some(format!("nar/{name}.nar.xz")),
+                    file_hash: Some(format!("sha256:{name}")),
+                    nar_hash: Some(format!("sha256:{name}nar")),
+                    nar_size_bytes: Some(64),
+                    closure_size_bytes: Some(192),
+                    compression: Some("xz".to_string()),
+                    references: Some(json!([])),
+                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    source_build_job_id: source,
+                    cache_metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        enforce_retention(&pool, &config).await.unwrap();
+
+        assert!(!cache_root.join(format!("{hash_a}.narinfo")).exists());
+        assert!(!cache_root.join("nar/root-a.nar.xz").exists());
+        assert!(!cache_root.join(format!("{hash_unique}.narinfo")).exists());
+        assert!(!cache_root.join("nar/unique.nar.xz").exists());
+        assert!(cache_root.join(format!("{hash_b}.narinfo")).exists());
+        assert!(cache_root.join("nar/root-b.nar.xz").exists());
+        assert!(cache_root.join(format!("{hash_shared}.narinfo")).exists());
+        assert!(cache_root.join("nar/shared.nar.xz").exists());
+        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].source_build_job_id.as_deref(),
+            Some("active-job")
         );
         fs::remove_dir_all(root).ok();
     }
