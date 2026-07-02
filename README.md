@@ -5,16 +5,16 @@ It runs inside customer infrastructure and provides local services that Cybex
 Manage can orchestrate without moving customer-specific heavy work into the
 SaaS control plane.
 
-Cybex Forge ships Forge Boot, Forge Build, and Forge Cache for managed local
-infrastructure:
+## Capabilities
 
-- `boot_v1`: PXE/iPXE provisioning, Boot profiles, clients, events, ISO sync,
-  and netboot asset generation.
-- `builder_v1`: local Nix Build execution for Manage-queued jobs that match the
-  configured artifact type, target, system, flake, and attribute allowlist.
-- `cache_v1`: signed local Nix binary cache export under `/cache/`, including
-  generated signing keys, validated `nix-cache-info`, signed `.narinfo`
-  metadata, retention, and Manage reporting.
+Cybex Forge currently provides three managed local capabilities:
+
+- Forge Boot (`boot_v1`): serves PXE/iPXE boot flows, installer ISOs, boot
+  profiles, known clients, boot assets, and boot events.
+- Forge Build (`builder_v1`): runs local Nix builds that Cybex Manage queues
+  for configured and allowed targets.
+- Forge Cache (`cache_v1`): publishes successful build outputs through a signed
+  local Nix binary cache and reports cache metadata back to Cybex Manage.
 
 Cybex Forge is not a standalone infrastructure management product. It is
 designed to work only with the Cybex commercial SaaS platform, including Cybex
