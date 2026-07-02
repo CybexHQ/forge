@@ -659,23 +659,6 @@ fn safe_cache_member_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn ensure_cache_path(config: &AppConfig, path: &Path) -> Result<()> {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        bail!("cache artifact path is not normalized");
-    }
-    if !path.starts_with(&config.cache.root_dir) {
-        bail!("cache artifact path is outside cache root");
-    }
-    Ok(())
-}
-
 fn public_key_fingerprint(public_key: &str) -> String {
     sha256_hex(public_key.as_bytes()).chars().take(24).collect()
 }
@@ -817,18 +800,6 @@ mod tests {
         assert!(safe_cache_member_path(root, "nar/abc.nar.xz").is_ok());
         assert!(safe_cache_member_path(root, "../abc.nar.xz").is_err());
         assert!(safe_cache_member_path(root, "/nar/abc.nar.xz").is_err());
-    }
-
-    #[test]
-    fn cache_delete_paths_must_stay_under_root() {
-        let mut config = AppConfig::default();
-        config.cache.root_dir = PathBuf::from("/srv/cybex-forge/www/cache");
-
-        assert!(ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/cache/nar/a")).is_ok());
-        assert!(
-            ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/cache/../secret")).is_err()
-        );
-        assert!(ensure_cache_path(&config, Path::new("/srv/cybex-forge/www/other")).is_err());
     }
 
     #[tokio::test]
