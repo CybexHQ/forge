@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -1025,6 +1027,8 @@ async fn set_profile_iso_boot_script(
     Ok(())
 }
 
+const NIXOS_NETBOOT_INITRD_FORMAT: &str = "zstd-combined-newc-v7";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct NixosNetbootManifest {
     iso_sha256: String,
@@ -1035,6 +1039,8 @@ struct NixosNetbootManifest {
     kernel_path: String,
     initrd_path: String,
     netboot_cpio_path: String,
+    #[serde(default)]
+    netboot_initrd_format: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1128,7 +1134,13 @@ fn read_valid_netboot_manifest(
     if manifest.iso_sha256 != iso_sha256 {
         return Ok(None);
     }
-    for filename in ["bzImage", "initrd", "nixos-netboot.cpio"] {
+    if manifest.netboot_initrd_format != NIXOS_NETBOOT_INITRD_FORMAT {
+        return Ok(None);
+    }
+    if !manifest.netboot_cpio_path.trim().is_empty() {
+        return Ok(None);
+    }
+    for filename in ["bzImage", "initrd"] {
         let path = artifact_dir.join(filename);
         if !path.is_file() {
             return Ok(None);
@@ -1175,6 +1187,7 @@ fn read_valid_prebuilt_netboot_manifest(
         kernel_path: format!("{artifact_relative_dir}/bzImage"),
         initrd_path: format!("{artifact_relative_dir}/initrd"),
         netboot_cpio_path: String::new(),
+        netboot_initrd_format: "prebuilt-single-initrd".to_string(),
     }))
 }
 
@@ -1197,14 +1210,14 @@ fn prepare_nixos_netboot_staging(
     extract_iso_file(iso_path, "/nix-store.squashfs", &squashfs_path)?;
 
     let initrd_fstab_path = find_initrd_fstab_path(&initrd_path)?;
-    let netboot_cpio_path = staging_dir.join("nixos-netboot.cpio");
-    write_nixos_netboot_cpio(&netboot_cpio_path, &squashfs_path, &initrd_fstab_path)?;
+    rebuild_zstd_initrd_with_netboot_files(&initrd_path, &squashfs_path, &initrd_fstab_path)?;
     fs::remove_file(&squashfs_path)
         .with_context(|| format!("remove temporary {}", squashfs_path.display()))?;
 
     ensure_nonempty_file(&kernel_path)?;
     ensure_nonempty_file(&initrd_path)?;
-    ensure_nonempty_file(&netboot_cpio_path)?;
+    set_public_artifact_permissions(&kernel_path)?;
+    set_public_artifact_permissions(&initrd_path)?;
 
     let manifest = NixosNetbootManifest {
         iso_sha256: iso_sha256.to_string(),
@@ -1214,7 +1227,8 @@ fn prepare_nixos_netboot_staging(
         cmdline: boot_config.cmdline,
         kernel_path: format!("{artifact_relative_dir}/bzImage"),
         initrd_path: format!("{artifact_relative_dir}/initrd"),
-        netboot_cpio_path: format!("{artifact_relative_dir}/nixos-netboot.cpio"),
+        netboot_cpio_path: String::new(),
+        netboot_initrd_format: NIXOS_NETBOOT_INITRD_FORMAT.to_string(),
     };
     fs::write(
         staging_dir.join("netboot-manifest.json"),
@@ -1279,7 +1293,13 @@ fn parse_nixos_netboot_ipxe_cmdline(script: &str) -> Result<String> {
             .ok_or_else(|| anyhow!("NixOS netboot iPXE kernel line must load bzImage"))?
             .trim();
         let cmdline = cmdline.replace("${cmdline}", "");
-        return normalize_kernel_cmdline(&cmdline);
+        let cmdline = normalize_kernel_cmdline(&cmdline)?;
+        let cmdline = cmdline
+            .split_whitespace()
+            .filter(|token| !token.starts_with("initrd="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok(cmdline);
     }
     bail!("NixOS netboot iPXE script omitted kernel line");
 }
@@ -1314,8 +1334,8 @@ fn render_nixos_netboot_script(
         return Ok(format!(
             "#!ipxe\n\
              echo Cybex Forge: Default Enrollment\n\
-             kernel {kernel_url} {cmdline}\n\
-             initrd {initrd_url}\n\
+             kernel {kernel_url} initrd=initrd {cmdline}\n\
+             initrd --name initrd {initrd_url}\n\
              boot\n",
             cmdline = manifest.cmdline
         ));
@@ -1432,27 +1452,201 @@ fn parse_newc_hex(input: &[u8]) -> Result<u64> {
     u64::from_str_radix(text, 16).context("newc header field was not hex")
 }
 
-fn write_nixos_netboot_cpio(
-    cpio_path: &Path,
+fn rebuild_zstd_initrd_with_netboot_files(
+    initrd_path: &Path,
     squashfs_path: &Path,
     initrd_fstab_path: &str,
 ) -> Result<()> {
-    let tmp_path = cpio_path.with_extension("cpio.tmp");
-    let mut out =
-        fs::File::create(&tmp_path).with_context(|| format!("create {}", tmp_path.display()))?;
-    write_newc_file_from_path(&mut out, "nix-store.squashfs", squashfs_path, 0o100644, 1)?;
+    let decoded_path = initrd_path.with_extension("decoded.cpio.tmp");
+    let rebuilt_path = initrd_path.with_extension("rebuilt.cpio.tmp");
+    let compressed_path = initrd_path.with_extension("zst.tmp");
+    for path in [&decoded_path, &rebuilt_path, &compressed_path] {
+        let _ = fs::remove_file(path);
+    }
+
+    let result = (|| -> Result<()> {
+        decompress_zstd_to_file(initrd_path, &decoded_path)?;
+        rewrite_newc_archive_with_netboot_files(
+            &decoded_path,
+            &rebuilt_path,
+            squashfs_path,
+            initrd_fstab_path,
+        )?;
+        compress_file_to_zstd(&rebuilt_path, &compressed_path)?;
+        fs::rename(&compressed_path, initrd_path)
+            .with_context(|| format!("publish recompressed {}", initrd_path.display()))?;
+        set_public_artifact_permissions(initrd_path)?;
+        Ok(())
+    })();
+
+    for path in [&decoded_path, &rebuilt_path, &compressed_path] {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn decompress_zstd_to_file(source: &Path, destination: &Path) -> Result<()> {
+    let output_file = fs::File::create(destination)
+        .with_context(|| format!("create {}", destination.display()))?;
+    let output = StdCommand::new("zstd")
+        .arg("-dc")
+        .arg(source)
+        .stdout(Stdio::from(output_file))
+        .output()
+        .with_context(|| "run zstd to decompress managed ISO initrd")?;
+    ensure_command_success(output, "zstd decompress managed ISO initrd")?;
+    ensure_nonempty_file(destination)?;
+    Ok(())
+}
+
+fn rewrite_newc_archive_with_netboot_files(
+    source: &Path,
+    destination: &Path,
+    squashfs_path: &Path,
+    initrd_fstab_path: &str,
+) -> Result<()> {
+    let input = fs::File::open(source).with_context(|| format!("open {}", source.display()))?;
+    let mut reader = BufReader::new(input);
+    let mut output = fs::File::create(destination)
+        .with_context(|| format!("create {}", destination.display()))?;
+    let mut replaced_fstab = false;
+    let mut next_ino = 1_000_000u32;
+
+    loop {
+        let Some(entry) = read_newc_entry_start(&mut reader)? else {
+            bail!("managed ISO initrd cpio omitted TRAILER!!!");
+        };
+        if entry.name == "TRAILER!!!" {
+            break;
+        }
+        if entry.name == initrd_fstab_path {
+            replaced_fstab = true;
+            skip_exact(&mut reader, entry.file_size)?;
+            skip_padding(&mut reader, entry.file_size)?;
+            continue;
+        }
+        output.write_all(&entry.header)?;
+        output.write_all(&entry.name_bytes)?;
+        output.write_all(&entry.name_padding)?;
+        copy_exact(&mut reader, &mut output, entry.file_size)?;
+        copy_exact(&mut reader, &mut output, newc_padding_len(entry.file_size))?;
+    }
+    if !replaced_fstab {
+        bail!("managed ISO initrd omitted expected fstab entry {initrd_fstab_path}");
+    }
+
     write_newc_file_from_bytes(
-        &mut out,
+        &mut output,
         initrd_fstab_path,
         nixos_netboot_fstab().as_bytes(),
         0o100644,
-        2,
+        next_ino,
     )?;
-    write_newc_trailer(&mut out)?;
-    out.sync_all()
-        .with_context(|| format!("sync {}", tmp_path.display()))?;
-    drop(out);
-    fs::rename(&tmp_path, cpio_path).with_context(|| format!("publish {}", cpio_path.display()))?;
+    next_ino += 1;
+    write_newc_file_from_path(
+        &mut output,
+        "nix-store.squashfs",
+        squashfs_path,
+        0o100644,
+        next_ino,
+    )?;
+    write_newc_trailer(&mut output)?;
+    output
+        .sync_all()
+        .with_context(|| format!("sync {}", destination.display()))?;
+    ensure_nonempty_file(destination)?;
+    Ok(())
+}
+
+struct NewcEntryStart {
+    header: [u8; 110],
+    name: String,
+    name_bytes: Vec<u8>,
+    name_padding: Vec<u8>,
+    file_size: u64,
+}
+
+fn read_newc_entry_start<R: Read>(reader: &mut R) -> Result<Option<NewcEntryStart>> {
+    let mut header = [0u8; 110];
+    let mut read = 0usize;
+    while read < header.len() {
+        let count = reader
+            .read(&mut header[read..])
+            .context("read initrd cpio header")?;
+        if count == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            bail!("truncated initrd cpio header");
+        }
+        read += count;
+    }
+    if &header[..6] != b"070701" && &header[..6] != b"070702" {
+        bail!("unsupported initrd cpio format");
+    }
+    let file_size = parse_newc_hex(&header[54..62])?;
+    let name_size = parse_newc_hex(&header[94..102])?;
+    if name_size == 0 || name_size > 4096 {
+        bail!("invalid initrd cpio name size");
+    }
+    let mut name_bytes = vec![0u8; name_size as usize];
+    reader
+        .read_exact(&mut name_bytes)
+        .context("read initrd cpio name")?;
+    let mut name = name_bytes.clone();
+    if name.last() == Some(&0) {
+        name.pop();
+    }
+    let name = String::from_utf8(name).context("initrd cpio name is not utf-8")?;
+    let name_padding_len = newc_padding_len(110 + name_size);
+    let mut name_padding = vec![0u8; name_padding_len as usize];
+    reader
+        .read_exact(&mut name_padding)
+        .context("read initrd cpio name padding")?;
+    Ok(Some(NewcEntryStart {
+        header,
+        name,
+        name_bytes,
+        name_padding,
+        file_size,
+    }))
+}
+
+fn compress_file_to_zstd(source: &Path, destination: &Path) -> Result<()> {
+    let output = StdCommand::new("zstd")
+        .arg("-q")
+        .arg("-f")
+        .arg("-T0")
+        .arg(source)
+        .arg("-o")
+        .arg(destination)
+        .output()
+        .with_context(|| "run zstd to recompress managed ISO initrd")?;
+    ensure_command_success(output, "zstd recompress managed ISO initrd")?;
+    ensure_nonempty_file(destination)?;
+    Ok(())
+}
+
+fn set_public_artifact_permissions(path: &Path) -> Result<()> {
+    set_file_mode(path, 0o644)
+}
+
+fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let permissions = fs::Permissions::from_mode(mode);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -1555,6 +1749,22 @@ fn skip_exact<R: Read>(reader: &mut R, len: u64) -> Result<()> {
         reader
             .read_exact(&mut buffer[..chunk])
             .context("skip initrd cpio data")?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+fn copy_exact<R: Read, W: Write>(reader: &mut R, writer: &mut W, len: u64) -> Result<()> {
+    let mut remaining = len;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        reader
+            .read_exact(&mut buffer[..chunk])
+            .context("read initrd cpio data")?;
+        writer
+            .write_all(&buffer[..chunk])
+            .context("write initrd cpio data")?;
         remaining -= chunk as u64;
     }
     Ok(())
@@ -3887,9 +4097,22 @@ fn managed_profile_raw_script(
         return Some(raw_script);
     }
     if managed_profile_needs_iso_sync(profile) {
-        return existing_raw_script.and_then(|value| clean_optional(Some(value.to_string())));
+        return existing_raw_script
+            .and_then(|value| clean_optional(Some(value.to_string())))
+            .filter(|script| generated_iso_raw_script_can_be_preserved(script));
     }
     None
+}
+
+fn generated_iso_raw_script_can_be_preserved(script: &str) -> bool {
+    if !script.contains("/files/installers/") {
+        return true;
+    }
+    if script.contains("nixos-netboot.cpio") {
+        return script.contains("initrd --name initrd ")
+            && script.contains("initrd --name nixos-netboot.cpio ");
+    }
+    script.contains("initrd --name initrd ")
 }
 
 fn managed_profile_needs_iso_sync(profile: &ManagedBootProfile) -> bool {
@@ -4008,10 +4231,10 @@ mod tests {
         append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
         bounded_error_message, bounded_http_timeout_seconds, fit_boot_report_body,
         forge_capabilities, has_unreported_known_profile_events, managed_profile_map,
-        managed_sync_interval_seconds, normalize_managed_settings, render_check_service,
-        render_nixos_netboot_script, serialize_boot_report_body, sync_clients,
-        sync_deleted_clients, sync_deleted_profiles, sync_profiles, validate_boot_config,
-        validate_profile, write_secure_json,
+        managed_sync_interval_seconds, normalize_managed_settings,
+        parse_nixos_netboot_ipxe_cmdline, render_check_service, render_nixos_netboot_script,
+        serialize_boot_report_body, sync_clients, sync_deleted_clients, sync_deleted_profiles,
+        sync_profiles, validate_boot_config, validate_profile, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -4082,6 +4305,7 @@ mod tests {
                 kernel_path: "installers/example/bzImage".to_string(),
                 initrd_path: "installers/example/initrd".to_string(),
                 netboot_cpio_path: "installers/example/nixos-netboot.cpio".to_string(),
+                netboot_initrd_format: String::new(),
             },
             "http://boot.example",
         )
@@ -4103,7 +4327,7 @@ mod tests {
     }
 
     #[test]
-    fn prebuilt_nixos_netboot_script_keeps_single_initrd() {
+    fn prebuilt_nixos_netboot_script_declares_single_initrd_for_uefi() {
         let script = render_nixos_netboot_script(
             &NixosNetbootManifest {
                 iso_sha256: "a".repeat(64),
@@ -4114,19 +4338,35 @@ mod tests {
                 kernel_path: "installers/example-nix-netboot/bzImage".to_string(),
                 initrd_path: "installers/example-nix-netboot/initrd".to_string(),
                 netboot_cpio_path: String::new(),
+                netboot_initrd_format: "prebuilt-single-initrd".to_string(),
             },
             "http://boot.example",
         )
         .unwrap();
 
         assert!(script.contains(
-            "kernel http://boot.example/files/installers/example-nix-netboot/bzImage root=fstab quiet"
+            "kernel http://boot.example/files/installers/example-nix-netboot/bzImage initrd=initrd root=fstab quiet"
         ));
-        assert!(
-            script
-                .contains("initrd http://boot.example/files/installers/example-nix-netboot/initrd")
-        );
+        assert!(script.contains(
+            "initrd --name initrd http://boot.example/files/installers/example-nix-netboot/initrd"
+        ));
         assert!(!script.contains("initrd=nixos-netboot.cpio"));
+    }
+
+    #[test]
+    fn prebuilt_nixos_netboot_cmdline_strips_ipxe_initrd_token() {
+        let cmdline = parse_nixos_netboot_ipxe_cmdline(
+            "#!ipxe\n\
+             kernel bzImage init=/nix/store/example-system/init initrd=initrd quiet root=fstab ${cmdline}\n\
+             initrd initrd\n\
+             boot\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cmdline,
+            "init=/nix/store/example-system/init quiet root=fstab"
+        );
     }
 
     #[test]
@@ -4772,6 +5012,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(raw_script.as_deref(), Some(generated_script));
+    }
+
+    #[tokio::test]
+    async fn managed_sync_clears_stale_generated_iso_raw_script_syntax() {
+        let pool = managed_test_pool().await;
+        let profile = sample_iso_sync_profile("profile-1");
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_iso_sync_profile("profile-1")], true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let stale_script = "#!ipxe\n\
+            echo Cybex Forge: Default Enrollment\n\
+            kernel http://boot.example/files/installers/example-nix-netboot/bzImage init=/nix/store/example/init initrd=initrd root=fstab\n\
+            initrd http://boot.example/files/installers/example-nix-netboot/initrd\n\
+            boot\n";
+        sqlx::query("UPDATE boot_profiles SET raw_script = ? WHERE managed_profile_id = ?")
+            .bind(stale_script)
+            .bind("profile-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[profile], true).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let raw_script: Option<String> = sqlx::query_scalar(
+            "SELECT raw_script FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(raw_script.is_none());
     }
 
     #[tokio::test]

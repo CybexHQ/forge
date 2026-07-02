@@ -284,8 +284,8 @@ fn append_kernel_boot(
 
 fn render_local_body() -> String {
     let mut script = String::new();
-    script.push_str("echo Returning to UEFI firmware for local boot\n");
-    script.push_str("exit 0\n");
+    script.push_str("echo Returning failure to UEFI firmware for local boot\n");
+    script.push_str("exit 1\n");
     script
 }
 
@@ -432,7 +432,7 @@ mod tests {
         );
         assert!(script.starts_with("#!ipxe"));
         assert!(script.contains("chain http://boot.local:8080/boot/select/2"));
-        assert!(script.contains("exit 0"));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]

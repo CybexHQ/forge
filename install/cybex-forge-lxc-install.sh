@@ -351,6 +351,8 @@ bootloader_embeds_current_chain() {
   [ -f "$path" ] || return 1
   LC_ALL=C grep -aFx -- "set boot-url $public_base_url" "$path" >/dev/null &&
     LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot.ipxe || goto failed" "$path" >/dev/null &&
+    LC_ALL=C grep -aFx -- "exit 1" "$path" >/dev/null &&
+    ! LC_ALL=C grep -aFx -- "echo Dropping to iPXE shell." "$path" >/dev/null &&
     LC_ALL=C grep -aFx -- "# Embedded chainloader for Cybex Forge UEFI PXE clients." "$path" >/dev/null
 }
 
@@ -1477,7 +1479,7 @@ check_ipxe_menu_response() {
     'item --gap ${cybex-timeout-copy}' \
     'choose --timeout ${menu-timeout} --default local selected || goto local' \
     ":local" \
-    "exit 0"; do
+    "exit 1"; do
     if grep -Fx -- "$expected" "$body_file" >/dev/null; then
       ok "$label contains $expected"
     else
@@ -1526,6 +1528,17 @@ check_ipxe_profile_response() {
       fail "$label uses iPXE cpio-wrapping syntax for a raw initrd image"
     else
       ok "$label avoids iPXE cpio-wrapping syntax for raw initrd images"
+    fi
+  elif grep -F "/files/installers/" "$body_file" >/dev/null; then
+    if grep -Eq '^kernel .+ initrd=initrd .+' "$body_file"; then
+      ok "$label declares the combined NixOS netboot initrd on the kernel line"
+    else
+      fail "$label does not declare the combined NixOS netboot initrd on the kernel line"
+    fi
+    if grep -Eq '^initrd --name initrd [^ ]+/initrd$' "$body_file"; then
+      ok "$label passes the combined NixOS netboot initrd as a raw named initrd"
+    else
+      fail "$label does not pass the combined NixOS netboot initrd as a raw named initrd"
     fi
   fi
 }
@@ -1820,10 +1833,12 @@ check_tftp_embedded_chain() {
   fi
   if LC_ALL=C grep -aFx -- "set boot-url $public_base_url" "$source_file" >/dev/null &&
     LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot.ipxe || goto failed" "$source_file" >/dev/null &&
+    LC_ALL=C grep -aFx -- "exit 1" "$source_file" >/dev/null &&
+    ! LC_ALL=C grep -aFx -- "echo Dropping to iPXE shell." "$source_file" >/dev/null &&
     LC_ALL=C grep -aFx -- "# Embedded chainloader for Cybex Forge UEFI PXE clients." "$source_file" >/dev/null; then
     ok "TFTP bootloader $bootloader embeds Cybex Forge chain URL"
   else
-    fail "TFTP bootloader $bootloader does not embed $public_base_url/boot.ipxe"
+    fail "TFTP bootloader $bootloader does not embed $public_base_url/boot.ipxe with firmware fallback"
   fi
 }
 
@@ -2266,8 +2281,8 @@ chain --autofree \${boot-url}/boot.ipxe || goto failed
 
 :failed
 echo Cybex Forge: failed to load \${boot-url}/boot.ipxe
-echo Dropping to iPXE shell.
-shell
+echo Returning failure to UEFI firmware.
+exit 1
 EOF
 }
 
