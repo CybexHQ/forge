@@ -22,9 +22,9 @@ storage="${CYBEX_FORGE_PROXMOX_STORAGE:-}"
 template_storage="${CYBEX_FORGE_PROXMOX_TEMPLATE_STORAGE:-}"
 bridge="${CYBEX_FORGE_PROXMOX_BRIDGE:-}"
 template="${CYBEX_FORGE_PROXMOX_TEMPLATE:-}"
-disk_gb="${CYBEX_FORGE_PROXMOX_DISK_GB:-32}"
-cpu_cores="${CYBEX_FORGE_PROXMOX_CPU_CORES:-2}"
-memory_mb="${CYBEX_FORGE_PROXMOX_MEMORY_MB:-4096}"
+disk_gb="${CYBEX_FORGE_PROXMOX_DISK_GB:-128}"
+cpu_cores="${CYBEX_FORGE_PROXMOX_CPU_CORES:-4}"
+memory_mb="${CYBEX_FORGE_PROXMOX_MEMORY_MB:-8192}"
 forge_git_url="${CYBEX_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
 forge_ref="${CYBEX_FORGE_REF:-$FORGE_REF_DEFAULT}"
 forge_source_dir="${CYBEX_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
@@ -49,9 +49,9 @@ Required:
   --auth-code CODE               One-time Forge install authorization code
 
 Generated resource options:
-  --proxmox-disk-gb GiB          Root disk size (default/recommended: 32)
-  --proxmox-cpu-cores COUNT      CPU cores (default/recommended: 2)
-  --proxmox-memory-mb MiB        Memory (default/recommended: 4096)
+  --proxmox-disk-gb GiB          Root disk size (default/recommended: 128)
+  --proxmox-cpu-cores COUNT      CPU cores (default/recommended: 4)
+  --proxmox-memory-mb MiB        Memory (default/recommended: 8192)
 
 Boot runtime options:
   --public-base-url URL          Override the auto-detected URL PXE clients use for this Forge node
@@ -428,9 +428,9 @@ validate_and_select_proxmox() {
 }
 
 resource_warnings() {
-  [ "$disk_gb" -ge 32 ] || warn "disk is below the 32 GiB recommendation"
-  [ "$cpu_cores" -ge 2 ] || warn "CPU allocation is below the 2-core recommendation"
-  [ "$memory_mb" -ge 4096 ] || warn "memory is below the 4096 MiB recommendation"
+  [ "$disk_gb" -ge 128 ] || warn "disk is below the 128 GiB recommendation"
+  [ "$cpu_cores" -ge 4 ] || warn "CPU allocation is below the 4-core recommendation"
+  [ "$memory_mb" -ge 8192 ] || warn "memory is below the 8192 MiB recommendation"
 }
 
 print_summary() {
