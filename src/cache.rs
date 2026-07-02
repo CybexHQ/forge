@@ -228,6 +228,42 @@ pub async fn record_cached_artifact(
     Ok(())
 }
 
+/// Remove specific artifacts (identified by artifact_type + hash) on request
+/// from the management server: delete their rows, then sweep any NAR/narinfo
+/// files no longer reachable from the remaining artifacts.
+pub async fn remove_artifacts_by_key(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    keys: &[(String, String)],
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let artifacts = db::list_cache_artifacts(pool).await?;
+    let doomed = artifacts
+        .iter()
+        .filter(|artifact| {
+            keys.iter().any(|(artifact_type, hash)| {
+                *artifact_type == artifact.artifact_type && *hash == artifact.hash
+            })
+        })
+        .map(|artifact| artifact.id)
+        .collect::<HashSet<_>>();
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    for id in &doomed {
+        db::delete_cache_artifact(pool, *id).await?;
+    }
+    let retained = artifacts
+        .iter()
+        .filter(|artifact| !doomed.contains(&artifact.id))
+        .map(RetainedArtifactFiles::from)
+        .collect::<Vec<_>>();
+    sweep_unreachable(config, retained).await?;
+    Ok(())
+}
+
 pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
         return Ok(());
@@ -1065,6 +1101,79 @@ mod tests {
             artifacts[0].source_build_job_id.as_deref(),
             Some("active-job")
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn remove_artifacts_by_key_deletes_rows_and_files() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("remove-by-key");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+
+        let kept_nar = cache_root.join("nar/kept.nar.xz");
+        let kept_narinfo = cache_root.join("kept.narinfo");
+        let doomed_nar = cache_root.join("nar/doomed.nar.xz");
+        let doomed_narinfo = cache_root.join("doomed.narinfo");
+        fs::write(&kept_nar, vec![1u8; 20]).unwrap();
+        fs::write(&kept_narinfo, "kept").unwrap();
+        fs::write(&doomed_nar, vec![2u8; 20]).unwrap();
+        fs::write(&doomed_narinfo, "doomed").unwrap();
+
+        for (hash, name, nar, narinfo) in [
+            ("b", "kept", &kept_nar, &kept_narinfo),
+            ("c", "doomed", &doomed_nar, &doomed_narinfo),
+        ] {
+            db::create_cache_artifact(
+                &pool,
+                crate::models::CreateCacheArtifactRequest {
+                    artifact_type: "nixos_closure".to_string(),
+                    hash: hash.repeat(64),
+                    size_bytes: 20,
+                    path: nar.display().to_string(),
+                    store_path: Some(format!(
+                        "/nix/store/{}-{name}",
+                        hash.repeat(32)
+                    )),
+                    narinfo_path: Some(narinfo.display().to_string()),
+                    nar_url: Some(format!("nar/{name}.nar.xz")),
+                    file_hash: Some(format!("sha256:{name}")),
+                    nar_hash: Some(format!("sha256:{name}nar")),
+                    nar_size_bytes: Some(20),
+                    closure_size_bytes: Some(20),
+                    compression: Some("xz".to_string()),
+                    references: Some(json!([])),
+                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    source_build_job_id: None,
+                    cache_metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        remove_artifacts_by_key(
+            &pool,
+            &config,
+            &[
+                ("nixos_closure".to_string(), "c".repeat(64)),
+                ("nixos_closure".to_string(), "f".repeat(64)),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(kept_nar.exists());
+        assert!(kept_narinfo.exists());
+        assert!(!doomed_nar.exists());
+        assert!(!doomed_narinfo.exists());
+        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].hash, "b".repeat(64));
         fs::remove_dir_all(root).ok();
     }
 }

@@ -116,6 +116,14 @@ struct AgentForgeConfigResponse {
     deleted_build_job_ids: Vec<String>,
     #[serde(default)]
     build_jobs_complete: bool,
+    #[serde(default)]
+    deleted_cache_artifacts: Vec<ManagedDeletedCacheArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedDeletedCacheArtifact {
+    artifact_type: String,
+    hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -738,6 +746,12 @@ async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Resu
         db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await?;
     }
     db::cancel_managed_build_jobs(&state.db, &desired.deleted_build_job_ids).await?;
+    let deletion_keys = desired
+        .deleted_cache_artifacts
+        .into_iter()
+        .map(|artifact| (artifact.artifact_type, artifact.hash))
+        .collect::<Vec<_>>();
+    crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await?;
 
     report_forge_state(state, managed).await
 }
