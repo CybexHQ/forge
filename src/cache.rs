@@ -78,10 +78,9 @@ pub async fn status_report(config: &AppConfig, pool: &SqlitePool) -> CacheStatus
         };
     }
     let artifacts = db::list_cache_artifacts(pool).await.unwrap_or_default();
-    let total_size_bytes = artifacts
-        .iter()
-        .map(|artifact| artifact.size_bytes.max(0) as u64)
-        .sum();
+    // Artifact rows only record each export's top-level NAR; the closure NARs
+    // written by `nix copy` dominate disk usage, so measure the cache root itself.
+    let total_size_bytes = cache_disk_usage(config).await;
     match ensure_signing_key(config).await {
         Ok(public_key) => CacheStatusReport {
             enabled: true,
@@ -275,6 +274,34 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
 
 pub fn cache_base_url(config: &AppConfig) -> String {
     format!("{}/cache", config.public_base_url())
+}
+
+async fn cache_disk_usage(config: &AppConfig) -> u64 {
+    let root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || directory_size_bytes(&root))
+        .await
+        .unwrap_or(0)
+}
+
+fn directory_size_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.file_type().is_dir() {
+                stack.push(entry.path());
+            } else if metadata.file_type().is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 async fn ensure_signing_key(config: &AppConfig) -> Result<String> {
@@ -673,6 +700,19 @@ mod tests {
     }
 
     #[test]
+    fn directory_size_counts_nested_files_and_missing_root_is_zero() {
+        let root = test_temp_dir("disk-usage");
+        fs::create_dir_all(root.join("nar/deep")).unwrap();
+        fs::write(root.join("top.narinfo"), vec![0u8; 10]).unwrap();
+        fs::write(root.join("nar/member.nar.xz"), vec![0u8; 100]).unwrap();
+        fs::write(root.join("nar/deep/other.nar.xz"), vec![0u8; 1000]).unwrap();
+
+        assert_eq!(directory_size_bytes(&root), 1110);
+        assert_eq!(directory_size_bytes(&root.join("does-not-exist")), 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn cache_member_paths_reject_traversal() {
         let root = Path::new("/tmp/cache");
         assert!(safe_cache_member_path(root, "nar/abc.nar.xz").is_ok());
@@ -698,6 +738,14 @@ mod tests {
         db::migrate(&pool).await.unwrap();
         let root = test_temp_dir("status-report");
         let mut config = AppConfig::default();
+        config.cache.root_dir = root.join("cache");
+        fs::create_dir_all(config.cache.root_dir.join("nar")).unwrap();
+        fs::write(config.cache.root_dir.join("nix-cache-info"), vec![0u8; 40]).unwrap();
+        fs::write(
+            config.cache.root_dir.join("nar/closure-member.nar.xz"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
         config.cache.private_key_path = root.join("cache-priv-key.pem");
         config.cache.public_key_path = root.join("cache-pub-key.pem");
         fs::write(&config.cache.private_key_path, "private").unwrap();
@@ -715,6 +763,7 @@ mod tests {
         let report = status_report(&config, &pool).await;
 
         assert_eq!(report.status, "ready");
+        assert_eq!(report.total_size_bytes, 4136);
         assert!(report.public_key.starts_with("cybex-forge-cache:"));
         assert_eq!(report.public_key_fingerprint.len(), 24);
         assert_eq!(
