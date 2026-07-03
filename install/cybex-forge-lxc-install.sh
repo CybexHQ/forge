@@ -104,6 +104,10 @@ validate_url() {
     echo "$name contains unsupported characters" >&2
     exit 2
   fi
+  if printf '%s' "$value" | LC_ALL=C grep -q '[;&|`$<>(){}]'; then
+    echo "$name contains unsupported characters" >&2
+    exit 2
+  fi
   case "$value" in
     *'?'*|*'#'*|*@*) echo "$name contains unsupported characters" >&2; exit 2 ;;
   esac
@@ -220,6 +224,10 @@ validate_runtime_root() {
   validate_absolute_path "$name" "$value"
   if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
     echo "$name must not contain whitespace" >&2
+    exit 2
+  fi
+  if ! printf '%s' "$value" | LC_ALL=C grep -Eq '^/[A-Za-z0-9._/-]+$'; then
+    echo "$name contains unsupported characters" >&2
     exit 2
   fi
   case "$value" in

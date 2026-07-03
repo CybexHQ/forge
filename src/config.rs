@@ -97,7 +97,7 @@ pub struct BuildConfig {
     pub targets: Vec<BuildTargetConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BuildTargetConfig {
     pub artifact_type: String,
@@ -156,6 +156,7 @@ impl AppConfig {
     pub fn redacted_for_display(&self) -> Self {
         let mut redacted = self.clone();
         redacted.auth.admin_token = redact_secret(&redacted.auth.admin_token);
+        redacted.manage.forge_install_code = redact_secret(&redacted.manage.forge_install_code);
         redacted
     }
 
@@ -223,10 +224,7 @@ impl AppConfig {
         if self.manage.enabled && self.manage.api_url.is_empty() {
             bail!("manage.api_url is required when managed mode is enabled");
         }
-        if self.manage.enabled
-            && self.manage.organization_id.is_empty()
-            && self.manage.organization_slug.is_empty()
-        {
+        if self.manage.enabled && self.manage.organization_id.is_empty() {
             bail!("manage.organization_id is required when managed mode is enabled");
         }
         Ok(())
@@ -266,10 +264,14 @@ pub(crate) fn normalize_http_url(field: &str, value: &str) -> anyhow::Result<Str
     if url.is_empty() {
         bail!("{field} must not be empty");
     }
-    if url
-        .chars()
-        .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '"' || ch == '\\')
-    {
+    if url.chars().any(|ch| {
+        ch.is_control()
+            || ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\\' | ';' | '&' | '|' | '`' | '$' | '<' | '>' | '(' | ')' | '{' | '}' | '@'
+            )
+    }) {
         bail!("{field} contains unsupported characters");
     }
     let parsed = Url::parse(&url)
@@ -567,18 +569,6 @@ impl Default for BuildConfig {
     }
 }
 
-impl Default for BuildTargetConfig {
-    fn default() -> Self {
-        Self {
-            artifact_type: String::new(),
-            target: String::new(),
-            system: String::new(),
-            flake: String::new(),
-            attr: String::new(),
-        }
-    }
-}
-
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -617,21 +607,26 @@ mod tests {
     fn print_config_view_redacts_admin_token() {
         let mut config = AppConfig::default();
         config.auth.admin_token = "secret-token".to_string();
+        config.manage.forge_install_code = "install-secret".to_string();
         config.server.public_base_url = "http://boot.example".to_string();
 
         let redacted = config.redacted_for_display();
 
         assert_eq!(redacted.auth.admin_token, "REDACTED");
+        assert_eq!(redacted.manage.forge_install_code, "REDACTED");
         assert_eq!(redacted.server.public_base_url, "http://boot.example");
         assert_eq!(config.auth.admin_token, "secret-token");
+        assert_eq!(config.manage.forge_install_code, "install-secret");
     }
 
     #[test]
     fn print_config_view_preserves_blank_admin_token() {
         let mut config = AppConfig::default();
         config.auth.admin_token = "   ".to_string();
+        config.manage.forge_install_code = "   ".to_string();
 
         assert_eq!(config.redacted_for_display().auth.admin_token, "");
+        assert_eq!(config.redacted_for_display().manage.forge_install_code, "");
     }
 
     #[test]
@@ -722,6 +717,21 @@ public_base_url = "https://"
     }
 
     #[test]
+    fn config_load_rejects_public_base_url_command_metacharacters() {
+        let path = write_temp_config(
+            r#"
+[server]
+public_base_url = "http://boot.example/forge;chain"
+"#,
+        );
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(err.to_string().contains("server.public_base_url"));
+    }
+
+    #[test]
     fn config_load_rejects_invalid_managed_api_url() {
         let path = write_temp_config(
             r#"
@@ -770,6 +780,29 @@ public_base_url = "http://boot.example"
 [manage]
 enabled = true
 api_url = "https://manage.example"
+"#,
+        );
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            err.to_string()
+                .contains("manage.organization_id is required")
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_enabled_managed_mode_with_only_organization_slug() {
+        let path = write_temp_config(
+            r#"
+[server]
+public_base_url = "http://boot.example"
+
+[manage]
+enabled = true
+api_url = "https://manage.example"
+organization_slug = "default"
 "#,
         );
 

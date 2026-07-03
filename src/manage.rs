@@ -30,6 +30,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     AppState, RuntimeSettings, assets,
@@ -338,7 +339,7 @@ impl From<BuildJob> for ForgeBuildJobReport {
     fn from(job: BuildJob) -> Self {
         Self {
             local_id: job.id,
-            managed_job_id: job.managed_job_id,
+            managed_job_id: optional_report_uuid(job.managed_job_id),
             requested_artifact_type: job.requested_artifact_type,
             build_spec: job.build_spec,
             target: job.target,
@@ -366,7 +367,7 @@ impl From<CacheArtifact> for ForgeCacheArtifactReport {
     fn from(artifact: CacheArtifact) -> Self {
         Self {
             local_id: artifact.id,
-            managed_artifact_id: artifact.managed_artifact_id,
+            managed_artifact_id: optional_report_uuid(artifact.managed_artifact_id),
             artifact_type: artifact.artifact_type,
             hash: artifact.hash,
             size_bytes: artifact.size_bytes,
@@ -381,7 +382,7 @@ impl From<CacheArtifact> for ForgeCacheArtifactReport {
             compression: artifact.compression,
             references: artifact.references,
             serving_url: artifact.serving_url,
-            source_build_job_id: artifact.source_build_job_id,
+            source_build_job_id: optional_report_uuid(artifact.source_build_job_id),
             cache_metadata: artifact.cache_metadata,
             created_at: artifact.created_at,
             updated_at: artifact.updated_at,
@@ -697,7 +698,7 @@ async fn report_boot_state(
                 serial_number: event.serial_number,
                 ip_address: event.ip_address,
                 user_agent: event.user_agent,
-                selected_profile_id: event.selected_profile_id,
+                selected_profile_id: optional_report_uuid(event.selected_profile_id),
                 selected_profile_name: event.selected_profile_name,
                 known_client: event.known_device != 0,
                 created_at: event.created_at,
@@ -921,6 +922,13 @@ async fn sync_desired_profile_isos(
     let targets = list_desired_profile_iso_targets(&state.db).await?;
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
+        if optional_report_uuid(Some(target.profile_id.clone())).is_none() {
+            warn!(
+                profile_id = %target.profile_id,
+                "skipping managed ISO sync report for non-UUID profile id"
+            );
+            continue;
+        }
         let started_at = Utc::now();
         match sync_desired_profile_iso(state, managed, &target, started_at).await {
             Ok(report) => reports.push(report),
@@ -2063,14 +2071,19 @@ async fn sync_profiles(
         let profile_type = BootProfileType::from_str(&profile.profile_type)
             .map_err(|err| anyhow!("invalid managed profile type: {err}"))?;
         let now = db::now_rfc3339();
-        let iso_path = managed_profile_iso_path(profile)?;
-        let existing: Option<(i64, Option<String>)> =
-            sqlx::query_as("SELECT id, raw_script FROM boot_profiles WHERE managed_profile_id = ?")
-                .bind(&profile.id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        if let Some((id, existing_raw_script)) = existing {
+        let existing: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, iso_path, raw_script FROM boot_profiles WHERE managed_profile_id = ?",
+        )
+        .bind(&profile.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((id, existing_iso_path, existing_raw_script)) = existing {
             let raw_script = managed_profile_raw_script(profile, existing_raw_script.as_deref());
+            let iso_path = managed_profile_iso_path(
+                profile,
+                existing_iso_path.as_deref(),
+                raw_script.as_deref(),
+            )?;
             sqlx::query(
                 "UPDATE boot_profiles
                  SET name = ?, description = ?, profile_type = ?, installer_iso_source = ?,
@@ -2107,6 +2120,8 @@ async fn sync_profiles(
             .execute(&mut **tx)
             .await?;
         } else {
+            let raw_script = managed_profile_raw_script(profile, None);
+            let iso_path = managed_profile_iso_path(profile, None, raw_script.as_deref())?;
             sqlx::query(
                 "INSERT INTO boot_profiles
                  (managed_profile_id, name, description, profile_type, installer_iso_source,
@@ -2130,7 +2145,7 @@ async fn sync_profiles(
             .bind(clean_optional(profile.initrd_path.clone()))
             .bind(iso_path)
             .bind(clean_optional(profile.cmdline.clone()))
-            .bind(managed_profile_raw_script(profile, None))
+            .bind(raw_script)
             .bind(clean_string(&profile.desired_iso_artifact_id))
             .bind(clean_string(&profile.desired_iso_filename))
             .bind(profile.desired_iso_size_bytes.max(0))
@@ -2487,6 +2502,15 @@ fn forge_capabilities() -> Vec<&'static str> {
         CAPABILITY_BUILDER_V1,
         CAPABILITY_CACHE_V1,
     ]
+}
+
+fn optional_report_uuid(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        Uuid::parse_str(trimmed)
+            .ok()
+            .map(|uuid| uuid.hyphenated().to_string())
+    })
 }
 
 fn ensure_key_material(state: &mut ManagedState) -> Result<()> {
@@ -3089,6 +3113,14 @@ fn normalize_managed_runtime_root(field: &str, value: &str, fallback: &Path) -> 
         .any(|byte| byte.is_ascii_whitespace())
     {
         bail!("{field} must not contain whitespace");
+    }
+    if !path
+        .as_os_str()
+        .to_string_lossy()
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        bail!("{field} contains unsupported characters");
     }
     let forge_root = Path::new("/srv/cybex-forge");
     if !path.starts_with(forge_root) {
@@ -3979,7 +4011,7 @@ fn managed_profile_has_boot_action(profile: &ManagedBootProfile) -> bool {
             if normalized_installer_iso_source(&profile.installer_iso_source)
                 == BOOT_PROFILE_ISO_SOURCE_ENROLLMENT =>
         {
-            true
+            managed_profile_needs_iso_sync(profile)
         }
         "linux_installer" | "iso_live" => {
             profile
@@ -4089,18 +4121,28 @@ fn validate_desired_iso_metadata(profile: &ManagedBootProfile) -> Result<()> {
     Ok(())
 }
 
-fn managed_profile_iso_path(profile: &ManagedBootProfile) -> Result<Option<String>> {
+fn managed_profile_iso_path(
+    profile: &ManagedBootProfile,
+    existing_iso_path: Option<&str>,
+    raw_script: Option<&str>,
+) -> Result<Option<String>> {
     if let Some(iso_path) = clean_optional(profile.iso_path.clone()) {
         return Ok(Some(iso_path));
     }
-    if profile.desired_iso_artifact_id.trim().is_empty()
-        || profile.desired_iso_filename.trim().is_empty()
+    if !managed_profile_needs_iso_sync(profile) {
+        return Ok(None);
+    }
+    if raw_script
+        .filter(|script| generated_iso_raw_script_can_be_preserved(script))
+        .is_none()
     {
         return Ok(None);
     }
-    Ok(Some(managed_iso_relative_path(&managed_iso_filename(
-        &profile.desired_iso_filename,
-    )?)))
+    let Some(existing_iso_path) = clean_optional(existing_iso_path.map(ToString::to_string)) else {
+        return Ok(None);
+    };
+    validate_relative_path(Some(&existing_iso_path), "iso_path")?;
+    Ok(Some(existing_iso_path))
 }
 
 fn managed_profile_raw_script(
@@ -4119,14 +4161,19 @@ fn managed_profile_raw_script(
 }
 
 fn generated_iso_raw_script_can_be_preserved(script: &str) -> bool {
-    if !script.contains("/files/installers/") {
-        return true;
+    if !script.contains("echo Cybex Forge: Default Enrollment")
+        || !script.contains("/files/installers/")
+        || !script.contains("kernel ")
+        || !script.contains("initrd --name initrd ")
+        || !script.lines().any(|line| line.trim() == "boot")
+    {
+        return false;
     }
-    if script.contains("nixos-netboot.cpio") {
+    if script.contains("initrd=nixos-netboot.cpio") {
         return script.contains("initrd --name initrd ")
             && script.contains("initrd --name nixos-netboot.cpio ");
     }
-    script.contains("initrd --name initrd ")
+    true
 }
 
 fn managed_profile_needs_iso_sync(profile: &ManagedBootProfile) -> bool {
@@ -4241,17 +4288,20 @@ mod tests {
         MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
         MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
-        NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
+        NIXOS_NETBOOT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
         append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
-        bounded_error_message, bounded_http_timeout_seconds, fit_boot_report_body,
-        forge_capabilities, has_unreported_known_profile_events, managed_profile_map,
-        managed_sync_interval_seconds, normalize_managed_settings,
-        parse_nixos_netboot_ipxe_cmdline, render_check_service, render_nixos_netboot_script,
-        serialize_boot_report_body, sync_clients, sync_deleted_clients, sync_deleted_profiles,
-        sync_profiles, validate_boot_config, validate_profile, write_secure_json,
+        bounded_error_message, bounded_http_timeout_seconds, clean_optional, fit_boot_report_body,
+        forge_capabilities, generated_iso_raw_script_can_be_preserved,
+        has_unreported_known_profile_events, managed_profile_map, managed_profile_needs_iso_sync,
+        managed_profile_raw_script, managed_sync_interval_seconds, normalize_managed_settings,
+        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline, render_check_service,
+        render_nixos_netboot_script, serialize_boot_report_body, sync_clients,
+        sync_deleted_clients, sync_deleted_profiles, sync_desired_profile_isos, sync_profiles,
+        validate_boot_config, validate_profile, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
+        AppState, boot,
         config::{AppConfig, ManageConfig},
         db,
         models::{CreateDeviceRequest, NewBootEvent},
@@ -4680,6 +4730,14 @@ mod tests {
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
+        let invalid_rendered_path = ManagedBootSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: "/srv/cybex-forge/tftp".to_string(),
+            http_root: "/srv/cybex-forge/www;include/tmp/bad".to_string(),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
         let invalid_listener = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "0.0.0.0:8080".to_string(),
@@ -4706,6 +4764,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("tftp_root")
+        );
+        assert!(
+            normalize_managed_settings(&invalid_rendered_path, &app_config)
+                .unwrap_err()
+                .to_string()
+                .contains("http_root")
         );
         assert!(
             normalize_managed_settings(&invalid_listener, &app_config)
@@ -4788,6 +4852,19 @@ mod tests {
         config.profiles[0].profile_type = "custom_ipxe".to_string();
         config.profiles[0].kernel_path = None;
         config.profiles[0].raw_script = None;
+
+        let err = validate_boot_config(&config).unwrap_err();
+
+        assert!(err.to_string().contains("runnable boot action"));
+    }
+
+    #[test]
+    fn managed_config_rejects_incomplete_enrollment_iso_assignments() {
+        let mut config = sample_boot_config();
+        config.profiles[0].profile_type = "iso_live".to_string();
+        config.profiles[0].installer_iso_source = "enrollment".to_string();
+        config.profiles[0].kernel_path = None;
+        config.profiles[0].cmdline = None;
 
         let err = validate_boot_config(&config).unwrap_err();
 
@@ -4996,6 +5073,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_sync_keeps_iso_profile_non_bootable_until_raw_script_is_ready() {
+        let pool = managed_test_pool().await;
+        let mut profile = sample_iso_sync_profile("profile-1");
+        profile.is_default = true;
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[profile], true).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let profile = db::list_profiles(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.managed_profile_id.as_deref() == Some("profile-1"))
+            .unwrap();
+
+        assert_eq!(profile.iso_path, None);
+        assert_eq!(profile.raw_script, None);
+        assert!(!boot::profile_has_boot_action(&profile));
+    }
+
+    #[tokio::test]
     async fn managed_sync_preserves_generated_iso_raw_script_until_resync() {
         let pool = managed_test_pool().await;
         let profile = sample_iso_sync_profile("profile-1");
@@ -5006,13 +5105,55 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let generated_script = "#!ipxe\necho generated\nboot";
-        sqlx::query("UPDATE boot_profiles SET raw_script = ? WHERE managed_profile_id = ?")
-            .bind(generated_script)
-            .bind("profile-1")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let generated_script = render_nixos_netboot_script(
+            &NixosNetbootManifest {
+                iso_sha256: "a".repeat(64),
+                kernel_iso_path: "boot/bzImage".to_string(),
+                initrd_iso_path: "boot/initrd".to_string(),
+                initrd_fstab_path: "/nix/.ro-store".to_string(),
+                cmdline: "root=fstab quiet".to_string(),
+                kernel_path: "installers/example/bzImage".to_string(),
+                initrd_path: "installers/example/initrd".to_string(),
+                netboot_cpio_path: "installers/example/nixos-netboot.cpio".to_string(),
+                netboot_initrd_format: NIXOS_NETBOOT_INITRD_FORMAT.to_string(),
+            },
+            "http://boot.example",
+        )
+        .unwrap();
+        assert!(generated_iso_raw_script_can_be_preserved(&generated_script));
+        sqlx::query(
+            "UPDATE boot_profiles SET iso_path = ?, raw_script = ? WHERE managed_profile_id = ?",
+        )
+        .bind("isos/installer.iso")
+        .bind(&generated_script)
+        .bind("profile-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pre_sync_raw_script: Option<String> = sqlx::query_scalar(
+            "SELECT raw_script FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pre_sync_raw_script.as_deref(),
+            Some(generated_script.as_str())
+        );
+        assert!(managed_profile_needs_iso_sync(&profile));
+        let cleaned_existing_script = clean_optional(pre_sync_raw_script.clone());
+        let cleaned_generated_script = generated_script.trim().to_string();
+        assert_eq!(
+            cleaned_existing_script.as_deref(),
+            Some(cleaned_generated_script.as_str())
+        );
+        assert!(generated_iso_raw_script_can_be_preserved(
+            cleaned_existing_script.as_deref().unwrap()
+        ));
+        assert_eq!(
+            managed_profile_raw_script(&profile, pre_sync_raw_script.as_deref()).as_deref(),
+            Some(cleaned_generated_script.as_str())
+        );
 
         let mut tx = pool.begin().await.unwrap();
         sync_profiles(&mut tx, &[profile], true).await.unwrap();
@@ -5024,8 +5165,54 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        let iso_path: Option<String> = sqlx::query_scalar(
+            "SELECT iso_path FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-        assert_eq!(raw_script.as_deref(), Some(generated_script));
+        assert_eq!(
+            raw_script.as_deref(),
+            Some(cleaned_generated_script.as_str())
+        );
+        assert_eq!(iso_path.as_deref(), Some("isos/installer.iso"));
+    }
+
+    #[tokio::test]
+    async fn managed_sync_clears_stale_custom_raw_script_during_iso_sync() {
+        let pool = managed_test_pool().await;
+        let profile = sample_iso_sync_profile("profile-1");
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_iso_sync_profile("profile-1")], true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        sqlx::query(
+            "UPDATE boot_profiles SET iso_path = ?, raw_script = ? WHERE managed_profile_id = ?",
+        )
+        .bind("isos/installer.iso")
+        .bind("#!ipxe\necho stale local script\nboot\n")
+        .bind("profile-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[profile], true).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let (iso_path, raw_script): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT iso_path, raw_script FROM boot_profiles WHERE managed_profile_id = 'profile-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(iso_path.is_none());
+        assert!(raw_script.is_none());
     }
 
     #[tokio::test]
@@ -5407,6 +5594,34 @@ mod tests {
             forge_capabilities(),
             vec!["boot_v1", "builder_v1", "cache_v1"]
         );
+    }
+
+    #[test]
+    fn optional_report_uuid_omits_non_uuid_ids() {
+        assert_eq!(optional_report_uuid(None), None);
+        assert_eq!(optional_report_uuid(Some("profile-1".to_string())), None);
+        assert_eq!(
+            optional_report_uuid(Some(" 5C3BAAB7-A204-4C21-A024-0F567D8CF41D ".to_string()))
+                .as_deref(),
+            Some("5c3baab7-a204-4c21-a024-0f567d8cf41d")
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_iso_sync_skips_non_uuid_managed_profile_ids() {
+        let pool = managed_test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_iso_sync_profile("profile-1")], true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let state = AppState::new(AppConfig::default(), pool);
+
+        let reports = sync_desired_profile_isos(&state, &ManagedState::default())
+            .await
+            .unwrap();
+
+        assert!(reports.is_empty());
     }
 
     #[test]

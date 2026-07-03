@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::task;
 
-use crate::{config::AppConfig, db, models::BuildJob};
+use crate::{config::AppConfig, db, models::BuildJob, redact::redact_sensitive_key_values};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CacheStatusReport {
@@ -706,17 +706,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sanitize_error(err: &anyhow::Error) -> String {
-    let text = err.to_string();
-    text.replace("secret-key=", "secret-key=REDACTED")
+    redact_sensitive_key_values(&err.to_string())
         .chars()
         .take(512)
         .collect()
 }
 
 fn bounded_command_error(stderr: &[u8], private_key: &Path) -> String {
-    String::from_utf8_lossy(stderr)
+    redact_sensitive_key_values(&String::from_utf8_lossy(stderr))
         .replace(&private_key.display().to_string(), "[cache-private-key]")
-        .replace("secret-key=", "secret-key=REDACTED")
         .chars()
         .take(1000)
         .collect::<String>()
@@ -740,6 +738,29 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn sanitize_error_redacts_entire_secret_key_value() {
+        let err =
+            anyhow!("copy failed for file:///cache?secret-key=/tmp/cache.key&compression=zstd");
+        let message = sanitize_error(&err);
+
+        assert!(message.contains("secret-key=[REDACTED]&compression=zstd"));
+        assert!(!message.contains("/tmp/cache.key"));
+    }
+
+    #[test]
+    fn bounded_command_error_redacts_secret_key_and_private_key_path() {
+        let private_key = PathBuf::from("/tmp/cache.key");
+        let message = bounded_command_error(
+            b"copy file:///cache?secret-key=/tmp/cache.key&compression=zstd failed /tmp/cache.key",
+            &private_key,
+        );
+
+        assert!(message.contains("secret-key=[REDACTED]&compression=zstd"));
+        assert!(message.contains("[cache-private-key]"));
+        assert!(!message.contains("/tmp/cache.key"));
     }
 
     #[test]
@@ -1135,10 +1156,7 @@ mod tests {
                     hash: hash.repeat(64),
                     size_bytes: 20,
                     path: nar.display().to_string(),
-                    store_path: Some(format!(
-                        "/nix/store/{}-{name}",
-                        hash.repeat(32)
-                    )),
+                    store_path: Some(format!("/nix/store/{}-{name}", hash.repeat(32))),
                     narinfo_path: Some(narinfo.display().to_string()),
                     nar_url: Some(format!("nar/{name}.nar.xz")),
                     file_hash: Some(format!("sha256:{name}")),

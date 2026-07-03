@@ -332,7 +332,11 @@ mod tests {
     use super::{asset_url, parse_byte_range, sanitize_relative_path, serve_file_from_root};
     use crate::{config::AppConfig, db};
     use axum::http::{HeaderMap, StatusCode};
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     #[test]
     fn rejects_path_traversal() {
@@ -439,16 +443,23 @@ mod tests {
     }
 
     fn temp_asset_root() -> std::path::PathBuf {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cybex-forge-assets-test-{}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
-        root
+        for _ in 0..100 {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "cybex-forge-assets-test-{}-{unique}-{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("create temp asset root {}: {err}", root.display()),
+            }
+        }
+        panic!("failed to allocate a unique temp asset root");
     }
 }

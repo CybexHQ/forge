@@ -22,6 +22,7 @@ use crate::{
     config::{AppConfig, BuildTargetConfig},
     db,
     models::BuildJob,
+    redact::{contains_sensitive_key_value, redact_sensitive_key_values},
 };
 
 const DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
@@ -95,8 +96,14 @@ struct NixOutputInfo {
 
 #[derive(Clone)]
 struct SharedLog {
-    inner: Arc<Mutex<String>>,
+    inner: Arc<Mutex<SharedLogState>>,
     max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct SharedLogState {
+    text: String,
+    redact_following: usize,
 }
 
 enum ProcessOutcome {
@@ -799,40 +806,42 @@ where
 impl SharedLog {
     fn new(max_bytes: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(String::new())),
+            inner: Arc::new(Mutex::new(SharedLogState::default())),
             max_bytes,
         }
     }
 
     async fn append(&self, text: &str) {
         let mut inner = self.inner.lock().await;
-        inner.push_str(&redact_log_text(text));
-        if inner.len() > self.max_bytes {
+        let redacted = redact_log_text(text, &mut inner.redact_following);
+        inner.text.push_str(&redacted);
+        if inner.text.len() > self.max_bytes {
             let marker = "[... earlier build log truncated ...]\n";
             let keep = self.max_bytes.saturating_sub(marker.len());
-            let start = utf8_tail_start(&inner, keep);
-            let tail = inner[start..].to_string();
-            *inner = format!("{marker}{tail}");
+            let start = utf8_tail_start(&inner.text, keep);
+            let tail = inner.text[start..].to_string();
+            inner.text = format!("{marker}{tail}");
         }
     }
 
     async fn snapshot(&self) -> String {
-        self.inner.lock().await.clone()
+        self.inner.lock().await.text.clone()
     }
 }
 
-fn redact_log_text(text: &str) -> String {
+fn redact_log_text(text: &str, redact_following: &mut usize) -> String {
     text.split_whitespace()
         .map(|token| {
+            if *redact_following > 0 {
+                *redact_following -= 1;
+                return "[REDACTED]".to_string();
+            }
             let lower = token.to_ascii_lowercase();
-            if lower.contains("token=")
-                || lower.contains("password=")
-                || lower.contains("secret=")
-                || lower.contains("authorization:")
-                || lower.contains("private-key")
-                || lower.contains("secret-key=")
-            {
+            if lower.contains("authorization:") || lower.contains("private-key") {
+                *redact_following = 2;
                 "[REDACTED]".to_string()
+            } else if contains_sensitive_key_value(token) {
+                redact_sensitive_key_values(token)
             } else {
                 token.to_string()
             }
@@ -945,8 +954,7 @@ fn default_schema_version() -> u32 {
 }
 
 fn safe_error(err: &anyhow::Error) -> String {
-    err.to_string()
-        .replace("secret-key=", "secret-key=REDACTED")
+    redact_sensitive_key_values(&err.to_string())
         .chars()
         .take(1000)
         .collect()
@@ -1101,6 +1109,42 @@ mod tests {
         assert!(snapshot.contains("[REDACTED]"));
         assert!(!snapshot.contains("hunter2"));
         assert!(snapshot.len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn log_capture_redacts_authorization_header_value() {
+        let log = SharedLog::new(1024);
+        log.append("normal Authorization: Bearer top-secret-token done\n")
+            .await;
+        let snapshot = log.snapshot().await;
+
+        assert!(snapshot.contains("normal"));
+        assert!(snapshot.contains("done"));
+        assert!(!snapshot.contains("Bearer"));
+        assert!(!snapshot.contains("top-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn log_capture_redacts_authorization_header_value_split_across_appends() {
+        let log = SharedLog::new(1024);
+        log.append("normal Authorization:").await;
+        log.append(" Bearer split-secret done\n").await;
+        let snapshot = log.snapshot().await;
+
+        assert!(snapshot.contains("normal"));
+        assert!(snapshot.contains("done"));
+        assert!(!snapshot.contains("Bearer"));
+        assert!(!snapshot.contains("split-secret"));
+    }
+
+    #[test]
+    fn safe_error_redacts_entire_secret_key_value() {
+        let err =
+            anyhow!("copy failed for file:///cache?secret-key=/tmp/cache.key&compression=zstd");
+        let message = safe_error(&err);
+
+        assert!(message.contains("secret-key=[REDACTED]&compression=zstd"));
+        assert!(!message.contains("/tmp/cache.key"));
     }
 
     #[test]

@@ -548,6 +548,14 @@ pub async fn create_device(pool: &SqlitePool, input: CreateDeviceRequest) -> App
     let notes = input.notes.unwrap_or_default();
     let tags = clean_tags(input.tags.unwrap_or_default());
     validate_device_metadata(hostname.as_deref(), serial_number.as_deref(), &notes, &tags)?;
+    validate_profile_assignment_id(pool, input.default_profile_id, "device default_profile_id")
+        .await?;
+    validate_profile_assignment_id(
+        pool,
+        input.one_time_profile_id,
+        "device one_time_profile_id",
+    )
+    .await?;
     let tags = serde_json::to_string(&tags).map_err(|err| AppError::Validation(err.to_string()))?;
 
     sqlx::query(
@@ -597,6 +605,8 @@ pub async fn update_device(
     let one_time_profile_id = input
         .one_time_profile_id
         .unwrap_or(current.one_time_profile_id);
+    validate_profile_assignment_id(pool, default_profile_id, "device default_profile_id").await?;
+    validate_profile_assignment_id(pool, one_time_profile_id, "device one_time_profile_id").await?;
     let now = now_rfc3339();
 
     sqlx::query(
@@ -658,12 +668,13 @@ pub async fn consume_one_time_profile(
              one_time_consumed_at = ?,
              last_selected_profile_id = ?,
              updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND one_time_profile_id = ?",
     )
     .bind(&now)
     .bind(profile_id)
     .bind(&now)
     .bind(device_id)
+    .bind(profile_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -701,13 +712,30 @@ pub async fn create_profile(
     input: CreateBootProfileRequest,
 ) -> AppResult<BootProfile> {
     validate_profile_name(&input.name)?;
-    validate_profile_path(input.kernel_path.as_deref(), "kernel_path")?;
-    validate_profile_path(input.initrd_path.as_deref(), "initrd_path")?;
-    validate_profile_path(input.iso_path.as_deref(), "iso_path")?;
-    validate_profile_cmdline(input.cmdline.as_deref())?;
-    validate_profile_description(input.description.as_deref())?;
-    validate_profile_raw_script(input.raw_script.as_deref())?;
-    if input.is_default.unwrap_or(false) {
+    let description = input.description.unwrap_or_default();
+    let enabled = input.enabled.unwrap_or(true);
+    let is_default = input.is_default.unwrap_or(false);
+    let one_time = input.one_time.unwrap_or(false);
+    let kernel_path = clean_optional_string(input.kernel_path);
+    let initrd_path = clean_optional_string(input.initrd_path);
+    let iso_path = clean_optional_string(input.iso_path);
+    let cmdline = clean_optional_string(input.cmdline);
+    let raw_script = clean_optional_string(input.raw_script);
+    validate_profile_path(kernel_path.as_deref(), "kernel_path")?;
+    validate_profile_path(initrd_path.as_deref(), "initrd_path")?;
+    validate_profile_path(iso_path.as_deref(), "iso_path")?;
+    validate_profile_cmdline(cmdline.as_deref())?;
+    validate_profile_description(Some(&description))?;
+    validate_profile_raw_script(raw_script.as_deref())?;
+    if is_default {
+        validate_assignable_profile_fields(
+            "default profile",
+            enabled,
+            input.profile_type,
+            kernel_path.as_deref(),
+            iso_path.as_deref(),
+            raw_script.as_deref(),
+        )?;
         clear_default_profiles(pool).await?;
     }
 
@@ -719,16 +747,16 @@ pub async fn create_profile(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
-    .bind(input.description.unwrap_or_default())
+    .bind(description)
     .bind(input.profile_type.as_str())
-    .bind(bool_to_i64(input.enabled.unwrap_or(true)))
-    .bind(bool_to_i64(input.is_default.unwrap_or(false)))
-    .bind(bool_to_i64(input.one_time.unwrap_or(false)))
-    .bind(clean_optional_string(input.kernel_path))
-    .bind(clean_optional_string(input.initrd_path))
-    .bind(clean_optional_string(input.iso_path))
-    .bind(clean_optional_string(input.cmdline))
-    .bind(clean_optional_string(input.raw_script))
+    .bind(bool_to_i64(enabled))
+    .bind(bool_to_i64(is_default))
+    .bind(bool_to_i64(one_time))
+    .bind(kernel_path)
+    .bind(initrd_path)
+    .bind(iso_path)
+    .bind(cmdline)
+    .bind(raw_script)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -779,7 +807,23 @@ pub async fn update_profile(
     validate_profile_raw_script(raw_script.as_deref())?;
 
     if is_default {
+        validate_assignable_profile_fields(
+            "default profile",
+            enabled,
+            profile_type,
+            kernel_path.as_deref(),
+            iso_path.as_deref(),
+            raw_script.as_deref(),
+        )?;
         clear_default_profiles(pool).await?;
+    } else if !profile_fields_have_boot_action(
+        profile_type,
+        kernel_path.as_deref(),
+        iso_path.as_deref(),
+        raw_script.as_deref(),
+    ) || !enabled
+    {
+        validate_profile_has_no_device_assignments(pool, id).await?;
     }
 
     let now = now_rfc3339();
@@ -1015,6 +1059,7 @@ pub async fn create_build_job(
     get_build_job(pool, result.last_insert_rowid()).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_managed_build_job(
     pool: &SqlitePool,
     managed_job_id: &str,
@@ -1048,7 +1093,10 @@ pub async fn upsert_managed_build_job(
          (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision, input_config_hash, status, cache_metadata, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
          ON CONFLICT(managed_job_id) DO UPDATE SET
-             requested_artifact_type = excluded.requested_artifact_type,
+             requested_artifact_type = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.requested_artifact_type
+                 ELSE forge_build_jobs.requested_artifact_type
+             END,
              build_spec = CASE
                  WHEN forge_build_jobs.status = 'queued' THEN excluded.build_spec
                  ELSE forge_build_jobs.build_spec
@@ -1061,8 +1109,14 @@ pub async fn upsert_managed_build_job(
                  WHEN forge_build_jobs.status = 'queued' THEN excluded.system
                  ELSE forge_build_jobs.system
              END,
-             input_revision = excluded.input_revision,
-             input_config_hash = excluded.input_config_hash,
+             input_revision = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.input_revision
+                 ELSE forge_build_jobs.input_revision
+             END,
+             input_config_hash = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.input_config_hash
+                 ELSE forge_build_jobs.input_config_hash
+             END,
              cache_metadata = excluded.cache_metadata,
              updated_at = excluded.updated_at",
     )
@@ -1244,28 +1298,60 @@ pub async fn finish_build_job(
     let output_sha256 = normalize_sha256(output_sha256, "output_sha256", true)?;
     validate_non_negative_i64(output_size_bytes, "output_size_bytes")?;
     let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
+    let cancelled_metadata =
+        metadata_to_string(Some(json!({"cancelled": true})), "cache_metadata")?;
+    let cancel_override = i64::from(status != "cancelled");
     let now = now_rfc3339();
     sqlx::query(
         "UPDATE forge_build_jobs
-         SET status = ?,
+         SET status = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 'cancelled'
+                 ELSE ?
+             END,
              logs = ?,
-             error = ?,
-             output_path = ?,
-             output_sha256 = ?,
-             output_size_bytes = ?,
-             exit_code = ?,
-             cache_metadata = ?,
+             error = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 'build cancelled by Manage'
+                 ELSE ?
+             END,
+             output_path = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN ''
+                 ELSE ?
+             END,
+             output_sha256 = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN ''
+                 ELSE ?
+             END,
+             output_size_bytes = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 0
+                 ELSE ?
+             END,
+             exit_code = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN NULL
+                 ELSE ?
+             END,
+             cache_metadata = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN ?
+                 ELSE ?
+             END,
              completed_at = ?,
              updated_at = ?
          WHERE id = ?",
     )
+    .bind(cancel_override)
     .bind(status)
     .bind(logs)
+    .bind(cancel_override)
     .bind(error)
+    .bind(cancel_override)
     .bind(output_path)
+    .bind(cancel_override)
     .bind(output_sha256)
+    .bind(cancel_override)
     .bind(output_size_bytes)
+    .bind(cancel_override)
     .bind(exit_code)
+    .bind(cancel_override)
+    .bind(cancelled_metadata)
     .bind(cache_metadata)
     .bind(&now)
     .bind(&now)
@@ -1275,6 +1361,7 @@ pub async fn finish_build_job(
     get_build_job(pool, id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_build_job_report(
     pool: &SqlitePool,
     managed_job_id: &str,
@@ -1374,6 +1461,7 @@ pub async fn create_cache_artifact(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_cache_artifact(
     pool: &SqlitePool,
     managed_artifact_id: Option<&str>,
@@ -1439,7 +1527,7 @@ pub async fn upsert_cache_artifact(
              updated_at = excluded.updated_at",
     )
     .bind(managed_artifact_id)
-    .bind(artifact_type)
+    .bind(&artifact_type)
     .bind(&hash)
     .bind(size_bytes)
     .bind(path)
@@ -1460,7 +1548,7 @@ pub async fn upsert_cache_artifact(
     .execute(pool)
     .await?;
 
-    get_cache_artifact_by_hash(pool, &hash).await
+    get_cache_artifact_by_key(pool, &artifact_type, &hash).await
 }
 
 pub async fn get_build_job(pool: &SqlitePool, id: i64) -> AppResult<BuildJob> {
@@ -1485,13 +1573,19 @@ pub async fn get_build_job_by_managed_id(
     row.try_into()
 }
 
-async fn get_cache_artifact_by_hash(pool: &SqlitePool, hash: &str) -> AppResult<CacheArtifact> {
-    let row =
-        sqlx::query_as::<_, CacheArtifactRow>("SELECT * FROM forge_cache_artifacts WHERE hash = ?")
-            .bind(hash)
-            .fetch_optional(pool)
-            .await?
-            .ok_or(AppError::NotFound)?;
+async fn get_cache_artifact_by_key(
+    pool: &SqlitePool,
+    artifact_type: &str,
+    hash: &str,
+) -> AppResult<CacheArtifact> {
+    let row = sqlx::query_as::<_, CacheArtifactRow>(
+        "SELECT * FROM forge_cache_artifacts WHERE artifact_type = ? AND hash = ?",
+    )
+    .bind(artifact_type)
+    .bind(hash)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
     row.try_into()
 }
 
@@ -1511,6 +1605,103 @@ async fn clear_default_profiles(pool: &SqlitePool) -> AppResult<()> {
     sqlx::query("UPDATE boot_profiles SET is_default = 0")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn validate_profile_assignment_id(
+    pool: &SqlitePool,
+    profile_id: Option<i64>,
+    field: &str,
+) -> AppResult<()> {
+    let Some(profile_id) = profile_id else {
+        return Ok(());
+    };
+    let row = sqlx::query_as::<_, BootProfileRow>("SELECT * FROM boot_profiles WHERE id = ?")
+        .bind(profile_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            AppError::Validation(format!("{field} references an unknown boot profile"))
+        })?;
+    let profile = BootProfile::try_from(row)?;
+    validate_assignable_profile(&profile, field)
+}
+
+fn validate_assignable_profile(profile: &BootProfile, field: &str) -> AppResult<()> {
+    validate_assignable_profile_fields(
+        field,
+        profile.enabled,
+        profile.profile_type,
+        profile.kernel_path.as_deref(),
+        profile.iso_path.as_deref(),
+        profile.raw_script.as_deref(),
+    )
+}
+
+fn validate_assignable_profile_fields(
+    field: &str,
+    enabled: bool,
+    profile_type: BootProfileType,
+    kernel_path: Option<&str>,
+    iso_path: Option<&str>,
+    raw_script: Option<&str>,
+) -> AppResult<()> {
+    if !enabled {
+        return Err(AppError::Validation(format!(
+            "{field} must target an enabled profile"
+        )));
+    }
+    if !profile_fields_have_boot_action(profile_type, kernel_path, iso_path, raw_script) {
+        return Err(AppError::Validation(format!(
+            "{field} must target a profile with a runnable boot action"
+        )));
+    }
+    Ok(())
+}
+
+fn profile_fields_have_boot_action(
+    profile_type: BootProfileType,
+    kernel_path: Option<&str>,
+    iso_path: Option<&str>,
+    raw_script: Option<&str>,
+) -> bool {
+    if raw_script
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match profile_type {
+        BootProfileType::LocalDisk => true,
+        BootProfileType::LinuxInstaller | BootProfileType::IsoLive => {
+            kernel_path
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+                || iso_path
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }
+        BootProfileType::CustomIpxe => false,
+    }
+}
+
+async fn validate_profile_has_no_device_assignments(
+    pool: &SqlitePool,
+    profile_id: i64,
+) -> AppResult<()> {
+    let assigned_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices
+         WHERE default_profile_id = ? OR one_time_profile_id = ?",
+    )
+    .bind(profile_id)
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await?;
+    if assigned_count > 0 {
+        return Err(AppError::Validation(
+            "assigned profile must remain enabled and runnable".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -2034,7 +2225,7 @@ fn clean_str_ref(value: &str) -> Option<String> {
 mod tests {
     use crate::models::{
         CreateBootProfileRequest, CreateBuildJobRequest, CreateCacheArtifactRequest,
-        CreateDeviceRequest, UpdateDeviceRequest,
+        CreateDeviceRequest, UpdateBootProfileRequest, UpdateDeviceRequest,
     };
 
     use super::*;
@@ -2124,6 +2315,70 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_one_time_profile_preserves_newer_assignment() {
+        let pool = test_pool().await;
+        let stale = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "Stale installer".to_string(),
+                description: None,
+                profile_type: BootProfileType::LinuxInstaller,
+                enabled: Some(true),
+                is_default: Some(false),
+                one_time: Some(true),
+                kernel_path: Some("netboot/stale-vmlinuz".to_string()),
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        let current = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "Current installer".to_string(),
+                description: None,
+                profile_type: BootProfileType::LinuxInstaller,
+                enabled: Some(true),
+                is_default: Some(false),
+                one_time: Some(true),
+                kernel_path: Some("netboot/current-vmlinuz".to_string()),
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        let device = create_device(
+            &pool,
+            CreateDeviceRequest {
+                mac: "aa:bb:cc:dd:ee:10".to_string(),
+                hostname: None,
+                serial_number: None,
+                notes: None,
+                tags: None,
+                default_profile_id: None,
+                one_time_profile_id: Some(current.id),
+            },
+        )
+        .await
+        .unwrap();
+
+        consume_one_time_profile(&pool, device.id, stale.id)
+            .await
+            .unwrap();
+        let updated = get_device(&pool, device.id).await.unwrap();
+
+        assert_eq!(updated.one_time_profile_id, Some(current.id));
+        assert_eq!(updated.last_selected_profile_id, None);
+        assert_eq!(updated.one_time_consumed_at, None);
     }
 
     #[tokio::test]
@@ -2509,6 +2764,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_profile_must_be_enabled_and_runnable() {
+        let pool = test_pool().await;
+        let before_defaults: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM boot_profiles WHERE is_default = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let err = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "Broken default".to_string(),
+                description: None,
+                profile_type: BootProfileType::IsoLive,
+                enabled: Some(true),
+                is_default: Some(true),
+                one_time: Some(false),
+                kernel_path: None,
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        let after_defaults: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM boot_profiles WHERE is_default = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert!(err.to_string().contains("runnable boot action"));
+        assert_eq!(after_defaults, before_defaults);
+    }
+
+    #[tokio::test]
+    async fn current_default_profile_cannot_be_disabled() {
+        let pool = test_pool().await;
+        let default_id: i64 =
+            sqlx::query_scalar("SELECT id FROM boot_profiles WHERE is_default = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let err = update_profile(
+            &pool,
+            default_id,
+            UpdateBootProfileRequest {
+                enabled: Some(false),
+                ..UpdateBootProfileRequest::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        let unchanged = get_profile(&pool, default_id).await.unwrap();
+
+        assert!(err.to_string().contains("enabled profile"));
+        assert!(unchanged.enabled);
+        assert!(unchanged.is_default);
+    }
+
+    #[tokio::test]
+    async fn device_assignments_must_target_enabled_runnable_profiles() {
+        let pool = test_pool().await;
+        let non_runnable = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "No assets".to_string(),
+                description: None,
+                profile_type: BootProfileType::IsoLive,
+                enabled: Some(true),
+                is_default: Some(false),
+                one_time: Some(false),
+                kernel_path: None,
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        let disabled = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "Disabled installer".to_string(),
+                description: None,
+                profile_type: BootProfileType::LinuxInstaller,
+                enabled: Some(false),
+                is_default: Some(false),
+                one_time: Some(false),
+                kernel_path: Some("netboot/vmlinuz".to_string()),
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let non_runnable_err = create_device(
+            &pool,
+            CreateDeviceRequest {
+                mac: "02:00:00:00:05:00".to_string(),
+                hostname: None,
+                serial_number: None,
+                notes: None,
+                tags: None,
+                default_profile_id: Some(non_runnable.id),
+                one_time_profile_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        let disabled_err = create_device(
+            &pool,
+            CreateDeviceRequest {
+                mac: "02:00:00:00:05:01".to_string(),
+                hostname: None,
+                serial_number: None,
+                notes: None,
+                tags: None,
+                default_profile_id: None,
+                one_time_profile_id: Some(disabled.id),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            non_runnable_err
+                .to_string()
+                .contains("runnable boot action")
+        );
+        assert!(disabled_err.to_string().contains("enabled profile"));
+    }
+
+    #[tokio::test]
+    async fn assigned_profile_cannot_be_updated_to_non_runnable() {
+        let pool = test_pool().await;
+        let profile = create_profile(
+            &pool,
+            CreateBootProfileRequest {
+                name: "Assigned installer".to_string(),
+                description: None,
+                profile_type: BootProfileType::LinuxInstaller,
+                enabled: Some(true),
+                is_default: Some(false),
+                one_time: Some(false),
+                kernel_path: Some("netboot/vmlinuz".to_string()),
+                initrd_path: None,
+                iso_path: None,
+                cmdline: None,
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        create_device(
+            &pool,
+            CreateDeviceRequest {
+                mac: "02:00:00:00:05:02".to_string(),
+                hostname: None,
+                serial_number: None,
+                notes: None,
+                tags: None,
+                default_profile_id: Some(profile.id),
+                one_time_profile_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = update_profile(
+            &pool,
+            profile.id,
+            UpdateBootProfileRequest {
+                kernel_path: Some(None),
+                ..UpdateBootProfileRequest::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        let unchanged = get_profile(&pool, profile.id).await.unwrap();
+
+        assert!(err.to_string().contains("assigned profile"));
+        assert_eq!(unchanged.kernel_path.as_deref(), Some("netboot/vmlinuz"));
+    }
+
+    #[tokio::test]
     async fn prune_missing_iso_assets_removes_unseen_rows() {
         let pool = test_pool().await;
         upsert_iso_asset(&pool, "keep.iso", "keep.iso", 10, &"a".repeat(64))
@@ -2582,6 +3029,100 @@ mod tests {
         assert_eq!(updated.output_size_bytes, 42);
         assert_eq!(updated.exit_code, Some(0));
         assert!(updated.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn finish_build_job_preserves_running_cancellation_request() {
+        let pool = test_pool().await;
+        let job = upsert_managed_build_job(
+            &pool,
+            "managed-cancel-1",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "rev-cancel",
+            &"a".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+        let claimed = claim_next_build_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job.id);
+
+        let cancelled = cancel_managed_build_jobs(&pool, &["managed-cancel-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(cancelled, 1);
+
+        let updated = finish_build_job(
+            &pool,
+            job.id,
+            "succeeded",
+            "done",
+            "",
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-output",
+            &"b".repeat(64),
+            42,
+            Some(0),
+            Some(json!({"cache": "exported"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.status, "cancelled");
+        assert_eq!(updated.error, "build cancelled by Manage");
+        assert_eq!(updated.output_path, "");
+        assert_eq!(updated.output_sha256, "");
+        assert_eq!(updated.output_size_bytes, 0);
+        assert_eq!(updated.exit_code, None);
+        assert_eq!(updated.cache_metadata["cancelled"], true);
+        assert!(updated.cancel_requested_at.is_some());
+        assert!(updated.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_build_job_upsert_does_not_mutate_claimed_build_identity() {
+        let pool = test_pool().await;
+        let job = upsert_managed_build_job(
+            &pool,
+            "managed-immutable-1",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "rev-1",
+            &"a".repeat(64),
+            Some(json!({"desired": "old"})),
+        )
+        .await
+        .unwrap();
+        let claimed = claim_next_build_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job.id);
+
+        let updated = upsert_managed_build_job(
+            &pool,
+            "managed-immutable-1",
+            "desktop_image",
+            None,
+            Some("image_target"),
+            Some("aarch64-linux"),
+            "rev-2",
+            &"b".repeat(64),
+            Some(json!({"desired": "new"})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.requested_artifact_type, "nixos_closure");
+        assert_eq!(updated.target, "desktop_experience");
+        assert_eq!(updated.system, "x86_64-linux");
+        assert_eq!(updated.input_revision, "rev-1");
+        assert_eq!(updated.input_config_hash, "a".repeat(64));
+        assert_eq!(updated.build_spec["artifact_type"], "nixos_closure");
+        assert_eq!(updated.build_spec["target"], "desktop_experience");
+        assert_eq!(updated.build_spec["system"], "x86_64-linux");
+        assert_eq!(updated.cache_metadata["desired"], "new");
     }
 
     #[tokio::test]
@@ -2772,6 +3313,73 @@ mod tests {
         assert_eq!(artifact.nar_size_bytes, 2048);
         assert_eq!(artifact.source_build_job_id.as_deref(), Some("job-1"));
         assert_eq!(artifact.cache_metadata["nix_cache_signing"], "pending");
+    }
+
+    #[tokio::test]
+    async fn cache_artifact_upsert_returns_matching_artifact_type_for_shared_hash() {
+        let pool = test_pool().await;
+        let shared_hash = "d".repeat(64);
+
+        let closure = create_cache_artifact(
+            &pool,
+            CreateCacheArtifactRequest {
+                artifact_type: "nixos_closure".to_string(),
+                hash: shared_hash.clone(),
+                size_bytes: 1024,
+                path: "/srv/cybex-forge/cache/closure.nar".to_string(),
+                store_path: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-closure".to_string()),
+                narinfo_path: None,
+                nar_url: None,
+                file_hash: None,
+                nar_hash: None,
+                nar_size_bytes: None,
+                closure_size_bytes: None,
+                compression: None,
+                references: None,
+                serving_url: Some("http://forge.example/cache/closure.nar".to_string()),
+                source_build_job_id: None,
+                cache_metadata: Some(json!({"kind": "closure"})),
+            },
+        )
+        .await
+        .unwrap();
+        let netboot = create_cache_artifact(
+            &pool,
+            CreateCacheArtifactRequest {
+                artifact_type: "netboot_artifact".to_string(),
+                hash: shared_hash.clone(),
+                size_bytes: 2048,
+                path: "/srv/cybex-forge/cache/netboot.nar".to_string(),
+                store_path: Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-netboot".to_string()),
+                narinfo_path: None,
+                nar_url: None,
+                file_hash: None,
+                nar_hash: None,
+                nar_size_bytes: None,
+                closure_size_bytes: None,
+                compression: None,
+                references: None,
+                serving_url: Some("http://forge.example/cache/netboot.nar".to_string()),
+                source_build_job_id: None,
+                cache_metadata: Some(json!({"kind": "netboot"})),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(closure.id, netboot.id);
+        assert_eq!(netboot.artifact_type, "netboot_artifact");
+        assert_eq!(netboot.path, "/srv/cybex-forge/cache/netboot.nar");
+        assert_eq!(netboot.cache_metadata["kind"], "netboot");
+
+        let artifacts = list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "nixos_closure" && artifact.hash == shared_hash
+        }));
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "netboot_artifact" && artifact.hash == shared_hash
+        }));
     }
 
     #[tokio::test]

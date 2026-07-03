@@ -8,6 +8,7 @@ pub mod db;
 pub mod error;
 pub mod manage;
 pub mod models;
+pub(crate) mod redact;
 pub mod routes;
 pub mod ui;
 
