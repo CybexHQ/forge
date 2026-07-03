@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -696,7 +697,15 @@ fn safe_cache_member_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn public_key_fingerprint(public_key: &str) -> String {
-    sha256_hex(public_key.as_bytes()).chars().take(24).collect()
+    // Cybex Manage validates this as the full 64-char sha256 hex of the
+    // decoded ed25519 key material ("name:base64" -> sha256 of the decoded
+    // 32 bytes), and rejects the whole forge report when it differs.
+    public_key
+        .split_once(':')
+        .and_then(|(_, material)| BASE64_STANDARD.decode(material).ok())
+        .filter(|bytes| bytes.len() == 32)
+        .map(|bytes| sha256_hex(&bytes))
+        .unwrap_or_default()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -806,7 +815,7 @@ mod tests {
              set -eu\n\
              if [ \"$1\" != \"--generate-binary-cache-key\" ]; then exit 2; fi\n\
              printf '%s\\n' \"$2-secret\" > \"$3\"\n\
-             printf '%s\\n' \"$2:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\" > \"$4\"\n",
+             printf '%s\\n' \"$2:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\" > \"$4\"\n",
         )
         .unwrap();
         fs::set_permissions(&fake_nix_store, fs::Permissions::from_mode(0o755)).unwrap();
@@ -822,7 +831,9 @@ mod tests {
         .unwrap();
 
         assert!(public.starts_with("cybex-forge-cache:"));
-        assert_eq!(public_key_fingerprint(&public).len(), 24);
+        let fingerprint = public_key_fingerprint(&public);
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             fs::metadata(&private_key).unwrap().permissions().mode() & 0o777,
             0o600
@@ -878,7 +889,7 @@ mod tests {
         fs::write(&config.cache.private_key_path, "private").unwrap();
         fs::write(
             &config.cache.public_key_path,
-            "cybex-forge-cache:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd",
+            "cybex-forge-cache:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         )
         .unwrap();
         fs::set_permissions(
@@ -892,7 +903,7 @@ mod tests {
         assert_eq!(report.status, "ready");
         assert_eq!(report.total_size_bytes, 4136);
         assert!(report.public_key.starts_with("cybex-forge-cache:"));
-        assert_eq!(report.public_key_fingerprint.len(), 24);
+        assert_eq!(report.public_key_fingerprint.len(), 64);
         assert_eq!(
             fs::metadata(&config.cache.private_key_path)
                 .unwrap()
