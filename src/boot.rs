@@ -18,7 +18,7 @@ pub struct ProfileSelection<'a> {
     pub source: SelectionSource,
 }
 
-const IPXE_MENU_TITLE: &str = "CYBEX";
+const IPXE_MENU_BACKGROUND_PATH: &str = "assets/pxe-menu.png";
 const IPXE_MENU_SUBTITLE: &str = "PXE BOOT - FORGE BOOT - X86_64 - UEFI";
 const IPXE_MENU_TIMEOUT_COPY: &str =
     "Booting the highlighted entry automatically - press any key to pause";
@@ -78,14 +78,13 @@ pub fn render_menu(
 ) -> String {
     let mut script = String::new();
     script.push_str("#!ipxe\n");
-    append_ipxe_menu_theme(&mut script);
-    script.push_str(&format!("set cybex-title {IPXE_MENU_TITLE}\n"));
+    append_ipxe_menu_theme(&mut script, public_base_url);
     script.push_str(&format!("set cybex-subtitle {IPXE_MENU_SUBTITLE}\n"));
     script.push_str(&format!(
         "set cybex-timeout-copy {IPXE_MENU_TIMEOUT_COPY}\n"
     ));
     script.push_str(&format!("set menu-timeout {timeout_ms}\n"));
-    script.push_str("menu ${cybex-title}\n");
+    script.push_str("menu\n");
     script.push_str("item --gap ${cybex-subtitle}\n");
     script.push_str("item --gap\n");
     script.push_str("item --key l local Boot local disk\n");
@@ -105,7 +104,6 @@ pub fn render_menu(
     script.push_str("item --gap\n");
     script.push_str("item --gap ${cybex-timeout-copy}\n");
     script.push_str(&format!("item --gap {IPXE_MENU_FOOTER}\n"));
-    script.push_str("item --key s shell iPXE shell\n");
     script.push_str("choose --timeout ${menu-timeout} --default local selected || goto local\n");
     script.push_str("goto ${selected}\n\n");
 
@@ -125,9 +123,6 @@ pub fn render_menu(
         script.push_str("goto end\n\n");
     }
 
-    script.push_str(":shell\n");
-    script.push_str("shell\n");
-    script.push_str("goto end\n\n");
     script.push_str(":local\n");
     script.push_str(&render_local_body());
     script.push_str("\n:failed\n");
@@ -138,13 +133,18 @@ pub fn render_menu(
     script
 }
 
-fn append_ipxe_menu_theme(script: &mut String) {
-    script.push_str("# Cybex text-mode boot menu theme, aligned with the ISO GRUB palette.\n");
+fn append_ipxe_menu_theme(script: &mut String, public_base_url: &str) {
+    let background_url = asset_url(public_base_url, IPXE_MENU_BACKGROUND_PATH)
+        .expect("built-in PXE menu background path must be safe");
+    script.push_str("# Cybex boot menu theme, aligned with the ISO GRUB palette.\n");
+    script.push_str(&format!(
+        "console --x 1024 --y 864 --picture {background_url} --left 280 --right 280 --top 260 --bottom 140 --depth 32 || console --x 1024 --y 768 --depth 32 || echo Cybex Forge: using firmware text console\n"
+    ));
     script.push_str("colour --basic 0 --rgb 0x0e0f12 0\n");
     script.push_str("colour --basic 3 --rgb 0xeb9b46 1\n");
     script.push_str("colour --basic 7 --rgb 0xa4a8b0 2\n");
-    script.push_str("colour --basic 7 --rgb 0x6f747d 3\n");
-    script.push_str("colour --basic 0 --rgb 0x241a10 4\n");
+    script.push_str("colour --basic 6 --rgb 0x6f747d 3\n");
+    script.push_str("colour --basic 4 --rgb 0x241a10 4\n");
     script.push_str("colour --basic 1 --rgb 0xdd0034 5\n");
     script.push_str("colour --basic 6 --rgb 0x16b8b8 6\n");
     script.push_str("colour --basic 7 --rgb 0xffffff 7\n");
@@ -440,14 +440,21 @@ mod tests {
         let profiles = vec![profile(1, BootProfileType::LocalDisk)];
         let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
 
-        assert!(script.contains("set cybex-title CYBEX"));
+        assert!(!script.contains("set cybex-title CYBEX"));
         assert!(script.contains("set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI"));
+        assert!(script.contains(
+            "console --x 1024 --y 864 --picture http://boot.local:8080/files/assets/pxe-menu.png --left 280 --right 280 --top 260 --bottom 140 --depth 32"
+        ));
         assert!(script.contains("colour --basic 0 --rgb 0x0e0f12 0"));
         assert!(script.contains("colour --basic 3 --rgb 0xeb9b46 1"));
+        assert!(script.contains("colour --basic 4 --rgb 0x241a10 4"));
         assert!(script.contains("cpair --foreground 1 --background 4 2"));
+        assert!(script.contains("menu\n"));
         assert!(script.contains("item --gap ${cybex-subtitle}"));
         assert!(script.contains("item --gap ${cybex-timeout-copy}"));
         assert!(script.contains("item --gap cybex-forge - pxe - x86_64 - uefi"));
+        assert!(!script.contains("iPXE shell"));
+        assert!(!script.contains(":shell"));
     }
 
     #[test]

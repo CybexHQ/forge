@@ -564,6 +564,13 @@ prepare_user_and_dirs() {
   harden_tftp_tree
 }
 
+install_theme_assets() {
+  local menu_background="$source_dir/assets/pxe-menu.png"
+  if [ -f "$menu_background" ]; then
+    install -m 0644 -o cybex-forge -g cybex-forge "$menu_background" "$http_root/assets/pxe-menu.png"
+  fi
+}
+
 write_config() {
   local config_path="/etc/cybex-forge/config.toml"
   local config_tmp
@@ -1466,6 +1473,8 @@ check_ipxe_menu_response() {
   local body_file="$3"
   local first_line
   local expected
+  local public_base_url
+  public_base_url="$(config_string_value public_base_url)"
   check_header_once "$label" "$headers_file" "Content-Type" "text/plain"
   check_header_once "$label" "$headers_file" "Cache-Control" "no-store"
   check_header_once "$label" "$headers_file" "Pragma" "no-cache"
@@ -1477,12 +1486,13 @@ check_ipxe_menu_response() {
     fail "$label first line is '$first_line', expected '#!ipxe'"
   fi
   for expected in \
-    "set cybex-title CYBEX" \
     "set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI" \
+    "console --x 1024 --y 864 --picture ${public_base_url}/files/assets/pxe-menu.png --left 280 --right 280 --top 260 --bottom 140 --depth 32 || console --x 1024 --y 768 --depth 32 || echo Cybex Forge: using firmware text console" \
     "colour --basic 0 --rgb 0x0e0f12 0" \
     "colour --basic 3 --rgb 0xeb9b46 1" \
+    "colour --basic 4 --rgb 0x241a10 4" \
     "cpair --foreground 1 --background 4 2" \
-    'menu ${cybex-title}' \
+    'menu' \
     'item --gap ${cybex-subtitle}' \
     'item --gap ${cybex-timeout-copy}' \
     'choose --timeout ${menu-timeout} --default local selected || goto local' \
@@ -1494,6 +1504,11 @@ check_ipxe_menu_response() {
       fail "$label is missing $expected"
     fi
   done
+  if grep -F "iPXE shell" "$body_file" >/dev/null; then
+    fail "$label still exposes iPXE shell"
+  else
+    ok "$label omits iPXE shell"
+  fi
 }
 
 check_ipxe_profile_response() {
@@ -2599,6 +2614,7 @@ prepare_source
 verify_source_compatibility
 install_binary
 prepare_user_and_dirs
+install_theme_assets
 write_config
 install_systemd
 install_maintenance_tools

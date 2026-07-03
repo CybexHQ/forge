@@ -45,6 +45,8 @@ use crate::{
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
+const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
+const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
 const MAX_DELETED_MANAGED_PROFILES: usize = 2_000;
 const MAX_MANAGED_CLIENTS: usize = 2_000;
@@ -3255,6 +3257,16 @@ fn ensure_runtime_directories(
     install_dir(
         &settings.http_root.join("assets"),
         "0755",
+        "cybex-forge",
+        "cybex-forge",
+    )?;
+    install_bytes_file(
+        &settings
+            .http_root
+            .join("assets")
+            .join(PXE_MENU_BACKGROUND_FILENAME),
+        PXE_MENU_BACKGROUND_ASSET,
+        "0644",
         "cybex-forge",
         "cybex-forge",
     )?;
