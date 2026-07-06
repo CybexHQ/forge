@@ -1414,11 +1414,45 @@ fn normalize_revision(value: &str) -> Result<String> {
 }
 
 fn normalize_installer_source_git_url(value: &str) -> Result<String> {
-    let value = normalize_installer_http_url("installer_iso.source_git_url", value)?;
+    let value = normalize_installer_git_url("installer_iso.source_git_url", value)?;
     if value.len() > 2048 {
         bail!("installer_iso.source_git_url is too long");
     }
     Ok(value)
+}
+
+fn normalize_installer_git_url(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        bail!("{field} must be a git URL without whitespace");
+    }
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{field} is not a URL"))?;
+    match parsed.scheme() {
+        "http" | "https" => normalize_installer_http_url(field, value),
+        "file" => {
+            if parsed.host_str().is_some()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                bail!("{field} file URL must be local");
+            }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                bail!("{field} must not include query parameters or fragments");
+            }
+            if value.contains("/../") || value.contains("/./") {
+                bail!("{field} file URL path is invalid");
+            }
+            let path = parsed.path();
+            if path == "/"
+                || path.contains('%')
+                || path.split('/').any(|part| part == "." || part == "..")
+            {
+                bail!("{field} file URL path is invalid");
+            }
+            Ok(value.trim_end_matches('/').to_string())
+        }
+        _ => bail!("{field} must use http, https, or file"),
+    }
 }
 
 fn normalize_installer_http_url(field: &str, value: &str) -> Result<String> {
@@ -1584,6 +1618,18 @@ mod tests {
             parsed.installer_iso.unwrap().kind,
             INSTALLER_ISO_BUILD_INPUT_KIND
         );
+    }
+
+    #[test]
+    fn installer_iso_source_accepts_local_file_git_url() {
+        assert_eq!(
+            normalize_installer_source_git_url("file:///var/lib/cybex-forge/manage-source.git")
+                .unwrap(),
+            "file:///var/lib/cybex-forge/manage-source.git"
+        );
+        assert!(normalize_installer_source_git_url("file://github.com/manage.git").is_err());
+        assert!(normalize_installer_source_git_url("file:///var/lib/../manage.git").is_err());
+        assert!(normalize_installer_source_git_url("file:///var/lib/manage%2egit").is_err());
     }
 
     #[test]

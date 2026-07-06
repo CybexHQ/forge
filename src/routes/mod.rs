@@ -220,6 +220,15 @@ iso_dir = "{root}/www/isos"
 static_dir = "{root}/www/assets"
 tftp_dir = "{root}/tftp"
 
+[build]
+work_dir = "{root}/build/work"
+output_dir = "{root}/build/outputs"
+
+[cache]
+root_dir = "{root}/www/cache"
+private_key_path = "{root}/cache/cache-priv-key.pem"
+public_key_path = "{root}/cache/cache-pub-key.pem"
+
 [manage]
 state_path = "{root}/manage-state.json"
 "#,
