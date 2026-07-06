@@ -9,7 +9,6 @@ User=cybex-forge
 Group=cybex-forge
 ExecStart=/usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml serve
 WorkingDirectory=/var/lib/cybex-forge
-Environment="NIX_PATH=nixpkgs=flake:nixpkgs"
 Restart=on-failure
 RestartSec=3
 StateDirectory=cybex-forge
