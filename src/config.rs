@@ -417,9 +417,10 @@ fn normalize_allowed_systems(values: &[String], field: &str) -> anyhow::Result<V
 fn normalize_build_artifact_type(value: &str) -> anyhow::Result<String> {
     let value = value.trim().to_ascii_lowercase();
     match value.as_str() {
-        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation" => Ok(value),
+        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation"
+        | "installer_iso" => Ok(value),
         _ => bail!(
-            "build artifact type must be one of nixos_closure, netboot_artifact, desktop_image, system_generation"
+            "build artifact type must be one of nixos_closure, netboot_artifact, desktop_image, system_generation, installer_iso"
         ),
     }
 }

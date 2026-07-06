@@ -7,7 +7,7 @@ SaaS control plane.
 
 ## Capabilities
 
-Cybex Forge currently provides three managed local capabilities:
+Cybex Forge currently provides four managed local capabilities:
 
 - Forge Boot (`boot_v1`): serves PXE/iPXE boot flows, installer ISOs, boot
   profiles, known clients, boot assets, and boot events.
@@ -15,6 +15,8 @@ Cybex Forge currently provides three managed local capabilities:
   for configured and allowed targets.
 - Forge Cache (`cache_v1`): publishes successful build outputs through a signed
   local Nix binary cache and reports cache metadata back to Cybex Manage.
+- Forge installer ISO builds (`installer_iso_builder_v1`): builds organization
+  enrollment installer ISOs locally and serves them from Forge public files.
 
 Cybex Forge is not a standalone infrastructure management product. It is
 designed to work only with the Cybex commercial SaaS platform, including Cybex

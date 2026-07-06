@@ -45,6 +45,7 @@ use crate::{
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
+const CAPABILITY_INSTALLER_ISO_BUILDER_V1: &str = "installer_iso_builder_v1";
 const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
 const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
@@ -415,6 +416,12 @@ struct ManagedIsoSyncTarget {
     desired_iso_size_bytes: i64,
     desired_iso_sha256: String,
     desired_iso_download_url: String,
+}
+
+#[derive(Clone, Debug)]
+enum ManagedIsoDownloadSource {
+    ManagePath(String),
+    DirectUrl(String),
 }
 
 #[derive(Debug)]
@@ -1010,11 +1017,11 @@ async fn sync_desired_profile_iso(
         ));
     }
 
-    let download_path = managed_iso_download_path(&target.desired_iso_download_url, state)?;
+    let download_source = managed_iso_download_source(&target.desired_iso_download_url, state)?;
     download_managed_iso(
         state,
         managed,
-        &download_path,
+        &download_source,
         &path,
         expected_size,
         &expected_sha,
@@ -1841,16 +1848,25 @@ async fn cached_iso_matches(path: &Path, expected_size: i64, expected_sha: &str)
 async fn download_managed_iso(
     state: &AppState,
     managed: &ManagedState,
-    download_path: &str,
+    download_source: &ManagedIsoDownloadSource,
     path: &Path,
     expected_size: i64,
     expected_sha: &str,
 ) -> Result<()> {
-    let mut response = signed_download_request(state, managed, download_path)
-        .await?
-        .send()
-        .await
-        .context("download managed ISO request failed")?;
+    let mut response = match download_source {
+        ManagedIsoDownloadSource::ManagePath(download_path) => {
+            signed_download_request(state, managed, download_path)
+                .await?
+                .send()
+                .await
+                .context("download managed ISO request failed")?
+        }
+        ManagedIsoDownloadSource::DirectUrl(download_url) => http_download_client(state)?
+            .get(download_url)
+            .send()
+            .await
+            .context("download Forge installer ISO request failed")?,
+    };
     let status = response.status();
     if !status.is_success() {
         bail!("download managed ISO failed with HTTP {status}");
@@ -1994,7 +2010,7 @@ fn validate_managed_iso_target(target: &ManagedIsoSyncTarget, state: &AppState) 
     if valid_sha256(&target.desired_iso_sha256).is_none() {
         bail!("managed ISO checksum must be 64 hex characters");
     }
-    managed_iso_download_path(&target.desired_iso_download_url, state)?;
+    managed_iso_download_source(&target.desired_iso_download_url, state)?;
     Ok(())
 }
 
@@ -2033,22 +2049,35 @@ fn managed_iso_tmp_path(path: &Path) -> Result<PathBuf> {
     )))
 }
 
-fn managed_iso_download_path(value: &str, state: &AppState) -> Result<String> {
-    managed_iso_download_path_with_base(value, Some(state.config.manage.api_url.trim()))
+fn managed_iso_download_source(value: &str, state: &AppState) -> Result<ManagedIsoDownloadSource> {
+    managed_iso_download_source_with_bases(
+        value,
+        Some(state.config.manage.api_url.trim()),
+        Some(state.runtime_settings().public_base_url.as_str()),
+    )
 }
 
-fn managed_iso_download_path_with_base(value: &str, api_base: Option<&str>) -> Result<String> {
+fn managed_iso_download_source_with_bases(
+    value: &str,
+    api_base: Option<&str>,
+    public_base: Option<&str>,
+) -> Result<ManagedIsoDownloadSource> {
     let trimmed = value.trim();
-    let path = if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        let base = api_base.unwrap_or_default().trim().trim_end_matches('/');
-        trimmed
-            .strip_prefix(base)
-            .filter(|path| path.starts_with('/'))
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("managed ISO download URL must be a Manage API path"))?
-    };
+    if trimmed.starts_with('/') {
+        return managed_iso_download_path_source(trimmed.to_string());
+    }
+    let base = api_base.unwrap_or_default().trim().trim_end_matches('/');
+    if let Some(path) = trimmed
+        .strip_prefix(base)
+        .filter(|path| path.starts_with('/'))
+        .map(ToString::to_string)
+    {
+        return managed_iso_download_path_source(path);
+    }
+    managed_iso_direct_download_source(trimmed, public_base)
+}
+
+fn managed_iso_download_path_source(path: String) -> Result<ManagedIsoDownloadSource> {
     if !path.starts_with("/v1/agent/devices/")
         || !path.contains("/boot/profiles/")
         || !path.ends_with("/iso/download")
@@ -2058,7 +2087,34 @@ fn managed_iso_download_path_with_base(value: &str, api_base: Option<&str>) -> R
     {
         bail!("managed ISO download URL must be an agent profile ISO download path");
     }
-    Ok(path)
+    Ok(ManagedIsoDownloadSource::ManagePath(path))
+}
+
+fn managed_iso_direct_download_source(
+    value: &str,
+    public_base: Option<&str>,
+) -> Result<ManagedIsoDownloadSource> {
+    let parsed = reqwest::Url::parse(value)
+        .with_context(|| "managed ISO direct download URL must be an HTTP URL")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path().contains('\\')
+        || !parsed.path().starts_with("/files/")
+    {
+        bail!("managed ISO direct download URL must be a Forge /files/ URL");
+    }
+    if let Some(public_base) = public_base.map(str::trim).filter(|value| !value.is_empty()) {
+        let public_base = public_base.trim_end_matches('/');
+        let required_prefix = format!("{public_base}/");
+        if value != public_base && !value.starts_with(&required_prefix) {
+            bail!("managed ISO direct download URL must match this Forge public base URL");
+        }
+    }
+    Ok(ManagedIsoDownloadSource::DirectUrl(value.to_string()))
 }
 
 async fn sync_profiles(
@@ -2503,6 +2559,7 @@ fn forge_capabilities() -> Vec<&'static str> {
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
         CAPABILITY_CACHE_V1,
+        CAPABILITY_INSTALLER_ISO_BUILDER_V1,
     ]
 }
 
@@ -4125,9 +4182,10 @@ fn validate_desired_iso_metadata(profile: &ManagedBootProfile) -> Result<()> {
         bail!("managed boot profile desired_iso_sha256 must be 64 hex characters");
     }
     if !profile.desired_iso_download_url.trim().is_empty() {
-        managed_iso_download_path_with_base(
+        managed_iso_download_source_with_bases(
             &profile.desired_iso_download_url,
             Some("http://localhost"),
+            None,
         )?;
     }
     Ok(())
@@ -5604,7 +5662,12 @@ mod tests {
     fn forge_capabilities_report_build_and_cache() {
         assert_eq!(
             forge_capabilities(),
-            vec!["boot_v1", "builder_v1", "cache_v1"]
+            vec![
+                "boot_v1",
+                "builder_v1",
+                "cache_v1",
+                "installer_iso_builder_v1"
+            ]
         );
     }
 

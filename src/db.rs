@@ -1840,10 +1840,14 @@ fn normalize_artifact_type(value: &str, field: &str) -> AppResult<String> {
     let value = value.trim().to_ascii_lowercase();
     if !matches!(
         value.as_str(),
-        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation"
+        "nixos_closure"
+            | "netboot_artifact"
+            | "desktop_image"
+            | "system_generation"
+            | "installer_iso"
     ) {
         return Err(AppError::Validation(format!(
-            "{field} must be one of nixos_closure, netboot_artifact, desktop_image, system_generation"
+            "{field} must be one of nixos_closure, netboot_artifact, desktop_image, system_generation, installer_iso"
         )));
     }
     Ok(value)

@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -9,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -18,7 +21,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    AppState, cache,
+    AppState, assets, cache,
     config::{AppConfig, BuildTargetConfig},
     db,
     models::BuildJob,
@@ -26,6 +29,7 @@ use crate::{
 };
 
 const DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
+const INSTALLER_ISO_BUILD_INPUT_KIND: &str = "cybex_manage_installer_iso";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -46,6 +50,8 @@ pub struct BuildSpec {
     pub desktop_experience_revision_config_hash: Option<String>,
     #[serde(default)]
     pub build_input: Option<DesktopExperienceBuildInput>,
+    #[serde(default)]
+    pub installer_iso: Option<InstallerIsoBuildInput>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,6 +65,17 @@ pub struct DesktopExperienceBuildInput {
     pub desktop_experience_revision: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallerIsoBuildInput {
+    pub kind: String,
+    pub source_git_url: String,
+    pub source_ref: String,
+    pub api_url: String,
+    pub organization_slug: String,
+    pub output: String,
+}
+
 #[derive(Clone, Debug)]
 struct ValidatedBuildSpec {
     artifact_type: String,
@@ -70,6 +87,7 @@ struct ValidatedBuildSpec {
     desktop_experience_revision_id: Option<String>,
     desktop_experience_revision_config_hash: Option<String>,
     build_input: Option<ValidatedDesktopExperienceBuildInput>,
+    installer_iso: Option<ValidatedInstallerIsoBuildInput>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +95,14 @@ struct ValidatedDesktopExperienceBuildInput {
     generated_nix: String,
     desktop_experience_name: Option<String>,
     desktop_experience_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedInstallerIsoBuildInput {
+    source_git_url: String,
+    source_ref: String,
+    api_url: String,
+    organization_slug: String,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +118,16 @@ struct NixOutputInfo {
     output_sha256: String,
     output_size_bytes: i64,
     closure_size_bytes: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedInstallerIso {
+    filename: String,
+    relative_path: String,
+    serving_url: String,
+    path: PathBuf,
+    sha256: String,
+    size_bytes: i64,
 }
 
 #[derive(Clone)]
@@ -176,6 +212,10 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             return Ok(());
         }
     };
+    if spec.artifact_type == "installer_iso" {
+        execute_installer_iso_job(state, job, spec).await?;
+        return Ok(());
+    }
     let target = match build_target(&state.config, &spec) {
         Ok(target) => target.clone(),
         Err(err) => {
@@ -346,6 +386,132 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     Ok(())
 }
 
+async fn execute_installer_iso_job(
+    state: &AppState,
+    job: BuildJob,
+    spec: ValidatedBuildSpec,
+) -> Result<()> {
+    let input = spec
+        .installer_iso
+        .as_ref()
+        .ok_or_else(|| anyhow!("validated installer ISO job did not include installer input"))?;
+    let log = SharedLog::new(state.config.build.max_log_bytes);
+    let source_dir = match checkout_installer_source(&state.config, &job, input, &log).await {
+        Ok(source_dir) => source_dir,
+        Err(err) => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                &log.snapshot().await,
+                &format!("source checkout failed: {}", safe_error(&err)),
+                "",
+                "",
+                0,
+                None,
+                Some(json!({"error_kind": "source_checkout_failed"})),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let command = installer_iso_nix_build_command(&state.config, &source_dir, input, job.id)?;
+    let outcome = run_nix_build(&state.db, &job, &command, &log, &state.config).await?;
+    let logs = log.snapshot().await;
+    match outcome {
+        ProcessOutcome::Succeeded(exit_code) => {
+            let published = match inspect_and_publish_installer_iso(state, &command, input).await {
+                Ok(published) => published,
+                Err(err) => {
+                    db::finish_build_job(
+                        &state.db,
+                        job.id,
+                        "failed",
+                        &logs,
+                        &format!("installer ISO publish failed: {}", safe_error(&err)),
+                        "",
+                        "",
+                        0,
+                        Some(exit_code.into()),
+                        Some(json!({"error_kind": "installer_iso_publish_failed"})),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "succeeded",
+                &logs,
+                "",
+                &published.path.display().to_string(),
+                &published.sha256,
+                published.size_bytes,
+                Some(exit_code.into()),
+                Some(json!({
+                    "schema": "cybex.forge.installer_iso.v1",
+                    "filename": published.filename,
+                    "relative_path": published.relative_path,
+                    "serving_url": published.serving_url,
+                    "organization_slug": input.organization_slug,
+                    "target": spec.target,
+                    "system": spec.system,
+                    "input_revision": spec.input_revision,
+                    "input_config_hash": spec.input_config_hash
+                })),
+            )
+            .await?;
+        }
+        ProcessOutcome::Failed(exit_code) => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                &logs,
+                &format!("nix-build installer ISO exited with status {exit_code}"),
+                "",
+                "",
+                0,
+                Some(exit_code.into()),
+                Some(json!({"error_kind": "installer_iso_build_failed"})),
+            )
+            .await?;
+        }
+        ProcessOutcome::Cancelled => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "cancelled",
+                &logs,
+                "build cancelled by Manage",
+                "",
+                "",
+                0,
+                None,
+                Some(json!({"cancelled": true})),
+            )
+            .await?;
+        }
+        ProcessOutcome::TimedOut => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                &logs,
+                "build exceeded configured timeout",
+                "",
+                "",
+                0,
+                None,
+                Some(json!({"error_kind": "build_timeout"})),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBuildSpec> {
     let spec: BuildSpec = serde_json::from_value(job.build_spec.clone())
         .context("build_spec does not match schema")?;
@@ -390,8 +556,26 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         .build_input
         .map(validate_desktop_experience_build_input)
         .transpose()?;
+    let installer_iso = spec
+        .installer_iso
+        .map(validate_installer_iso_build_input)
+        .transpose()?;
     if build_input.is_some() && artifact_type != "nixos_closure" {
         bail!("desktop_experience build_input requires artifact_type nixos_closure");
+    }
+    if installer_iso.is_some() && artifact_type != "installer_iso" {
+        bail!("installer_iso input requires artifact_type installer_iso");
+    }
+    if artifact_type == "installer_iso" {
+        if target != "enrollment_iso" {
+            bail!("installer_iso jobs require target enrollment_iso");
+        }
+        if build_input.is_some() {
+            bail!("installer_iso jobs must not include desktop_experience build_input");
+        }
+        if installer_iso.is_none() {
+            bail!("installer_iso jobs require installer_iso input");
+        }
     }
     Ok(ValidatedBuildSpec {
         artifact_type,
@@ -403,6 +587,7 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         desktop_experience_revision_id,
         desktop_experience_revision_config_hash,
         build_input,
+        installer_iso,
     })
 }
 
@@ -429,6 +614,23 @@ fn validate_desktop_experience_build_input(
             .map(|value| bounded_metadata_text(&value, 200))
             .filter(|value| !value.is_empty()),
         desktop_experience_revision: input.desktop_experience_revision.filter(|value| *value > 0),
+    })
+}
+
+fn validate_installer_iso_build_input(
+    input: InstallerIsoBuildInput,
+) -> Result<ValidatedInstallerIsoBuildInput> {
+    if input.kind.trim() != INSTALLER_ISO_BUILD_INPUT_KIND {
+        bail!("unsupported installer_iso kind");
+    }
+    if input.output.trim() != "iso" {
+        bail!("installer_iso output must be iso");
+    }
+    Ok(ValidatedInstallerIsoBuildInput {
+        source_git_url: normalize_installer_source_git_url(&input.source_git_url)?,
+        source_ref: normalize_installer_source_ref(&input.source_ref)?,
+        api_url: normalize_installer_http_url("installer_iso.api_url", &input.api_url)?,
+        organization_slug: normalize_installer_organization_slug(&input.organization_slug)?,
     })
 }
 
@@ -604,6 +806,298 @@ fn desktop_experience_compat_module() -> &'static str {
   };
 }
 "#
+}
+
+async fn checkout_installer_source(
+    config: &AppConfig,
+    job: &BuildJob,
+    input: &ValidatedInstallerIsoBuildInput,
+    log: &SharedLog,
+) -> Result<PathBuf> {
+    let source_dir = config.build.work_dir.join(format!("job-{}-source", job.id));
+    let _ = tokio::fs::remove_dir_all(&source_dir).await;
+    tokio::fs::create_dir_all(&source_dir)
+        .await
+        .with_context(|| format!("create installer source directory {}", source_dir.display()))?;
+    run_git_command(
+        &["-C", source_dir_as_str(&source_dir)?, "init"],
+        "initialize installer source checkout",
+        log,
+    )
+    .await?;
+    run_git_command(
+        &[
+            "-C",
+            source_dir_as_str(&source_dir)?,
+            "remote",
+            "add",
+            "origin",
+            &input.source_git_url,
+        ],
+        "configure installer source remote",
+        log,
+    )
+    .await?;
+    run_git_command(
+        &[
+            "-C",
+            source_dir_as_str(&source_dir)?,
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            &input.source_ref,
+        ],
+        "fetch installer source ref",
+        log,
+    )
+    .await?;
+    run_git_command(
+        &[
+            "-C",
+            source_dir_as_str(&source_dir)?,
+            "checkout",
+            "--detach",
+            "FETCH_HEAD",
+        ],
+        "checkout installer source ref",
+        log,
+    )
+    .await?;
+    Ok(source_dir)
+}
+
+fn source_dir_as_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow!("installer source path is not UTF-8"))
+}
+
+async fn run_git_command(args: &[&str], description: &str, log: &SharedLog) -> Result<()> {
+    log.append(&format!("{description}\n")).await;
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("run git to {description}"))?;
+    if !output.stdout.is_empty() {
+        log.append(&String::from_utf8_lossy(&output.stdout)).await;
+    }
+    if !output.stderr.is_empty() {
+        log.append(&String::from_utf8_lossy(&output.stderr)).await;
+    }
+    if !output.status.success() {
+        bail!("{description} failed with status {}", output.status);
+    }
+    Ok(())
+}
+
+fn installer_iso_nix_build_command(
+    config: &AppConfig,
+    source_dir: &Path,
+    input: &ValidatedInstallerIsoBuildInput,
+    job_id: i64,
+) -> Result<NixBuildCommand> {
+    let expression = source_dir
+        .join("deploy")
+        .join("nixos")
+        .join("cybex-installer-iso.nix");
+    if !expression.is_file() {
+        bail!(
+            "installer ISO Nix expression is missing at {}",
+            expression.display()
+        );
+    }
+    let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
+    let out_link = job_dir.join("installer-iso-result");
+    Ok(NixBuildCommand {
+        program: nix_build_binary(config),
+        args: vec![
+            expression.display().to_string(),
+            "--argstr".to_string(),
+            "apiUrl".to_string(),
+            input.api_url.clone(),
+            "--argstr".to_string(),
+            "organizationSlug".to_string(),
+            input.organization_slug.clone(),
+            "--argstr".to_string(),
+            "output".to_string(),
+            "iso".to_string(),
+            "--out-link".to_string(),
+            out_link.display().to_string(),
+        ],
+        out_link,
+    })
+}
+
+fn nix_build_binary(config: &AppConfig) -> String {
+    let nix = Path::new(&config.build.nix_binary);
+    if nix.file_name().and_then(|value| value.to_str()) == Some("nix") {
+        if let Some(parent) = nix.parent() {
+            return parent.join("nix-build").display().to_string();
+        }
+    }
+    "nix-build".to_string()
+}
+
+async fn inspect_and_publish_installer_iso(
+    state: &AppState,
+    command: &NixBuildCommand,
+    input: &ValidatedInstallerIsoBuildInput,
+) -> Result<PublishedInstallerIso> {
+    let output_path = tokio::fs::read_link(&command.out_link)
+        .await
+        .with_context(|| format!("read installer ISO out-link {}", command.out_link.display()))?;
+    let iso_path = find_installer_iso_file(&output_path).await?;
+    let metadata = tokio::fs::metadata(&iso_path)
+        .await
+        .with_context(|| format!("stat built installer ISO {}", iso_path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        bail!("built installer ISO is empty or not a regular file");
+    }
+    if metadata.len() > state.config.build.max_artifact_size_bytes {
+        bail!("built installer ISO exceeded max_artifact_size_bytes");
+    }
+    let sha256 = sha256_file(&iso_path).await?;
+    let size_bytes =
+        i64::try_from(metadata.len()).context("built installer ISO size does not fit i64")?;
+    tokio::fs::create_dir_all(&state.config.paths.iso_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "create installer ISO publish directory {}",
+                state.config.paths.iso_dir.display()
+            )
+        })?;
+    let filename = published_installer_iso_filename(&input.organization_slug, &sha256);
+    let published_path = state.config.paths.iso_dir.join(&filename);
+    let tmp_path = state
+        .config
+        .paths
+        .iso_dir
+        .join(format!(".{filename}.tmp-{}", std::process::id()));
+    tokio::fs::copy(&iso_path, &tmp_path)
+        .await
+        .with_context(|| {
+            format!(
+                "copy built installer ISO {} to {}",
+                iso_path.display(),
+                tmp_path.display()
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        let permissions = std::fs::Permissions::from_mode(0o644);
+        tokio::fs::set_permissions(&tmp_path, permissions)
+            .await
+            .with_context(|| format!("set installer ISO permissions {}", tmp_path.display()))?;
+    }
+    tokio::fs::rename(&tmp_path, &published_path)
+        .await
+        .with_context(|| {
+            format!(
+                "publish installer ISO {} to {}",
+                tmp_path.display(),
+                published_path.display()
+            )
+        })?;
+    let relative_path = published_path
+        .strip_prefix(&state.config.paths.boot_assets_dir)
+        .with_context(|| {
+            format!(
+                "published ISO path {} is outside boot assets directory {}",
+                published_path.display(),
+                state.config.paths.boot_assets_dir.display()
+            )
+        })?
+        .to_str()
+        .ok_or_else(|| anyhow!("published installer ISO relative path is not UTF-8"))?
+        .to_string();
+    let serving_url = assets::asset_url(state.config.public_base_url(), &relative_path)
+        .context("build installer ISO serving URL")?;
+    db::upsert_iso_asset(&state.db, &filename, &relative_path, size_bytes, &sha256)
+        .await
+        .context("record published installer ISO asset")?;
+    Ok(PublishedInstallerIso {
+        filename,
+        relative_path,
+        serving_url,
+        path: published_path,
+        sha256,
+        size_bytes,
+    })
+}
+
+async fn find_installer_iso_file(output_path: &Path) -> Result<PathBuf> {
+    let output_path = output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || find_installer_iso_file_blocking(&output_path))
+        .await
+        .context("join installer ISO discovery task")?
+}
+
+fn find_installer_iso_file_blocking(output_path: &Path) -> Result<PathBuf> {
+    if output_path.is_file() {
+        if output_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+        {
+            return Ok(output_path.to_path_buf());
+        }
+        bail!("build output file was not an ISO");
+    }
+    let mut candidates = Vec::new();
+    collect_iso_files(output_path, &mut candidates)?;
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("build output did not contain an ISO"))
+}
+
+fn collect_iso_files(path: &Path, candidates: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_iso_files(&entry_path, candidates)?;
+        } else if metadata.is_file()
+            && entry_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+        {
+            candidates.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 64];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn published_installer_iso_filename(organization_slug: &str, sha256: &str) -> String {
+    format!(
+        "cybex-{}-installer-{}.iso",
+        organization_slug,
+        &sha256[..12]
+    )
 }
 
 async fn run_nix_build(
@@ -875,7 +1369,8 @@ fn terminate_child(child: &mut tokio::process::Child) {
 fn normalize_artifact_type(value: &str) -> Result<String> {
     let value = value.trim().to_ascii_lowercase();
     match value.as_str() {
-        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation" => Ok(value),
+        "nixos_closure" | "netboot_artifact" | "desktop_image" | "system_generation"
+        | "installer_iso" => Ok(value),
         _ => bail!("unsupported artifact_type"),
     }
 }
@@ -916,6 +1411,66 @@ fn normalize_revision(value: &str) -> Result<String> {
         bail!("invalid input_revision");
     }
     Ok(value.to_string())
+}
+
+fn normalize_installer_source_git_url(value: &str) -> Result<String> {
+    let value = normalize_installer_http_url("installer_iso.source_git_url", value)?;
+    if value.len() > 2048 {
+        bail!("installer_iso.source_git_url is too long");
+    }
+    Ok(value)
+}
+
+fn normalize_installer_http_url(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        bail!("{field} must be an HTTP URL without whitespace");
+    }
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{field} is not a URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("{field} must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        bail!("{field} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("{field} must not include embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("{field} must not include query parameters or fragments");
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn normalize_installer_source_ref(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.chars().any(char::is_control)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        bail!("installer_iso.source_ref is invalid");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_installer_organization_slug(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 80
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("installer_iso.organization_slug is invalid");
+    }
+    Ok(value)
 }
 
 fn normalize_sha256(value: &str) -> Result<String> {
@@ -1007,6 +1562,31 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_accepts_installer_iso_input() {
+        let value = json!({
+            "schema_version": 1,
+            "artifact_type": "installer_iso",
+            "target": "enrollment_iso",
+            "system": "x86_64-linux",
+            "input_revision": "main",
+            "input_config_hash": "a".repeat(64),
+            "installer_iso": {
+                "kind": "cybex_manage_installer_iso",
+                "source_git_url": "https://github.com/CybexHQ/manage.git",
+                "source_ref": "main",
+                "api_url": "https://manage.cybex.net",
+                "organization_slug": "default",
+                "output": "iso"
+            }
+        });
+        let parsed = serde_json::from_value::<BuildSpec>(value).unwrap();
+        assert_eq!(
+            parsed.installer_iso.unwrap().kind,
+            INSTALLER_ISO_BUILD_INPUT_KIND
+        );
+    }
+
+    #[test]
     fn nix_build_command_uses_allowlisted_attr() {
         let mut config = AppConfig::default();
         config.build.output_dir = PathBuf::from("/tmp/cybex-forge-test-builds");
@@ -1028,6 +1608,7 @@ mod tests {
             desktop_experience_revision_id: None,
             desktop_experience_revision_config_hash: None,
             build_input: None,
+            installer_iso: None,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
@@ -1076,6 +1657,7 @@ mod tests {
                 desktop_experience_name: Some("Standard Workstation".to_string()),
                 desktop_experience_revision: Some(8),
             }),
+            installer_iso: None,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
