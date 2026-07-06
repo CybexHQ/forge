@@ -1976,6 +1976,7 @@ check_systemd_contains cybex-forge ExecStart "cybex-forge --config /etc/cybex-fo
 check_systemd_contains cybex-forge ExecStartPre "cybex-forge --config /etc/cybex-forge/config.toml migrate"
 check_systemd_contains cybex-forge SupplementaryGroups nix-users
 check_systemd_value cybex-forge WorkingDirectory /var/lib/cybex-forge
+check_systemd_contains cybex-forge Environment "NIX_PATH=nixpkgs=flake:nixpkgs"
 check_systemd_contains cybex-forge Environment "RUST_LOG=cybex_forge=info,tower_http=warn"
 check_systemd_value nginx LockPersonality yes
 check_systemd_value nginx NoNewPrivileges yes
