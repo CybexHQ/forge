@@ -106,6 +106,48 @@ pub async fn status_report(config: &AppConfig, pool: &SqlitePool) -> CacheStatus
     }
 }
 
+/// Contents written to a fresh cache root. Installers add this cache alongside
+/// cache.nixos.org (Priority 40); the lower value prefers the LAN cache when
+/// both carry a path.
+const NIX_CACHE_INFO_CONTENTS: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
+
+/// Make the served cache root a valid Nix binary cache before the first build
+/// export. `nix copy` only writes `nix-cache-info` as a side effect of an
+/// export, so until then installers that were handed this cache as a
+/// substituter see "does not appear to be a binary cache" and silently skip
+/// substitution. Also pre-generates the signing key pair so the cache reports
+/// ready from first boot. Existing files are never modified.
+pub async fn initialize(config: &AppConfig) -> Result<()> {
+    if !config.cache.enabled {
+        return Ok(());
+    }
+    let cache_dir = config.cache.root_dir.clone();
+    task::spawn_blocking(move || initialize_cache_root_blocking(&cache_dir))
+        .await
+        .context("join cache init task")??;
+    ensure_signing_key(config).await?;
+    Ok(())
+}
+
+fn initialize_cache_root_blocking(cache_dir: &Path) -> Result<()> {
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
+    let path = cache_dir.join("nix-cache-info");
+    if path.exists() {
+        // Present means either a previous init or a real `nix copy` wrote it;
+        // validate but never clobber metadata nix itself maintains.
+        read_nix_cache_info(cache_dir)?;
+        return Ok(());
+    }
+    parse_nix_cache_info(NIX_CACHE_INFO_CONTENTS)
+        .context("validate built-in nix-cache-info template")?;
+    let staged = cache_dir.join(".nix-cache-info.tmp");
+    fs::write(&staged, NIX_CACHE_INFO_CONTENTS)
+        .with_context(|| format!("write {}", staged.display()))?;
+    fs::rename(&staged, &path).with_context(|| format!("publish {}", path.display()))?;
+    Ok(())
+}
+
 pub async fn export_output(
     config: &AppConfig,
     job: &BuildJob,
@@ -747,6 +789,49 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn initialize_cache_root_writes_valid_nix_cache_info() {
+        let root = test_temp_dir("init-fresh");
+        let cache_dir = root.join("cache");
+
+        initialize_cache_root_blocking(&cache_dir).unwrap();
+
+        let parsed = read_nix_cache_info(&cache_dir).unwrap();
+        assert_eq!(parsed.store_dir, "/nix/store");
+        assert!(parsed.want_mass_query);
+        assert_eq!(parsed.priority, Some(30));
+        assert!(!cache_dir.join(".nix-cache-info.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_cache_root_preserves_existing_nix_cache_info() {
+        let root = test_temp_dir("init-existing");
+        let existing = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 50\n";
+        fs::write(root.join("nix-cache-info"), existing).unwrap();
+
+        initialize_cache_root_blocking(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("nix-cache-info")).unwrap(),
+            existing
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_cache_root_rejects_corrupt_existing_nix_cache_info() {
+        let root = test_temp_dir("init-corrupt");
+        fs::write(root.join("nix-cache-info"), "StoreDir: /tmp/store\n").unwrap();
+
+        let err = initialize_cache_root_blocking(&root).unwrap_err();
+        assert!(err.to_string().contains("/nix/store"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

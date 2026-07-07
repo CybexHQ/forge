@@ -128,6 +128,11 @@ async fn run_server(
         .parse()
         .with_context(|| format!("invalid listen address {}", config.server.listen_addr))?;
     let state = AppState::new(config, pool);
+    if let Err(err) = cybex_forge::cache::initialize(&state.config).await {
+        // Degraded, not fatal: exports re-run key setup and `nix copy`
+        // rewrites nix-cache-info, so the cache can still heal later.
+        warn!(error = %err, "Forge Cache initialization failed; substituters will reject this cache until resolved");
+    }
     cybex_forge::build::spawn(state.clone());
     if state.config.manage.enabled {
         cybex_forge::manage::spawn(state.clone());
