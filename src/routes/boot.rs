@@ -185,8 +185,7 @@ async fn build_boot_script(
                 boot_logic::SelectionSource::OneTime => {
                     db::consume_one_time_profile(&state.db, device.id, profile.id).await?;
                 }
-                boot_logic::SelectionSource::Assigned
-                | boot_logic::SelectionSource::GlobalDefault => {
+                boot_logic::SelectionSource::Assigned => {
                     db::set_device_last_selected(&state.db, device.id, profile.id).await?;
                 }
                 boot_logic::SelectionSource::Menu => {}

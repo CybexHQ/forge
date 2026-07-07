@@ -422,8 +422,8 @@ pub(crate) fn normalize_absolute_config_path(field: &str, path: &Path) -> anyhow
 }
 
 pub(crate) fn validate_menu_timeout_ms(value: u32) -> anyhow::Result<()> {
-    if !(1_000..=600_000).contains(&value) {
-        bail!("boot.menu_timeout_ms must be between 1000 and 600000");
+    if value != 0 && !(1_000..=600_000).contains(&value) {
+        bail!("boot.menu_timeout_ms must be 0 or between 1000 and 600000");
     }
     Ok(())
 }
@@ -631,7 +631,7 @@ impl Default for BootConfig {
     fn default() -> Self {
         Self {
             bootloader_filename: "snponly.efi".to_string(),
-            menu_timeout_ms: 8000,
+            menu_timeout_ms: 0,
         }
     }
 }
@@ -1025,7 +1025,7 @@ state_path = "/var/lib/cybex-forge/../manage-state.json"
 public_base_url = "http://boot.example"
 
 [boot]
-menu_timeout_ms = 0
+menu_timeout_ms = 42
 "#,
         );
 

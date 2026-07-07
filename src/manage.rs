@@ -3420,11 +3420,7 @@ fn normalize_managed_settings(
     } else {
         normalize_bootloader_filename(&settings.bootloader_filename)?
     };
-    let menu_timeout_ms = if settings.menu_timeout_ms == 0 {
-        config.boot.menu_timeout_ms
-    } else {
-        settings.menu_timeout_ms
-    };
+    let menu_timeout_ms = settings.menu_timeout_ms;
     validate_menu_timeout_ms(menu_timeout_ms)?;
 
     Ok(NormalizedManagedSettings {

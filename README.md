@@ -24,6 +24,12 @@ Manage at [manage.cybex.net](https://manage.cybex.net). Profiles, device
 enrollment, runtime settings, desired Build jobs, artifact metadata, and
 reporting are controlled by Cybex Manage.
 
+Default PXE requests render a non-timed iPXE menu because `menu_timeout_ms`
+defaults to `0`. The first entry boots the local disk, and the server default
+profile, normally `Default Enrollment`, is listed next. Explicit per-client
+one-time or default profile assignments still bypass the menu and boot the
+assigned profile directly.
+
 ## Installation
 
 Installation is currently supported only through the Proxmox installer generated

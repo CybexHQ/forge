@@ -8,7 +8,6 @@ use crate::{
 pub enum SelectionSource {
     OneTime,
     Assigned,
-    GlobalDefault,
     Menu,
 }
 
@@ -53,16 +52,6 @@ pub fn choose_profile<'a>(
         }
     }
 
-    if let Some(profile) = enabled_profiles
-        .iter()
-        .find(|profile| profile.is_default && profile_has_boot_action(profile))
-    {
-        return ProfileSelection {
-            profile: Some(profile),
-            source: SelectionSource::GlobalDefault,
-        };
-    }
-
     ProfileSelection {
         profile: None,
         source: SelectionSource::Menu,
@@ -80,20 +69,19 @@ pub fn render_menu(
     script.push_str("#!ipxe\n");
     append_ipxe_menu_theme(&mut script, public_base_url);
     script.push_str(&format!("set cybex-subtitle {IPXE_MENU_SUBTITLE}\n"));
-    script.push_str(&format!(
-        "set cybex-timeout-copy {IPXE_MENU_TIMEOUT_COPY}\n"
-    ));
-    script.push_str(&format!("set menu-timeout {timeout_ms}\n"));
+    if timeout_ms > 0 {
+        script.push_str(&format!(
+            "set cybex-timeout-copy {IPXE_MENU_TIMEOUT_COPY}\n"
+        ));
+        script.push_str(&format!("set menu-timeout {timeout_ms}\n"));
+    }
     script.push_str("menu\n");
     script.push_str("item --gap ${cybex-subtitle}\n");
     script.push_str("item --gap\n");
     script.push_str("item --key l local Boot local disk\n");
 
-    for profile in profiles.iter().filter(|profile| {
-        profile.enabled
-            && profile.profile_type != BootProfileType::LocalDisk
-            && profile_has_boot_action(profile)
-    }) {
+    let menu_profiles = menu_profiles(profiles);
+    for profile in &menu_profiles {
         script.push_str(&format!(
             "item profile_{} {}\n",
             profile.id,
@@ -102,16 +90,19 @@ pub fn render_menu(
     }
 
     script.push_str("item --gap\n");
-    script.push_str("item --gap ${cybex-timeout-copy}\n");
+    if timeout_ms > 0 {
+        script.push_str("item --gap ${cybex-timeout-copy}\n");
+    }
     script.push_str(&format!("item --gap {IPXE_MENU_FOOTER}\n"));
-    script.push_str("choose --timeout ${menu-timeout} --default local selected || goto local\n");
+    if timeout_ms > 0 {
+        script
+            .push_str("choose --timeout ${menu-timeout} --default local selected || goto local\n");
+    } else {
+        script.push_str("choose --default local selected || goto local\n");
+    }
     script.push_str("goto ${selected}\n\n");
 
-    for profile in profiles.iter().filter(|profile| {
-        profile.enabled
-            && profile.profile_type != BootProfileType::LocalDisk
-            && profile_has_boot_action(profile)
-    }) {
+    for profile in &menu_profiles {
         script.push_str(&format!(":profile_{}\n", profile.id));
         script.push_str(&format!(
             "chain {}/boot/select/{}?mac={}&serial={} || goto failed\n",
@@ -131,6 +122,25 @@ pub fn render_menu(
     script.push_str("goto local\n\n");
     script.push_str(":end\n");
     script
+}
+
+fn menu_profiles(profiles: &[BootProfile]) -> Vec<&BootProfile> {
+    let mut profiles: Vec<_> = profiles
+        .iter()
+        .filter(|profile| {
+            profile.enabled
+                && profile.profile_type != BootProfileType::LocalDisk
+                && profile_has_boot_action(profile)
+        })
+        .collect();
+    profiles.sort_by(|left, right| {
+        right
+            .is_default
+            .cmp(&left.is_default)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    profiles
 }
 
 fn append_ipxe_menu_theme(script: &mut String, public_base_url: &str) {
@@ -406,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn assigned_profile_wins_over_global_default() {
+    fn assigned_profile_auto_selects() {
         let mut local = profile(1, BootProfileType::LocalDisk);
         local.is_default = true;
         let mut installer = profile(2, BootProfileType::LinuxInstaller);
@@ -419,26 +429,53 @@ mod tests {
     }
 
     #[test]
-    fn menu_contains_select_chains_and_local_boot() {
+    fn global_default_profile_gets_menu_instead_of_auto_boot() {
         let mut installer = profile(2, BootProfileType::LinuxInstaller);
+        installer.is_default = true;
         installer.kernel_path = Some("ubuntu/vmlinuz".to_string());
         let profiles = vec![profile(1, BootProfileType::LocalDisk), installer];
+        let device = device(None, None);
+
+        let selection = choose_profile(Some(&device), &profiles);
+
+        assert_eq!(selection.source, SelectionSource::Menu);
+        assert!(selection.profile.is_none());
+    }
+
+    #[test]
+    fn menu_contains_select_chains_and_orders_local_then_default() {
+        let mut installer = profile(2, BootProfileType::LinuxInstaller);
+        installer.name = "Default Enrollment".to_string();
+        installer.is_default = true;
+        installer.kernel_path = Some("ubuntu/vmlinuz".to_string());
+        let mut other = profile(3, BootProfileType::LinuxInstaller);
+        other.name = "Other Installer".to_string();
+        other.kernel_path = Some("other/vmlinuz".to_string());
+        let profiles = vec![profile(1, BootProfileType::LocalDisk), other, installer];
         let script = render_menu(
             "http://boot.local:8080",
             &profiles,
             Some("aa:bb:cc:dd:ee:ff"),
             None,
-            8000,
+            0,
         );
         assert!(script.starts_with("#!ipxe"));
         assert!(script.contains("chain http://boot.local:8080/boot/select/2"));
+        assert!(script.contains("choose --default local selected || goto local"));
+        assert!(!script.contains("choose --timeout"));
+        assert!(!script.contains("menu-timeout"));
         assert!(script.contains("exit 1"));
+        let local_item = script.find("item --key l local Boot local disk").unwrap();
+        let default_item = script.find("item profile_2 Default Enrollment").unwrap();
+        let other_item = script.find("item profile_3 Other Installer").unwrap();
+        assert!(local_item < default_item);
+        assert!(default_item < other_item);
     }
 
     #[test]
     fn menu_includes_cybex_iso_aligned_theme() {
         let profiles = vec![profile(1, BootProfileType::LocalDisk)];
-        let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
+        let script = render_menu("http://boot.local:8080", &profiles, None, None, 0);
 
         assert!(!script.contains("set cybex-title CYBEX"));
         assert!(script.contains("set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI"));
@@ -451,10 +488,25 @@ mod tests {
         assert!(script.contains("cpair --foreground 1 --background 4 2"));
         assert!(script.contains("menu\n"));
         assert!(script.contains("item --gap ${cybex-subtitle}"));
-        assert!(script.contains("item --gap ${cybex-timeout-copy}"));
         assert!(script.contains("item --gap cybex-forge - pxe - x86_64 - uefi"));
+        assert!(script.contains("choose --default local selected || goto local"));
+        assert!(!script.contains("choose --timeout"));
         assert!(!script.contains("iPXE shell"));
         assert!(!script.contains(":shell"));
+    }
+
+    #[test]
+    fn configured_menu_timeout_emits_countdown() {
+        let profiles = vec![profile(1, BootProfileType::LocalDisk)];
+        let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
+
+        assert!(script.contains("set menu-timeout 8000"));
+        assert!(script.contains("item --gap ${cybex-timeout-copy}"));
+        assert!(
+            script.contains(
+                "choose --timeout ${menu-timeout} --default local selected || goto local"
+            )
+        );
     }
 
     #[test]
@@ -474,7 +526,7 @@ mod tests {
             iso_with_file,
         ];
 
-        let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
+        let script = render_menu("http://boot.local:8080", &profiles, None, None, 0);
 
         assert!(!script.contains("profile_2"));
         assert!(script.contains("profile_3"));
@@ -492,8 +544,8 @@ mod tests {
 
         let selection = choose_profile(Some(&device), &profiles);
 
-        assert_eq!(selection.source, SelectionSource::GlobalDefault);
-        assert_eq!(selection.profile.unwrap().id, 1);
+        assert_eq!(selection.source, SelectionSource::Menu);
+        assert!(selection.profile.is_none());
     }
 
     #[test]
@@ -503,7 +555,7 @@ mod tests {
         installer.kernel_path = Some("ubuntu/vmlinuz".to_string());
         let profiles = vec![profile(1, BootProfileType::LocalDisk), installer];
 
-        let script = render_menu("http://boot.local:8080", &profiles, None, None, 8000);
+        let script = render_menu("http://boot.local:8080", &profiles, None, None, 0);
 
         assert!(!script.contains('\x1b'));
         assert!(script.contains("Installer  shell"));

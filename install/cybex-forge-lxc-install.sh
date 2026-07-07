@@ -26,7 +26,7 @@ Options:
   --tftp-root PATH          TFTP root below /srv/cybex-forge (default: /srv/cybex-forge/tftp)
   --http-root PATH          HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME         UEFI iPXE loader filename (default: snponly.efi)
-  --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage (default: 8000)
+  --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage; 0 disables it (default: 0)
   --dry-run, --validate-only
                             Validate inputs/environment without installing or enrolling
   -h, --help                Show this help
@@ -51,7 +51,7 @@ listen_addr="${CYBEX_FORGE_LISTEN_ADDR:-127.0.0.1:8080}"
 tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
 http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
-menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-8000}"
+menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
 dry_run=0
 
 while [ "$#" -gt 0 ]; do
@@ -279,8 +279,8 @@ validate_menu_timeout() {
     echo "--menu-timeout-ms must be numeric" >&2
     exit 2
   fi
-  if [ "$menu_timeout_ms" -lt 1000 ] || [ "$menu_timeout_ms" -gt 600000 ]; then
-    echo "--menu-timeout-ms must be between 1000 and 600000" >&2
+  if [ "$menu_timeout_ms" -ne 0 ] && { [ "$menu_timeout_ms" -lt 1000 ] || [ "$menu_timeout_ms" -gt 600000 ]; }; then
+    echo "--menu-timeout-ms must be 0 or between 1000 and 600000" >&2
     exit 2
   fi
 }
@@ -1428,6 +1428,11 @@ config_string_value() {
   awk -v key="$key" -F '"' '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print $2; exit }' /etc/cybex-forge/config.toml 2>/dev/null
 }
 
+config_number_value() {
+  local key="$1"
+  awk -v key="$key" '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print $3; exit }' /etc/cybex-forge/config.toml 2>/dev/null
+}
+
 config_path_value() {
   local key="$1"
   local fallback="$2"
@@ -1598,8 +1603,11 @@ check_ipxe_menu_response() {
   local body_file="$3"
   local first_line
   local expected
+  local menu_timeout
   local public_base_url
   public_base_url="$(config_string_value public_base_url)"
+  menu_timeout="$(config_number_value menu_timeout_ms)"
+  menu_timeout="${menu_timeout:-0}"
   check_header_once "$label" "$headers_file" "Content-Type" "text/plain"
   check_header_once "$label" "$headers_file" "Cache-Control" "no-store"
   check_header_once "$label" "$headers_file" "Pragma" "no-cache"
@@ -1619,8 +1627,6 @@ check_ipxe_menu_response() {
     "cpair --foreground 1 --background 4 2" \
     'menu' \
     'item --gap ${cybex-subtitle}' \
-    'item --gap ${cybex-timeout-copy}' \
-    'choose --timeout ${menu-timeout} --default local selected || goto local' \
     ":local" \
     "exit 1"; do
     if grep -Fx -- "$expected" "$body_file" >/dev/null; then
@@ -1629,6 +1635,26 @@ check_ipxe_menu_response() {
       fail "$label is missing $expected"
     fi
   done
+  if [ "$menu_timeout" = "0" ]; then
+    if grep -F -- "choose --timeout" "$body_file" >/dev/null; then
+      fail "$label unexpectedly includes a timed menu"
+    elif grep -Fx -- "choose --default local selected || goto local" "$body_file" >/dev/null; then
+      ok "$label uses non-timed menu selection"
+    else
+      fail "$label is missing non-timed menu selection"
+    fi
+  else
+    for expected in \
+      "set menu-timeout ${menu_timeout}" \
+      'item --gap ${cybex-timeout-copy}' \
+      'choose --timeout ${menu-timeout} --default local selected || goto local'; do
+      if grep -Fx -- "$expected" "$body_file" >/dev/null; then
+        ok "$label contains $expected"
+      else
+        fail "$label is missing $expected"
+      fi
+    done
+  fi
   if grep -F "iPXE shell" "$body_file" >/dev/null; then
     fail "$label still exposes iPXE shell"
   else

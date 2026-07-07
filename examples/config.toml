@@ -16,7 +16,7 @@ cookie_name = "cybex_admin"
 
 [boot]
 bootloader_filename = "snponly.efi"
-menu_timeout_ms = 8000
+menu_timeout_ms = 0
 
 [build]
 enabled = true

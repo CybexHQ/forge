@@ -14,7 +14,7 @@ listen_addr="${CYBEX_FORGE_LISTEN_ADDR:-127.0.0.1:8080}"
 tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
 http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
-menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-8000}"
+menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
 
 vmid="${CYBEX_FORGE_PROXMOX_VMID:-}"
 hostname="${CYBEX_FORGE_PROXMOX_HOSTNAME:-cybex-forge}"
@@ -59,7 +59,7 @@ Boot runtime options:
   --tftp-root PATH               TFTP root below /srv/cybex-forge (default: /srv/cybex-forge/tftp)
   --http-root PATH               HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME              UEFI iPXE loader filename (default: snponly.efi)
-  --menu-timeout-ms MS           Boot menu timeout (default: 8000)
+  --menu-timeout-ms MS           Boot menu timeout; 0 disables it (default: 0)
 
 Advanced Proxmox options:
   --vmid ID                      Container VMID (default: next cluster id)
@@ -596,7 +596,9 @@ validate_auth_code
 validate_runtime_roots
 validate_absolute_path "--forge-source-dir" "$forge_source_dir"
 validate_bootloader_filename
-validate_int_range "--menu-timeout-ms" "$menu_timeout_ms" 1000 600000
+if [ "$menu_timeout_ms" != "0" ]; then
+  validate_int_range "--menu-timeout-ms" "$menu_timeout_ms" 1000 600000
+fi
 validate_int_range "--proxmox-disk-gb" "$disk_gb" 8 4096
 validate_int_range "--proxmox-cpu-cores" "$cpu_cores" 1 128
 validate_int_range "--proxmox-memory-mb" "$memory_mb" 1024 1048576
