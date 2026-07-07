@@ -229,6 +229,10 @@ root_dir = "{root}/www/cache"
 private_key_path = "{root}/cache/cache-priv-key.pem"
 public_key_path = "{root}/cache/cache-pub-key.pem"
 
+[update]
+work_dir = "{root}/updates"
+releases_dir = "{root}/releases"
+
 [manage]
 state_path = "{root}/manage-state.json"
 "#,

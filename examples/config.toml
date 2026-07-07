@@ -28,7 +28,7 @@ max_artifact_size_bytes = 17179869184
 allowed_systems = ["x86_64-linux"]
 work_dir = "/var/lib/cybex-forge/build"
 output_dir = "/var/lib/cybex-forge/build-outputs"
-nix_binary = "nix"
+nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 
 # Add one or more allowlisted Nix targets before queueing production jobs.
 # For generated Desktop Experience closure builds, flake is the nixpkgs input
@@ -48,6 +48,20 @@ private_key_path = "/var/lib/cybex-forge/cache/cache-priv-key.pem"
 public_key_path = "/var/lib/cybex-forge/cache/cache-pub-key.pem"
 max_bytes = 68719476736
 retain_recent_builds = 50
+
+[update]
+enabled = true
+work_dir = "/var/lib/cybex-forge/updates"
+releases_dir = "/opt/cybex-forge/releases"
+binary_path = "/usr/local/bin/cybex-forge"
+config_path = "/etc/cybex-forge/config.toml"
+service_name = "cybex-forge.service"
+# Empty means derive the local health probe from server.listen_addr.
+health_url = ""
+max_artifact_size_bytes = 134217728
+# Optional Ed25519 public key. When set, Manage release manifests must include
+# a signature over: version + "\n" + sha256 + "\n" + artifact_url + "\n".
+trusted_public_key = ""
 
 [manage]
 enabled = false

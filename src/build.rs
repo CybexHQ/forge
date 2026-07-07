@@ -588,7 +588,15 @@ fn forge_nixos_configuration() -> &'static str {
 
   boot.loader.grub.enable = lib.mkDefault false;
   boot.loader.systemd-boot.enable = lib.mkDefault false;
+  boot.initrd.enable = lib.mkForce false;
   boot.initrd.systemd.enable = lib.mkDefault false;
+  boot.initrd.includeDefaultModules = false;
+  boot.initrd.availableKernelModules = lib.mkForce [];
+  boot.initrd.kernelModules = lib.mkForce [];
+  boot.kernelModules = lib.mkForce [];
+  boot.extraModulePackages = lib.mkForce [];
+  security.lockKernelModules = lib.mkForce false;
+  systemd.services.systemd-udevd.restartTriggers = lib.mkForce [];
 }
 "#
 }
@@ -601,6 +609,12 @@ fn desktop_experience_compat_module() -> &'static str {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
     description = "Cybex Desktop Experience metadata accepted while Forge prebuilds a generic NixOS closure.";
+  };
+
+  options.services.cybex-agent = lib.mkOption {
+    type = lib.types.attrsOf lib.types.anything;
+    default = {};
+    description = "Cybex Agent policy accepted while Forge prebuilds a generic NixOS closure.";
   };
 }
 "#
@@ -1093,6 +1107,17 @@ mod tests {
             root.join("work/job-42-input/desktop-experience.nix")
                 .is_file()
         );
+        let configuration =
+            std::fs::read_to_string(root.join("work/job-42-input/configuration.nix")).unwrap();
+        assert!(
+            configuration
+                .contains("systemd.services.systemd-udevd.restartTriggers = lib.mkForce [];")
+        );
+        assert!(configuration.contains("boot.initrd.enable = lib.mkForce false;"));
+        assert!(configuration.contains("boot.initrd.includeDefaultModules = false;"));
+        assert!(configuration.contains("boot.initrd.availableKernelModules = lib.mkForce [];"));
+        assert!(configuration.contains("boot.kernelModules = lib.mkForce [];"));
+        assert!(configuration.contains("security.lockKernelModules = lib.mkForce false;"));
         let flake = std::fs::read_to_string(root.join("work/job-42-input/flake.nix")).unwrap();
         assert!(flake.contains(r#"inputs.nixpkgs.url = "/srv/cybex-forge/build-inputs/cybex";"#));
         assert!(!flake.contains("nixos-26.05"));

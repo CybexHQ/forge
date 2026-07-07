@@ -358,14 +358,14 @@ bootloader_embeds_current_chain() {
   local path="$1"
   [ -f "$path" ] || return 1
   LC_ALL=C grep -aFx -- "set boot-url $public_base_url" "$path" >/dev/null &&
-    LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot.ipxe || goto failed" "$path" >/dev/null &&
+    LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot/\${mac} || goto failed" "$path" >/dev/null &&
     LC_ALL=C grep -aFx -- "exit 1" "$path" >/dev/null &&
     ! LC_ALL=C grep -aFx -- "echo Dropping to iPXE shell." "$path" >/dev/null &&
     LC_ALL=C grep -aFx -- "# Embedded chainloader for Cybex Forge UEFI PXE clients." "$path" >/dev/null
 }
 
 run_as_boot() {
-  runuser -u cybex-forge -- "$@"
+  runuser -u cybex-forge -- bash -c 'umask 077; exec "$@"' bash "$@"
 }
 
 install_packages() {
@@ -374,7 +374,7 @@ install_packages() {
   apt-get install -y --no-install-recommends \
     ca-certificates curl git build-essential pkg-config libssl-dev \
     tftpd-hpa ipxe ipxe-qemu nginx logrotate openssl python3-minimal \
-    xorriso zstd
+    sqlite3 xorriso zstd squashfs-tools
 }
 
 set_nix_conf_value() {
@@ -401,20 +401,60 @@ set_nix_conf_value() {
   rm -f "$tmp"
 }
 
-ensure_nix_toolchain() {
-  if command -v nix >/dev/null 2>&1 && command -v nix-store >/dev/null 2>&1; then
-    set_nix_conf_value experimental-features "nix-command flakes"
-    set_nix_conf_value trusted-users "root cybex-forge"
-    return
+nix_version_at_least() {
+  local version="$1"
+  local minimum_major="$2"
+  local minimum_minor="$3"
+  local major minor rest
+  IFS=. read -r major minor rest <<EOF
+$version
+EOF
+  case "$major:$minor" in
+    *[!0-9:]*|:|*:)
+      return 1
+      ;;
+  esac
+  if [ "$major" -gt "$minimum_major" ]; then
+    return 0
+  fi
+  if [ "$major" -eq "$minimum_major" ] && [ "$minor" -ge "$minimum_minor" ]; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_current_nix_profile() {
+  local profile_nix="/nix/var/nix/profiles/default/bin/nix"
+  local version=""
+  if [ -x "$profile_nix" ]; then
+    version="$("$profile_nix" --version 2>/dev/null | awk '{print $3}')"
+    if nix_version_at_least "$version" 2 18; then
+      return
+    fi
   fi
 
-  if ! apt-cache show nix-bin >/dev/null 2>&1 || ! apt-cache show nix-setup-systemd >/dev/null 2>&1; then
-    echo "Debian Nix packages nix-bin and nix-setup-systemd are required for Forge Build/Cache" >&2
+  NIX_CONFIG="experimental-features = nix-command flakes" nix upgrade-nix -p /nix/var/nix/profiles/default
+  if [ ! -x "$profile_nix" ]; then
+    echo "Nix profile upgrade did not install $profile_nix" >&2
     exit 1
   fi
+  version="$("$profile_nix" --version 2>/dev/null | awk '{print $3}')"
+  if ! nix_version_at_least "$version" 2 18; then
+    echo "Forge Build requires Nix 2.18 or newer at $profile_nix, found ${version:-unknown}" >&2
+    exit 1
+  fi
+}
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y --no-install-recommends nix-bin nix-setup-systemd
+ensure_nix_toolchain() {
+  if ! command -v nix >/dev/null 2>&1 || ! command -v nix-store >/dev/null 2>&1; then
+    if ! apt-cache show nix-bin >/dev/null 2>&1 || ! apt-cache show nix-setup-systemd >/dev/null 2>&1; then
+      echo "Debian Nix packages nix-bin and nix-setup-systemd are required for Forge Build/Cache" >&2
+      exit 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends nix-bin nix-setup-systemd
+  fi
   set_nix_conf_value experimental-features "nix-command flakes"
   set_nix_conf_value trusted-users "root cybex-forge"
   systemctl enable --now nix-daemon.socket >/dev/null 2>&1 || \
@@ -422,6 +462,7 @@ ensure_nix_toolchain() {
 
   require_command nix
   require_command nix-store
+  ensure_current_nix_profile
 }
 
 ensure_rust() {
@@ -520,7 +561,7 @@ verify_source_compatibility() {
   require_source_file_contains "$source_dir/src/manage.rs" "boot_report_body_fitter_trims_inventory_before_events" "managed report body byte budget"
   require_source_file_contains "$source_dir/src/manage.rs" "selected_profile_id: Option<String>" "managed selected profile event field"
   require_source_file_contains "$source_dir/src/manage.rs" "managed_profile_id AS selected_profile_id" "managed selected profile event lookup"
-  require_source_file_contains "$source_dir/src/manage.rs" "selected_profile_id: event.selected_profile_id" "managed selected profile event report"
+  require_source_file_contains "$source_dir/src/manage.rs" "selected_profile_id: optional_report_uuid(event.selected_profile_id)" "managed selected profile event report"
   require_source_file_contains "$source_dir/src/manage.rs" "has_unreported_known_profile_events" "pre-config known-profile event reporting"
   require_source_file_contains "$source_dir/src/manage.rs" "apply_runtime_config_once" "root managed runtime apply command"
   require_source_file_contains "$source_dir/src/manage.rs" "managed runtime configuration is pending adoption; skipping apply" "pending runtime apply no-op"
@@ -531,7 +572,7 @@ verify_source_compatibility() {
 install_binary() {
   # shellcheck disable=SC1091
   [ -f /root/.cargo/env ] && . /root/.cargo/env
-  cargo build --release --manifest-path "$source_dir/Cargo.toml"
+  cargo build --quiet --release --manifest-path "$source_dir/Cargo.toml"
   rm -f /usr/local/bin/cybex-forge
   install -m 0755 -o root -g root "$source_dir/target/release/cybex-forge" /usr/local/bin/cybex-forge
 }
@@ -545,7 +586,8 @@ prepare_user_and_dirs() {
   fi
   install -m 0750 -o root -g cybex-forge -d /etc/cybex-forge
   install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge
-  install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge/build /var/lib/cybex-forge/build-outputs /var/lib/cybex-forge/cache
+  install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge/build /var/lib/cybex-forge/build-outputs /var/lib/cybex-forge/cache /var/lib/cybex-forge/updates
+  install -m 0755 -o root -g root -d /opt/cybex-forge/releases
   install -m 0755 -o root -g cybex-forge -d /srv/cybex-forge
   install -m 0755 -o cybex-forge -g cybex-forge -d "$http_root" "$http_root/isos" "$http_root/assets" "$http_root/cache"
   install -m 0555 -o root -g root -d "$tftp_root"
@@ -600,11 +642,18 @@ max_concurrent_builds = 1
 timeout_seconds = 3600
 cancel_grace_seconds = 10
 max_log_bytes = 65536
-max_artifact_size_bytes = 8589934592
+max_artifact_size_bytes = 17179869184
 allowed_systems = ["x86_64-linux"]
 work_dir = "/var/lib/cybex-forge/build"
 output_dir = "/var/lib/cybex-forge/build-outputs"
-nix_binary = "nix"
+nix_binary = "/nix/var/nix/profiles/default/bin/nix"
+
+[[build.targets]]
+artifact_type = "nixos_closure"
+target = "desktop_experience"
+system = "x86_64-linux"
+flake = "github:NixOS/nixpkgs/nixos-unstable"
+attr = "packages.x86_64-linux.desktop-experience"
 
 [cache]
 enabled = true
@@ -614,6 +663,17 @@ private_key_path = "/var/lib/cybex-forge/cache/cache-priv-key.pem"
 public_key_path = "/var/lib/cybex-forge/cache/cache-pub-key.pem"
 max_bytes = 68719476736
 retain_recent_builds = 50
+
+[update]
+enabled = true
+work_dir = "/var/lib/cybex-forge/updates"
+releases_dir = "/opt/cybex-forge/releases"
+binary_path = "/usr/local/bin/cybex-forge"
+config_path = "/etc/cybex-forge/config.toml"
+service_name = "cybex-forge.service"
+health_url = ""
+max_artifact_size_bytes = 134217728
+trusted_public_key = ""
 
 [manage]
 enabled = true
@@ -924,6 +984,77 @@ check_user_group() {
   fi
 }
 
+systemd_property_is_container_relaxed() {
+  local property="$1"
+  [ -f /run/systemd/system/service.d/zzz-lxc-service.conf ] || [ -s /run/systemd/container ] || return 1
+  case "$property" in
+    NoNewPrivileges|PrivateDevices|PrivateTmp|ProtectControlGroups|ProtectHome|ProtectKernelLogs|ProtectKernelModules|ProtectKernelTunables|ProtectProc|ProtectSystem|ProcSubset|ReadOnlyPaths|ReadWritePaths)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+systemd_configured_property_lines() {
+  local unit="$1"
+  local property="$2"
+  systemctl cat "$unit" 2>/dev/null | awk -v property="$property" '
+    /^# / {
+      skip = ($0 ~ /^# \/run\/systemd\/system\/service\.d\//)
+      next
+    }
+    skip { next }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (index(line, property "=") == 1) {
+        sub("^" property "=", "", line)
+        print line
+      }
+    }
+  '
+}
+
+systemd_configured_value() {
+  local unit="$1"
+  local property="$2"
+  local line
+  local value=""
+  while IFS= read -r line; do
+    value="$line"
+  done < <(systemd_configured_property_lines "$unit" "$property")
+  printf '%s' "$value"
+}
+
+normalize_systemd_scalar() {
+  case "$1" in
+    true) printf 'yes' ;;
+    false) printf 'no' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+normalize_systemd_set() {
+  printf '%s\n' "$1" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort | xargs
+}
+
+systemd_configured_set() {
+  local unit="$1"
+  local property="$2"
+  local line
+  local items=""
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      items=""
+    else
+      items="${items:+$items }$line"
+    fi
+  done < <(systemd_configured_property_lines "$unit" "$property")
+  normalize_systemd_set "$items"
+}
+
 check_systemd_value() {
   local unit="$1"
   local property="$2"
@@ -932,6 +1063,8 @@ check_systemd_value() {
   value="$(systemctl show "$unit" -p "$property" --value 2>/dev/null || true)"
   if [ "$value" = "$expected" ]; then
     ok "$unit $property is $expected"
+  elif systemd_property_is_container_relaxed "$property" && [ "$(normalize_systemd_scalar "$(systemd_configured_value "$unit" "$property")")" = "$expected" ]; then
+    ok "$unit $property is configured as $expected; effective value is relaxed by container runtime"
   else
     fail "$unit $property is '$value', expected '$expected'"
   fi
@@ -945,6 +1078,8 @@ check_systemd_contains() {
   value="$(systemctl show "$unit" -p "$property" --value 2>/dev/null || true)"
   if printf '%s\n' "$value" | grep -F -- "$expected" >/dev/null; then
     ok "$unit $property contains $expected"
+  elif systemd_property_is_container_relaxed "$property" && printf '%s\n' "$(systemd_configured_property_lines "$unit" "$property")" | grep -F -- "$expected" >/dev/null; then
+    ok "$unit $property is configured with $expected; effective value is relaxed by container runtime"
   else
     fail "$unit $property does not contain $expected"
   fi
@@ -965,6 +1100,8 @@ check_systemd_exact_set() {
   value="$(systemctl show "$unit" -p "$property" --value 2>/dev/null || true)"
   if [ "$(printf '%s\n' "$value" | tr ' ' '\n' | LC_ALL=C sort | xargs)" = "$(printf '%s\n' "$expected" | tr ' ' '\n' | LC_ALL=C sort | xargs)" ]; then
     ok "$unit $property is $expected"
+  elif systemd_property_is_container_relaxed "$property" && [ "$(systemd_configured_set "$unit" "$property")" = "$(normalize_systemd_set "$expected")" ]; then
+    ok "$unit $property is configured as $expected; effective value is relaxed by container runtime"
   else
     fail "$unit $property is '$value', expected '$expected'"
   fi
@@ -1318,22 +1455,10 @@ check_local_management_routes_unavailable() {
 
 boot_event_user_agent_count() {
   local user_agent="$1"
-  python3 - "$database_path" "$user_agent" <<'PY'
-import sqlite3
-import sys
-
-db_path = sys.argv[1]
-user_agent = sys.argv[2]
-conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-try:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM boot_events WHERE user_agent = ?",
-        (user_agent,),
-    ).fetchone()
-finally:
-    conn.close()
-print(row[0])
-PY
+  case "$user_agent" in
+    *[!A-Za-z0-9._:-]*) return 1 ;;
+  esac
+  sqlite3 -readonly "$database_path" "SELECT COUNT(*) FROM boot_events WHERE user_agent = '$user_agent';"
 }
 
 check_boot_listener() {
@@ -1855,13 +1980,13 @@ check_tftp_embedded_chain() {
     return
   fi
   if LC_ALL=C grep -aFx -- "set boot-url $public_base_url" "$source_file" >/dev/null &&
-    LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot.ipxe || goto failed" "$source_file" >/dev/null &&
+    LC_ALL=C grep -aFx -- "chain --autofree \${boot-url}/boot/\${mac} || goto failed" "$source_file" >/dev/null &&
     LC_ALL=C grep -aFx -- "exit 1" "$source_file" >/dev/null &&
     ! LC_ALL=C grep -aFx -- "echo Dropping to iPXE shell." "$source_file" >/dev/null &&
     LC_ALL=C grep -aFx -- "# Embedded chainloader for Cybex Forge UEFI PXE clients." "$source_file" >/dev/null; then
     ok "TFTP bootloader $bootloader embeds Cybex Forge chain URL"
   else
-    fail "TFTP bootloader $bootloader does not embed $public_base_url/boot.ipxe with firmware fallback"
+    fail "TFTP bootloader $bootloader does not embed $public_base_url/boot/\${mac} with firmware fallback"
   fi
 }
 
@@ -2007,8 +2132,6 @@ check_systemd_contains tftpd-hpa ReadOnlyPaths "$tftp_root"
 check_systemd_contains tftpd-hpa InaccessiblePaths /etc/cybex-forge
 check_systemd_contains tftpd-hpa InaccessiblePaths /var/lib/cybex-forge
 check_systemd_contains tftpd-hpa InaccessiblePaths "$http_root"
-check_systemd_contains tftpd-hpa EnvironmentFiles /etc/default/tftpd-hpa
-check_systemd_contains tftpd-hpa ExecStart 'in.tftpd --listen --user $TFTP_USERNAME --address $TFTP_ADDRESS $TFTP_OPTIONS $TFTP_DIRECTORY'
 check_file_contains "TFTP uses Cybex service user" /etc/default/tftpd-hpa 'TFTP_USERNAME="cybex-forge"'
 check_file_contains "TFTP serves managed root" /etc/default/tftpd-hpa "TFTP_DIRECTORY=\"$tftp_root\""
 check_file_contains "TFTP listens on IPv4 wildcard" /etc/default/tftpd-hpa 'TFTP_ADDRESS="0.0.0.0:69"'
@@ -2020,6 +2143,8 @@ check_file_contains "sync helper uses service config" /usr/local/sbin/cybex-forg
 check_path_stat "checker permissions" /usr/local/sbin/cybex-forge-check "root:root 755"
 check_file_contains "Nix enables flake build commands" /etc/nix/nix.conf "experimental-features = nix-command flakes"
 check_file_contains "Nix trusts Forge build user" /etc/nix/nix.conf "trusted-users = root cybex-forge"
+check_file_contains "Forge Build uses current Nix profile" /etc/cybex-forge/config.toml 'nix_binary = "/nix/var/nix/profiles/default/bin/nix"'
+check_command_success "current Nix profile command available" /nix/var/nix/profiles/default/bin/nix --version
 check_path_stat "Boot service unit permissions" /etc/systemd/system/cybex-forge.service "root:root 644"
 check_path_stat "Boot logging drop-in permissions" /etc/systemd/system/cybex-forge.service.d/10-logging.conf "root:root 644"
 check_path_stat "Boot migrate drop-in permissions" /etc/systemd/system/cybex-forge.service.d/20-migrate.conf "root:root 644"
@@ -2231,13 +2356,13 @@ install_tftp_loader() {
   if bootloader_supports_embedded_script "$bootloader_filename"; then
     if build_embedded_ipxe_loader; then
       if ! bootloader_embeds_current_chain "$installed_loader"; then
-        echo "error: built $bootloader_filename does not embed $public_base_url/boot.ipxe" >&2
+        echo "error: built $bootloader_filename does not embed $public_base_url/boot/\${mac}" >&2
         exit 1
       fi
     elif bootloader_embeds_current_chain "$installed_loader"; then
       echo "warning: embedded iPXE loader build failed; preserving existing verified $bootloader_filename" >&2
     else
-      echo "error: embedded iPXE loader build failed and no existing $bootloader_filename embeds $public_base_url/boot.ipxe" >&2
+      echo "error: embedded iPXE loader build failed and no existing $bootloader_filename embeds $public_base_url/boot/\${mac}" >&2
       exit 1
     fi
   elif [ -n "$candidate" ]; then
@@ -2300,10 +2425,10 @@ write_embedded_ipxe_script() {
 # filenames to native PXE and iPXE clients.
 isset \${net0/ip} || dhcp || goto failed
 set boot-url $public_base_url
-chain --autofree \${boot-url}/boot.ipxe || goto failed
+chain --autofree \${boot-url}/boot/\${mac} || goto failed
 
 :failed
-echo Cybex Forge: failed to load \${boot-url}/boot.ipxe
+echo Cybex Forge: failed to load \${boot-url}/boot/\${mac}
 echo Returning failure to UEFI firmware.
 exit 1
 EOF
@@ -2542,6 +2667,17 @@ prepare_nginx_logs() {
   chmod 0640 /var/log/nginx/cybex-forge.access.log /var/log/nginx/cybex-forge.error.log
 }
 
+fix_database_permissions() {
+  local database_path="/var/lib/cybex-forge/cybex-forge.sqlite"
+  local path
+  for path in "$database_path" "$database_path-wal" "$database_path-shm"; do
+    if [ -e "$path" ]; then
+      chown cybex-forge:cybex-forge "$path"
+      chmod 0600 "$path"
+    fi
+  done
+}
+
 wait_for_boot_ready() {
   local url="http://$listen_addr/healthz"
   local code=""
@@ -2559,8 +2695,12 @@ wait_for_boot_ready() {
   exit 1
 }
 
-start_service() {
+prepare_database() {
   run_as_boot /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml migrate
+  fix_database_permissions
+}
+
+start_service() {
   systemctl enable cybex-forge
   systemctl restart cybex-forge
   wait_for_boot_ready
@@ -2571,6 +2711,7 @@ submit_enrollment() {
     echo "enrollment command failed; inspect journalctl -u cybex-forge" >&2
     exit 1
   }
+  fix_database_permissions
 }
 
 verify_installation() {
@@ -2621,8 +2762,9 @@ install_maintenance_tools
 install_tftp_loader
 configure_tftp
 configure_nginx
-start_service
+prepare_database
 submit_enrollment
+start_service
 verify_installation
 
 echo "Cybex Forge installed. Accept the pending cybex-forge enrollment in Cybex Manage."

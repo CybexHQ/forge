@@ -45,6 +45,9 @@ pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
     fs::create_dir_all(&config.build.output_dir)?;
     set_private_dir_permissions(&config.build.output_dir)?;
     fs::create_dir_all(&config.cache.root_dir)?;
+    fs::create_dir_all(&config.update.work_dir)?;
+    set_private_dir_permissions(&config.update.work_dir)?;
+    fs::create_dir_all(&config.update.releases_dir)?;
     if let Some(parent) = config.cache.private_key_path.parent() {
         fs::create_dir_all(parent)?;
         set_private_dir_permissions(parent)?;
@@ -54,6 +57,15 @@ pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
         set_private_dir_permissions(parent)?;
     }
     Ok(())
+}
+
+pub async fn active_build_job_count(pool: &SqlitePool) -> AppResult<i64> {
+    let count = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM forge_build_jobs WHERE status IN ('queued', 'running')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 pub async fn connect(config: &AppConfig) -> AppResult<SqlitePool> {

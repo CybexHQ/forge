@@ -46,6 +46,7 @@ pub struct AppConfig {
     pub boot: BootConfig,
     pub build: BuildConfig,
     pub cache: CacheConfig,
+    pub update: UpdateConfig,
     pub manage: ManageConfig,
 }
 
@@ -117,6 +118,20 @@ pub struct CacheConfig {
     pub public_key_path: PathBuf,
     pub max_bytes: u64,
     pub retain_recent_builds: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    pub work_dir: PathBuf,
+    pub releases_dir: PathBuf,
+    pub binary_path: PathBuf,
+    pub config_path: PathBuf,
+    pub service_name: String,
+    pub health_url: String,
+    pub max_artifact_size_bytes: u64,
+    pub trusted_public_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -209,6 +224,29 @@ impl AppConfig {
             .max_bytes
             .clamp(16 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
         self.cache.retain_recent_builds = self.cache.retain_recent_builds.clamp(1, 10_000);
+        self.update.work_dir =
+            normalize_absolute_config_path("update.work_dir", &self.update.work_dir)?;
+        self.update.releases_dir =
+            normalize_absolute_config_path("update.releases_dir", &self.update.releases_dir)?;
+        self.update.binary_path =
+            normalize_absolute_config_path("update.binary_path", &self.update.binary_path)?;
+        self.update.config_path =
+            normalize_absolute_config_path("update.config_path", &self.update.config_path)?;
+        self.update.service_name =
+            normalize_systemd_unit_name("update.service_name", &self.update.service_name)?;
+        self.update.health_url = if self.update.health_url.trim().is_empty() {
+            local_health_url_from_listen_addr(&self.server.listen_addr)?
+        } else {
+            normalize_http_url("update.health_url", &self.update.health_url)?
+        };
+        self.update.max_artifact_size_bytes = self
+            .update
+            .max_artifact_size_bytes
+            .clamp(1024 * 1024, 1024 * 1024 * 1024);
+        self.update.trusted_public_key = normalize_optional_public_key_text(
+            "update.trusted_public_key",
+            &self.update.trusted_public_key,
+        )?;
         self.manage.api_url = if self.manage.api_url.trim().is_empty() {
             String::new()
         } else {
@@ -292,6 +330,53 @@ pub(crate) fn normalize_http_url(field: &str, value: &str) -> anyhow::Result<Str
         bail!("{field} must not include fragments");
     }
     Ok(url)
+}
+
+fn local_health_url_from_listen_addr(listen_addr: &str) -> anyhow::Result<String> {
+    let parsed: SocketAddr = listen_addr.parse().with_context(
+        || "server.listen_addr must be an IP socket address such as 127.0.0.1:8080",
+    )?;
+    let host = if parsed.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else if parsed.ip().is_ipv6() {
+        format!("[{}]", parsed.ip())
+    } else {
+        parsed.ip().to_string()
+    };
+    Ok(format!("http://{host}:{}/healthz", parsed.port()))
+}
+
+fn normalize_systemd_unit_name(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if value.len() > 160
+        || value.starts_with(['.', '-'])
+        || value.contains('/')
+        || value.contains('\\')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+    {
+        bail!("{field} must be a safe systemd unit name");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_optional_public_key_text(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > 2048
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        bail!("{field} is invalid");
+    }
+    Ok(value.to_string())
 }
 
 pub(crate) fn normalize_bootloader_filename(value: &str) -> anyhow::Result<String> {
@@ -579,6 +664,22 @@ impl Default for CacheConfig {
             public_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-pub-key.pem"),
             max_bytes: 64 * 1024 * 1024 * 1024,
             retain_recent_builds: 50,
+        }
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            work_dir: PathBuf::from("/var/lib/cybex-forge/updates"),
+            releases_dir: PathBuf::from("/opt/cybex-forge/releases"),
+            binary_path: PathBuf::from("/usr/local/bin/cybex-forge"),
+            config_path: PathBuf::from("/etc/cybex-forge/config.toml"),
+            service_name: "cybex-forge.service".to_string(),
+            health_url: String::new(),
+            max_artifact_size_bytes: 128 * 1024 * 1024,
+            trusted_public_key: String::new(),
         }
     }
 }

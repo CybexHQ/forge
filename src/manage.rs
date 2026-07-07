@@ -40,11 +40,13 @@ use crate::{
     },
     db,
     models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
+    updater::{ForgeUpdateStatusReport, ManagedUpdateRequest},
 };
 
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
+const CAPABILITY_UPDATER_V1: &str = "updater_v1";
 const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
 const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
@@ -123,6 +125,8 @@ struct AgentForgeConfigResponse {
     build_jobs_complete: bool,
     #[serde(default)]
     deleted_cache_artifacts: Vec<ManagedDeletedCacheArtifact>,
+    #[serde(default)]
+    update: Option<ManagedUpdateRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +288,7 @@ struct BootAgentProfileSyncReport {
 struct ForgeAgentReportRequest {
     capabilities: Vec<&'static str>,
     cache: crate::cache::CacheStatusReport,
+    update: Option<ForgeUpdateStatusReport>,
     build_jobs: Vec<ForgeBuildJobReport>,
     cache_artifacts: Vec<ForgeCacheArtifactReport>,
 }
@@ -490,6 +495,7 @@ pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
     let desired = fetch_boot_config_for_config(config, &managed).await?;
     let settings = normalize_managed_settings(&desired.settings, config)?;
     apply_runtime_settings_to_host(config, &settings)?;
+    crate::updater::apply_requested_update(config).await?;
     info!("managed runtime configuration applied");
     Ok(())
 }
@@ -757,6 +763,7 @@ async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Resu
         .map(|artifact| (artifact.artifact_type, artifact.hash))
         .collect::<Vec<_>>();
     crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await?;
+    crate::updater::store_update_request(&state.config, desired.update).await?;
 
     report_forge_state(state, managed).await
 }
@@ -779,9 +786,11 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
     let build_jobs = db::list_build_jobs(&state.db).await?;
     let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
     let cache = crate::cache::status_report(&state.config, &state.db).await;
+    let update = crate::updater::status_report(&state.config).await?;
     let body = ForgeAgentReportRequest {
-        capabilities: forge_capabilities(),
+        capabilities: forge_capabilities(&state.config),
         cache,
+        update,
         build_jobs: build_jobs
             .into_iter()
             .take(MAX_REPORT_BUILD_JOBS)
@@ -1051,7 +1060,10 @@ async fn set_profile_iso_boot_script(
     Ok(())
 }
 
-const NIXOS_NETBOOT_INITRD_FORMAT: &str = "zstd-combined-newc-v7";
+const NIXOS_NETBOOT_INITRD_FORMAT: &str = "zstd-combined-newc-v13";
+const NIXOS_NETBOOT_INJECTED_CONFIG_ISO_PATH: &str = "/cybex-installer/config.toml";
+const NIXOS_NETBOOT_INJECTED_CONFIG_STORE_BASENAME: &str =
+    "00000000000000000000000000000000-cybex-forge-netboot-config.toml";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct NixosNetbootManifest {
@@ -1229,14 +1241,26 @@ fn prepare_nixos_netboot_staging(
     let kernel_path = staging_dir.join("bzImage");
     let initrd_path = staging_dir.join("initrd");
     let squashfs_path = staging_dir.join("nix-store.squashfs");
+    let injected_config_path = staging_dir.join("cybex-installer-config.toml");
     extract_iso_file(iso_path, &boot_config.kernel_iso_path, &kernel_path)?;
     extract_iso_file(iso_path, &boot_config.initrd_iso_path, &initrd_path)?;
     extract_iso_file(iso_path, "/nix-store.squashfs", &squashfs_path)?;
+    let injected_config = if try_extract_iso_file(
+        iso_path,
+        NIXOS_NETBOOT_INJECTED_CONFIG_ISO_PATH,
+        &injected_config_path,
+    )? {
+        Some(injected_config_path.as_path())
+    } else {
+        None
+    };
 
     let initrd_fstab_path = find_initrd_fstab_path(&initrd_path)?;
+    patch_nixos_netboot_squashfs(&squashfs_path, injected_config)?;
     rebuild_zstd_initrd_with_netboot_files(&initrd_path, &squashfs_path, &initrd_fstab_path)?;
     fs::remove_file(&squashfs_path)
         .with_context(|| format!("remove temporary {}", squashfs_path.display()))?;
+    let _ = fs::remove_file(&injected_config_path);
 
     ensure_nonempty_file(&kernel_path)?;
     ensure_nonempty_file(&initrd_path)?;
@@ -1391,6 +1415,324 @@ fn extract_iso_file(iso_path: &Path, source_path: &str, destination: &Path) -> R
         .output()
         .with_context(|| "run xorriso to extract managed ISO boot artifact")?;
     ensure_command_success(output, "xorriso extract managed ISO boot artifact")
+}
+
+fn try_extract_iso_file(iso_path: &Path, source_path: &str, destination: &Path) -> Result<bool> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let output = StdCommand::new("xorriso")
+        .arg("-osirrox")
+        .arg("on")
+        .arg("-indev")
+        .arg(iso_path)
+        .arg("-extract")
+        .arg(source_path)
+        .arg(destination)
+        .output()
+        .with_context(|| "run xorriso to extract optional managed ISO artifact")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Cannot determine attributes")
+        && stderr.contains(source_path)
+        && stderr.contains("No such file or directory")
+    {
+        let _ = fs::remove_file(destination);
+        return Ok(false);
+    }
+    ensure_command_success(output, "xorriso extract optional managed ISO artifact")?;
+    Ok(true)
+}
+
+fn patch_nixos_netboot_squashfs(
+    squashfs_path: &Path,
+    injected_config_path: Option<&Path>,
+) -> Result<()> {
+    let parent = squashfs_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", squashfs_path.display()))?;
+    let extract_dir = temp_path(parent, "nix-store.squashfs-root")?;
+    let patched_path = temp_path(parent, "nix-store.squashfs")?;
+    let _ = fs::remove_dir_all(&extract_dir);
+    let _ = fs::remove_file(&patched_path);
+
+    let result = (|| -> Result<()> {
+        let output = StdCommand::new("unsquashfs")
+            .arg("-f")
+            .arg("-d")
+            .arg(&extract_dir)
+            .arg(squashfs_path)
+            .output()
+            .with_context(|| "run unsquashfs to extract managed ISO Nix store")?;
+        ensure_command_success(output, "unsquashfs extract managed ISO Nix store")?;
+        patch_nixos_netboot_squashfs_fstab(&extract_dir)?;
+        if let Some(injected_config_path) = injected_config_path {
+            patch_nixos_netboot_squashfs_injected_config(&extract_dir, injected_config_path)?;
+        }
+        patch_nixos_netboot_squashfs_graphical_kiosk(&extract_dir)?;
+
+        let output = StdCommand::new("mksquashfs")
+            .arg(&extract_dir)
+            .arg(&patched_path)
+            .arg("-noappend")
+            .arg("-all-root")
+            .arg("-no-recovery")
+            .arg("-no-progress")
+            .arg("-processors")
+            .arg("1")
+            .arg("-b")
+            .arg("1048576")
+            .arg("-comp")
+            .arg("zstd")
+            .arg("-Xcompression-level")
+            .arg("6")
+            .output()
+            .with_context(|| "run mksquashfs to rebuild managed ISO Nix store")?;
+        ensure_command_success(output, "mksquashfs rebuild managed ISO Nix store")?;
+        ensure_nonempty_file(&patched_path)?;
+        fs::rename(&patched_path, squashfs_path)
+            .with_context(|| format!("publish patched {}", squashfs_path.display()))?;
+        Ok(())
+    })();
+
+    if extract_dir.exists() {
+        let _ = run_command_os(
+            "chmod",
+            [
+                OsString::from("-R"),
+                OsString::from("u+w"),
+                extract_dir.as_os_str().to_os_string(),
+            ],
+        );
+        let _ = fs::remove_dir_all(&extract_dir);
+    }
+    let _ = fs::remove_file(&patched_path);
+    result
+}
+
+fn patch_nixos_netboot_squashfs_injected_config(
+    squashfs_root: &Path,
+    injected_config_path: &Path,
+) -> Result<()> {
+    ensure_nonempty_file(injected_config_path)?;
+    let store_relative = NIXOS_NETBOOT_INJECTED_CONFIG_STORE_BASENAME;
+    let store_absolute = format!("/nix/store/{store_relative}");
+    let target = squashfs_root.join(store_relative);
+    fs::copy(injected_config_path, &target).with_context(|| {
+        format!(
+            "copy injected installer config {} -> {}",
+            injected_config_path.display(),
+            target.display()
+        )
+    })?;
+    set_file_mode(&target, 0o444)?;
+
+    let patched_units = patch_nixos_netboot_installer_config_units(squashfs_root, &store_absolute)?;
+    if patched_units == 0 {
+        bail!("managed ISO Nix store omitted cybex-installer-config.service");
+    }
+    Ok(())
+}
+
+fn patch_nixos_netboot_squashfs_graphical_kiosk(squashfs_root: &Path) -> Result<()> {
+    let patched_units = patch_nixos_netboot_installer_kiosk_units(squashfs_root)?;
+    if patched_units == 0 {
+        bail!("managed ISO Nix store omitted cybex-installer-kiosk.service");
+    }
+    Ok(())
+}
+
+fn patch_nixos_netboot_installer_kiosk_units(squashfs_root: &Path) -> Result<usize> {
+    let mut patched = 0usize;
+    for entry in
+        fs::read_dir(squashfs_root).with_context(|| format!("read {}", squashfs_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("read {}", squashfs_root.display()))?;
+        let unit_dir = entry.path();
+        if !unit_dir.is_dir() {
+            continue;
+        }
+        for relative in [
+            Path::new("cybex-installer-kiosk.service"),
+            Path::new("multi-user.target.wants/cybex-installer-kiosk.service"),
+        ] {
+            let unit_path = unit_dir.join(relative);
+            if !unit_path.is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(&unit_path)
+                .with_context(|| format!("read {}", unit_path.display()))?;
+            if !text.contains("cybex-installer-kiosk") || !text.contains("[Service]") {
+                continue;
+            }
+            let updated = rewrite_nixos_netboot_kiosk_unit(&text)?;
+            set_file_mode(&unit_path, 0o644)?;
+            fs::write(&unit_path, updated)
+                .with_context(|| format!("write {}", unit_path.display()))?;
+            set_file_mode(&unit_path, 0o444)?;
+            patched += 1;
+        }
+    }
+    Ok(patched)
+}
+
+fn rewrite_nixos_netboot_kiosk_unit(unit: &str) -> Result<String> {
+    let updated = upsert_systemd_service_line(unit, "PAMName=", "PAMName=login", true)?;
+    let updated = upsert_systemd_service_line(
+        &updated,
+        "RuntimeDirectoryMode=",
+        "RuntimeDirectoryMode=0700",
+        true,
+    )?;
+    let updated =
+        upsert_systemd_service_line(&updated, "TTYVTDisallocate=", "TTYVTDisallocate=true", true)?;
+    let updated =
+        upsert_systemd_service_line(&updated, "UtmpIdentifier=", "UtmpIdentifier=tty1", true)?;
+    upsert_systemd_service_line(&updated, "UtmpMode=", "UtmpMode=user", true)
+}
+
+fn upsert_systemd_service_line(
+    unit: &str,
+    prefix: &str,
+    replacement: &str,
+    insert_if_missing: bool,
+) -> Result<String> {
+    let mut output = Vec::new();
+    let mut in_service = false;
+    let mut saw_service = false;
+    let mut wrote_line = false;
+
+    for current in unit.lines() {
+        if current.starts_with('[') {
+            if in_service && insert_if_missing && !wrote_line {
+                output.push(replacement.to_string());
+                wrote_line = true;
+            }
+            in_service = current == "[Service]";
+            saw_service |= in_service;
+            output.push(current.to_string());
+            continue;
+        }
+        if in_service && current.starts_with(prefix) {
+            if !wrote_line {
+                output.push(replacement.to_string());
+                wrote_line = true;
+            }
+            continue;
+        }
+        output.push(current.to_string());
+    }
+
+    if in_service && insert_if_missing && !wrote_line {
+        output.push(replacement.to_string());
+        wrote_line = true;
+    }
+    if !saw_service {
+        bail!("systemd unit omitted [Service] section");
+    }
+    if !wrote_line {
+        bail!("systemd unit omitted {prefix} line");
+    }
+
+    let mut updated = output.join("\n");
+    updated.push('\n');
+    Ok(updated)
+}
+
+fn patch_nixos_netboot_installer_config_units(
+    squashfs_root: &Path,
+    injected_config_store_path: &str,
+) -> Result<usize> {
+    let mut patched = 0usize;
+    for entry in
+        fs::read_dir(squashfs_root).with_context(|| format!("read {}", squashfs_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("read {}", squashfs_root.display()))?;
+        let unit_dir = entry.path();
+        if !unit_dir.is_dir() {
+            continue;
+        }
+        let unit_path = unit_dir.join("cybex-installer-config.service");
+        if !unit_path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&unit_path)
+            .with_context(|| format!("read {}", unit_path.display()))?;
+        if !text.contains("cybex-installer-config") || !text.contains("[Service]") {
+            continue;
+        }
+        let updated = inject_systemd_environment_line(
+            &text,
+            &format!("CYBEX_INJECTED_CONFIG={injected_config_store_path}"),
+        )?;
+        set_file_mode(&unit_path, 0o644)?;
+        fs::write(&unit_path, updated).with_context(|| format!("write {}", unit_path.display()))?;
+        set_file_mode(&unit_path, 0o444)?;
+        patched += 1;
+    }
+    Ok(patched)
+}
+
+fn inject_systemd_environment_line(unit: &str, environment: &str) -> Result<String> {
+    let line = format!("Environment=\"{environment}\"");
+    let mut output = Vec::new();
+    let mut inserted = false;
+    let mut replaced = false;
+    for current in unit.lines() {
+        if current.starts_with("Environment=\"CYBEX_INJECTED_CONFIG=") {
+            if !replaced {
+                output.push(line.clone());
+                replaced = true;
+                inserted = true;
+            }
+            continue;
+        }
+        output.push(current.to_string());
+        if current == "[Service]" && !inserted {
+            output.push(line.clone());
+            inserted = true;
+        }
+    }
+    if !inserted {
+        bail!("systemd unit omitted [Service] section");
+    }
+    let mut updated = output.join("\n");
+    updated.push('\n');
+    Ok(updated)
+}
+
+fn patch_nixos_netboot_squashfs_fstab(squashfs_root: &Path) -> Result<()> {
+    let mut patched = 0usize;
+    for entry in
+        fs::read_dir(squashfs_root).with_context(|| format!("read {}", squashfs_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("read {}", squashfs_root.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with("-etc-fstab") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        if !text.contains("/dev/disk/by-label/") && !text.contains("/sysroot/iso/") {
+            continue;
+        }
+        set_file_mode(&path, 0o644)?;
+        fs::write(&path, nixos_netboot_fstab())
+            .with_context(|| format!("write {}", path.display()))?;
+        set_file_mode(&path, 0o444)?;
+        patched += 1;
+    }
+    if patched == 0 {
+        bail!("managed ISO Nix store omitted generated etc-fstab with ISO mounts");
+    }
+    Ok(())
 }
 
 fn find_initrd_fstab_path(initrd_path: &Path) -> Result<String> {
@@ -2475,16 +2817,16 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
         "kernel_version": kernel_version(),
         "virtualization": virtualization(),
         "device_kind": "cybex-forge",
-        "capabilities": forge_capabilities(),
+        "capabilities": forge_capabilities(&state.config),
         "unsupported_capabilities": [],
         "public_key": public_key,
         "public_key_fingerprint": public_key_fingerprint,
         "hardware_fingerprint": machine_id_hash.clone(),
         "hardware_fingerprint_candidates": [machine_id_hash.clone()],
-        "hardware_fingerprint_sources": {
-            "machine_id_hash": machine_id_hash,
-            "public_key_fingerprint": public_key_fingerprint,
-        },
+        "hardware_fingerprint_sources": [
+            "machine_id_hash",
+            "public_key_fingerprint",
+        ],
         "facts": {
             "service": "cybex-forge",
             "public_base_url": state.config.public_base_url(),
@@ -2493,17 +2835,21 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
             "http_root": state.config.paths.boot_assets_dir.display().to_string(),
             "bootloader_filename": state.config.boot.bootloader_filename.clone(),
             "menu_timeout_ms": state.config.boot.menu_timeout_ms,
-            "capabilities": forge_capabilities(),
+            "capabilities": forge_capabilities(&state.config),
         }
     }))
 }
 
-fn forge_capabilities() -> Vec<&'static str> {
-    vec![
+fn forge_capabilities(config: &AppConfig) -> Vec<&'static str> {
+    let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
         CAPABILITY_CACHE_V1,
-    ]
+    ];
+    if crate::updater::capabilities_enabled(config) {
+        capabilities.push(CAPABILITY_UPDATER_V1);
+    }
+    capabilities
 }
 
 fn optional_report_uuid(value: Option<String>) -> Option<String> {
@@ -3101,6 +3447,20 @@ fn validate_managed_listen_addr(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn managed_update_health_url(listen_addr: &str) -> Result<String> {
+    let parsed: std::net::SocketAddr = listen_addr
+        .parse()
+        .with_context(|| format!("managed boot settings listen_addr {listen_addr} is invalid"))?;
+    let host = if parsed.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else if parsed.ip().is_ipv6() {
+        format!("[{}]", parsed.ip())
+    } else {
+        parsed.ip().to_string()
+    };
+    Ok(format!("http://{host}:{}/healthz", parsed.port()))
+}
+
 fn normalize_managed_runtime_root(field: &str, value: &str, fallback: &Path) -> Result<PathBuf> {
     let raw = if value.trim().is_empty() {
         fallback.to_path_buf()
@@ -3283,6 +3643,13 @@ fn ensure_runtime_directories(
         "cybex-forge",
         "cybex-forge",
     )?;
+    install_dir(
+        &config.update.work_dir,
+        "0700",
+        "cybex-forge",
+        "cybex-forge",
+    )?;
+    install_dir(&config.update.releases_dir, "0755", "root", "root")?;
     if let Some(parent) = config.cache.private_key_path.parent() {
         install_dir(parent, "0700", "cybex-forge", "cybex-forge")?;
     }
@@ -3350,6 +3717,16 @@ fn render_managed_config(
          public_key_path = {cache_public_key_path}\n\
          max_bytes = {cache_max_bytes}\n\
          retain_recent_builds = {cache_retain_recent_builds}\n\n\
+         [update]\n\
+         enabled = {update_enabled}\n\
+         work_dir = {update_work_dir}\n\
+         releases_dir = {update_releases_dir}\n\
+         binary_path = {update_binary_path}\n\
+         config_path = {update_config_path}\n\
+         service_name = {update_service_name}\n\
+         health_url = {update_health_url}\n\
+         max_artifact_size_bytes = {update_max_artifact_size_bytes}\n\
+         trusted_public_key = {update_trusted_public_key}\n\n\
          [manage]\n\
          enabled = true\n\
          api_url = {api_url}\n\
@@ -3386,6 +3763,15 @@ fn render_managed_config(
         cache_public_key_path = toml_string(&config.cache.public_key_path.display().to_string())?,
         cache_max_bytes = config.cache.max_bytes,
         cache_retain_recent_builds = config.cache.retain_recent_builds,
+        update_enabled = config.update.enabled,
+        update_work_dir = toml_string(&config.update.work_dir.display().to_string())?,
+        update_releases_dir = toml_string(&config.update.releases_dir.display().to_string())?,
+        update_binary_path = toml_string(&config.update.binary_path.display().to_string())?,
+        update_config_path = toml_string(&config.update.config_path.display().to_string())?,
+        update_service_name = toml_string(&config.update.service_name)?,
+        update_health_url = toml_string(&managed_update_health_url(&settings.listen_addr)?)?,
+        update_max_artifact_size_bytes = config.update.max_artifact_size_bytes,
+        update_trusted_public_key = toml_string(&config.update.trusted_public_key)?,
         api_url = toml_string(&config.manage.api_url)?,
         organization_id = toml_string(&organization_id(config)?)?,
         state_path = toml_string(&config.manage.state_path.display().to_string())?,
@@ -3658,7 +4044,7 @@ fn ensure_bootloader_artifacts(settings: &NormalizedManagedSettings) -> Result<b
         }
         if !loader_embeds_boot_url(&target, &settings.public_base_url)? {
             bail!(
-                "TFTP bootloader {} does not embed {}/boot.ipxe",
+                "TFTP bootloader {} does not embed {}/boot/${{mac}}",
                 target.display(),
                 settings.public_base_url
             );
@@ -3726,7 +4112,9 @@ fn loader_embeds_boot_url(path: &Path, public_base_url: &str) -> Result<bool> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     Ok(text.contains(public_base_url)
-        && text.contains("chain --autofree ${boot-url}/boot.ipxe || goto failed"))
+        && text.contains("chain --autofree ${boot-url}/boot/${mac} || goto failed")
+        && text.contains("exit 1")
+        && !text.contains("echo Dropping to iPXE shell."))
 }
 
 fn build_embedded_ipxe_loader(settings: &NormalizedManagedSettings) -> Result<bool> {
@@ -3787,11 +4175,11 @@ fn render_embedded_ipxe_script(public_base_url: &str) -> String {
          # Embedded chainloader for Cybex Forge UEFI PXE clients.\n\
          isset ${{net0/ip}} || dhcp || goto failed\n\
          set boot-url {public_base_url}\n\
-         chain --autofree ${{boot-url}}/boot.ipxe || goto failed\n\n\
+         chain --autofree ${{boot-url}}/boot/${{mac}} || goto failed\n\n\
          :failed\n\
-         echo Cybex Forge: failed to load ${{boot-url}}/boot.ipxe\n\
-         echo Dropping to iPXE shell.\n\
-         shell\n"
+         echo Cybex Forge: failed to load ${{boot-url}}/boot/${{mac}}\n\
+         echo Returning failure to UEFI firmware.\n\
+         exit 1\n"
     )
 }
 
@@ -4023,7 +4411,7 @@ fn managed_profile_has_boot_action(profile: &ManagedBootProfile) -> bool {
             if normalized_installer_iso_source(&profile.installer_iso_source)
                 == BOOT_PROFILE_ISO_SOURCE_ENROLLMENT =>
         {
-            managed_profile_needs_iso_sync(profile)
+            true
         }
         "linux_installer" | "iso_live" => {
             profile
@@ -4305,8 +4693,10 @@ mod tests {
         bounded_error_message, bounded_http_timeout_seconds, clean_optional, fit_boot_report_body,
         forge_capabilities, generated_iso_raw_script_can_be_preserved,
         has_unreported_known_profile_events, managed_profile_map, managed_profile_needs_iso_sync,
-        managed_profile_raw_script, managed_sync_interval_seconds, normalize_managed_settings,
-        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline, render_check_service,
+        managed_profile_raw_script, managed_sync_interval_seconds, nixos_netboot_fstab,
+        normalize_managed_settings, optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
+        patch_nixos_netboot_squashfs_fstab, patch_nixos_netboot_squashfs_graphical_kiosk,
+        patch_nixos_netboot_squashfs_injected_config, render_check_service, render_managed_config,
         render_nixos_netboot_script, serialize_boot_report_body, sync_clients,
         sync_deleted_clients, sync_deleted_profiles, sync_desired_profile_isos, sync_profiles,
         validate_boot_config, validate_profile, write_secure_json,
@@ -4443,6 +4833,120 @@ mod tests {
             cmdline,
             "init=/nix/store/example-system/init quiet root=fstab"
         );
+    }
+
+    #[test]
+    fn netboot_squashfs_fstab_patch_removes_iso_mounts() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("cybex-forge-fstab-test-{}", hex::encode(random)));
+        fs::create_dir_all(&dir).unwrap();
+        let fstab_path = dir.join("abc123-etc-fstab");
+        fs::write(
+            &fstab_path,
+            "# generated\n\
+             tmpfs / tmpfs x-initrd.mount,mode=0755 0 0\n\
+             /dev/disk/by-label/nixos-minimal-26.05-x86_64 /iso iso9660 x-initrd.mount 0 0\n\
+             /sysroot/iso/nix-store.squashfs /nix/.ro-store squashfs x-initrd.mount,loop,threads=multi 0 0\n\
+             tmpfs /nix/.rw-store tmpfs x-initrd.mount,mode=0755 0 0\n",
+        )
+        .unwrap();
+
+        patch_nixos_netboot_squashfs_fstab(&dir).unwrap();
+        let rewritten = fs::read_to_string(&fstab_path).unwrap();
+
+        assert_eq!(rewritten, nixos_netboot_fstab());
+        assert!(!rewritten.contains("/dev/disk/by-label/"));
+        assert!(!rewritten.contains("/sysroot/iso/"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn netboot_squashfs_injected_config_patch_updates_service() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("cybex-forge-config-test-{}", hex::encode(random)));
+        let unit_dir = dir.join("abc123-unit-cybex-installer-config.service");
+        fs::create_dir_all(&unit_dir).unwrap();
+        let unit_path = unit_dir.join("cybex-installer-config.service");
+        fs::write(
+            &unit_path,
+            "[Unit]\n\
+             Description=Prepare Cybex injected installer configuration\n\
+             \n\
+             [Service]\n\
+             Environment=\"PATH=/nix/store/example/bin\"\n\
+             ExecStart=/nix/store/example-cybex-installer-config/bin/cybex-installer-config\n",
+        )
+        .unwrap();
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "api_url = \"https://dev.cybex.net\"\norganization_slug = \"default\"\n",
+        )
+        .unwrap();
+
+        patch_nixos_netboot_squashfs_injected_config(&dir, &config_path).unwrap();
+
+        let store_path = dir.join(super::NIXOS_NETBOOT_INJECTED_CONFIG_STORE_BASENAME);
+        assert_eq!(
+            fs::read_to_string(&store_path).unwrap(),
+            fs::read_to_string(&config_path).unwrap()
+        );
+        let unit = fs::read_to_string(&unit_path).unwrap();
+        assert!(unit.contains("Environment=\"CYBEX_INJECTED_CONFIG=/nix/store/"));
+        assert!(unit.contains(super::NIXOS_NETBOOT_INJECTED_CONFIG_STORE_BASENAME));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn netboot_squashfs_graphical_kiosk_patch_adds_session_settings() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("cybex-forge-kiosk-test-{}", hex::encode(random)));
+        let system_units_dir = dir.join("abc123-system-units");
+        let wants_dir = system_units_dir.join("multi-user.target.wants");
+        let unit_store_dir = dir.join("def456-unit-cybex-installer-kiosk.service");
+        fs::create_dir_all(&wants_dir).unwrap();
+        fs::create_dir_all(&unit_store_dir).unwrap();
+        let unit = "[Unit]\n\
+                    Description=Cybex graphical installer kiosk\n\
+                    \n\
+                    [Service]\n\
+                    Environment=CYBEX_RUNTIME_DIR=/run/cybex-installer\n\
+                    ExecStart=/nix/store/ghi789-cybex-installer-kiosk/bin/cybex-installer-kiosk\n\
+                    Restart=on-failure\n\
+                    StandardInput=tty\n\
+                    StandardOutput=journal\n\
+                    TTYPath=/dev/tty1\n\
+                    \n\
+                    [Install]\n\
+                    WantedBy=multi-user.target\n";
+        let system_unit = system_units_dir.join("cybex-installer-kiosk.service");
+        let wanted_unit = wants_dir.join("cybex-installer-kiosk.service");
+        let store_unit = unit_store_dir.join("cybex-installer-kiosk.service");
+        fs::write(&system_unit, unit).unwrap();
+        fs::write(&wanted_unit, unit).unwrap();
+        fs::write(&store_unit, unit).unwrap();
+
+        patch_nixos_netboot_squashfs_graphical_kiosk(&dir).unwrap();
+
+        for unit_path in [system_unit, wanted_unit, store_unit] {
+            let rewritten = fs::read_to_string(unit_path).unwrap();
+            assert!(rewritten.contains(
+                "ExecStart=/nix/store/ghi789-cybex-installer-kiosk/bin/cybex-installer-kiosk"
+            ));
+            assert!(rewritten.contains("PAMName=login"));
+            assert!(rewritten.contains("RuntimeDirectoryMode=0700"));
+            assert!(rewritten.contains("TTYVTDisallocate=true"));
+            assert!(rewritten.contains("UtmpIdentifier=tty1"));
+            assert!(rewritten.contains("UtmpMode=user"));
+            assert!(rewritten.contains("StandardOutput=journal"));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4716,6 +5220,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_config_derives_update_health_url_from_listen_addr() {
+        let mut config = AppConfig::default();
+        config.manage.organization_id = "org-1".to_string();
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:9181".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp-managed"),
+            http_root: PathBuf::from("/srv/cybex-forge/www-managed"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        let rendered = render_managed_config(&config, &settings).unwrap();
+
+        assert!(rendered.contains("health_url = \"http://127.0.0.1:9181/healthz\""));
+    }
+
+    #[test]
     fn managed_settings_reject_invalid_runtime_values() {
         let app_config = AppConfig::default();
         let invalid_url = ManagedBootSettings {
@@ -4871,16 +5393,14 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_rejects_incomplete_enrollment_iso_assignments() {
+    fn managed_config_accepts_enrollment_iso_assignments_before_sync_metadata() {
         let mut config = sample_boot_config();
         config.profiles[0].profile_type = "iso_live".to_string();
         config.profiles[0].installer_iso_source = "enrollment".to_string();
         config.profiles[0].kernel_path = None;
         config.profiles[0].cmdline = None;
 
-        let err = validate_boot_config(&config).unwrap_err();
-
-        assert!(err.to_string().contains("runnable boot action"));
+        validate_boot_config(&config).unwrap();
     }
 
     #[test]
@@ -5602,9 +6122,10 @@ mod tests {
 
     #[test]
     fn forge_capabilities_report_build_and_cache() {
+        let config = AppConfig::default();
         assert_eq!(
-            forge_capabilities(),
-            vec!["boot_v1", "builder_v1", "cache_v1"]
+            forge_capabilities(&config),
+            vec!["boot_v1", "builder_v1", "cache_v1", "updater_v1"]
         );
     }
 
