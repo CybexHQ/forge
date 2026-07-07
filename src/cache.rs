@@ -159,6 +159,11 @@ pub async fn export_output(
     if !config.cache.enabled {
         bail!("Forge Cache is disabled");
     }
+    crate::disk::ensure_headroom(
+        &config.cache.root_dir,
+        closure_size_bytes.max(0) as u64,
+        "Forge cache export",
+    )?;
     let public_key = ensure_signing_key(config).await?;
     let cache_dir = config.cache.root_dir.clone();
     let private_key_path = config.cache.private_key_path.clone();
@@ -314,6 +319,9 @@ pub async fn remove_artifacts_by_key(
 
 pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
+        tracing::warn!(
+            "cache.max_bytes is 0: Forge Cache retention is disabled and the cache root can grow without bound"
+        );
         return Ok(());
     }
     // Artifact rows only track top-level NARs while `nix copy` stores whole
@@ -336,27 +344,46 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     let mut candidates = db::list_cache_artifacts(pool).await?;
     candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     let mut evicted_ids: HashSet<i64> = HashSet::new();
-    for index in 0..candidates.len() {
-        if total <= config.cache.max_bytes {
+    // Evict oldest-first in rounds: pick a batch whose estimated compressed
+    // footprint covers the excess, then mark-and-sweep ONCE for the whole
+    // batch. Closure sharing can make the estimate optimistic, so re-measure
+    // disk usage and run another round while still over budget. This keeps
+    // the expensive full-cache walks proportional to rounds (usually one),
+    // not to the number of evicted artifacts.
+    let mut next_index = 0;
+    while total > config.cache.max_bytes && next_index < candidates.len() {
+        let excess = total - config.cache.max_bytes;
+        let mut estimated_freed: u64 = 0;
+        let mut evicted_this_round = false;
+        while next_index < candidates.len() && estimated_freed <= excess {
+            let artifact = &candidates[next_index];
+            next_index += 1;
+            if artifact
+                .source_build_job_id
+                .as_deref()
+                .is_some_and(|id| protected_sources.contains(id))
+            {
+                continue;
+            }
+            db::delete_cache_artifact(pool, artifact.id).await?;
+            evicted_ids.insert(artifact.id);
+            evicted_this_round = true;
+            let estimate = artifact
+                .closure_file_size_bytes
+                .max(artifact.size_bytes)
+                .max(1) as u64;
+            estimated_freed = estimated_freed.saturating_add(estimate);
+        }
+        if !evicted_this_round {
             break;
         }
-        let artifact = &candidates[index];
-        if artifact
-            .source_build_job_id
-            .as_deref()
-            .is_some_and(|id| protected_sources.contains(id))
-        {
-            continue;
-        }
-        db::delete_cache_artifact(pool, artifact.id).await?;
-        evicted_ids.insert(artifact.id);
         let retained = candidates
             .iter()
             .filter(|candidate| !evicted_ids.contains(&candidate.id))
             .map(RetainedArtifactFiles::from)
             .collect::<Vec<_>>();
-        let freed = sweep_unreachable(config, retained).await?;
-        total = total.saturating_sub(freed);
+        sweep_unreachable(config, retained).await?;
+        total = cache_disk_usage(config).await;
     }
     Ok(())
 }

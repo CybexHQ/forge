@@ -291,6 +291,7 @@ struct ForgeAgentReportRequest {
     update: Option<ForgeUpdateStatusReport>,
     build_jobs: Vec<ForgeBuildJobReport>,
     cache_artifacts: Vec<ForgeCacheArtifactReport>,
+    disk: Option<crate::disk::DiskStats>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -449,15 +450,26 @@ struct NormalizedManagedSettings {
 
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
+        let mut consecutive_failures: u32 = 0;
         loop {
-            let outcome = match sync_once_with_outcome(&state).await {
-                Ok(outcome) => outcome,
+            let interval = match sync_once_with_outcome(&state).await {
+                Ok(outcome) => {
+                    consecutive_failures = 0;
+                    managed_sync_interval_seconds(&state.config.manage, outcome)
+                }
                 Err(err) => {
-                    warn!(error = %safe_error(&err), "managed sync failed");
-                    SyncOutcome::Synced
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let interval =
+                        failed_sync_interval_seconds(&state.config.manage, consecutive_failures);
+                    warn!(
+                        error = %safe_error(&err),
+                        consecutive_failures,
+                        retry_in_seconds = interval,
+                        "managed sync failed"
+                    );
+                    interval
                 }
             };
-            let interval = managed_sync_interval_seconds(&state.config.manage, outcome);
             sleep(Duration::from_secs(interval)).await;
         }
     });
@@ -803,6 +815,7 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
             .take(MAX_REPORT_CACHE_ARTIFACTS)
             .map(ForgeCacheArtifactReport::from)
             .collect(),
+        disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
     };
     let body_bytes = serialize_forge_report_body(&body)?;
     let device_id = managed_device_id(managed)?;
@@ -2190,6 +2203,7 @@ async fn download_managed_iso(
     expected_size: i64,
     expected_sha: &str,
 ) -> Result<()> {
+    crate::disk::ensure_headroom(path, expected_size.max(0) as u64, "managed ISO download")?;
     let mut response = signed_download_request(state, managed, download_path)
         .await?
         .send()
@@ -3073,8 +3087,12 @@ fn http_download_client(state: &AppState) -> Result<Client> {
         state.config.manage.http_timeout_seconds,
     ))
     .min(Duration::from_secs(10));
+    // No overall timeout: multi-GB ISO downloads legitimately run long. The
+    // read timeout still fails a stalled transfer, which would otherwise hang
+    // the single sync loop indefinitely.
     Client::builder()
         .connect_timeout(connect_timeout)
+        .read_timeout(Duration::from_secs(60))
         .build()
         .context("failed to build managed ISO download HTTP client")
 }
@@ -3088,6 +3106,16 @@ fn managed_sync_interval_seconds(config: &ManageConfig, outcome: SyncOutcome) ->
         SyncOutcome::Synced => config.sync_interval_seconds.clamp(5, 3600),
         SyncOutcome::PendingEnrollment => config.enrollment_poll_seconds.clamp(1, 300),
     }
+}
+
+/// Exponential backoff after failed syncs: retry quickly at first (a
+/// transient blip should not cost a full sync interval), never slower than
+/// the normal cadence.
+fn failed_sync_interval_seconds(config: &ManageConfig, consecutive_failures: u32) -> u64 {
+    let normal = config.sync_interval_seconds.clamp(5, 3600);
+    let exponent = consecutive_failures.saturating_sub(1).min(10);
+    let backoff = 5u64.saturating_mul(1u64 << exponent);
+    backoff.clamp(5, normal.max(5))
 }
 
 fn api_url(state: &AppState, path: &str) -> Result<String> {
@@ -4688,8 +4716,9 @@ mod tests {
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
         NIXOS_NETBOOT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
         append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
-        bounded_error_message, bounded_http_timeout_seconds, clean_optional, fit_boot_report_body,
-        forge_capabilities, generated_iso_raw_script_can_be_preserved,
+        bounded_error_message, bounded_http_timeout_seconds, clean_optional,
+        failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
+        generated_iso_raw_script_can_be_preserved,
         has_unreported_known_profile_events, managed_profile_map, managed_profile_needs_iso_sync,
         managed_profile_raw_script, managed_sync_interval_seconds, nixos_netboot_fstab,
         normalize_managed_settings, optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
@@ -4708,6 +4737,18 @@ mod tests {
     };
     use rand::{RngCore, rngs::OsRng};
     use std::{fs, path::PathBuf};
+
+    #[test]
+    fn failed_sync_backoff_grows_and_caps_at_normal_interval() {
+        let mut config = ManageConfig::default();
+        config.sync_interval_seconds = 30;
+
+        assert_eq!(failed_sync_interval_seconds(&config, 1), 5);
+        assert_eq!(failed_sync_interval_seconds(&config, 2), 10);
+        assert_eq!(failed_sync_interval_seconds(&config, 3), 20);
+        assert_eq!(failed_sync_interval_seconds(&config, 4), 30);
+        assert_eq!(failed_sync_interval_seconds(&config, 100), 30);
+    }
 
     #[test]
     fn asset_scan_success_is_reported_as_ok() {

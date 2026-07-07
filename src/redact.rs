@@ -1,5 +1,19 @@
 const REDACTION: &str = "[REDACTED]";
-const SENSITIVE_VALUE_KEYS: &[&str] = &["secret-key=", "password=", "secret=", "token="];
+const SENSITIVE_VALUE_KEYS: &[&str] = &[
+    "secret-key=",
+    "secret_key=",
+    "password=",
+    "passwd=",
+    "secret=",
+    "token=",
+    "api-key=",
+    "api_key=",
+    "apikey=",
+    "private-key=",
+    "private_key=",
+    "authorization=",
+    "bearer ",
+];
 
 pub(crate) fn contains_sensitive_key_value(text: &str) -> bool {
     next_sensitive_key(text).is_some()
@@ -61,5 +75,17 @@ mod tests {
         let redacted = redact_sensitive_key_values("Secret=abc TOKEN=def");
 
         assert_eq!(redacted, "Secret=[REDACTED] TOKEN=[REDACTED]");
+    }
+
+    #[test]
+    fn redacts_api_key_and_bearer_shapes() {
+        let redacted = redact_sensitive_key_values(
+            "curl -H 'Authorization: Bearer eyJhbGci' https://x/?api_key=k1&apikey=k2 private_key=pk",
+        );
+
+        assert!(!redacted.contains("eyJhbGci"));
+        assert!(!redacted.contains("k1"));
+        assert!(!redacted.contains("k2"));
+        assert!(!redacted.contains("pk"));
     }
 }

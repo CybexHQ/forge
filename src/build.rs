@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -130,6 +130,7 @@ pub fn spawn(state: AppState) {
             Ok(_) => {}
             Err(err) => warn!(error = %err, "failed to recover running Forge build jobs"),
         }
+        sweep_stale_job_dirs(&state.config).await;
 
         for worker_index in 0..state.config.build.max_concurrent_builds {
             let worker_state = state.clone();
@@ -139,20 +140,90 @@ pub fn spawn(state: AppState) {
 }
 
 async fn worker_loop(state: AppState, worker_index: usize) {
+    let mut claim_failures: u32 = 0;
     loop {
         match db::claim_next_build_job(&state.db).await {
             Ok(Some(job)) => {
-                info!(job_id = job.id, worker_index, "claimed Forge build job");
+                claim_failures = 0;
+                let job_id = job.id;
+                info!(job_id, worker_index, "claimed Forge build job");
                 if let Err(err) = execute_claimed_job(&state, job).await {
                     warn!(error = %safe_error(&err), worker_index, "Forge build job execution failed");
                 }
+                cleanup_job_dirs(&state.config, job_id).await;
             }
-            Ok(None) => sleep(Duration::from_secs(2)).await,
+            Ok(None) => {
+                claim_failures = 0;
+                sleep(Duration::from_secs(2)).await;
+            }
             Err(err) => {
-                warn!(error = %err, worker_index, "failed to claim Forge build job");
-                sleep(Duration::from_secs(5)).await;
+                claim_failures = claim_failures.saturating_add(1);
+                let delay = (5u64 << claim_failures.saturating_sub(1).min(5)).min(120);
+                warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim Forge build job");
+                sleep(Duration::from_secs(delay)).await;
             }
         }
+    }
+}
+
+/// Remove a finished job's output dir (whose `result` out-link is an indirect
+/// Nix gcroot pinning the build closure) and its generated flake input dir.
+/// The out-link is only needed between build completion and cache export, so
+/// once the job reaches a terminal state these must go or `/nix/store` grows
+/// without bound.
+async fn cleanup_job_dirs(config: &AppConfig, job_id: i64) {
+    let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
+    let input_dir = config.build.work_dir.join(format!("job-{job_id}-input"));
+    for dir in [job_dir, input_dir] {
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(error = %err, path = %dir.display(), "failed to remove Forge build job directory");
+            }
+        }
+    }
+}
+
+/// Remove job dirs left behind by earlier Forge runs. Runs once at startup,
+/// after stale running jobs have been marked failed and before workers start,
+/// so nothing under these names can be live.
+async fn sweep_stale_job_dirs(config: &AppConfig) {
+    let mut removed = 0usize;
+    for (root, prefix, suffix) in [
+        (&config.build.output_dir, "job-", ""),
+        (&config.build.work_dir, "job-", "-input"),
+    ] {
+        let mut entries = match tokio::fs::read_dir(root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                warn!(error = %err, path = %root.display(), "failed to scan Forge build directory");
+                continue;
+            }
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(middle) = name
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+            else {
+                continue;
+            };
+            if middle.is_empty() || !middle.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            match tokio::fs::remove_dir_all(entry.path()).await {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    warn!(error = %err, path = %entry.path().display(), "failed to remove stale Forge build job directory");
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        info!(removed, "removed stale Forge build job directories");
     }
 }
 
@@ -195,6 +266,27 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             return Ok(());
         }
     };
+
+    if let Err(err) = crate::disk::ensure_headroom(
+        Path::new("/nix/store"),
+        state.config.build.max_artifact_size_bytes,
+        "Forge build",
+    ) {
+        db::finish_build_job(
+            &state.db,
+            job.id,
+            "failed",
+            "",
+            &safe_error(&err),
+            "",
+            "",
+            0,
+            None,
+            Some(json!({"error_kind": "insufficient_disk_space"})),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let command = nix_build_command(&state.config, &target, &spec, job.id)?;
     let log = SharedLog::new(state.config.build.max_log_bytes);
@@ -981,6 +1073,47 @@ mod tests {
     use crate::config::{AppConfig, BuildTargetConfig};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_and_sweep_remove_job_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-build-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = AppConfig::default();
+        config.build.output_dir = root.join("out");
+        config.build.work_dir = root.join("work");
+        let finished_out = config.build.output_dir.join("job-7");
+        let finished_input = config.build.work_dir.join("job-7-input");
+        let stale_out = config.build.output_dir.join("job-3");
+        let stale_input = config.build.work_dir.join("job-3-input");
+        let unrelated_out = config.build.output_dir.join("job-notanumber");
+        let unrelated_work = config.build.work_dir.join("keepme");
+        for dir in [
+            &finished_out,
+            &finished_input,
+            &stale_out,
+            &stale_input,
+            &unrelated_out,
+            &unrelated_work,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("result"), b"x").unwrap();
+        }
+
+        cleanup_job_dirs(&config, 7).await;
+        assert!(!finished_out.exists());
+        assert!(!finished_input.exists());
+        assert!(stale_out.exists());
+
+        sweep_stale_job_dirs(&config).await;
+        assert!(!stale_out.exists());
+        assert!(!stale_input.exists());
+        assert!(unrelated_out.exists());
+        assert!(unrelated_work.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn build_spec_rejects_unknown_fields() {

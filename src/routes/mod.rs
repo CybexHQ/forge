@@ -1,4 +1,3 @@
-pub mod api;
 pub mod boot;
 pub mod files;
 

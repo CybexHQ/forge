@@ -86,14 +86,19 @@ The release manifest asset is JSON:
 }
 ```
 
-Forge downloads to `update.work_dir`, enforces `max_artifact_size_bytes`,
-verifies the SHA-256, optionally verifies an Ed25519 signature when
-`trusted_public_key` is configured, stages the binary under `releases_dir`, smoke
-tests it with `--config <config_path> print-config`, atomically replaces
-`binary_path`, restarts `service_name`, and waits for `health_url`. Leave
-`health_url` empty in config to derive it from `server.listen_addr`; managed
-config rendering keeps it aligned with Manage-owned listener changes. On restart
-or health failure, Forge restores the previous binary and reports `rolled_back`.
+Forge first verifies the request's Ed25519 signature against
+`update.trusted_public_key` (the signature covers version, sha256, and artifact
+URL, so nothing is downloaded for an unsigned request; an empty
+`trusted_public_key` refuses updates outright), then downloads to
+`update.work_dir` after a free-disk preflight, enforces
+`max_artifact_size_bytes`, verifies the SHA-256, stages the binary under
+`releases_dir`, smoke tests it with `--config <config_path> print-config`,
+atomically replaces `binary_path`, restarts `service_name`, and waits for
+`health_url`. Leave `health_url` empty in config to derive it from
+`server.listen_addr`; managed config rendering keeps it aligned with
+Manage-owned listener changes. On restart or health failure, Forge restores the
+previous binary and reports `rolled_back`. Backups and staged binaries from
+earlier attempts are pruned after each apply.
 
 When signing is enabled, sign this exact message:
 

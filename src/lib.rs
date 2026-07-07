@@ -1,16 +1,15 @@
 pub mod assets;
-pub mod auth;
 pub mod boot;
 pub mod build;
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod disk;
 pub mod error;
 pub mod manage;
 pub mod models;
 pub(crate) mod redact;
 pub mod routes;
-pub mod ui;
 pub mod updater;
 
 use std::sync::{Arc, RwLock};

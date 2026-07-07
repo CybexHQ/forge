@@ -175,8 +175,10 @@ pub async fn apply_requested_update(config: &AppConfig) -> Result<()> {
 
     let started_at = now_rfc3339();
     let attempt_id = request_attempt_id(&request);
-    if let Err(err) = apply_requested_update_inner(config, &request, &attempt_id, &started_at).await
-    {
+    let apply_result =
+        apply_requested_update_inner(config, &request, &attempt_id, &started_at).await;
+    prune_stale_update_files(config, &attempt_id, &request.version);
+    if let Err(err) = apply_result {
         write_status(
             config,
             ForgeUpdateStatusReport {
@@ -219,19 +221,22 @@ async fn apply_requested_update_inner(
         return Ok(());
     }
 
+    // The signature covers (version, sha256, artifact URL), so verify it
+    // before fetching anything: an unsigned request must not trigger a
+    // download at all.
+    write_progress(config, request, attempt_id, started_at, "verifying", 15, "")?;
+    verify_signature(config, request)?;
+
     write_progress(
         config,
         request,
         attempt_id,
         started_at,
         "downloading",
-        20,
+        30,
         "",
     )?;
     let artifact = download_artifact(config, request).await?;
-
-    write_progress(config, request, attempt_id, started_at, "verifying", 55, "")?;
-    verify_signature(config, request)?;
 
     let staged = stage_artifact(config, request, &artifact)?;
     write_progress(config, request, attempt_id, started_at, "staged", 70, "")?;
@@ -326,6 +331,11 @@ async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -
         bail!("update artifact exceeds configured size limit");
     }
 
+    crate::disk::ensure_headroom(
+        &config.update.work_dir,
+        config.update.max_artifact_size_bytes,
+        "Forge update download",
+    )?;
     let tmp_path = config.update.work_dir.join("artifact.download");
     let mut file = tokio_fs::File::create(&tmp_path)
         .await
@@ -356,7 +366,9 @@ async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -
 
 fn verify_signature(config: &AppConfig, request: &ManagedUpdateRequest) -> Result<()> {
     if config.update.trusted_public_key.trim().is_empty() {
-        return Ok(());
+        bail!(
+            "update.trusted_public_key is not configured; refusing to apply an unverified Forge update (configure the trusted release key or set update.enabled = false)"
+        );
     }
     if request.signature.trim().is_empty() {
         bail!("update signature is required");
@@ -428,6 +440,43 @@ fn install_binary(config: &AppConfig, staged: &Path) -> Result<()> {
     fs::rename(&tmp, &config.update.binary_path)
         .with_context(|| format!("replace {}", config.update.binary_path.display()))?;
     Ok(())
+}
+
+/// Remove backups and staged release binaries from earlier attempts/versions.
+/// The current attempt's backup and the current version's staged binary are
+/// kept so a post-restart rollback remains possible; everything older is one
+/// full binary copy each and would otherwise accumulate forever.
+fn prune_stale_update_files(config: &AppConfig, keep_attempt_id: &str, keep_version: &str) {
+    let keep_backup = format!("cybex-forge-backup-{keep_attempt_id}");
+    let keep_release = format!("cybex-forge-{}", safe_version_filename(keep_version));
+    for (dir, prefix, keep) in [
+        (&config.update.work_dir, "cybex-forge-backup-", &keep_backup),
+        (&config.update.releases_dir, "cybex-forge-", &keep_release),
+    ] {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(prefix) || name == keep.as_str() {
+                continue;
+            }
+            // The releases prefix also matches backup names when both dirs
+            // coincide; never let the releases pass delete the kept backup.
+            if name == keep_backup {
+                continue;
+            }
+            if let Err(err) = fs::remove_file(entry.path()) {
+                tracing::warn!(
+                    error = %err,
+                    path = %entry.path().display(),
+                    "failed to prune stale Forge update file"
+                );
+            }
+        }
+    }
 }
 
 fn restore_binary(config: &AppConfig, backup: &Path) -> Result<()> {
@@ -706,6 +755,46 @@ mod tests {
         config.update.work_dir = root.join("updates");
         config.update.releases_dir = root.join("releases");
         (config, root)
+    }
+
+    #[test]
+    fn verify_signature_requires_trusted_public_key() {
+        let (config, _root) = test_config();
+        assert!(config.update.trusted_public_key.trim().is_empty());
+        let request = test_request("2026-07-06T00:00:00Z");
+
+        let err = verify_signature(&config, &request).expect_err("must refuse unverified updates");
+        assert!(err.to_string().contains("trusted_public_key"));
+    }
+
+    #[test]
+    fn prune_stale_update_files_keeps_current_attempt_and_version() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&config.update.work_dir).unwrap();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        let keep_backup = config.update.work_dir.join("cybex-forge-backup-current");
+        let stale_backup = config.update.work_dir.join("cybex-forge-backup-old");
+        let unrelated = config.update.work_dir.join("request.json");
+        let keep_release = config.update.releases_dir.join("cybex-forge-v0.1.2");
+        let stale_release = config.update.releases_dir.join("cybex-forge-v0.1.1");
+        for path in [
+            &keep_backup,
+            &stale_backup,
+            &unrelated,
+            &keep_release,
+            &stale_release,
+        ] {
+            fs::write(path, b"x").unwrap();
+        }
+
+        prune_stale_update_files(&config, "current", "v0.1.2");
+
+        assert!(keep_backup.exists());
+        assert!(unrelated.exists());
+        assert!(keep_release.exists());
+        assert!(!stale_backup.exists());
+        assert!(!stale_release.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
