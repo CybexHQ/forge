@@ -40,6 +40,7 @@ pub struct CachedNixArtifact {
     pub nar_hash: String,
     pub nar_size_bytes: i64,
     pub closure_size_bytes: i64,
+    pub closure_file_size_bytes: i64,
     pub compression: String,
     pub references: Vec<String>,
     pub metadata: Value,
@@ -202,6 +203,7 @@ pub async fn export_output(
         if nar_len > i64::MAX as u64 {
             bail!("generated NAR is too large to report");
         }
+        let closure_file_size_bytes = closure_file_size_bytes_blocking(&cache_dir, &store_path);
         let metadata = json!({
             "cache_schema": "cybex.forge.cache.v1",
             "public_key_fingerprint": public_key_fingerprint(&public_key),
@@ -211,6 +213,7 @@ pub async fn export_output(
             "file_size": narinfo.file_size,
             "nar_size": narinfo.nar_size,
             "closure_size": closure_size_bytes,
+            "closure_file_size": closure_file_size_bytes,
             "source_build_job_id": managed_job_id,
         });
         Ok(CachedNixArtifact {
@@ -224,6 +227,7 @@ pub async fn export_output(
             nar_hash: narinfo.nar_hash,
             nar_size_bytes: narinfo.nar_size,
             closure_size_bytes,
+            closure_file_size_bytes,
             compression: narinfo.compression,
             references: narinfo.references,
             metadata,
@@ -259,6 +263,7 @@ pub async fn record_cached_artifact(
         &artifact.nar_hash,
         artifact.nar_size_bytes,
         artifact.closure_size_bytes,
+        artifact.closure_file_size_bytes,
         &artifact.compression,
         Some(json!(artifact.references)),
         &serving_url,
@@ -473,6 +478,41 @@ fn sweep_unreachable_blocking(
         }
     }
     Ok(freed)
+}
+
+/// Sum the compressed bytes (narinfo `FileSize`) of every store path reachable
+/// from `store_path` through the cache's narinfo reference graph — the
+/// artifact's real on-disk cache footprint, as opposed to `closure_size_bytes`
+/// which is the uncompressed installed size. Unreadable narinfos are skipped,
+/// so the result is a lower bound on a partially swept cache.
+fn closure_file_size_bytes_blocking(cache_root: &Path, store_path: &str) -> i64 {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = store_path_hash(store_path).into_iter().collect();
+    let mut total: i64 = 0;
+    while let Some(hash) = queue.pop() {
+        if !visited.insert(hash.clone()) {
+            continue;
+        }
+        let narinfo_path = cache_root.join(format!("{hash}.narinfo"));
+        let Ok(contents) = fs::read_to_string(&narinfo_path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            if let Some(file_size) = line.strip_prefix("FileSize:") {
+                let parsed = file_size.trim().parse::<i64>().unwrap_or(0);
+                total = total.saturating_add(parsed.max(0));
+            } else if let Some(references) = line.strip_prefix("References:") {
+                for reference in references.split_whitespace() {
+                    if let Some(reference_hash) = store_basename_hash(reference) {
+                        if !visited.contains(&reference_hash) {
+                            queue.push(reference_hash);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
 }
 
 fn store_path_hash(store_path: &str) -> Option<String> {
@@ -792,6 +832,47 @@ mod tests {
     }
 
     #[test]
+    fn closure_file_size_sums_unique_reachable_narinfos() {
+        let root = test_temp_dir("closure-file-size");
+        let hash_root = "a".repeat(32);
+        let hash_dep = "b".repeat(32);
+        let hash_shared = "c".repeat(32);
+        let hash_missing = "d".repeat(32);
+        fs::write(
+            root.join(format!("{hash_root}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_root}-root\nFileSize: 100\nReferences: {hash_dep}-dep {hash_shared}-shared {hash_root}-root\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join(format!("{hash_dep}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_dep}-dep\nFileSize: 40\nReferences: {hash_shared}-shared {hash_missing}-missing\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join(format!("{hash_shared}.narinfo")),
+            format!("StorePath: /nix/store/{hash_shared}-shared\nFileSize: 7\nReferences: \n"),
+        )
+        .unwrap();
+
+        // Shared dependency counted once, self-reference ignored, missing
+        // narinfo skipped: 100 + 40 + 7.
+        assert_eq!(
+            closure_file_size_bytes_blocking(&root, &format!("/nix/store/{hash_root}-root")),
+            147
+        );
+        assert_eq!(
+            closure_file_size_bytes_blocking(&root, "not-a-store-path"),
+            0
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn initialize_cache_root_writes_valid_nix_cache_info() {
         let root = test_temp_dir("init-fresh");
         let cache_dir = root.join("cache");
@@ -1085,6 +1166,7 @@ mod tests {
                     nar_hash: Some(format!("sha256:{name}nar")),
                     nar_size_bytes: Some(64),
                     closure_size_bytes: Some(192),
+                    closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
                     serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
@@ -1167,6 +1249,7 @@ mod tests {
                 nar_hash: Some("sha256:protectednar".to_string()),
                 nar_size_bytes: Some(20),
                 closure_size_bytes: Some(20),
+                closure_file_size_bytes: None,
                 compression: Some("xz".to_string()),
                 references: Some(json!([
                     "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-protected"
@@ -1194,6 +1277,7 @@ mod tests {
                 nar_hash: Some("sha256:unprotectednar".to_string()),
                 nar_size_bytes: Some(20),
                 closure_size_bytes: Some(20),
+                closure_file_size_bytes: None,
                 compression: Some("xz".to_string()),
                 references: Some(json!([
                     "/nix/store/cccccccccccccccccccccccccccccccc-unprotected"
@@ -1259,6 +1343,7 @@ mod tests {
                     nar_hash: Some(format!("sha256:{name}nar")),
                     nar_size_bytes: Some(20),
                     closure_size_bytes: Some(20),
+                    closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
                     serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),

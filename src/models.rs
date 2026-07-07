@@ -143,6 +143,7 @@ pub struct CacheArtifact {
     pub nar_hash: String,
     pub nar_size_bytes: i64,
     pub closure_size_bytes: i64,
+    pub closure_file_size_bytes: i64,
     pub compression: String,
     pub references: Value,
     pub serving_url: String,
@@ -186,6 +187,8 @@ pub struct CreateCacheArtifactRequest {
     pub nar_size_bytes: Option<i64>,
     #[serde(default)]
     pub closure_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub closure_file_size_bytes: Option<i64>,
     #[serde(default)]
     pub compression: Option<String>,
     #[serde(default)]

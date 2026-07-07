@@ -340,6 +340,7 @@ struct CacheArtifactRow {
     nar_hash: String,
     nar_size_bytes: i64,
     closure_size_bytes: i64,
+    closure_file_size_bytes: i64,
     compression: String,
     references_json: String,
     serving_url: String,
@@ -367,6 +368,7 @@ impl TryFrom<CacheArtifactRow> for CacheArtifact {
             nar_hash: row.nar_hash,
             nar_size_bytes: row.nar_size_bytes,
             closure_size_bytes: row.closure_size_bytes,
+            closure_file_size_bytes: row.closure_file_size_bytes,
             compression: row.compression,
             references: json_from_db(&row.references_json, "cache artifact references_json")?,
             serving_url: row.serving_url,
@@ -1464,6 +1466,7 @@ pub async fn create_cache_artifact(
         input.nar_hash.as_deref().unwrap_or(""),
         input.nar_size_bytes.unwrap_or(0),
         input.closure_size_bytes.unwrap_or(0),
+        input.closure_file_size_bytes.unwrap_or(0),
         input.compression.as_deref().unwrap_or(""),
         input.references,
         input.serving_url.as_deref().unwrap_or(""),
@@ -1488,6 +1491,7 @@ pub async fn upsert_cache_artifact(
     nar_hash: &str,
     nar_size_bytes: i64,
     closure_size_bytes: i64,
+    closure_file_size_bytes: i64,
     compression: &str,
     references: Option<Value>,
     serving_url: &str,
@@ -1508,6 +1512,7 @@ pub async fn upsert_cache_artifact(
     let nar_hash = normalize_optional_nix_hash(nar_hash, "nar_hash")?;
     validate_non_negative_i64(nar_size_bytes, "nar_size_bytes")?;
     validate_non_negative_i64(closure_size_bytes, "closure_size_bytes")?;
+    validate_non_negative_i64(closure_file_size_bytes, "closure_file_size_bytes")?;
     let compression = normalize_optional_cache_token(compression, "compression")?;
     let references_json = references_to_string(references)?;
     let serving_url = normalize_optional_url(serving_url, "serving_url")?;
@@ -1518,8 +1523,8 @@ pub async fn upsert_cache_artifact(
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO forge_cache_artifacts
-         (managed_artifact_id, artifact_type, hash, size_bytes, path, store_path, narinfo_path, nar_url, file_hash, nar_hash, nar_size_bytes, closure_size_bytes, compression, references_json, serving_url, source_build_job_id, cache_metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (managed_artifact_id, artifact_type, hash, size_bytes, path, store_path, narinfo_path, nar_url, file_hash, nar_hash, nar_size_bytes, closure_size_bytes, closure_file_size_bytes, compression, references_json, serving_url, source_build_job_id, cache_metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(artifact_type, hash) DO UPDATE SET
              managed_artifact_id = excluded.managed_artifact_id,
              size_bytes = excluded.size_bytes,
@@ -1531,6 +1536,7 @@ pub async fn upsert_cache_artifact(
              nar_hash = excluded.nar_hash,
              nar_size_bytes = excluded.nar_size_bytes,
              closure_size_bytes = excluded.closure_size_bytes,
+             closure_file_size_bytes = excluded.closure_file_size_bytes,
              compression = excluded.compression,
              references_json = excluded.references_json,
              serving_url = excluded.serving_url,
@@ -1550,6 +1556,7 @@ pub async fn upsert_cache_artifact(
     .bind(nar_hash)
     .bind(nar_size_bytes)
     .bind(closure_size_bytes)
+    .bind(closure_file_size_bytes)
     .bind(compression)
     .bind(references_json)
     .bind(serving_url)
@@ -3250,6 +3257,7 @@ mod tests {
                 nar_hash: None,
                 nar_size_bytes: None,
                 closure_size_bytes: None,
+                closure_file_size_bytes: None,
                 compression: None,
                 references: None,
                 serving_url: Some("http://forge.example/cache/artifact".to_string()),
@@ -3276,6 +3284,7 @@ mod tests {
                 nar_hash: None,
                 nar_size_bytes: None,
                 closure_size_bytes: None,
+                closure_file_size_bytes: None,
                 compression: None,
                 references: None,
                 serving_url: Some("http://forge.example/cache/artifact".to_string()),
@@ -3305,6 +3314,7 @@ mod tests {
                 nar_hash: Some("sha256:def".to_string()),
                 nar_size_bytes: Some(2048),
                 closure_size_bytes: Some(4096),
+                closure_file_size_bytes: None,
                 compression: Some("xz".to_string()),
                 references: Some(json!([
                     "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-output"
@@ -3346,6 +3356,7 @@ mod tests {
                 nar_hash: None,
                 nar_size_bytes: None,
                 closure_size_bytes: None,
+                closure_file_size_bytes: None,
                 compression: None,
                 references: None,
                 serving_url: Some("http://forge.example/cache/closure.nar".to_string()),
@@ -3369,6 +3380,7 @@ mod tests {
                 nar_hash: None,
                 nar_size_bytes: None,
                 closure_size_bytes: None,
+                closure_file_size_bytes: None,
                 compression: None,
                 references: None,
                 serving_url: Some("http://forge.example/cache/netboot.nar".to_string()),
