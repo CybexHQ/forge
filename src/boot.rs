@@ -294,7 +294,16 @@ fn append_kernel_boot(
 
 fn render_local_body() -> String {
     let mut script = String::new();
-    script.push_str("echo Returning failure to UEFI firmware for local boot\n");
+    script.push_str("echo Booting from local disk\n");
+    script.push_str("iseq ${platform} efi && goto local_efi || goto local_bios\n");
+    script.push_str(":local_efi\n");
+    script.push_str("sanboot --drive 0 || goto local_exit\n");
+    script.push_str("goto end\n");
+    script.push_str(":local_bios\n");
+    script.push_str("sanboot --no-describe --drive 0x80 || goto local_exit\n");
+    script.push_str("goto end\n");
+    script.push_str(":local_exit\n");
+    script.push_str("echo Returning failure to firmware for local boot\n");
     script.push_str("exit 1\n");
     script
 }
@@ -464,6 +473,9 @@ mod tests {
         assert!(script.contains("choose --default local selected || goto local"));
         assert!(!script.contains("choose --timeout"));
         assert!(!script.contains("menu-timeout"));
+        assert!(script.contains("iseq ${platform} efi && goto local_efi || goto local_bios"));
+        assert!(script.contains("sanboot --drive 0 || goto local_exit"));
+        assert!(script.contains("sanboot --no-describe --drive 0x80 || goto local_exit"));
         assert!(script.contains("exit 1"));
         let local_item = script.find("item --key l local Boot local disk").unwrap();
         let default_item = script.find("item profile_2 Default Enrollment").unwrap();
