@@ -29,7 +29,7 @@ use tokio::{
     fs as tokio_fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -1082,6 +1082,8 @@ async fn set_profile_iso_boot_script(
 }
 
 const NIXOS_NETBOOT_INITRD_FORMAT: &str = "zstd-combined-newc-v13";
+const NIXOS_NETBOOT_SPLIT_INITRD_FORMAT: &str = "zstd-split-squashfs-v14";
+const NIXOS_NETBOOT_CAPS_ISO_PATH: &str = "/cybex-netboot-caps.json";
 const NIXOS_NETBOOT_INJECTED_CONFIG_ISO_PATH: &str = "/cybex-installer/config.toml";
 const NIXOS_NETBOOT_INJECTED_CONFIG_STORE_BASENAME: &str =
     "00000000000000000000000000000000-cybex-forge-netboot-config.toml";
@@ -1098,6 +1100,16 @@ struct NixosNetbootManifest {
     netboot_cpio_path: String,
     #[serde(default)]
     netboot_initrd_format: String,
+    #[serde(default)]
+    squashfs_path: String,
+    #[serde(default)]
+    squashfs_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NixosNetbootCaps {
+    #[serde(default)]
+    formats: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1139,16 +1151,23 @@ fn ensure_nixos_netboot_artifacts_blocking(
         return Ok(manifest);
     }
 
+    fs::create_dir_all(&installers_dir)
+        .with_context(|| format!("create {}", installers_dir.display()))?;
+    let split_squashfs_capable =
+        probe_nixos_netboot_split_squashfs_capability(iso_path, &installers_dir, &iso_sha256)?;
+
     let artifact_relative_dir = format!("installers/{iso_sha256}");
     let artifact_dir = boot_assets_dir.join("installers").join(&iso_sha256);
     let manifest_path = artifact_dir.join("netboot-manifest.json");
-    if let Some(manifest) = read_valid_netboot_manifest(&manifest_path, &artifact_dir, &iso_sha256)?
-    {
+    if let Some(manifest) = read_valid_netboot_manifest(
+        &manifest_path,
+        &artifact_dir,
+        &iso_sha256,
+        split_squashfs_capable,
+    )? {
         return Ok(manifest);
     }
 
-    fs::create_dir_all(&installers_dir)
-        .with_context(|| format!("create {}", installers_dir.display()))?;
     let staging_dir = netboot_staging_dir(&installers_dir, &iso_sha256)?;
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)
@@ -1157,8 +1176,13 @@ fn ensure_nixos_netboot_artifacts_blocking(
     fs::create_dir_all(&staging_dir)
         .with_context(|| format!("create {}", staging_dir.display()))?;
 
-    let result =
-        prepare_nixos_netboot_staging(iso_path, &staging_dir, &artifact_relative_dir, &iso_sha256);
+    let result = prepare_nixos_netboot_staging(
+        iso_path,
+        &staging_dir,
+        &artifact_relative_dir,
+        &iso_sha256,
+        split_squashfs_capable,
+    );
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging_dir);
     }
@@ -1182,6 +1206,7 @@ fn read_valid_netboot_manifest(
     manifest_path: &Path,
     artifact_dir: &Path,
     iso_sha256: &str,
+    split_squashfs_capable: bool,
 ) -> Result<Option<NixosNetbootManifest>> {
     let Ok(raw) = fs::read(manifest_path) else {
         return Ok(None);
@@ -1191,10 +1216,41 @@ fn read_valid_netboot_manifest(
     if manifest.iso_sha256 != iso_sha256 {
         return Ok(None);
     }
-    if manifest.netboot_initrd_format != NIXOS_NETBOOT_INITRD_FORMAT {
+    let expected_format = if split_squashfs_capable {
+        NIXOS_NETBOOT_SPLIT_INITRD_FORMAT
+    } else {
+        NIXOS_NETBOOT_INITRD_FORMAT
+    };
+    if manifest.netboot_initrd_format != expected_format {
         return Ok(None);
     }
     if !manifest.netboot_cpio_path.trim().is_empty() {
+        return Ok(None);
+    }
+    if split_squashfs_capable {
+        if assets::sanitize_relative_path(&manifest.squashfs_path).is_err() {
+            return Ok(None);
+        }
+        if manifest.squashfs_path != format!("installers/{iso_sha256}/nix-store.squashfs") {
+            return Ok(None);
+        }
+        if valid_sha256(&manifest.squashfs_sha256).is_none() {
+            return Ok(None);
+        }
+        let squashfs_path = artifact_dir.join("nix-store.squashfs");
+        if !squashfs_path.is_file() {
+            return Ok(None);
+        }
+        if fs::metadata(&squashfs_path)
+            .with_context(|| format!("stat {}", squashfs_path.display()))?
+            .len()
+            == 0
+        {
+            return Ok(None);
+        }
+    } else if !manifest.squashfs_path.trim().is_empty()
+        || !manifest.squashfs_sha256.trim().is_empty()
+    {
         return Ok(None);
     }
     for filename in ["bzImage", "initrd"] {
@@ -1245,7 +1301,45 @@ fn read_valid_prebuilt_netboot_manifest(
         initrd_path: format!("{artifact_relative_dir}/initrd"),
         netboot_cpio_path: String::new(),
         netboot_initrd_format: "prebuilt-single-initrd".to_string(),
+        squashfs_path: String::new(),
+        squashfs_sha256: String::new(),
     }))
+}
+
+fn probe_nixos_netboot_split_squashfs_capability(
+    iso_path: &Path,
+    scratch_dir: &Path,
+    iso_sha256: &str,
+) -> Result<bool> {
+    let caps_path = temp_path(
+        scratch_dir,
+        &format!("{iso_sha256}.cybex-netboot-caps.json"),
+    )?;
+    let result = (|| -> Result<bool> {
+        if !try_extract_iso_file(iso_path, NIXOS_NETBOOT_CAPS_ISO_PATH, &caps_path)? {
+            debug!("managed ISO has no netboot capability marker");
+            return Ok(false);
+        }
+        let raw = fs::read(&caps_path).with_context(|| format!("read {}", caps_path.display()))?;
+        match parse_nixos_netboot_split_squashfs_capability(&raw) {
+            Ok(capable) => Ok(capable),
+            Err(error) => {
+                debug!(%error, "managed ISO netboot capability marker was malformed");
+                Ok(false)
+            }
+        }
+    })();
+    let _ = fs::remove_file(&caps_path);
+    result
+}
+
+fn parse_nixos_netboot_split_squashfs_capability(raw: &[u8]) -> Result<bool> {
+    let caps = serde_json::from_slice::<NixosNetbootCaps>(raw)
+        .context("parse managed ISO netboot capability marker")?;
+    Ok(caps
+        .formats
+        .iter()
+        .any(|format| format == NIXOS_NETBOOT_SPLIT_INITRD_FORMAT))
 }
 
 fn prepare_nixos_netboot_staging(
@@ -1253,6 +1347,7 @@ fn prepare_nixos_netboot_staging(
     staging_dir: &Path,
     artifact_relative_dir: &str,
     iso_sha256: &str,
+    split_squashfs_capable: bool,
 ) -> Result<NixosNetbootManifest> {
     let isolinux_cfg = staging_dir.join("isolinux.cfg");
     extract_iso_file(iso_path, "/isolinux/isolinux.cfg", &isolinux_cfg)?;
@@ -1278,9 +1373,21 @@ fn prepare_nixos_netboot_staging(
 
     let initrd_fstab_path = find_initrd_fstab_path(&initrd_path)?;
     patch_nixos_netboot_squashfs(&squashfs_path, injected_config)?;
-    rebuild_zstd_initrd_with_netboot_files(&initrd_path, &squashfs_path, &initrd_fstab_path)?;
-    fs::remove_file(&squashfs_path)
-        .with_context(|| format!("remove temporary {}", squashfs_path.display()))?;
+    let squashfs_for_initrd = if split_squashfs_capable {
+        None
+    } else {
+        Some(squashfs_path.as_path())
+    };
+    rebuild_zstd_initrd_with_netboot_files(&initrd_path, squashfs_for_initrd, &initrd_fstab_path)?;
+    let squashfs_sha256 = if split_squashfs_capable {
+        ensure_nonempty_file(&squashfs_path)?;
+        set_public_artifact_permissions(&squashfs_path)?;
+        sha256_file_blocking(&squashfs_path)?
+    } else {
+        fs::remove_file(&squashfs_path)
+            .with_context(|| format!("remove temporary {}", squashfs_path.display()))?;
+        String::new()
+    };
     let _ = fs::remove_file(&injected_config_path);
 
     ensure_nonempty_file(&kernel_path)?;
@@ -1297,7 +1404,18 @@ fn prepare_nixos_netboot_staging(
         kernel_path: format!("{artifact_relative_dir}/bzImage"),
         initrd_path: format!("{artifact_relative_dir}/initrd"),
         netboot_cpio_path: String::new(),
-        netboot_initrd_format: NIXOS_NETBOOT_INITRD_FORMAT.to_string(),
+        netboot_initrd_format: if split_squashfs_capable {
+            NIXOS_NETBOOT_SPLIT_INITRD_FORMAT
+        } else {
+            NIXOS_NETBOOT_INITRD_FORMAT
+        }
+        .to_string(),
+        squashfs_path: if split_squashfs_capable {
+            format!("{artifact_relative_dir}/nix-store.squashfs")
+        } else {
+            String::new()
+        },
+        squashfs_sha256,
     };
     fs::write(
         staging_dir.join("netboot-manifest.json"),
@@ -1398,7 +1516,18 @@ fn render_nixos_netboot_script(
 ) -> Result<String> {
     let kernel_url = assets::asset_url(public_base_url, &manifest.kernel_path)?;
     let initrd_url = assets::asset_url(public_base_url, &manifest.initrd_path)?;
-    validate_cmdline(Some(&manifest.cmdline))?;
+    let mut cmdline = manifest.cmdline.clone();
+    if manifest.netboot_initrd_format == NIXOS_NETBOOT_SPLIT_INITRD_FORMAT {
+        let squashfs_url = assets::asset_url(public_base_url, &manifest.squashfs_path)?;
+        if valid_sha256(&manifest.squashfs_sha256).is_none() {
+            bail!("managed ISO netboot squashfs checksum must be 64 hex characters");
+        }
+        cmdline = format!(
+            "{cmdline} cybex.squashfs_url={squashfs_url} cybex.squashfs_sha256={}",
+            manifest.squashfs_sha256
+        );
+    }
+    validate_cmdline(Some(&cmdline))?;
     if manifest.netboot_cpio_path.trim().is_empty() {
         return Ok(format!(
             "#!ipxe\n\
@@ -1406,7 +1535,7 @@ fn render_nixos_netboot_script(
              kernel {kernel_url} initrd=initrd {cmdline}\n\
              initrd --name initrd {initrd_url}\n\
              boot\n",
-            cmdline = manifest.cmdline
+            cmdline = cmdline
         ));
     }
     let cpio_url = assets::asset_url(public_base_url, &manifest.netboot_cpio_path)?;
@@ -1417,7 +1546,7 @@ fn render_nixos_netboot_script(
          initrd --name initrd {initrd_url}\n\
          initrd --name nixos-netboot.cpio {cpio_url}\n\
          boot\n",
-        cmdline = manifest.cmdline
+        cmdline = cmdline
     ))
 }
 
@@ -1841,7 +1970,7 @@ fn parse_newc_hex(input: &[u8]) -> Result<u64> {
 
 fn rebuild_zstd_initrd_with_netboot_files(
     initrd_path: &Path,
-    squashfs_path: &Path,
+    squashfs_path: Option<&Path>,
     initrd_fstab_path: &str,
 ) -> Result<()> {
     let decoded_path = initrd_path.with_extension("decoded.cpio.tmp");
@@ -1889,7 +2018,7 @@ fn decompress_zstd_to_file(source: &Path, destination: &Path) -> Result<()> {
 fn rewrite_newc_archive_with_netboot_files(
     source: &Path,
     destination: &Path,
-    squashfs_path: &Path,
+    squashfs_path: Option<&Path>,
     initrd_fstab_path: &str,
 ) -> Result<()> {
     let input = fs::File::open(source).with_context(|| format!("open {}", source.display()))?;
@@ -1930,13 +2059,15 @@ fn rewrite_newc_archive_with_netboot_files(
         next_ino,
     )?;
     next_ino += 1;
-    write_newc_file_from_path(
-        &mut output,
-        "nix-store.squashfs",
-        squashfs_path,
-        0o100644,
-        next_ino,
-    )?;
+    if let Some(squashfs_path) = squashfs_path {
+        write_newc_file_from_path(
+            &mut output,
+            "nix-store.squashfs",
+            squashfs_path,
+            0o100644,
+            next_ino,
+        )?;
+    }
     write_newc_trailer(&mut output)?;
     output
         .sync_all()
@@ -2167,6 +2298,22 @@ fn ensure_nonempty_file(path: &Path) -> Result<()> {
         bail!("{} is not a non-empty file", path.display());
     }
     Ok(())
+}
+
+fn sha256_file_blocking(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 128];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn ensure_command_success(output: std::process::Output, context: &str) -> Result<()> {
@@ -4720,19 +4867,22 @@ mod tests {
         MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
         MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
-        NIXOS_NETBOOT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
-        append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
-        bounded_error_message, bounded_http_timeout_seconds, clean_optional,
-        failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
+        NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest,
+        NormalizedManagedSettings, SyncOutcome, append_bounded_response_chunk_with_limit,
+        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
+        clean_optional, failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
         generated_iso_raw_script_can_be_preserved, has_unreported_known_profile_events,
         managed_profile_map, managed_profile_needs_iso_sync, managed_profile_raw_script,
         managed_sync_interval_seconds, nixos_netboot_fstab, normalize_managed_settings,
-        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline, patch_nixos_netboot_squashfs_fstab,
+        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
+        parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
         patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
-        render_check_service, render_managed_config, render_nixos_netboot_script,
-        serialize_boot_report_body, sync_clients, sync_deleted_clients, sync_deleted_profiles,
-        sync_desired_profile_isos, sync_profiles, validate_boot_config, validate_profile,
-        write_secure_json,
+        read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
+        render_managed_config, render_nixos_netboot_script,
+        rewrite_newc_archive_with_netboot_files, serialize_boot_report_body, skip_padding,
+        sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_desired_profile_isos,
+        sync_profiles, validate_boot_config, validate_profile, write_newc_file_from_bytes,
+        write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -4742,7 +4892,49 @@ mod tests {
         models::{CreateDeviceRequest, NewBootEvent},
     };
     use rand::{RngCore, rngs::OsRng};
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{BufReader, Read},
+        path::{Path, PathBuf},
+    };
+
+    fn sample_netboot_manifest(
+        iso_sha256: &str,
+        format: &str,
+        squashfs_path: &str,
+        squashfs_sha256: &str,
+    ) -> NixosNetbootManifest {
+        NixosNetbootManifest {
+            iso_sha256: iso_sha256.to_string(),
+            kernel_iso_path: "/boot/kernel".to_string(),
+            initrd_iso_path: "/boot/initrd".to_string(),
+            initrd_fstab_path: "nix/store/example-initrd-fstab".to_string(),
+            cmdline: "root=fstab quiet".to_string(),
+            kernel_path: "installers/example/bzImage".to_string(),
+            initrd_path: "installers/example/initrd".to_string(),
+            netboot_cpio_path: String::new(),
+            netboot_initrd_format: format.to_string(),
+            squashfs_path: squashfs_path.to_string(),
+            squashfs_sha256: squashfs_sha256.to_string(),
+        }
+    }
+
+    fn read_newc_archive_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let input = fs::File::open(path).unwrap();
+        let mut reader = BufReader::new(input);
+        let mut entries = Vec::new();
+        loop {
+            let entry = read_newc_entry_start(&mut reader).unwrap().unwrap();
+            if entry.name == "TRAILER!!!" {
+                break;
+            }
+            let mut data = vec![0u8; entry.file_size as usize];
+            reader.read_exact(&mut data).unwrap();
+            skip_padding(&mut reader, entry.file_size).unwrap();
+            entries.push((entry.name, data));
+        }
+        entries
+    }
 
     #[test]
     fn failed_sync_backoff_grows_and_caps_at_normal_interval() {
@@ -4817,6 +5009,8 @@ mod tests {
                 initrd_path: "installers/example/initrd".to_string(),
                 netboot_cpio_path: "installers/example/nixos-netboot.cpio".to_string(),
                 netboot_initrd_format: String::new(),
+                squashfs_path: String::new(),
+                squashfs_sha256: String::new(),
             },
             "http://boot.example",
         )
@@ -4850,6 +5044,8 @@ mod tests {
                 initrd_path: "installers/example-nix-netboot/initrd".to_string(),
                 netboot_cpio_path: String::new(),
                 netboot_initrd_format: "prebuilt-single-initrd".to_string(),
+                squashfs_path: String::new(),
+                squashfs_sha256: String::new(),
             },
             "http://boot.example",
         )
@@ -4862,6 +5058,122 @@ mod tests {
             "initrd --name initrd http://boot.example/files/installers/example-nix-netboot/initrd"
         ));
         assert!(!script.contains("initrd=nixos-netboot.cpio"));
+    }
+
+    #[test]
+    fn netboot_caps_json_detects_split_squashfs_format() {
+        assert!(
+            parse_nixos_netboot_split_squashfs_capability(
+                br#"{"initrd_squashfs_fetch":true,"formats":["zstd-split-squashfs-v14","zstd-combined-newc-v13"]}"#
+            )
+            .unwrap()
+        );
+        assert!(
+            !parse_nixos_netboot_split_squashfs_capability(br#"{"initrd_squashfs_fetch":true}"#)
+                .unwrap()
+        );
+        assert!(parse_nixos_netboot_split_squashfs_capability(b"{").is_err());
+    }
+
+    #[test]
+    fn split_nixos_netboot_script_adds_squashfs_cmdline_params() {
+        let script = render_nixos_netboot_script(
+            &NixosNetbootManifest {
+                iso_sha256: "a".repeat(64),
+                kernel_iso_path: "/boot/kernel".to_string(),
+                initrd_iso_path: "/boot/initrd".to_string(),
+                initrd_fstab_path: "nix/store/example-initrd-fstab".to_string(),
+                cmdline: "root=fstab quiet".to_string(),
+                kernel_path: "installers/example/bzImage".to_string(),
+                initrd_path: "installers/example/initrd".to_string(),
+                netboot_cpio_path: String::new(),
+                netboot_initrd_format: NIXOS_NETBOOT_SPLIT_INITRD_FORMAT.to_string(),
+                squashfs_path: "installers/example/nix-store.squashfs".to_string(),
+                squashfs_sha256: "b".repeat(64),
+            },
+            "http://boot.example",
+        )
+        .unwrap();
+
+        assert!(script.contains(
+            "kernel http://boot.example/files/installers/example/bzImage initrd=initrd root=fstab quiet cybex.squashfs_url=http://boot.example/files/installers/example/nix-store.squashfs cybex.squashfs_sha256="
+        ));
+        assert!(script.contains(&"b".repeat(64)));
+        assert!(
+            script.contains(
+                "initrd --name initrd http://boot.example/files/installers/example/initrd"
+            )
+        );
+        assert!(!script.contains("initrd=nixos-netboot.cpio"));
+    }
+
+    #[test]
+    fn netboot_manifest_validation_tracks_iso_split_capability() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("cybex-forge-manifest-test-{}", hex::encode(random)));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bzImage"), b"kernel").unwrap();
+        fs::write(dir.join("initrd"), b"initrd").unwrap();
+        fs::write(dir.join("nix-store.squashfs"), b"squashfs").unwrap();
+        let manifest_path = dir.join("netboot-manifest.json");
+        let iso_sha256 = "a".repeat(64);
+
+        let mut manifest = sample_netboot_manifest(
+            &iso_sha256,
+            NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
+            &format!("installers/{iso_sha256}/nix-store.squashfs"),
+            &"b".repeat(64),
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, false)
+                .unwrap()
+                .is_none()
+        );
+
+        manifest.squashfs_sha256 = "not-a-sha".to_string();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, true)
+                .unwrap()
+                .is_none()
+        );
+
+        manifest = sample_netboot_manifest(&iso_sha256, NIXOS_NETBOOT_INITRD_FORMAT, "", "");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, false)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, true)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_file(dir.join("nix-store.squashfs")).unwrap();
+        manifest = sample_netboot_manifest(
+            &iso_sha256,
+            NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
+            &format!("installers/{iso_sha256}/nix-store.squashfs"),
+            &"b".repeat(64),
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            read_valid_netboot_manifest(&manifest_path, &dir, &iso_sha256, true)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4904,6 +5216,56 @@ mod tests {
         assert_eq!(rewritten, nixos_netboot_fstab());
         assert!(!rewritten.contains("/dev/disk/by-label/"));
         assert!(!rewritten.contains("/sysroot/iso/"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newc_rewrite_without_squashfs_replaces_fstab_only() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("cybex-forge-newc-test-{}", hex::encode(random)));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.cpio");
+        let destination = dir.join("destination.cpio");
+        {
+            let mut file = fs::File::create(&source).unwrap();
+            write_newc_file_from_bytes(&mut file, "keep-me", b"unchanged", 0o100644, 1).unwrap();
+            write_newc_file_from_bytes(
+                &mut file,
+                "nix/store/example-initrd-fstab",
+                b"old fstab",
+                0o100644,
+                2,
+            )
+            .unwrap();
+            write_newc_trailer(&mut file).unwrap();
+        }
+
+        rewrite_newc_archive_with_netboot_files(
+            &source,
+            &destination,
+            None,
+            "nix/store/example-initrd-fstab",
+        )
+        .unwrap();
+
+        let entries = read_newc_archive_entries(&destination);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("keep-me".to_string(), b"unchanged".to_vec()));
+        assert_eq!(
+            entries[1],
+            (
+                "nix/store/example-initrd-fstab".to_string(),
+                nixos_netboot_fstab().into_bytes()
+            )
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(name, _)| name.as_str() != "nix-store.squashfs")
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5693,6 +6055,8 @@ mod tests {
                 initrd_path: "installers/example/initrd".to_string(),
                 netboot_cpio_path: "installers/example/nixos-netboot.cpio".to_string(),
                 netboot_initrd_format: NIXOS_NETBOOT_INITRD_FORMAT.to_string(),
+                squashfs_path: String::new(),
+                squashfs_sha256: String::new(),
             },
             "http://boot.example",
         )
