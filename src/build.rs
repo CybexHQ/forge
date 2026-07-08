@@ -247,6 +247,14 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             return Ok(());
         }
     };
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(8),
+        "validating",
+        "Build spec validated",
+    )
+    .await?;
     let target = match build_target(&state.config, &spec) {
         Ok(target) => target.clone(),
         Err(err) => {
@@ -267,6 +275,14 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         }
     };
 
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(12),
+        "preparing",
+        "Checking builder capacity and preparing inputs",
+    )
+    .await?;
     if let Err(err) = crate::disk::ensure_headroom(
         Path::new("/nix/store"),
         state.config.build.max_artifact_size_bytes,
@@ -290,10 +306,26 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
 
     let command = nix_build_command(&state.config, &target, &spec, job.id)?;
     let log = SharedLog::new(state.config.build.max_log_bytes);
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(25),
+        "building",
+        "Building NixOS closure",
+    )
+    .await?;
     let outcome = run_nix_build(&state.db, &job, &command, &log, &state.config).await?;
     let logs = log.snapshot().await;
     match outcome {
         ProcessOutcome::Succeeded(exit_code) => {
+            db::update_build_job_progress(
+                &state.db,
+                job.id,
+                Some(80),
+                "inspecting",
+                "Inspecting build output",
+            )
+            .await?;
             let output_info = match inspect_build_output(&state.config, &command).await {
                 Ok(info) => info,
                 Err(err) => {
@@ -329,6 +361,14 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 .await?;
                 return Ok(());
             }
+            db::update_build_job_progress(
+                &state.db,
+                job.id,
+                Some(90),
+                "exporting",
+                "Exporting closure to Forge cache",
+            )
+            .await?;
             let cached = match cache::export_output(
                 &state.config,
                 &job,
@@ -356,6 +396,14 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     return Ok(());
                 }
             };
+            db::update_build_job_progress(
+                &state.db,
+                job.id,
+                Some(96),
+                "publishing",
+                "Publishing cache artifact metadata",
+            )
+            .await?;
             cache::record_cached_artifact(
                 &state.db,
                 &state.config,

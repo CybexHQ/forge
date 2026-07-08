@@ -30,6 +30,8 @@ const MAX_PROFILE_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_PROFILE_RAW_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_BUILD_LOG_BYTES: usize = 64 * 1024;
 const MAX_BUILD_ERROR_CHARS: usize = 2_000;
+const MAX_BUILD_PROGRESS_STAGE_CHARS: usize = 48;
+const MAX_BUILD_PROGRESS_MESSAGE_CHARS: usize = 160;
 const MAX_CACHE_METADATA_BYTES: usize = 1024 * 1024;
 const ALLOWED_BUILD_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "cancelled"];
 
@@ -281,6 +283,9 @@ struct BuildJobRow {
     input_revision: String,
     input_config_hash: String,
     status: String,
+    progress_percent: Option<i32>,
+    progress_stage: Option<String>,
+    progress_message: Option<String>,
     logs: String,
     error: String,
     output_path: String,
@@ -309,6 +314,9 @@ impl TryFrom<BuildJobRow> for BuildJob {
             input_revision: row.input_revision,
             input_config_hash: row.input_config_hash,
             status: row.status,
+            progress_percent: row.progress_percent,
+            progress_stage: row.progress_stage,
+            progress_message: row.progress_message,
             logs: row.logs,
             error: row.error,
             output_path: row.output_path,
@@ -1055,8 +1063,9 @@ pub async fn create_build_job(
     let now = now_rfc3339();
     let result = sqlx::query(
         "INSERT INTO forge_build_jobs
-         (requested_artifact_type, build_spec, target, system, input_revision, input_config_hash, status, cache_metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+         (requested_artifact_type, build_spec, target, system, input_revision, input_config_hash,
+          status, progress_percent, progress_stage, progress_message, cache_metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Forge to claim the build', ?, ?, ?)",
     )
     .bind(requested_artifact_type)
     .bind(build_spec)
@@ -1104,8 +1113,10 @@ pub async fn upsert_managed_build_job(
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO forge_build_jobs
-         (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision, input_config_hash, status, cache_metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+         (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision,
+          input_config_hash, status, progress_percent, progress_stage, progress_message,
+          cache_metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Forge to claim the build', ?, ?, ?)
          ON CONFLICT(managed_job_id) DO UPDATE SET
              requested_artifact_type = CASE
                  WHEN forge_build_jobs.status = 'queued' THEN excluded.requested_artifact_type
@@ -1130,6 +1141,18 @@ pub async fn upsert_managed_build_job(
              input_config_hash = CASE
                  WHEN forge_build_jobs.status = 'queued' THEN excluded.input_config_hash
                  ELSE forge_build_jobs.input_config_hash
+             END,
+             progress_percent = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_percent
+                 ELSE forge_build_jobs.progress_percent
+             END,
+             progress_stage = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_stage
+                 ELSE forge_build_jobs.progress_stage
+             END,
+             progress_message = CASE
+                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_message
+                 ELSE forge_build_jobs.progress_message
              END,
              cache_metadata = excluded.cache_metadata,
              updated_at = excluded.updated_at",
@@ -1172,6 +1195,12 @@ pub async fn cancel_absent_managed_build_jobs(
         sqlx::query(
             "UPDATE forge_build_jobs
              SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                 progress_percent = CASE WHEN status = 'queued' THEN 100 ELSE COALESCE(progress_percent, 5) END,
+                 progress_stage = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
+                 progress_message = CASE
+                     WHEN status = 'queued' THEN 'Build cancelled before start'
+                     ELSE 'Cancellation requested; waiting for Forge to stop the build'
+                 END,
                  cancel_requested_at = CASE WHEN status = 'running' THEN ? ELSE cancel_requested_at END,
                  completed_at = CASE WHEN status = 'queued' THEN ? ELSE completed_at END,
                  updated_at = ?
@@ -1199,6 +1228,12 @@ pub async fn cancel_managed_build_jobs(
         let affected = sqlx::query(
             "UPDATE forge_build_jobs
              SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                 progress_percent = CASE WHEN status = 'queued' THEN 100 ELSE COALESCE(progress_percent, 5) END,
+                 progress_stage = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
+                 progress_message = CASE
+                     WHEN status = 'queued' THEN 'Build cancelled before start'
+                     ELSE 'Cancellation requested; waiting for Forge to stop the build'
+                 END,
                  cancel_requested_at = CASE WHEN status = 'running' THEN ? ELSE cancel_requested_at END,
                  completed_at = CASE WHEN status = 'queued' THEN ? ELSE completed_at END,
                  updated_at = ?
@@ -1222,6 +1257,9 @@ pub async fn recover_running_build_jobs(pool: &SqlitePool, reason: &str) -> AppR
     let affected = sqlx::query(
         "UPDATE forge_build_jobs
          SET status = 'failed',
+             progress_percent = 100,
+             progress_stage = 'failed',
+             progress_message = 'Build interrupted by Forge restart recovery',
              error = ?,
              completed_at = ?,
              updated_at = ?
@@ -1241,6 +1279,9 @@ pub async fn claim_next_build_job(pool: &SqlitePool) -> AppResult<Option<BuildJo
     let row = sqlx::query_as::<_, BuildJobRow>(
         "UPDATE forge_build_jobs
          SET status = 'running',
+             progress_percent = 5,
+             progress_stage = 'claimed',
+             progress_message = 'Build claimed by Forge',
              started_at = COALESCE(started_at, ?),
              cancel_requested_at = NULL,
              logs = '',
@@ -1292,6 +1333,35 @@ pub async fn update_build_job_logs(pool: &SqlitePool, id: i64, logs: &str) -> Ap
     Ok(())
 }
 
+pub async fn update_build_job_progress(
+    pool: &SqlitePool,
+    id: i64,
+    progress_percent: Option<i32>,
+    progress_stage: &str,
+    progress_message: &str,
+) -> AppResult<()> {
+    let now = now_rfc3339();
+    sqlx::query(
+        "UPDATE forge_build_jobs
+         SET progress_percent = ?,
+             progress_stage = ?,
+             progress_message = ?,
+             updated_at = ?
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(normalize_build_progress_percent(
+        progress_percent,
+        "running",
+    ))
+    .bind(bounded_progress_stage(progress_stage))
+    .bind(bounded_progress_message(progress_message))
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn finish_build_job(
     pool: &SqlitePool,
@@ -1315,6 +1385,8 @@ pub async fn finish_build_job(
     let cancelled_metadata =
         metadata_to_string(Some(json!({"cancelled": true})), "cache_metadata")?;
     let cancel_override = i64::from(status != "cancelled");
+    let progress_stage = terminal_build_progress_stage(status);
+    let progress_message = terminal_build_progress_message(status);
     let now = now_rfc3339();
     sqlx::query(
         "UPDATE forge_build_jobs
@@ -1347,6 +1419,15 @@ pub async fn finish_build_job(
                  WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN ?
                  ELSE ?
              END,
+             progress_percent = 100,
+             progress_stage = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 'cancelled'
+                 ELSE ?
+             END,
+             progress_message = CASE
+                 WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 'Build cancelled by Manage'
+                 ELSE ?
+             END,
              completed_at = ?,
              updated_at = ?
          WHERE id = ?",
@@ -1367,6 +1448,10 @@ pub async fn finish_build_job(
     .bind(cancel_override)
     .bind(cancelled_metadata)
     .bind(cache_metadata)
+    .bind(cancel_override)
+    .bind(progress_stage)
+    .bind(cancel_override)
+    .bind(progress_message)
     .bind(&now)
     .bind(&now)
     .bind(id)
@@ -1380,6 +1465,9 @@ pub async fn update_build_job_report(
     pool: &SqlitePool,
     managed_job_id: &str,
     status: &str,
+    progress_percent: Option<i32>,
+    progress_stage: Option<&str>,
+    progress_message: Option<&str>,
     logs: &str,
     error: &str,
     output_path: &str,
@@ -1391,6 +1479,9 @@ pub async fn update_build_job_report(
 ) -> AppResult<BuildJob> {
     let managed_job_id = normalize_managed_id(managed_job_id, "managed_job_id")?;
     validate_build_status(status)?;
+    let progress_percent = normalize_build_progress_percent(progress_percent, status);
+    let progress_stage = progress_stage.map(bounded_progress_stage);
+    let progress_message = progress_message.map(bounded_progress_message);
     let logs = bounded_log_text(logs);
     let error = bounded_error_text(error);
     let output_path = normalize_optional_absolute_path(output_path, "output_path")?;
@@ -1403,6 +1494,9 @@ pub async fn update_build_job_report(
     sqlx::query(
         "UPDATE forge_build_jobs
          SET status = ?,
+             progress_percent = ?,
+             progress_stage = ?,
+             progress_message = ?,
              logs = ?,
              error = ?,
              output_path = ?,
@@ -1415,6 +1509,9 @@ pub async fn update_build_job_report(
          WHERE managed_job_id = ?",
     )
     .bind(status)
+    .bind(progress_percent)
+    .bind(progress_stage)
+    .bind(progress_message)
     .bind(logs)
     .bind(error)
     .bind(output_path)
@@ -2011,6 +2108,82 @@ fn bounded_log_text(value: &str) -> String {
 
 fn bounded_error_text(value: &str) -> String {
     value.chars().take(MAX_BUILD_ERROR_CHARS).collect()
+}
+
+fn normalize_build_progress_percent(value: Option<i32>, status: &str) -> Option<i32> {
+    match value {
+        Some(value) => Some(value.clamp(0, 100)),
+        None if matches!(status, "succeeded" | "failed" | "cancelled") => Some(100),
+        None if status == "queued" => Some(0),
+        None => None,
+    }
+}
+
+fn bounded_progress_stage(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_separator = false;
+    for byte in value.trim().bytes() {
+        let next = if byte.is_ascii_alphanumeric() {
+            Some(byte.to_ascii_lowercase() as char)
+        } else if matches!(byte, b' ' | b'-' | b'_' | b'.' | b'/') {
+            Some('_')
+        } else {
+            None
+        };
+        let Some(ch) = next else {
+            continue;
+        };
+        if ch == '_' {
+            if normalized.is_empty() || last_was_separator {
+                continue;
+            }
+            last_was_separator = true;
+        } else {
+            last_was_separator = false;
+        }
+        normalized.push(ch);
+        if normalized.chars().count() >= MAX_BUILD_PROGRESS_STAGE_CHARS {
+            break;
+        }
+    }
+    let normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        "running".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn bounded_progress_message(value: &str) -> String {
+    let compact = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_BUILD_PROGRESS_MESSAGE_CHARS)
+        .collect::<String>();
+    if compact.is_empty() {
+        "Build progress updated".to_string()
+    } else {
+        compact
+    }
+}
+
+fn terminal_build_progress_stage(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "succeeded",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    }
+}
+
+fn terminal_build_progress_message(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "Build completed and cached",
+        "cancelled" => "Build cancelled by Manage",
+        _ => "Build failed",
+    }
 }
 
 fn bounded_bytes(value: &str, max_bytes: usize) -> String {
@@ -3013,6 +3186,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(job.status, "queued");
+        assert_eq!(job.progress_percent, Some(0));
+        assert_eq!(job.progress_stage.as_deref(), Some("queued"));
         assert_eq!(job.target, "desktop_experience");
         assert_eq!(job.system, "x86_64-linux");
         assert_eq!(job.build_spec["artifact_type"], "nixos_closure");
@@ -3020,13 +3195,22 @@ mod tests {
         let claimed = claim_next_build_job(&pool).await.unwrap().unwrap();
         assert_eq!(claimed.id, job.id);
         assert_eq!(claimed.status, "running");
+        assert_eq!(claimed.progress_percent, Some(5));
+        assert_eq!(claimed.progress_stage.as_deref(), Some("claimed"));
         assert!(claimed.started_at.is_some());
+
+        update_build_job_progress(&pool, job.id, Some(42), "cache/export", "Exporting cache")
+            .await
+            .unwrap();
 
         update_build_job_logs(&pool, job.id, &"x".repeat(MAX_BUILD_LOG_BYTES + 100))
             .await
             .unwrap();
         let running = get_build_job(&pool, job.id).await.unwrap();
         assert!(running.logs.len() <= MAX_BUILD_LOG_BYTES);
+        assert_eq!(running.progress_percent, Some(42));
+        assert_eq!(running.progress_stage.as_deref(), Some("cache_export"));
+        assert_eq!(running.progress_message.as_deref(), Some("Exporting cache"));
 
         finish_build_job(
             &pool,
@@ -3045,6 +3229,8 @@ mod tests {
         let updated = get_build_job(&pool, job.id).await.unwrap();
 
         assert_eq!(updated.status, "succeeded");
+        assert_eq!(updated.progress_percent, Some(100));
+        assert_eq!(updated.progress_stage.as_deref(), Some("succeeded"));
         assert_eq!(updated.output_size_bytes, 42);
         assert_eq!(updated.exit_code, Some(0));
         assert!(updated.completed_at.is_some());
@@ -3090,6 +3276,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(updated.status, "cancelled");
+        assert_eq!(updated.progress_percent, Some(100));
+        assert_eq!(updated.progress_stage.as_deref(), Some("cancelled"));
         assert_eq!(updated.error, "build cancelled by Manage");
         assert_eq!(updated.output_path, "");
         assert_eq!(updated.output_sha256, "");
@@ -3187,6 +3375,13 @@ mod tests {
         assert_eq!(
             get_build_job(&pool, first.id).await.unwrap().status,
             "failed"
+        );
+        assert_eq!(
+            get_build_job(&pool, first.id)
+                .await
+                .unwrap()
+                .progress_percent,
+            Some(100)
         );
 
         sqlx::query("UPDATE forge_build_jobs SET managed_job_id = ? WHERE id = ?")
