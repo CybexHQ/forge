@@ -644,7 +644,7 @@ impl Default for BuildConfig {
             timeout_seconds: 60 * 60,
             cancel_grace_seconds: 10,
             max_log_bytes: 64 * 1024,
-            max_artifact_size_bytes: 16 * 1024 * 1024 * 1024,
+            max_artifact_size_bytes: 20 * 1024 * 1024 * 1024,
             allowed_systems: vec!["x86_64-linux".to_string()],
             work_dir: PathBuf::from("/var/lib/cybex-forge/build"),
             output_dir: PathBuf::from("/var/lib/cybex-forge/build-outputs"),
