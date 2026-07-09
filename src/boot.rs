@@ -1,3 +1,5 @@
+use std::{cmp::Reverse, fmt::Write as _};
+
 use crate::{
     assets::asset_url,
     error::{AppError, AppResult},
@@ -18,6 +20,7 @@ pub struct ProfileSelection<'a> {
 }
 
 const IPXE_MENU_BACKGROUND_PATH: &str = "assets/pxe-menu.png";
+const IPXE_MENU_TITLE: &str = "CYBEX";
 const IPXE_MENU_SUBTITLE: &str = "PXE BOOT - FORGE BOOT - X86_64 - UEFI";
 const IPXE_MENU_TIMEOUT_COPY: &str =
     "Booting the highlighted entry automatically - press any key to pause";
@@ -65,35 +68,35 @@ pub fn render_menu(
     serial: Option<&str>,
     timeout_ms: u32,
 ) -> String {
-    let mut script = String::new();
+    let menu_profiles = menu_profiles(profiles);
+    let mut script = String::with_capacity(2048 + (menu_profiles.len() * 256));
     script.push_str("#!ipxe\n");
     append_ipxe_menu_theme(&mut script, public_base_url);
-    script.push_str(&format!("set cybex-subtitle {IPXE_MENU_SUBTITLE}\n"));
+    let _ = writeln!(script, "set cybex-title {IPXE_MENU_TITLE}");
+    let _ = writeln!(script, "set cybex-subtitle {IPXE_MENU_SUBTITLE}");
     if timeout_ms > 0 {
-        script.push_str(&format!(
-            "set cybex-timeout-copy {IPXE_MENU_TIMEOUT_COPY}\n"
-        ));
-        script.push_str(&format!("set menu-timeout {timeout_ms}\n"));
+        let _ = writeln!(script, "set cybex-timeout-copy {IPXE_MENU_TIMEOUT_COPY}");
+        let _ = writeln!(script, "set menu-timeout {timeout_ms}");
     }
-    script.push_str("menu\n");
+    script.push_str("menu ${cybex-title}\n");
     script.push_str("item --gap ${cybex-subtitle}\n");
     script.push_str("item --gap\n");
     script.push_str("item --key l local Boot local disk\n");
 
-    let menu_profiles = menu_profiles(profiles);
     for profile in &menu_profiles {
-        script.push_str(&format!(
-            "item profile_{} {}\n",
+        let _ = writeln!(
+            script,
+            "item profile_{} {}",
             profile.id,
             ipxe_text(&profile.name)
-        ));
+        );
     }
 
     script.push_str("item --gap\n");
     if timeout_ms > 0 {
         script.push_str("item --gap ${cybex-timeout-copy}\n");
     }
-    script.push_str(&format!("item --gap {IPXE_MENU_FOOTER}\n"));
+    let _ = writeln!(script, "item --gap {IPXE_MENU_FOOTER}");
     if timeout_ms > 0 {
         script
             .push_str("choose --timeout ${menu-timeout} --default local selected || goto local\n");
@@ -103,14 +106,15 @@ pub fn render_menu(
     script.push_str("goto ${selected}\n\n");
 
     for profile in &menu_profiles {
-        script.push_str(&format!(":profile_{}\n", profile.id));
-        script.push_str(&format!(
-            "chain {}/boot/select/{}?mac={}&serial={} || goto failed\n",
+        let _ = writeln!(script, ":profile_{}", profile.id);
+        let _ = writeln!(
+            script,
+            "chain --autofree {}/boot/select/{}?mac={}&serial={} || goto failed",
             public_base_url.trim_end_matches('/'),
             profile.id,
             query_value(mac, "${mac}"),
             query_value(serial, "${serial}")
-        ));
+        );
         script.push_str("goto end\n\n");
     }
 
@@ -133,12 +137,12 @@ fn menu_profiles(profiles: &[BootProfile]) -> Vec<&BootProfile> {
                 && profile_has_boot_action(profile)
         })
         .collect();
-    profiles.sort_by(|left, right| {
-        right
-            .is_default
-            .cmp(&left.is_default)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.id.cmp(&right.id))
+    profiles.sort_by_cached_key(|profile| {
+        (
+            Reverse(profile.is_default),
+            profile.name.to_lowercase(),
+            profile.id,
+        )
     });
     profiles
 }
@@ -469,7 +473,7 @@ mod tests {
             0,
         );
         assert!(script.starts_with("#!ipxe"));
-        assert!(script.contains("chain http://boot.local:8080/boot/select/2"));
+        assert!(script.contains("chain --autofree http://boot.local:8080/boot/select/2"));
         assert!(script.contains("choose --default local selected || goto local"));
         assert!(!script.contains("choose --timeout"));
         assert!(!script.contains("menu-timeout"));
@@ -489,7 +493,7 @@ mod tests {
         let profiles = vec![profile(1, BootProfileType::LocalDisk)];
         let script = render_menu("http://boot.local:8080", &profiles, None, None, 0);
 
-        assert!(!script.contains("set cybex-title CYBEX"));
+        assert!(script.contains("set cybex-title CYBEX"));
         assert!(script.contains("set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI"));
         assert!(script.contains(
             "console --x 1024 --y 864 --picture http://boot.local:8080/files/assets/pxe-menu.png --left 280 --right 280 --top 260 --bottom 140 --depth 32"
@@ -498,7 +502,7 @@ mod tests {
         assert!(script.contains("colour --basic 3 --rgb 0xeb9b46 1"));
         assert!(script.contains("colour --basic 4 --rgb 0x241a10 4"));
         assert!(script.contains("cpair --foreground 1 --background 4 2"));
-        assert!(script.contains("menu\n"));
+        assert!(script.contains("menu ${cybex-title}\n"));
         assert!(script.contains("item --gap ${cybex-subtitle}"));
         assert!(script.contains("item --gap cybex-forge - pxe - x86_64 - uefi"));
         assert!(script.contains("choose --default local selected || goto local"));

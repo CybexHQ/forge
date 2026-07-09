@@ -1619,13 +1619,14 @@ check_ipxe_menu_response() {
     fail "$label first line is '$first_line', expected '#!ipxe'"
   fi
   for expected in \
+    "set cybex-title CYBEX" \
     "set cybex-subtitle PXE BOOT - FORGE BOOT - X86_64 - UEFI" \
     "console --x 1024 --y 864 --picture ${public_base_url}/files/assets/pxe-menu.png --left 280 --right 280 --top 260 --bottom 140 --depth 32 || console --x 1024 --y 768 --depth 32 || echo Cybex Forge: using firmware text console" \
     "colour --basic 0 --rgb 0x0e0f12 0" \
     "colour --basic 3 --rgb 0xeb9b46 1" \
     "colour --basic 4 --rgb 0x241a10 4" \
     "cpair --foreground 1 --background 4 2" \
-    'menu' \
+    'menu ${cybex-title}' \
     'item --gap ${cybex-subtitle}' \
     ":local" \
     "exit 1"; do
