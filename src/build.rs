@@ -25,7 +25,8 @@ use crate::{
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
 };
 
-const DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
+const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
+const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,24 +40,29 @@ pub struct BuildSpec {
     pub input_revision: String,
     pub input_config_hash: String,
     #[serde(default)]
-    pub desktop_experience_id: Option<String>,
+    #[serde(alias = "desktop_experience_id")]
+    pub blueprint_id: Option<String>,
     #[serde(default)]
-    pub desktop_experience_revision_id: Option<String>,
+    #[serde(alias = "desktop_experience_revision_id")]
+    pub blueprint_revision_id: Option<String>,
     #[serde(default)]
-    pub desktop_experience_revision_config_hash: Option<String>,
+    #[serde(alias = "desktop_experience_revision_config_hash")]
+    pub blueprint_revision_config_hash: Option<String>,
     #[serde(default)]
-    pub build_input: Option<DesktopExperienceBuildInput>,
+    pub build_input: Option<BlueprintBuildInput>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DesktopExperienceBuildInput {
+pub struct BlueprintBuildInput {
     pub kind: String,
     pub generated_nix: String,
     #[serde(default)]
-    pub desktop_experience_name: Option<String>,
+    #[serde(alias = "desktop_experience_name")]
+    pub blueprint_name: Option<String>,
     #[serde(default)]
-    pub desktop_experience_revision: Option<i64>,
+    #[serde(alias = "desktop_experience_revision")]
+    pub blueprint_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,17 +72,17 @@ struct ValidatedBuildSpec {
     system: String,
     input_revision: String,
     input_config_hash: String,
-    desktop_experience_id: Option<String>,
-    desktop_experience_revision_id: Option<String>,
-    desktop_experience_revision_config_hash: Option<String>,
-    build_input: Option<ValidatedDesktopExperienceBuildInput>,
+    blueprint_id: Option<String>,
+    blueprint_revision_id: Option<String>,
+    blueprint_revision_config_hash: Option<String>,
+    build_input: Option<ValidatedBlueprintBuildInput>,
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedDesktopExperienceBuildInput {
+struct ValidatedBlueprintBuildInput {
     generated_nix: String,
-    desktop_experience_name: Option<String>,
-    desktop_experience_revision: Option<i64>,
+    blueprint_name: Option<String>,
+    blueprint_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -428,10 +434,10 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     "system": spec.system,
                     "input_revision": spec.input_revision,
                     "input_config_hash": spec.input_config_hash,
-                    "desktop_experience_id": spec.desktop_experience_id,
-                    "desktop_experience_revision_id": spec.desktop_experience_revision_id,
-                    "desktop_experience_revision_config_hash": spec.desktop_experience_revision_config_hash,
-                    "build_input_kind": spec.build_input.as_ref().map(|_| DESKTOP_EXPERIENCE_BUILD_INPUT_KIND),
+                    "blueprint_id": spec.blueprint_id,
+                    "blueprint_revision_id": spec.blueprint_revision_id,
+                    "blueprint_revision_config_hash": spec.blueprint_revision_config_hash,
+                    "build_input_kind": spec.build_input.as_ref().map(|_| BLUEPRINT_BUILD_INPUT_KIND),
                     "cache": "exported"
                 })),
             )
@@ -514,24 +520,24 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
     if input_revision != job.input_revision || input_config_hash != job.input_config_hash {
         bail!("build_spec input revision/hash does not match job row");
     }
-    let desktop_experience_id = spec
-        .desktop_experience_id
-        .map(|value| normalize_optional_uuidish("desktop_experience_id", &value))
+    let blueprint_id = spec
+        .blueprint_id
+        .map(|value| normalize_optional_uuidish("blueprint_id", &value))
         .transpose()?;
-    let desktop_experience_revision_id = spec
-        .desktop_experience_revision_id
-        .map(|value| normalize_optional_uuidish("desktop_experience_revision_id", &value))
+    let blueprint_revision_id = spec
+        .blueprint_revision_id
+        .map(|value| normalize_optional_uuidish("blueprint_revision_id", &value))
         .transpose()?;
-    let desktop_experience_revision_config_hash = spec
-        .desktop_experience_revision_config_hash
+    let blueprint_revision_config_hash = spec
+        .blueprint_revision_config_hash
         .map(|value| normalize_sha256(&value))
         .transpose()?;
     let build_input = spec
         .build_input
-        .map(validate_desktop_experience_build_input)
+        .map(validate_blueprint_build_input)
         .transpose()?;
     if build_input.is_some() && artifact_type != "nixos_closure" {
-        bail!("desktop_experience build_input requires artifact_type nixos_closure");
+        bail!("blueprint build_input requires artifact_type nixos_closure");
     }
     Ok(ValidatedBuildSpec {
         artifact_type,
@@ -539,18 +545,21 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         system,
         input_revision,
         input_config_hash,
-        desktop_experience_id,
-        desktop_experience_revision_id,
-        desktop_experience_revision_config_hash,
+        blueprint_id,
+        blueprint_revision_id,
+        blueprint_revision_config_hash,
         build_input,
     })
 }
 
-fn validate_desktop_experience_build_input(
-    input: DesktopExperienceBuildInput,
-) -> Result<ValidatedDesktopExperienceBuildInput> {
+fn validate_blueprint_build_input(
+    input: BlueprintBuildInput,
+) -> Result<ValidatedBlueprintBuildInput> {
     let kind = input.kind.trim();
-    if kind != DESKTOP_EXPERIENCE_BUILD_INPUT_KIND {
+    if !matches!(
+        kind,
+        BLUEPRINT_BUILD_INPUT_KIND | LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND
+    ) {
         bail!("unsupported build_input kind");
     }
     if input.generated_nix.trim().is_empty() {
@@ -562,13 +571,13 @@ fn validate_desktop_experience_build_input(
     if input.generated_nix.bytes().any(|byte| byte == 0) {
         bail!("build_input.generated_nix must not contain NUL bytes");
     }
-    Ok(ValidatedDesktopExperienceBuildInput {
+    Ok(ValidatedBlueprintBuildInput {
         generated_nix: input.generated_nix,
-        desktop_experience_name: input
-            .desktop_experience_name
+        blueprint_name: input
+            .blueprint_name
             .map(|value| bounded_metadata_text(&value, 200))
             .filter(|value| !value.is_empty()),
-        desktop_experience_revision: input.desktop_experience_revision.filter(|value| *value > 0),
+        blueprint_revision: input.blueprint_revision.filter(|value| *value > 0),
     })
 }
 
@@ -582,12 +591,20 @@ fn build_target<'a>(
         .iter()
         .find(|target| {
             target.artifact_type == spec.artifact_type
-                && target.target == spec.target
+                && build_target_names_compatible(&target.target, &spec.target)
                 && target.system == spec.system
         })
         .ok_or_else(|| {
             anyhow!("no configured build target matched artifact_type, target, and system")
         })
+}
+
+fn build_target_names_compatible(configured: &str, requested: &str) -> bool {
+    configured == requested
+        || matches!(
+            (configured, requested),
+            ("desktop_experience", "blueprint") | ("blueprint", "desktop_experience")
+        )
 }
 
 fn nix_build_command(
@@ -597,7 +614,7 @@ fn nix_build_command(
     job_id: i64,
 ) -> Result<NixBuildCommand> {
     if let Some(build_input) = spec.build_input.as_ref() {
-        return desktop_experience_nix_build_command(config, target, spec, build_input, job_id);
+        return blueprint_nix_build_command(config, target, spec, build_input, job_id);
     }
     let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
     let out_link = job_dir.join("result");
@@ -618,23 +635,20 @@ fn nix_build_command(
     })
 }
 
-fn desktop_experience_nix_build_command(
+fn blueprint_nix_build_command(
     config: &AppConfig,
     target: &BuildTargetConfig,
     spec: &ValidatedBuildSpec,
-    build_input: &ValidatedDesktopExperienceBuildInput,
+    build_input: &ValidatedBlueprintBuildInput,
     job_id: i64,
 ) -> Result<NixBuildCommand> {
     let input_dir = config.build.work_dir.join(format!("job-{job_id}-input"));
     fs::create_dir_all(&input_dir)
         .with_context(|| format!("create build input directory {}", input_dir.display()))?;
-    write_job_input_file(
-        input_dir.join("desktop-experience.nix"),
-        &build_input.generated_nix,
-    )?;
+    write_job_input_file(input_dir.join("blueprint.nix"), &build_input.generated_nix)?;
     write_job_input_file(
         input_dir.join("cybex-compat-options.nix"),
-        desktop_experience_compat_module(),
+        blueprint_compat_module(),
     )?;
     write_job_input_file(
         input_dir.join("configuration.nix"),
@@ -669,20 +683,17 @@ fn write_job_input_file(path: PathBuf, contents: &str) -> Result<()> {
 fn forge_nixos_flake(
     nixpkgs_flake: &str,
     system: &str,
-    build_input: &ValidatedDesktopExperienceBuildInput,
+    build_input: &ValidatedBlueprintBuildInput,
 ) -> String {
-    let name = build_input
-        .desktop_experience_name
-        .as_deref()
-        .unwrap_or("Desktop Experience");
+    let name = build_input.blueprint_name.as_deref().unwrap_or("Blueprint");
     let revision = build_input
-        .desktop_experience_revision
+        .blueprint_revision
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let description = serde_json::to_string(&format!(
-        "Cybex Forge Desktop Experience build: {name} rev {revision}"
+        "Cybex Forge Blueprint build: {name} rev {revision}"
     ))
-    .unwrap_or_else(|_| "\"Cybex Forge Desktop Experience build\"".to_string());
+    .unwrap_or_else(|_| "\"Cybex Forge Blueprint build\"".to_string());
     let nixpkgs_flake =
         serde_json::to_string(nixpkgs_flake).unwrap_or_else(|_| "\"nixpkgs\"".to_string());
     format!(
@@ -714,7 +725,7 @@ fn forge_nixos_configuration() -> &'static str {
 {
   imports = [
     ./cybex-compat-options.nix
-    ./desktop-experience.nix
+    ./blueprint.nix
   ];
 
   system.stateVersion = lib.mkDefault lib.trivial.release;
@@ -741,14 +752,14 @@ fn forge_nixos_configuration() -> &'static str {
 "#
 }
 
-fn desktop_experience_compat_module() -> &'static str {
+fn blueprint_compat_module() -> &'static str {
     r#"{ lib, ... }:
 
 {
   options.cybex = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Desktop Experience metadata accepted while Forge prebuilds a generic NixOS closure.";
+    description = "Cybex Blueprint metadata accepted while Forge prebuilds a generic NixOS closure.";
   };
 
   options.services.cybex-agent = lib.mkOption {
@@ -1179,7 +1190,27 @@ mod tests {
     }
 
     #[test]
-    fn build_spec_accepts_desktop_experience_build_input() {
+    fn build_spec_accepts_blueprint_build_input() {
+        let value = json!({
+            "schema_version": 1,
+            "artifact_type": "nixos_closure",
+            "target": "blueprint",
+            "system": "x86_64-linux",
+            "input_revision": "rev",
+            "input_config_hash": "a".repeat(64),
+            "build_input": {
+                "kind": "blueprint_nixos_module",
+                "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
+                "blueprint_name": "Standard Workstation",
+                "blueprint_revision": 8
+            }
+        });
+        let parsed = serde_json::from_value::<BuildSpec>(value).unwrap();
+        assert_eq!(parsed.build_input.unwrap().kind, BLUEPRINT_BUILD_INPUT_KIND);
+    }
+
+    #[test]
+    fn build_spec_accepts_legacy_desktop_experience_aliases() {
         let value = json!({
             "schema_version": 1,
             "artifact_type": "nixos_closure",
@@ -1187,18 +1218,24 @@ mod tests {
             "system": "x86_64-linux",
             "input_revision": "rev",
             "input_config_hash": "a".repeat(64),
+            "desktop_experience_id": "legacy-blueprint",
             "build_input": {
                 "kind": "desktop_experience_nixos_module",
                 "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
-                "desktop_experience_name": "Standard Workstation",
-                "desktop_experience_revision": 8
+                "desktop_experience_name": "Legacy Workstation",
+                "desktop_experience_revision": 7
             }
         });
         let parsed = serde_json::from_value::<BuildSpec>(value).unwrap();
+        assert_eq!(parsed.blueprint_id.as_deref(), Some("legacy-blueprint"));
         assert_eq!(
-            parsed.build_input.unwrap().kind,
-            DESKTOP_EXPERIENCE_BUILD_INPUT_KIND
+            parsed.build_input.unwrap().blueprint_name.as_deref(),
+            Some("Legacy Workstation")
         );
+        assert!(build_target_names_compatible(
+            "desktop_experience",
+            "blueprint"
+        ));
     }
 
     #[test]
@@ -1208,20 +1245,20 @@ mod tests {
         config.build.nix_binary = "nix".to_string();
         let target = BuildTargetConfig {
             artifact_type: "nixos_closure".to_string(),
-            target: "desktop_experience".to_string(),
+            target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
             flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
-            target: "desktop_experience".to_string(),
+            target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
             input_revision: "rev".to_string(),
             input_config_hash: "a".repeat(64),
-            desktop_experience_id: None,
-            desktop_experience_revision_id: None,
-            desktop_experience_revision_config_hash: None,
+            blueprint_id: None,
+            blueprint_revision_id: None,
+            blueprint_revision_config_hash: None,
             build_input: None,
         };
 
@@ -1239,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn nix_build_command_writes_desktop_experience_flake_input() {
+    fn nix_build_command_writes_blueprint_flake_input() {
         let root = std::env::temp_dir().join(format!(
             "cybex-forge-build-input-test-{}",
             std::process::id()
@@ -1251,25 +1288,25 @@ mod tests {
         config.build.nix_binary = "nix".to_string();
         let target = BuildTargetConfig {
             artifact_type: "nixos_closure".to_string(),
-            target: "desktop_experience".to_string(),
+            target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
             flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let spec = ValidatedBuildSpec {
             artifact_type: "nixos_closure".to_string(),
-            target: "desktop_experience".to_string(),
+            target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
             input_revision: "rev".to_string(),
             input_config_hash: "a".repeat(64),
-            desktop_experience_id: None,
-            desktop_experience_revision_id: None,
-            desktop_experience_revision_config_hash: None,
-            build_input: Some(ValidatedDesktopExperienceBuildInput {
+            blueprint_id: None,
+            blueprint_revision_id: None,
+            blueprint_revision_config_hash: None,
+            build_input: Some(ValidatedBlueprintBuildInput {
                 generated_nix: "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }"
                     .to_string(),
-                desktop_experience_name: Some("Standard Workstation".to_string()),
-                desktop_experience_revision: Some(8),
+                blueprint_name: Some("Standard Workstation".to_string()),
+                blueprint_revision: Some(8),
             }),
         };
 
@@ -1284,10 +1321,7 @@ mod tests {
                 .any(|arg| arg.ends_with("#packages.x86_64-linux.desktop-experience"))
         );
         assert!(root.join("work/job-42-input/flake.nix").is_file());
-        assert!(
-            root.join("work/job-42-input/desktop-experience.nix")
-                .is_file()
-        );
+        assert!(root.join("work/job-42-input/blueprint.nix").is_file());
         let configuration =
             std::fs::read_to_string(root.join("work/job-42-input/configuration.nix")).unwrap();
         assert!(

@@ -31,11 +31,11 @@ output_dir = "/var/lib/cybex-forge/build-outputs"
 nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 
 # Add one or more allowlisted Nix targets before queueing production jobs.
-# For generated Desktop Experience closure builds, flake is the nixpkgs input
+# For generated Blueprint closure builds, flake is the nixpkgs input
 # used for evaluation; pin it to the same revision used by installer media.
 # [[build.targets]]
 # artifact_type = "nixos_closure"
-# target = "desktop_experience"
+# target = "blueprint"
 # system = "x86_64-linux"
 # flake = "github:NixOS/nixpkgs/567a49d1913ce81ac6e9582e3553dd90a955875f"
 # attr = "packages.x86_64-linux.desktop-experience"

@@ -650,7 +650,7 @@ nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 
 [[build.targets]]
 artifact_type = "nixos_closure"
-target = "desktop_experience"
+target = "blueprint"
 system = "x86_64-linux"
 flake = "github:NixOS/nixpkgs/nixos-unstable"
 attr = "packages.x86_64-linux.desktop-experience"

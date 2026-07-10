@@ -52,10 +52,10 @@ flake builds.
 Proxmox LXC is fine for Forge Boot and small Build/Cache deployments when the
 LXC has enough CPU, memory, disk, and Nix privileges for the configured targets.
 Serious NixOS closure/image building may need larger LXC resources, a VM, or
-dedicated hardware. The default installer creates a narrow generated Desktop
-Experience closure target in `[[build.targets]]`; add further targets
-deliberately instead of using a broad build allowlist. For generated Desktop
-Experience closure jobs, pin the target `flake` to the same nixpkgs revision
+dedicated hardware. The default installer creates a narrow generated Blueprint
+closure target in `[[build.targets]]`; add further targets deliberately instead
+of using a broad build allowlist. For generated Blueprint closure jobs, pin the
+target `flake` to the same nixpkgs revision
 used by the installer media when you need strict reproducibility, and keep
 `attr` at the generated
 `packages.<system>.desktop-experience` output. Manual standalone installation is
