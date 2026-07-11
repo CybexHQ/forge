@@ -28,6 +28,7 @@ use crate::{
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
+const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,7 +358,10 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             return Ok(());
         }
     };
-    let capacity_error = if capacity.memory_bytes < state.config.build.minimum_memory_bytes {
+    let capacity_error = if !capacity_meets_minimum(
+        capacity.memory_bytes,
+        state.config.build.minimum_memory_bytes,
+    ) {
         Some((
             "insufficient_memory",
             format!(
@@ -365,7 +369,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 state.config.build.minimum_memory_bytes, capacity.memory_bytes
             ),
         ))
-    } else if capacity.swap_bytes < state.config.build.minimum_swap_bytes {
+    } else if !capacity_meets_minimum(capacity.swap_bytes, state.config.build.minimum_swap_bytes) {
         Some((
             "insufficient_swap",
             format!(
@@ -626,6 +630,10 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn capacity_meets_minimum(actual: u64, minimum: u64) -> bool {
+    actual >= minimum.saturating_sub(CAPACITY_ACCOUNTING_TOLERANCE_BYTES)
 }
 
 fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBuildSpec> {
@@ -1577,6 +1585,17 @@ mod tests {
             capacity_from_sysinfo_values(u64::MAX, 1, 4096).memory_bytes,
             u64::MAX
         );
+    }
+
+    #[test]
+    fn capacity_minimum_allows_only_small_kernel_accounting_rounding() {
+        let eight_gib = 8 * 1024 * 1024 * 1024;
+        assert!(capacity_meets_minimum(eight_gib, eight_gib));
+        assert!(capacity_meets_minimum(eight_gib - 4096, eight_gib));
+        assert!(!capacity_meets_minimum(
+            eight_gib - CAPACITY_ACCOUNTING_TOLERANCE_BYTES - 1,
+            eight_gib
+        ));
     }
 
     #[test]
