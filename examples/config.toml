@@ -21,6 +21,9 @@ menu_timeout_ms = 0
 [build]
 enabled = true
 max_concurrent_builds = 1
+max_build_cores = 4
+minimum_memory_bytes = 17179869184
+minimum_swap_bytes = 8589934592
 timeout_seconds = 3600
 cancel_grace_seconds = 10
 max_log_bytes = 65536
@@ -37,7 +40,7 @@ nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 # artifact_type = "nixos_closure"
 # target = "blueprint"
 # system = "x86_64-linux"
-# flake = "github:NixOS/nixpkgs/567a49d1913ce81ac6e9582e3553dd90a955875f"
+# flake = "github:NixOS/nixpkgs/74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
 # attr = "packages.x86_64-linux.desktop-experience"
 
 [cache]

@@ -24,7 +24,8 @@ bridge="${CYBEX_FORGE_PROXMOX_BRIDGE:-}"
 template="${CYBEX_FORGE_PROXMOX_TEMPLATE:-}"
 disk_gb="${CYBEX_FORGE_PROXMOX_DISK_GB:-128}"
 cpu_cores="${CYBEX_FORGE_PROXMOX_CPU_CORES:-4}"
-memory_mb="${CYBEX_FORGE_PROXMOX_MEMORY_MB:-8192}"
+memory_mb="${CYBEX_FORGE_PROXMOX_MEMORY_MB:-16384}"
+swap_mb="${CYBEX_FORGE_PROXMOX_SWAP_MB:-8192}"
 forge_git_url="${CYBEX_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
 forge_ref="${CYBEX_FORGE_REF:-$FORGE_REF_DEFAULT}"
 forge_source_dir="${CYBEX_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
@@ -51,7 +52,8 @@ Required:
 Generated resource options:
   --proxmox-disk-gb GiB          Root disk size (default/recommended: 128)
   --proxmox-cpu-cores COUNT      CPU cores (default/recommended: 4)
-  --proxmox-memory-mb MiB        Memory (default/recommended: 8192)
+  --proxmox-memory-mb MiB        Memory (minimum/recommended: 16384)
+  --proxmox-swap-mb MiB          Emergency swap headroom (default/recommended: 8192)
 
 Boot runtime options:
   --public-base-url URL          Override the auto-detected URL PXE clients use for this Forge node
@@ -138,6 +140,7 @@ while [ "$#" -gt 0 ]; do
     --proxmox-disk-gb) disk_gb="${2:-}"; shift 2 ;;
     --proxmox-cpu-cores) cpu_cores="${2:-}"; shift 2 ;;
     --proxmox-memory-mb) memory_mb="${2:-}"; shift 2 ;;
+    --proxmox-swap-mb) swap_mb="${2:-}"; shift 2 ;;
     --forge-git-url) forge_git_url="${2:-}"; shift 2 ;;
     --forge-ref) forge_ref="${2:-}"; shift 2 ;;
     --forge-source-dir) forge_source_dir="${2:-}"; shift 2 ;;
@@ -436,7 +439,8 @@ validate_and_select_proxmox() {
 resource_warnings() {
   [ "$disk_gb" -ge 128 ] || warn "disk is below the 128 GiB recommendation"
   [ "$cpu_cores" -ge 4 ] || warn "CPU allocation is below the 4-core recommendation"
-  [ "$memory_mb" -ge 8192 ] || warn "memory is below the 8192 MiB recommendation"
+  [ "$memory_mb" -ge 16384 ] || warn "memory is below the 16384 MiB minimum"
+  [ "$swap_mb" -ge 8192 ] || warn "swap is below the 8192 MiB recommendation"
 }
 
 print_summary() {
@@ -449,6 +453,7 @@ print_summary() {
   info "Disk: ${disk_gb} GiB"
   info "CPU: ${cpu_cores} cores"
   info "Memory: ${memory_mb} MiB"
+  info "Swap: ${swap_mb} MiB"
   info "Manage API: $api_url"
   info "Organization: $organization_id"
   if [ -n "$public_base_url" ]; then
@@ -467,6 +472,7 @@ create_container() {
     --hostname "$hostname" \
     --cores "$cpu_cores" \
     --memory "$memory_mb" \
+    --swap "$swap_mb" \
     --rootfs "${storage}:${disk_gb}" \
     --net0 "name=eth0,bridge=${bridge},ip=dhcp" \
     --ostype debian \
@@ -602,6 +608,7 @@ fi
 validate_int_range "--proxmox-disk-gb" "$disk_gb" 8 4096
 validate_int_range "--proxmox-cpu-cores" "$cpu_cores" 1 128
 validate_int_range "--proxmox-memory-mb" "$memory_mb" 1024 1048576
+validate_int_range "--proxmox-swap-mb" "$swap_mb" 0 1048576
 tooling_preflight
 validate_and_select_proxmox
 resource_warnings

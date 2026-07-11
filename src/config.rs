@@ -87,6 +87,9 @@ pub struct BootConfig {
 pub struct BuildConfig {
     pub enabled: bool,
     pub max_concurrent_builds: usize,
+    pub max_build_cores: usize,
+    pub minimum_memory_bytes: u64,
+    pub minimum_swap_bytes: u64,
     pub timeout_seconds: u64,
     pub cancel_grace_seconds: u64,
     pub max_log_bytes: usize,
@@ -194,6 +197,15 @@ impl AppConfig {
             normalize_bootloader_filename(&self.boot.bootloader_filename)?;
         validate_menu_timeout_ms(self.boot.menu_timeout_ms)?;
         self.build.max_concurrent_builds = self.build.max_concurrent_builds.clamp(1, 16);
+        self.build.max_build_cores = self.build.max_build_cores.clamp(1, 128);
+        self.build.minimum_memory_bytes = self
+            .build
+            .minimum_memory_bytes
+            .clamp(1024 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
+        self.build.minimum_swap_bytes = self
+            .build
+            .minimum_swap_bytes
+            .clamp(0, 1024 * 1024 * 1024 * 1024);
         self.build.timeout_seconds = self.build.timeout_seconds.clamp(30, 24 * 60 * 60);
         self.build.cancel_grace_seconds = self.build.cancel_grace_seconds.clamp(1, 300);
         self.build.max_log_bytes = self.build.max_log_bytes.clamp(1024, 8 * 1024 * 1024);
@@ -481,8 +493,23 @@ fn normalize_build_target_config(target: &mut BuildTargetConfig) -> anyhow::Resu
     target.target = normalize_safe_identifier("build.targets.target", &target.target, 64)?;
     target.system = normalize_build_system("build.targets.system", &target.system)?;
     target.flake = normalize_build_flake("build.targets.flake", &target.flake)?;
+    if matches!(target.target.as_str(), "blueprint" | "desktop_experience") {
+        pinned_nixpkgs_revision(&target.flake)?;
+    }
     target.attr = normalize_build_attr("build.targets.attr", &target.attr)?;
     Ok(())
+}
+
+pub fn pinned_nixpkgs_revision(flake: &str) -> anyhow::Result<&str> {
+    let revision = flake.strip_prefix("github:NixOS/nixpkgs/").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Blueprint build target flake must use github:NixOS/nixpkgs/<40-character-commit>"
+        )
+    })?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Blueprint build target flake must pin an immutable 40-character nixpkgs commit");
+    }
+    Ok(revision)
 }
 
 fn normalize_allowed_systems(values: &[String], field: &str) -> anyhow::Result<Vec<String>> {
@@ -641,6 +668,9 @@ impl Default for BuildConfig {
         Self {
             enabled: true,
             max_concurrent_builds: 1,
+            max_build_cores: 4,
+            minimum_memory_bytes: 16 * 1024 * 1024 * 1024,
+            minimum_swap_bytes: 8 * 1024 * 1024 * 1024,
             timeout_seconds: 60 * 60,
             cancel_grace_seconds: 10,
             max_log_bytes: 64 * 1024,
@@ -753,6 +783,22 @@ mod tests {
             PathBuf::from("/srv/cybex-forge/tftp")
         );
         assert_eq!(config.manage.http_timeout_seconds, 30);
+        assert_eq!(config.build.max_build_cores, 4);
+        assert_eq!(config.build.minimum_memory_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(config.build.minimum_swap_bytes, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn blueprint_build_targets_require_immutable_nixpkgs_commits() {
+        assert!(pinned_nixpkgs_revision("github:NixOS/nixpkgs/nixos-unstable").is_err());
+        assert!(pinned_nixpkgs_revision("github:NixOS/nixpkgs/abc123").is_err());
+        assert_eq!(
+            pinned_nixpkgs_revision(
+                "github:NixOS/nixpkgs/74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+            )
+            .unwrap(),
+            "74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+        );
     }
 
     #[test]

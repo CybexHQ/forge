@@ -49,17 +49,17 @@ The installer uses Debian's Nix package to bootstrap `/nix/var/nix/profiles/defa
 to a current Nix release, and Forge Build uses that profile binary for managed
 flake builds.
 
-Proxmox LXC is fine for Forge Boot and small Build/Cache deployments when the
-LXC has enough CPU, memory, disk, and Nix privileges for the configured targets.
-Serious NixOS closure/image building may need larger LXC resources, a VM, or
-dedicated hardware. The default installer creates a narrow generated Blueprint
-closure target in `[[build.targets]]`; add further targets deliberately instead
-of using a broad build allowlist. For generated Blueprint closure jobs, pin the
-target `flake` to the same nixpkgs revision
-used by the installer media when you need strict reproducibility, and keep
-`attr` at the generated
-`packages.<system>.desktop-experience` output. Manual standalone installation is
-not currently supported.
+Proxmox LXC is supported for Forge Boot and Build/Cache. Build/Cache requires at
+least **16 GiB of memory**, 4 CPU cores, and 8 GiB of emergency swap; use 32 GiB
+for heavy developer Blueprints. The default installer enforces those capacity
+minimums, limits individual Nix derivations to four cores, and creates a narrow
+generated Blueprint closure target in `[[build.targets]]`. Blueprint targets
+must use an immutable 40-character nixpkgs commit. The installer validates the
+pin and representative heavy browser outputs against `cache.nixos.org` before
+starting Forge. Jobs and cache artifacts record the exact pin used, and capacity,
+OOM, disk, timeout, and package failures are reported as distinct operator-facing
+states. Add further targets deliberately instead of using a broad build
+allowlist. Manual standalone installation is not currently supported.
 
 ## Managed Updates
 

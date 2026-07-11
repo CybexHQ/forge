@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::{
     AppState, cache,
-    config::{AppConfig, BuildTargetConfig},
+    config::{AppConfig, BuildTargetConfig, pinned_nixpkgs_revision},
     db,
     models::BuildJob,
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
@@ -117,6 +117,12 @@ enum ProcessOutcome {
     Failed(i32),
     Cancelled,
     TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BuildCapacity {
+    memory_bytes: u64,
+    swap_bytes: u64,
 }
 
 pub fn spawn(state: AppState) {
@@ -247,7 +253,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "",
                 0,
                 None,
-                Some(json!({"error_kind": "invalid_build_spec"})),
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    None,
+                    Some("invalid_build_spec"),
+                )),
             )
             .await?;
             return Ok(());
@@ -274,7 +285,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "",
                 0,
                 None,
-                Some(json!({"error_kind": "target_not_allowed"})),
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    None,
+                    Some("target_not_allowed"),
+                )),
             )
             .await?;
             return Ok(());
@@ -304,7 +320,100 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             "",
             0,
             None,
-            Some(json!({"error_kind": "insufficient_disk_space"})),
+            Some(build_result_metadata(
+                &state.config,
+                &job,
+                Some(&target),
+                Some("insufficient_disk_space"),
+            )),
+        )
+        .await?;
+        return Ok(());
+    }
+    let capacity = match build_capacity() {
+        Ok(capacity) => capacity,
+        Err(err) => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                "",
+                &format!(
+                    "could not inspect Forge memory capacity: {}",
+                    safe_error(&err)
+                ),
+                "",
+                "",
+                0,
+                None,
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some("capacity_check_failed"),
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let capacity_error = if capacity.memory_bytes < state.config.build.minimum_memory_bytes {
+        Some((
+            "insufficient_memory",
+            format!(
+                "Forge requires at least {} bytes of memory for Build/Cache; detected {} bytes",
+                state.config.build.minimum_memory_bytes, capacity.memory_bytes
+            ),
+        ))
+    } else if capacity.swap_bytes < state.config.build.minimum_swap_bytes {
+        Some((
+            "insufficient_swap",
+            format!(
+                "Forge requires at least {} bytes of emergency swap for Build/Cache; detected {} bytes",
+                state.config.build.minimum_swap_bytes, capacity.swap_bytes
+            ),
+        ))
+    } else {
+        None
+    };
+    if let Some((error_kind, error)) = capacity_error {
+        db::finish_build_job(
+            &state.db,
+            job.id,
+            "failed",
+            "",
+            &error,
+            "",
+            "",
+            0,
+            None,
+            Some(build_result_metadata(
+                &state.config,
+                &job,
+                Some(&target),
+                Some(error_kind),
+            )),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(err) = ensure_nix_daemon_available(&state.config).await {
+        db::finish_build_job(
+            &state.db,
+            job.id,
+            "failed",
+            "",
+            &format!("Nix daemon is unavailable: {}", safe_error(&err)),
+            "",
+            "",
+            0,
+            None,
+            Some(build_result_metadata(
+                &state.config,
+                &job,
+                Some(&target),
+                Some("nix_daemon_unavailable"),
+            )),
         )
         .await?;
         return Ok(());
@@ -320,7 +429,9 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         "Building NixOS closure",
     )
     .await?;
+    let oom_kills_before = cgroup_oom_kill_count();
     let outcome = run_nix_build(&state.db, &job, &command, &log, &state.config).await?;
+    let oom_kills_after = cgroup_oom_kill_count();
     let logs = log.snapshot().await;
     match outcome {
         ProcessOutcome::Succeeded(exit_code) => {
@@ -345,7 +456,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                         "",
                         0,
                         Some(exit_code.into()),
-                        Some(json!({"error_kind": "output_validation_failed"})),
+                        Some(build_result_metadata(
+                            &state.config,
+                            &job,
+                            Some(&target),
+                            Some("output_validation_failed"),
+                        )),
                     )
                     .await?;
                     return Ok(());
@@ -362,7 +478,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     &output_info.output_sha256,
                     output_info.output_size_bytes,
                     Some(exit_code.into()),
-                    Some(json!({"error_kind": "artifact_too_large"})),
+                    Some(build_result_metadata(
+                        &state.config,
+                        &job,
+                        Some(&target),
+                        Some("artifact_too_large"),
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -375,7 +496,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "Exporting closure to Forge cache",
             )
             .await?;
-            let cached = match cache::export_output(
+            let mut cached = match cache::export_output(
                 &state.config,
                 &job,
                 &output_info.output_path,
@@ -396,12 +517,21 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                         &output_info.output_sha256,
                         output_info.output_size_bytes,
                         Some(exit_code.into()),
-                        Some(json!({"error_kind": "cache_export_failed"})),
+                        Some(build_result_metadata(
+                            &state.config,
+                            &job,
+                            Some(&target),
+                            Some("cache_export_failed"),
+                        )),
                     )
                     .await?;
                     return Ok(());
                 }
             };
+            merge_build_metadata(
+                &mut cached.metadata,
+                &build_result_metadata(&state.config, &job, Some(&target), None),
+            );
             db::update_build_job_progress(
                 &state.db,
                 job.id,
@@ -428,33 +558,29 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 &output_info.output_sha256,
                 output_info.output_size_bytes,
                 Some(exit_code.into()),
-                Some(json!({
-                    "schema": "cybex.forge.build.result.v1",
-                    "target": spec.target,
-                    "system": spec.system,
-                    "input_revision": spec.input_revision,
-                    "input_config_hash": spec.input_config_hash,
-                    "blueprint_id": spec.blueprint_id,
-                    "blueprint_revision_id": spec.blueprint_revision_id,
-                    "blueprint_revision_config_hash": spec.blueprint_revision_config_hash,
-                    "build_input_kind": spec.build_input.as_ref().map(|_| BLUEPRINT_BUILD_INPUT_KIND),
-                    "cache": "exported"
-                })),
+                Some(success_result_metadata(&state.config, &job, &target, &spec)),
             )
             .await?;
         }
         ProcessOutcome::Failed(exit_code) => {
+            let oom_killed = oom_kills_after > oom_kills_before;
+            let (error_kind, error) = classify_nix_build_failure(&logs, oom_killed);
             db::finish_build_job(
                 &state.db,
                 job.id,
                 "failed",
                 &logs,
-                &format!("nix build exited with status {exit_code}"),
+                &error,
                 "",
                 "",
                 0,
                 Some(exit_code.into()),
-                Some(json!({"error_kind": "nix_build_failed"})),
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some(error_kind),
+                )),
             )
             .await?;
         }
@@ -469,7 +595,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "",
                 0,
                 None,
-                Some(json!({"cancelled": true})),
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some("cancelled"),
+                )),
             )
             .await?;
         }
@@ -484,7 +615,12 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "",
                 0,
                 None,
-                Some(json!({"error_kind": "build_timeout"})),
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some("build_timeout"),
+                )),
             )
             .await?;
         }
@@ -607,6 +743,212 @@ fn build_target_names_compatible(configured: &str, requested: &str) -> bool {
         )
 }
 
+fn build_capacity() -> Result<BuildCapacity> {
+    let memory_bytes = read_cgroup_limit("/sys/fs/cgroup/memory.max")?
+        .or_else(|| read_meminfo_bytes("MemTotal"))
+        .ok_or_else(|| anyhow!("memory limit and MemTotal were unavailable"))?;
+    let swap_bytes = read_cgroup_limit("/sys/fs/cgroup/memory.swap.max")?
+        .or_else(|| read_meminfo_bytes("SwapTotal"))
+        .unwrap_or(0);
+    Ok(BuildCapacity {
+        memory_bytes,
+        swap_bytes,
+    })
+}
+
+fn read_cgroup_limit(path: &str) -> Result<Option<u64>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => parse_cgroup_limit(&raw).with_context(|| format!("parse cgroup limit {path}")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read cgroup limit {path}")),
+    }
+}
+
+fn parse_cgroup_limit(raw: &str) -> Result<Option<u64>> {
+    let raw = raw.trim();
+    if raw == "max" || raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(raw.parse().context("cgroup limit is not an integer")?))
+}
+
+fn read_meminfo_bytes(field: &str) -> Option<u64> {
+    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo_bytes(&raw, field)
+}
+
+fn parse_meminfo_bytes(raw: &str, field: &str) -> Option<u64> {
+    let value_kib = raw.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name != field {
+            return None;
+        }
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })?;
+    value_kib.checked_mul(1024)
+}
+
+fn cgroup_oom_kill_count() -> u64 {
+    fs::read_to_string("/sys/fs/cgroup/memory.events")
+        .ok()
+        .and_then(|raw| parse_memory_event(&raw, "oom_kill"))
+        .unwrap_or(0)
+}
+
+fn parse_memory_event(raw: &str, event: &str) -> Option<u64> {
+    raw.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == event)
+            .then(|| fields.next()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, String) {
+    let lower = logs.to_ascii_lowercase();
+    if lower.contains("daemon-socket")
+        || lower.contains("cannot connect to socket")
+        || lower.contains("error connecting to the nix daemon")
+    {
+        return (
+            "nix_daemon_unavailable",
+            "The Nix daemon is unavailable; restore nix-daemon.socket and retry".to_string(),
+        );
+    }
+    if oom_killed || lower.contains("out of memory") || lower.contains("oom-kill") {
+        return (
+            "out_of_memory",
+            "Forge exhausted its build memory; increase memory/swap or reduce max_build_cores"
+                .to_string(),
+        );
+    }
+    if lower.contains("no space left on device") || lower.contains("disk full") {
+        return (
+            "insufficient_disk_space",
+            "Forge ran out of disk space while building the Nix closure".to_string(),
+        );
+    }
+    if lower.contains("builder for '")
+        || lower.contains("failed to build")
+        || lower.contains("dependencies of derivation")
+    {
+        return (
+            "package_build_failed",
+            "A package in the pinned nixpkgs revision failed to build; inspect the bounded build log"
+                .to_string(),
+        );
+    }
+    (
+        "nix_build_failed",
+        "Nix failed to build the requested closure; inspect the bounded build log".to_string(),
+    )
+}
+
+async fn ensure_nix_daemon_available(config: &AppConfig) -> Result<()> {
+    let output = Command::new(&config.build.nix_binary)
+        .args(["store", "ping", "--store", "daemon"])
+        .output()
+        .await
+        .with_context(|| format!("run {} store ping", config.build.nix_binary))?;
+    if !output.status.success() {
+        bail!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    Ok(())
+}
+
+fn build_result_metadata(
+    config: &AppConfig,
+    job: &BuildJob,
+    target: Option<&BuildTargetConfig>,
+    error_kind: Option<&str>,
+) -> Value {
+    let mut metadata = job.cache_metadata.as_object().cloned().unwrap_or_default();
+    metadata.insert(
+        "result_schema".to_string(),
+        json!("cybex.forge.build.result.v1"),
+    );
+    metadata.insert(
+        "max_build_cores".to_string(),
+        json!(config.build.max_build_cores),
+    );
+    metadata.insert(
+        "minimum_memory_bytes".to_string(),
+        json!(config.build.minimum_memory_bytes),
+    );
+    metadata.insert(
+        "minimum_swap_bytes".to_string(),
+        json!(config.build.minimum_swap_bytes),
+    );
+    if let Some(target) = target {
+        metadata.insert("nixpkgs_flake".to_string(), json!(target.flake));
+        if let Ok(revision) = pinned_nixpkgs_revision(&target.flake) {
+            metadata.insert("nixpkgs_revision".to_string(), json!(revision));
+        }
+    }
+    if let Some(error_kind) = error_kind {
+        metadata.insert("error_kind".to_string(), json!(error_kind));
+    } else {
+        metadata.remove("error_kind");
+    }
+    Value::Object(metadata)
+}
+
+fn success_result_metadata(
+    config: &AppConfig,
+    job: &BuildJob,
+    target: &BuildTargetConfig,
+    spec: &ValidatedBuildSpec,
+) -> Value {
+    let mut metadata = build_result_metadata(config, job, Some(target), None);
+    let Some(object) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    object.insert("target".to_string(), json!(spec.target));
+    object.insert("system".to_string(), json!(spec.system));
+    object.insert("input_revision".to_string(), json!(spec.input_revision));
+    object.insert(
+        "input_config_hash".to_string(),
+        json!(spec.input_config_hash),
+    );
+    object.insert("blueprint_id".to_string(), json!(spec.blueprint_id));
+    object.insert(
+        "blueprint_revision_id".to_string(),
+        json!(spec.blueprint_revision_id),
+    );
+    object.insert(
+        "blueprint_revision_config_hash".to_string(),
+        json!(spec.blueprint_revision_config_hash),
+    );
+    object.insert(
+        "build_input_kind".to_string(),
+        json!(
+            spec.build_input
+                .as_ref()
+                .map(|_| BLUEPRINT_BUILD_INPUT_KIND)
+        ),
+    );
+    object.insert("cache".to_string(), json!("exported"));
+    metadata
+}
+
+fn merge_build_metadata(destination: &mut Value, source: &Value) {
+    let Some(source) = source.as_object() else {
+        return;
+    };
+    let Some(destination) = destination.as_object_mut() else {
+        return;
+    };
+    for (key, value) in source {
+        destination.insert(key.clone(), value.clone());
+    }
+}
+
 fn nix_build_command(
     config: &AppConfig,
     target: &BuildTargetConfig,
@@ -624,6 +966,8 @@ fn nix_build_command(
         args: vec![
             "build".to_string(),
             installable,
+            "--cores".to_string(),
+            config.build.max_build_cores.to_string(),
             "--system".to_string(),
             spec.system.clone(),
             "--out-link".to_string(),
@@ -667,6 +1011,8 @@ fn blueprint_nix_build_command(
         args: vec![
             "build".to_string(),
             installable,
+            "--cores".to_string(),
+            config.build.max_build_cores.to_string(),
             "--out-link".to_string(),
             out_link.display().to_string(),
             "--print-build-logs".to_string(),
@@ -1273,6 +1619,41 @@ mod tests {
             )
         );
         assert!(command.args.contains(&"--out-link".to_string()));
+        assert!(command.args.windows(2).any(|args| args == ["--cores", "4"]));
+    }
+
+    #[test]
+    fn resource_parsers_and_failure_classifier_are_specific() {
+        assert_eq!(
+            parse_cgroup_limit("8589934592\n").unwrap(),
+            Some(8_589_934_592)
+        );
+        assert_eq!(parse_cgroup_limit("max\n").unwrap(), None);
+        assert_eq!(
+            parse_meminfo_bytes("MemTotal: 16384 kB\nSwapTotal: 8192 kB\n", "SwapTotal"),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_memory_event("oom 3\noom_kill 2\n", "oom_kill"),
+            Some(2)
+        );
+        assert_eq!(
+            classify_nix_build_failure("compiler killed", true).0,
+            "out_of_memory"
+        );
+        assert_eq!(
+            classify_nix_build_failure("error: builder for '/nix/store/example.drv' failed", false)
+                .0,
+            "package_build_failed"
+        );
+        assert_eq!(
+            classify_nix_build_failure("No space left on device", false).0,
+            "insufficient_disk_space"
+        );
+        assert_eq!(
+            classify_nix_build_failure("cannot connect to socket at daemon-socket", false).0,
+            "nix_daemon_unavailable"
+        );
     }
 
     #[test]

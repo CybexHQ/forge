@@ -4,6 +4,8 @@ set -euo pipefail
 FORGE_GIT_URL_DEFAULT="https://github.com/CybexHQ/forge.git"
 FORGE_REF_DEFAULT="main"
 FORGE_SOURCE_DIR_DEFAULT="/root/forge"
+NIXPKGS_REVISION="74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+NIXPKGS_FLAKE="github:NixOS/nixpkgs/$NIXPKGS_REVISION"
 
 usage() {
   cat <<'EOF'
@@ -639,6 +641,9 @@ menu_timeout_ms = $menu_timeout_ms
 [build]
 enabled = true
 max_concurrent_builds = 1
+max_build_cores = 4
+minimum_memory_bytes = 17179869184
+minimum_swap_bytes = 8589934592
 timeout_seconds = 3600
 cancel_grace_seconds = 10
 max_log_bytes = 65536
@@ -652,7 +657,7 @@ nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 artifact_type = "nixos_closure"
 target = "blueprint"
 system = "x86_64-linux"
-flake = "github:NixOS/nixpkgs/nixos-unstable"
+flake = "$NIXPKGS_FLAKE"
 attr = "packages.x86_64-linux.desktop-experience"
 
 [cache]
@@ -691,6 +696,25 @@ EOF
   trap - RETURN
 }
 
+validate_pinned_build_inputs() {
+  local profile_nix="/nix/var/nix/profiles/default/bin/nix"
+  local package output hash
+  echo "Validating pinned nixpkgs revision $NIXPKGS_REVISION and representative heavy packages."
+  runuser -u cybex-forge -- "$profile_nix" flake metadata --no-write-lock-file "$NIXPKGS_FLAKE" >/dev/null
+  for package in firefox-devedition firefox-esr; do
+    output="$(runuser -u cybex-forge -- "$profile_nix" eval --raw "$NIXPKGS_FLAKE#$package.outPath")"
+    case "$output" in
+      /nix/store/*) ;;
+      *) echo "Pinned nixpkgs validation returned an invalid store path for $package" >&2; exit 1 ;;
+    esac
+    hash="$(basename "$output" | cut -d- -f1)"
+    curl -fsS --max-time 30 -o /dev/null "https://cache.nixos.org/$hash.narinfo" || {
+      echo "Pinned nixpkgs package $package is not available from cache.nixos.org" >&2
+      exit 1
+    }
+  done
+}
+
 install_systemd() {
   install -m 0644 "$source_dir/systemd/cybex-forge.service" /etc/systemd/system/cybex-forge.service
   install -m 0644 "$source_dir/systemd/cybex-forge-runtime-apply.service" /etc/systemd/system/cybex-forge-runtime-apply.service
@@ -727,6 +751,17 @@ EOF
 ProtectProc=invisible
 ProcSubset=pid
 EOF
+  cat > /etc/systemd/system/cybex-forge.service.d/55-nix-daemon.conf <<'EOF'
+[Unit]
+Wants=nix-daemon.socket
+After=nix-daemon.socket
+EOF
+  install -m 0755 -d /etc/systemd/system/nix-daemon.service.d
+  cat > /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=3s
+EOF
   chown root:root \
     /etc/systemd/system/cybex-forge.service \
     /etc/systemd/system/cybex-forge-runtime-apply.service \
@@ -735,7 +770,9 @@ EOF
     /etc/systemd/system/cybex-forge.service.d/20-migrate.conf \
     /etc/systemd/system/cybex-forge.service.d/30-address-families.conf \
     /etc/systemd/system/cybex-forge.service.d/40-write-paths.conf \
-    /etc/systemd/system/cybex-forge.service.d/50-proc.conf
+    /etc/systemd/system/cybex-forge.service.d/50-proc.conf \
+    /etc/systemd/system/cybex-forge.service.d/55-nix-daemon.conf \
+    /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf
   if [ -f /etc/systemd/system/cybex-forge.service.d/35-nix-groups.conf ]; then
     chown root:root /etc/systemd/system/cybex-forge.service.d/35-nix-groups.conf
   fi
@@ -747,11 +784,15 @@ EOF
     /etc/systemd/system/cybex-forge.service.d/20-migrate.conf \
     /etc/systemd/system/cybex-forge.service.d/30-address-families.conf \
     /etc/systemd/system/cybex-forge.service.d/40-write-paths.conf \
-    /etc/systemd/system/cybex-forge.service.d/50-proc.conf
+    /etc/systemd/system/cybex-forge.service.d/50-proc.conf \
+    /etc/systemd/system/cybex-forge.service.d/55-nix-daemon.conf \
+    /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf
   if [ -f /etc/systemd/system/cybex-forge.service.d/35-nix-groups.conf ]; then
     chmod 0644 /etc/systemd/system/cybex-forge.service.d/35-nix-groups.conf
   fi
   systemctl daemon-reload
+  systemctl reset-failed nix-daemon.service nix-daemon.socket || true
+  systemctl enable --now nix-daemon.socket
   systemctl enable --now cybex-forge-runtime-apply.timer
 }
 
@@ -2099,7 +2140,11 @@ check_systemd_value cybex-forge RestartUSec 3s
 check_systemd_value cybex-forge StateDirectory cybex-forge
 check_systemd_value cybex-forge UMask 0077
 check_systemd_contains cybex-forge Wants network-online.target
+check_systemd_contains cybex-forge Wants nix-daemon.socket
 check_systemd_contains cybex-forge After network-online.target
+check_systemd_contains cybex-forge After nix-daemon.socket
+check_systemd_value nix-daemon Restart on-failure
+check_systemd_value nix-daemon RestartUSec 3s
 check_systemd_value cybex-forge AmbientCapabilities ""
 check_systemd_value cybex-forge CapabilityBoundingSet ""
 check_systemd_value cybex-forge LockPersonality yes
@@ -2171,6 +2216,10 @@ check_path_stat "checker permissions" /usr/local/sbin/cybex-forge-check "root:ro
 check_file_contains "Nix enables flake build commands" /etc/nix/nix.conf "experimental-features = nix-command flakes"
 check_file_contains "Nix trusts Forge build user" /etc/nix/nix.conf "trusted-users = root cybex-forge"
 check_file_contains "Forge Build uses current Nix profile" /etc/cybex-forge/config.toml 'nix_binary = "/nix/var/nix/profiles/default/bin/nix"'
+check_file_contains "Forge Build limits per-derivation cores" /etc/cybex-forge/config.toml 'max_build_cores = 4'
+check_file_contains "Forge Build requires 16 GiB memory" /etc/cybex-forge/config.toml 'minimum_memory_bytes = 17179869184'
+check_file_contains "Forge Build requires 8 GiB emergency swap" /etc/cybex-forge/config.toml 'minimum_swap_bytes = 8589934592'
+check_file_contains "Forge Build pins nixpkgs" /etc/cybex-forge/config.toml "flake = \"github:NixOS/nixpkgs/$NIXPKGS_REVISION\""
 check_command_success "current Nix profile command available" /nix/var/nix/profiles/default/bin/nix --version
 check_path_stat "Boot service unit permissions" /etc/systemd/system/cybex-forge.service "root:root 644"
 check_path_stat "Boot logging drop-in permissions" /etc/systemd/system/cybex-forge.service.d/10-logging.conf "root:root 644"
@@ -2179,6 +2228,8 @@ check_path_stat "Boot address-family drop-in permissions" /etc/systemd/system/cy
 check_path_stat "Boot Nix group drop-in permissions" /etc/systemd/system/cybex-forge.service.d/35-nix-groups.conf "root:root 644"
 check_path_stat "Boot write-path drop-in permissions" /etc/systemd/system/cybex-forge.service.d/40-write-paths.conf "root:root 644"
 check_path_stat "Boot proc drop-in permissions" /etc/systemd/system/cybex-forge.service.d/50-proc.conf "root:root 644"
+check_path_stat "Boot Nix dependency drop-in permissions" /etc/systemd/system/cybex-forge.service.d/55-nix-daemon.conf "root:root 644"
+check_path_stat "Nix daemon restart drop-in permissions" /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf "root:root 644"
 check_path_stat "nginx hardening drop-in permissions" /etc/systemd/system/nginx.service.d/10-cybex-hardening.conf "root:root 644"
 check_path_stat "nginx site permissions" /etc/nginx/sites-available/cybex-forge "root:root 644"
 check_path_stat "TFTP hardening drop-in permissions" /etc/systemd/system/tftpd-hpa.service.d/10-cybex-hardening.conf "root:root 644"
@@ -2783,6 +2834,7 @@ verify_source_compatibility
 install_binary
 prepare_user_and_dirs
 install_theme_assets
+validate_pinned_build_inputs
 write_config
 install_systemd
 install_maintenance_tools

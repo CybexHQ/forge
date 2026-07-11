@@ -1154,7 +1154,10 @@ pub async fn upsert_managed_build_job(
                  WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_message
                  ELSE forge_build_jobs.progress_message
              END,
-             cache_metadata = excluded.cache_metadata,
+             cache_metadata = CASE
+                 WHEN forge_build_jobs.status IN ('queued', 'running') THEN excluded.cache_metadata
+                 ELSE forge_build_jobs.cache_metadata
+             END,
              updated_at = excluded.updated_at",
     )
     .bind(&managed_job_id)
@@ -1381,12 +1384,12 @@ pub async fn finish_build_job(
     let output_path = normalize_optional_absolute_path(output_path, "output_path")?;
     let output_sha256 = normalize_sha256(output_sha256, "output_sha256", true)?;
     validate_non_negative_i64(output_size_bytes, "output_size_bytes")?;
+    let progress_message = terminal_build_progress_message(status, cache_metadata.as_ref());
     let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
     let cancelled_metadata =
         metadata_to_string(Some(json!({"cancelled": true})), "cache_metadata")?;
     let cancel_override = i64::from(status != "cancelled");
     let progress_stage = terminal_build_progress_stage(status);
-    let progress_message = terminal_build_progress_message(status);
     let now = now_rfc3339();
     sqlx::query(
         "UPDATE forge_build_jobs
@@ -2178,11 +2181,24 @@ fn terminal_build_progress_stage(status: &str) -> &'static str {
     }
 }
 
-fn terminal_build_progress_message(status: &str) -> &'static str {
+fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> String {
     match status {
-        "succeeded" => "Build completed and cached",
-        "cancelled" => "Build cancelled by Manage",
-        _ => "Build failed",
+        "succeeded" => "Build completed and cached".to_string(),
+        "cancelled" => "Build cancelled by Manage".to_string(),
+        _ => match metadata
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("error_kind"))
+            .and_then(Value::as_str)
+        {
+            Some("out_of_memory") => "Build ran out of memory".to_string(),
+            Some("insufficient_memory") => "Forge memory is below the required minimum".to_string(),
+            Some("insufficient_swap") => "Forge swap is below the required minimum".to_string(),
+            Some("insufficient_disk_space") => "Forge disk space is insufficient".to_string(),
+            Some("package_build_failed") => "A package failed to build".to_string(),
+            Some("nix_daemon_unavailable") => "Nix daemon is unavailable".to_string(),
+            Some("build_timeout") => "Build timed out".to_string(),
+            _ => "Build failed".to_string(),
+        },
     }
 }
 
@@ -3330,6 +3346,44 @@ mod tests {
         assert_eq!(updated.build_spec["target"], "desktop_experience");
         assert_eq!(updated.build_spec["system"], "x86_64-linux");
         assert_eq!(updated.cache_metadata["desired"], "new");
+
+        let finished = finish_build_job(
+            &pool,
+            job.id,
+            "failed",
+            "bounded log",
+            "package failed",
+            "",
+            "",
+            0,
+            Some(1),
+            Some(json!({"desired": "new", "error_kind": "package_build_failed"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            finished.cache_metadata["error_kind"],
+            "package_build_failed"
+        );
+
+        let reported_again = upsert_managed_build_job(
+            &pool,
+            "managed-immutable-1",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "rev-1",
+            &"a".repeat(64),
+            Some(json!({"desired": "request-only"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reported_again.cache_metadata["error_kind"],
+            "package_build_failed"
+        );
+        assert_eq!(reported_again.cache_metadata["desired"], "new");
     }
 
     #[tokio::test]
