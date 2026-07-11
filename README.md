@@ -58,7 +58,9 @@ must use an immutable 40-character nixpkgs commit. The installer validates the
 pin and representative heavy browser outputs against `cache.nixos.org` before
 starting Forge. Jobs and cache artifacts record the exact pin used, and capacity,
 OOM, disk, timeout, and package failures are reported as distinct operator-facing
-states. Add further targets deliberately instead of using a broad build
+states. Capacity detection supports finite cgroup limits, `/proc/meminfo`, and
+the LXC-virtualized `sysinfo(2)` fallback used when hardened systemd services
+hide non-process procfs files. Add further targets deliberately instead of using a broad build
 allowlist. Manual standalone installation is not currently supported.
 
 ## Managed Updates

@@ -744,16 +744,45 @@ fn build_target_names_compatible(configured: &str, requested: &str) -> bool {
 }
 
 fn build_capacity() -> Result<BuildCapacity> {
+    // Hardened systemd units may use ProcSubset=pid, which intentionally hides
+    // /proc/meminfo. LXC virtualizes sysinfo(2), so keep it as the fallback
+    // when the cgroup controller reports an unbounded root and procfs omits
+    // the host-adjusted totals.
+    let sysinfo = kernel_sysinfo_capacity();
     let memory_bytes = read_cgroup_limit("/sys/fs/cgroup/memory.max")?
         .or_else(|| read_meminfo_bytes("MemTotal"))
+        .or_else(|| sysinfo.map(|capacity| capacity.memory_bytes))
         .ok_or_else(|| anyhow!("memory limit and MemTotal were unavailable"))?;
     let swap_bytes = read_cgroup_limit("/sys/fs/cgroup/memory.swap.max")?
         .or_else(|| read_meminfo_bytes("SwapTotal"))
+        .or_else(|| sysinfo.map(|capacity| capacity.swap_bytes))
         .unwrap_or(0);
     Ok(BuildCapacity {
         memory_bytes,
         swap_bytes,
     })
+}
+
+fn kernel_sysinfo_capacity() -> Option<BuildCapacity> {
+    let mut info = std::mem::MaybeUninit::<libc::sysinfo>::zeroed();
+    // SAFETY: sysinfo(2) initializes the provided libc::sysinfo structure on
+    // success, and we only assume initialization after checking its return.
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(capacity_from_sysinfo_values(
+        info.totalram as u64,
+        info.totalswap as u64,
+        u64::from(info.mem_unit),
+    ))
+}
+
+fn capacity_from_sysinfo_values(totalram: u64, totalswap: u64, mem_unit: u64) -> BuildCapacity {
+    BuildCapacity {
+        memory_bytes: totalram.saturating_mul(mem_unit),
+        swap_bytes: totalswap.saturating_mul(mem_unit),
+    }
 }
 
 fn read_cgroup_limit(path: &str) -> Result<Option<u64>> {
@@ -1533,6 +1562,21 @@ mod tests {
         });
         let parsed = serde_json::from_value::<BuildSpec>(value);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn sysinfo_capacity_scales_kernel_units_without_overflow() {
+        assert_eq!(
+            capacity_from_sysinfo_values(32 * 1024 * 1024, 8 * 1024 * 1024, 1024),
+            BuildCapacity {
+                memory_bytes: 32 * 1024 * 1024 * 1024,
+                swap_bytes: 8 * 1024 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            capacity_from_sysinfo_values(u64::MAX, 1, 4096).memory_bytes,
+            u64::MAX
+        );
     }
 
     #[test]
