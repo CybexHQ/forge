@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_path="${CYBEX_FORGE_CONFIG:-/etc/cybex-forge/config.toml}"
+state_path="${CYBEX_FORGE_RELIABILITY_STATE:-/var/lib/cybex-forge/reliability-state.json}"
+lock_path="${CYBEX_FORGE_SENTINEL_LOCK:-/run/cybex-forge-sentinel.lock}"
+
+exec 9>"$lock_path"
+flock -n 9 || exit 0
+
+config_value() {
+  local section="$1" key="$2"
+  awk -v section="[$section]" -v key="$key" '
+    $0 == section { active=1; next }
+    /^\[/ { active=0 }
+    active && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^\"|\"$/, ""); print; exit
+    }
+  ' "$config_path"
+}
+
+api_url="$(config_value manage api_url || true)"
+listen_addr="$(config_value server listen_addr || true)"
+listen_addr="${listen_addr:-127.0.0.1:8080}"
+api_host="$(printf '%s' "$api_url" | sed -E 's#^https?://([^/:]+).*#\1#')"
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+failed_component=""
+failure_class=""
+repair_count=0
+dns_healthy=true
+control_plane_reachable=true
+local_boot_healthy=true
+services_healthy=true
+
+mark_failure() {
+  [ -n "$failed_component" ] || failed_component="$1"
+  [ -n "$failure_class" ] || failure_class="$2"
+}
+
+repair_service() {
+  local unit="$1"
+  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  if systemctl restart "$unit" >/dev/null 2>&1; then
+    repair_count=$((repair_count + 1))
+    logger -t cybex-forge-sentinel "repaired $unit"
+    return 0
+  fi
+  return 1
+}
+
+if ! systemctl is-active --quiet systemd-resolved.service; then
+  dns_healthy=false
+  mark_failure systemd-resolved service_inactive
+  repair_service systemd-resolved.service || true
+fi
+if [ -n "$api_host" ] && ! getent ahosts "$api_host" >/dev/null 2>&1; then
+  dns_healthy=false
+  mark_failure dns resolution_failed
+  repair_service systemd-resolved.service || true
+fi
+if [ -n "$api_url" ] && ! curl -fsS --connect-timeout 3 --max-time 8 "${api_url%/}/v1/health" >/dev/null 2>&1; then
+  control_plane_reachable=false
+  mark_failure control_plane unreachable
+fi
+
+for unit in cybex-forge.service nginx.service tftpd-hpa.service; do
+  if ! systemctl is-active --quiet "$unit"; then
+    services_healthy=false
+    mark_failure "$unit" service_inactive
+    repair_service "$unit" || true
+  fi
+done
+
+if ! curl -fsS --connect-timeout 2 --max-time 5 "http://${listen_addr}/healthz" >/dev/null 2>&1; then
+  services_healthy=false
+  mark_failure cybex-forge backend_unhealthy
+  repair_service cybex-forge.service || true
+fi
+if ! curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1/boot.ipxe?cybex_check=1" >/dev/null 2>&1; then
+  local_boot_healthy=false
+  mark_failure pxe local_boot_unhealthy
+  repair_service nginx.service || true
+  repair_service cybex-forge.service || true
+fi
+
+json_number() {
+  local key="$1" fallback="$2" value
+  value="$(if [ -f "$state_path" ]; then sed -n -E "s/.*\"$key\":([0-9]+).*/\\1/p" "$state_path" | head -n1; fi)"
+  printf '%s' "${value:-$fallback}"
+}
+
+json_string() {
+  local key="$1"
+  if [ -f "$state_path" ]; then
+    sed -n -E "s/.*\"$key\":\"([^\"]*)\".*/\\1/p" "$state_path" | head -n1
+  fi
+}
+
+json_value_or_null() {
+  if [ -n "$1" ]; then printf '"%s"' "$1"; else printf 'null'; fi
+}
+
+previous_status="$(json_string status)"
+previous_consecutive="$(json_number consecutive_failures 0)"
+previous_repairs="$(json_number total_repairs 0)"
+last_component="${failed_component:-$(json_string last_component)}"
+last_error_class="${failure_class:-$(json_string last_error_class)}"
+last_failure_at="$(json_string last_failure_at)"
+last_recovery_at="$(json_string last_recovery_at)"
+if [ "$dns_healthy" = true ] && [ "$control_plane_reachable" = true ] && \
+   [ "$local_boot_healthy" = true ] && [ "$services_healthy" = true ]; then
+  status=healthy
+  consecutive_failures=0
+  if [ "$previous_status" = degraded ]; then last_recovery_at="$now"; fi
+else
+  status=degraded
+  consecutive_failures=$((previous_consecutive + 1))
+  last_failure_at="$now"
+fi
+total_repairs=$((previous_repairs + repair_count))
+
+state_dir="$(dirname "$state_path")"
+mkdir -p "$state_dir"
+state_tmp="$(mktemp "$state_dir/.reliability-state.XXXXXX")"
+trap 'rm -f "${state_tmp:-}"' EXIT
+printf '{"schema_version":1,"status":"%s","checked_at":"%s","consecutive_failures":%s,"total_repairs":%s,"dns_healthy":%s,"control_plane_reachable":%s,"local_boot_healthy":%s,"services_healthy":%s,"last_component":%s,"last_error_class":%s,"last_failure_at":%s,"last_recovery_at":%s}\n' \
+  "$status" "$now" "$consecutive_failures" "$total_repairs" \
+  "$dns_healthy" "$control_plane_reachable" "$local_boot_healthy" "$services_healthy" \
+  "$(json_value_or_null "$last_component")" "$(json_value_or_null "$last_error_class")" \
+  "$(json_value_or_null "$last_failure_at")" "$(json_value_or_null "$last_recovery_at")" > "$state_tmp"
+chmod 0644 "$state_tmp"
+sync -f "$state_tmp"
+mv -f "$state_tmp" "$state_path"
+state_tmp=""
+trap - EXIT
+
+if [ -n "$failed_component" ]; then
+  logger -t cybex-forge-sentinel "availability check degraded component=$failed_component class=$failure_class repairs=$repair_count"
+fi

@@ -63,6 +63,34 @@ the LXC-virtualized `sysinfo(2)` fallback used when hardened systemd services
 hide non-process procfs files. Add further targets deliberately instead of using a broad build
 allowlist. Manual standalone installation is not currently supported.
 
+## Availability and self-healing
+
+Forge keeps PXE availability on a latency-sensitive systemd slice while Nix
+build/cache work runs in a separately throttled slice. The Forge process uses
+systemd readiness notification and a 30-second watchdog; Forge, nginx, TFTP,
+Nix, and `systemd-resolved` have unlimited restart attempts rather than a
+permanent start-limit failure. A hardened sentinel runs every 30 seconds,
+checks DNS, Manage reachability, the local backend, nginx PXE, and TFTP, and
+repairs failed local services. Manage outages are recorded but do not cause
+cached local PXE assets to be removed or disabled.
+
+The sentinel atomically persists a bounded, non-secret incident summary at
+`/var/lib/cybex-forge/reliability-state.json`. Managed reports expose that
+summary to Cybex Manage, including the failing component, consecutive failures,
+repair count, and recovery timestamp. The hourly comprehensive checker remains
+independent and verifies deeper security, configuration, HTTP, and TFTP
+invariants without requiring fixed operator-selected build capacity values.
+
+Managed runtime settings are serialized with a root-only lock. Forge backs up
+all managed configuration files, installs changes atomically, validates nginx,
+restarts and verifies all local boot services, probes cached PXE, and restores
+the previous files and services if any stage fails.
+
+The self-healing units, slices, resolver/service drop-ins, and sentinel script
+are embedded in the Forge binary's privileged runtime apply plan. Existing
+managed nodes therefore adopt the same availability baseline after a verified
+binary update; reliability is not limited to newly provisioned appliances.
+
 ## Managed Updates
 
 Managed installs enable `[update]` by default. Cybex Manage discovers the latest

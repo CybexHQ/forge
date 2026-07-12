@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -70,6 +70,49 @@ const MAX_PROFILE_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_PROFILE_RAW_SCRIPT_BYTES: usize = 64 * 1024;
 const BOOT_PROFILE_ISO_SOURCE_BOOT_PROFILE: &str = "boot_profile";
 const BOOT_PROFILE_ISO_SOURCE_ENROLLMENT: &str = "enrollment";
+const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-forge/reliability-state.json";
+const MAX_RELIABILITY_STATE_BYTES: usize = 16 * 1024;
+const FORGE_SERVICE_UNIT: &str = include_str!("../systemd/cybex-forge.service");
+const FORGE_CONTROL_SLICE_UNIT: &str = include_str!("../systemd/cybex-forge-control.slice");
+const FORGE_BUILD_SLICE_UNIT: &str = include_str!("../systemd/cybex-forge-build.slice");
+const FORGE_SENTINEL_SERVICE_UNIT: &str = include_str!("../systemd/cybex-forge-sentinel.service");
+const FORGE_SENTINEL_TIMER_UNIT: &str = include_str!("../systemd/cybex-forge-sentinel.timer");
+const FORGE_CHECK_SCRIPT: &str = include_str!("../install/cybex-forge-check");
+const FORGE_SENTINEL_SCRIPT: &str = include_str!("../install/cybex-forge-sentinel");
+const RESOLVER_RECOVERY_DROPIN: &str = r#"[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=2s
+Slice=cybex-forge-control.slice
+CPUWeight=1000
+IOWeight=1000
+OOMScoreAdjust=-750
+"#;
+const NIX_DAEMON_RESOURCE_DROPIN: &str = r#"[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=3s
+Slice=cybex-forge-build.slice
+CPUWeight=25
+IOWeight=25
+OOMScoreAdjust=250
+"#;
+const NGINX_AVAILABILITY_DROPIN: &str = r#"[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=2s
+Slice=cybex-forge-control.slice
+CPUWeight=1000
+IOWeight=1000
+OOMScoreAdjust=-500
+"#;
+const TFTP_AVAILABILITY_DROPIN: &str = NGINX_AVAILABILITY_DROPIN;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -511,6 +554,7 @@ pub async fn sync_once(state: &AppState) -> Result<()> {
 
 pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
     ensure_root_supervisor()?;
+    let _apply_lock = acquire_runtime_apply_lock()?;
     ensure_manage_enabled_config(config)?;
     let managed = load_managed_state_from_config(config)?;
     if managed
@@ -528,6 +572,31 @@ pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
     crate::updater::apply_requested_update(config).await?;
     info!("managed runtime configuration applied");
     Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_runtime_apply_lock() -> Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open("/run/cybex-forge-runtime-apply.lock")
+        .context("open managed runtime apply lock")?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        bail!("another managed runtime apply is already running");
+    }
+    Ok(lock)
+}
+
+#[cfg(not(unix))]
+fn acquire_runtime_apply_lock() -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open("cybex-forge-runtime-apply.lock")
+        .context("open managed runtime apply lock")
 }
 
 async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
@@ -686,12 +755,24 @@ async fn report_boot_state(
     )
     .await?;
     let runtime = state.runtime_settings();
-    let reported_status = if asset_scan.error.is_some() {
+    let reliability_state = load_reliability_state();
+    let reliability_degraded = reliability_state
+        .as_ref()
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| status != "healthy");
+    let reported_status = if asset_scan.error.is_some() || reliability_degraded {
         "warning"
     } else {
         "online"
     };
-    let reported_state = boot_report_state(profile_count, devices.len(), assets.len(), &asset_scan);
+    let reported_state = boot_report_state(
+        profile_count,
+        devices.len(),
+        assets.len(),
+        &asset_scan,
+        reliability_state,
+    );
     let body = BootAgentReportRequest {
         settings: BootAgentSettingsReport {
             public_base_url: runtime.public_base_url,
@@ -3713,61 +3794,235 @@ fn apply_runtime_settings_to_host(
     settings: &NormalizedManagedSettings,
 ) -> Result<()> {
     ensure_runtime_directories(config, settings)?;
+    let runtime_files = runtime_managed_files(config, settings)?;
+    let backups = capture_runtime_file_backups(&runtime_files)?;
+    let apply_result = apply_runtime_managed_files(settings, &runtime_files);
+    if let Err(err) = apply_result {
+        if let Err(rollback_err) = rollback_runtime_files(&runtime_files, &backups) {
+            return Err(err).context(format!(
+                "runtime configuration failed and rollback also failed: {rollback_err:#}"
+            ));
+        }
+        return Err(err).context("runtime configuration failed; previous files were restored");
+    }
+    Ok(())
+}
+
+struct RuntimeManagedFile {
+    path: &'static str,
+    contents: String,
+    mode: &'static str,
+    owner: &'static str,
+    group: &'static str,
+    component: &'static str,
+}
+
+fn runtime_managed_files(
+    config: &AppConfig,
+    settings: &NormalizedManagedSettings,
+) -> Result<Vec<RuntimeManagedFile>> {
+    Ok(vec![
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge.service",
+            contents: FORGE_SERVICE_UNIT.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd-boot",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge-control.slice",
+            contents: FORGE_CONTROL_SLICE_UNIT.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge-build.slice",
+            contents: FORGE_BUILD_SLICE_UNIT.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge-sentinel.service",
+            contents: FORGE_SENTINEL_SERVICE_UNIT.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "sentinel",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge-sentinel.timer",
+            contents: FORGE_SENTINEL_TIMER_UNIT.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "sentinel",
+        },
+        RuntimeManagedFile {
+            path: "/usr/local/bin/cybex-forge-check",
+            contents: FORGE_CHECK_SCRIPT.to_string(),
+            mode: "0755",
+            owner: "root",
+            group: "root",
+            component: "checker",
+        },
+        RuntimeManagedFile {
+            path: "/usr/local/bin/cybex-forge-sentinel",
+            contents: FORGE_SENTINEL_SCRIPT.to_string(),
+            mode: "0755",
+            owner: "root",
+            group: "root",
+            component: "sentinel",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/systemd-resolved.service.d/10-cybex-forge-recovery.conf",
+            contents: RESOLVER_RECOVERY_DROPIN.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "resolver",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf",
+            contents: NIX_DAEMON_RESOURCE_DROPIN.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/nginx.service.d/20-cybex-availability.conf",
+            contents: NGINX_AVAILABILITY_DROPIN.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd-nginx",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/tftpd-hpa.service.d/20-cybex-availability.conf",
+            contents: TFTP_AVAILABILITY_DROPIN.to_string(),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd-tftp",
+        },
+        RuntimeManagedFile {
+            path: "/etc/cybex-forge/config.toml",
+            contents: render_managed_config(config, settings)?,
+            mode: "0640",
+            owner: "root",
+            group: "cybex-forge",
+            component: "boot",
+        },
+        RuntimeManagedFile {
+            path: "/etc/nginx/sites-available/cybex-forge",
+            contents: render_nginx_config(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "nginx",
+        },
+        RuntimeManagedFile {
+            path: "/etc/default/tftpd-hpa",
+            contents: render_tftpd_defaults(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "tftp",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge.service.d/40-write-paths.conf",
+            contents: render_boot_write_paths_dropin(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/nginx.service.d/10-cybex-hardening.conf",
+            contents: render_nginx_hardening_dropin(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/tftpd-hpa.service.d/10-cybex-hardening.conf",
+            contents: render_tftpd_hardening_dropin(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+        RuntimeManagedFile {
+            path: "/etc/systemd/system/cybex-forge-check.service",
+            contents: render_check_service(settings),
+            mode: "0644",
+            owner: "root",
+            group: "root",
+            component: "systemd",
+        },
+    ])
+}
+
+fn capture_runtime_file_backups(files: &[RuntimeManagedFile]) -> Result<Vec<Option<Vec<u8>>>> {
+    files
+        .iter()
+        .map(|file| match fs::read(file.path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("back up {}", file.path)),
+        })
+        .collect()
+}
+
+fn apply_runtime_managed_files(
+    settings: &NormalizedManagedSettings,
+    files: &[RuntimeManagedFile],
+) -> Result<()> {
     let mut boot_changed = false;
     let mut nginx_changed = false;
     let mut tftp_changed = false;
     let mut daemon_reload = false;
+    let mut resolver_changed = false;
 
-    boot_changed |= install_text_file(
-        Path::new("/etc/cybex-forge/config.toml"),
-        &render_managed_config(config, settings)?,
-        "0640",
-        "root",
-        "cybex-forge",
-    )?;
-    nginx_changed |= install_text_file(
-        Path::new("/etc/nginx/sites-available/cybex-forge"),
-        &render_nginx_config(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
-    tftp_changed |= install_text_file(
-        Path::new("/etc/default/tftpd-hpa"),
-        &render_tftpd_defaults(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
-
-    daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/cybex-forge.service.d/40-write-paths.conf"),
-        &render_boot_write_paths_dropin(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
-    daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/nginx.service.d/10-cybex-hardening.conf"),
-        &render_nginx_hardening_dropin(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
-    daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/tftpd-hpa.service.d/10-cybex-hardening.conf"),
-        &render_tftpd_hardening_dropin(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
-    daemon_reload |= install_text_file(
-        Path::new("/etc/systemd/system/cybex-forge-check.service"),
-        &render_check_service(settings),
-        "0644",
-        "root",
-        "root",
-    )?;
+    for file in files {
+        let changed = install_text_file(
+            Path::new(file.path),
+            &file.contents,
+            file.mode,
+            file.owner,
+            file.group,
+        )?;
+        match file.component {
+            "boot" => boot_changed |= changed,
+            "nginx" => nginx_changed |= changed,
+            "tftp" => tftp_changed |= changed,
+            "systemd" => daemon_reload |= changed,
+            "systemd-boot" => {
+                daemon_reload |= changed;
+                boot_changed |= changed;
+            }
+            "systemd-nginx" => {
+                daemon_reload |= changed;
+                nginx_changed |= changed;
+            }
+            "systemd-tftp" => {
+                daemon_reload |= changed;
+                tftp_changed |= changed;
+            }
+            "resolver" => {
+                daemon_reload |= changed;
+                resolver_changed |= changed;
+            }
+            "sentinel" => daemon_reload |= changed,
+            _ => {}
+        }
+    }
 
     tftp_changed |= ensure_bootloader_artifacts(settings)?;
 
@@ -3788,6 +4043,61 @@ fn apply_runtime_settings_to_host(
     }
     if tftp_changed {
         run_command("systemctl", ["restart", "tftpd-hpa.service"])?;
+    }
+    if resolver_changed {
+        run_command("systemctl", ["restart", "systemd-resolved.service"])?;
+    }
+    for unit in ["cybex-forge.service", "nginx.service", "tftpd-hpa.service"] {
+        run_command("systemctl", ["is-active", "--quiet", unit])?;
+    }
+    run_command(
+        "curl",
+        ["-fsS", "--max-time", "5", "http://127.0.0.1/healthz"],
+    )?;
+    run_command(
+        "curl",
+        [
+            "-fsS",
+            "--max-time",
+            "5",
+            "http://127.0.0.1/boot.ipxe?cybex_check=1",
+        ],
+    )?;
+    run_command(
+        "systemctl",
+        ["enable", "--now", "cybex-forge-sentinel.timer"],
+    )?;
+    Ok(())
+}
+
+fn rollback_runtime_files(files: &[RuntimeManagedFile], backups: &[Option<Vec<u8>>]) -> Result<()> {
+    for (file, backup) in files.iter().zip(backups) {
+        match backup {
+            Some(contents) => {
+                install_bytes_file(
+                    Path::new(file.path),
+                    contents,
+                    file.mode,
+                    file.owner,
+                    file.group,
+                )?;
+            }
+            None => match fs::remove_file(file.path) {
+                Ok(()) => sync_parent_dir(Path::new(file.path))?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err).with_context(|| format!("remove {}", file.path)),
+            },
+        }
+    }
+    run_command("systemctl", ["daemon-reload"])?;
+    run_command("nginx", ["-t"])?;
+    for unit in [
+        "systemd-resolved.service",
+        "cybex-forge.service",
+        "nginx.service",
+        "tftpd-hpa.service",
+    ] {
+        run_command("systemctl", ["restart", unit])?;
     }
     Ok(())
 }
@@ -4189,7 +4499,7 @@ After=network-online.target cybex-forge.service nginx.service tftpd-hpa.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/cybex-forge-check --quiet
+ExecStart=/usr/local/bin/cybex-forge-check --quiet
 Nice=5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -4820,6 +5130,7 @@ fn boot_report_state(
     client_count: usize,
     asset_count: usize,
     asset_scan: &AssetScanReport,
+    reliability_state: Option<Value>,
 ) -> Value {
     let mut state = json!({
         "managed": true,
@@ -4835,8 +5146,37 @@ fn boot_report_state(
         if let Some(error) = &asset_scan.error {
             object.insert("asset_scan_error".to_string(), json!(error));
         }
+        if let Some(reliability) = reliability_state {
+            object.insert("reliability".to_string(), reliability);
+        }
     }
     state
+}
+
+fn load_reliability_state() -> Option<Value> {
+    let bytes = fs::read(RELIABILITY_STATE_PATH).ok()?;
+    if bytes.len() > MAX_RELIABILITY_STATE_BYTES {
+        warn!(
+            path = RELIABILITY_STATE_PATH,
+            bytes = bytes.len(),
+            "ignoring oversized Forge reliability state"
+        );
+        return None;
+    }
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(object)) => Some(Value::Object(object)),
+        Ok(_) => {
+            warn!(
+                path = RELIABILITY_STATE_PATH,
+                "ignoring non-object Forge reliability state"
+            );
+            None
+        }
+        Err(err) => {
+            warn!(path = RELIABILITY_STATE_PATH, error = %err, "ignoring invalid Forge reliability state");
+            None
+        }
+    }
 }
 
 fn bounded_error_message(message: String) -> String {
@@ -4898,10 +5238,10 @@ mod tests {
         patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
         read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
         render_managed_config, render_nixos_netboot_script,
-        rewrite_newc_archive_with_netboot_files, serialize_boot_report_body, skip_padding,
-        sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_desired_profile_isos,
-        sync_profiles, validate_boot_config, validate_profile, write_newc_file_from_bytes,
-        write_newc_trailer, write_secure_json,
+        rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
+        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles,
+        sync_desired_profile_isos, sync_profiles, validate_boot_config, validate_profile,
+        write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -4912,6 +5252,7 @@ mod tests {
     };
     use rand::{RngCore, rngs::OsRng};
     use std::{
+        collections::HashMap,
         fs,
         io::{BufReader, Read},
         path::{Path, PathBuf},
@@ -4977,7 +5318,7 @@ mod tests {
     #[test]
     fn asset_scan_success_is_reported_as_ok() {
         let scan = asset_scan_report(Ok(4));
-        let state = boot_report_state(2, 3, 4, &scan);
+        let state = boot_report_state(2, 3, 4, &scan, None);
 
         assert_eq!(scan.status, "ok");
         assert_eq!(
@@ -4994,7 +5335,7 @@ mod tests {
     #[test]
     fn asset_scan_failure_is_reported_without_dropping_asset_count() {
         let scan = asset_scan_report(Err(AppError::Config("scan\nfailed".to_string())));
-        let state = boot_report_state(2, 3, 7, &scan);
+        let state = boot_report_state(2, 3, 7, &scan, None);
 
         assert_eq!(scan.status, "failed");
         assert_eq!(
@@ -5010,6 +5351,30 @@ mod tests {
             Some("configuration error: scan failed")
         );
         assert!(state.pointer("/asset_scan_count").is_none());
+    }
+
+    #[test]
+    fn reliability_incident_is_included_in_managed_report_state() {
+        let scan = asset_scan_report(Ok(1));
+        let reliability = serde_json::json!({
+            "status": "degraded",
+            "last_component": "dns",
+            "total_repairs": 2
+        });
+        let state = boot_report_state(1, 0, 1, &scan, Some(reliability));
+
+        assert_eq!(
+            state
+                .pointer("/reliability/status")
+                .and_then(|value| value.as_str()),
+            Some("degraded")
+        );
+        assert_eq!(
+            state
+                .pointer("/reliability/total_repairs")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -5650,6 +6015,53 @@ mod tests {
         assert!(service.contains(
             "ReadWritePaths=/run /srv/cybex-forge/www-managed /var/lib/cybex-forge /var/lib/nginx /var/log/nginx"
         ));
+        assert!(service.contains("ExecStart=/usr/local/bin/cybex-forge-check --quiet"));
+    }
+
+    #[test]
+    fn managed_runtime_apply_carries_self_healing_units_for_existing_nodes() {
+        let mut config = AppConfig::default();
+        config.manage.organization_id = "00000000-0000-0000-0000-000000000001".to_string();
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp-managed"),
+            http_root: PathBuf::from("/srv/cybex-forge/www-managed"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        let files = runtime_managed_files(&config, &settings).unwrap();
+        let by_path = files
+            .iter()
+            .map(|file| (file.path, file))
+            .collect::<HashMap<_, _>>();
+
+        assert!(
+            by_path["/etc/systemd/system/cybex-forge.service"]
+                .contents
+                .contains("WatchdogSec=30s")
+        );
+        assert!(
+            by_path["/usr/local/bin/cybex-forge-sentinel"]
+                .contents
+                .contains("reliability-state.json")
+        );
+        assert!(
+            by_path["/usr/local/bin/cybex-forge-check"]
+                .contents
+                .contains("check_systemd_value cybex-forge Type notify")
+        );
+        assert_eq!(by_path["/usr/local/bin/cybex-forge-check"].mode, "0755");
+        assert!(by_path.contains_key("/etc/systemd/system/cybex-forge-sentinel.timer"));
+        assert!(by_path.contains_key(
+            "/etc/systemd/system/systemd-resolved.service.d/10-cybex-forge-recovery.conf"
+        ));
+        assert!(
+            by_path.contains_key(
+                "/etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf"
+            )
+        );
     }
 
     #[test]

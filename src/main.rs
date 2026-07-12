@@ -9,6 +9,8 @@ use cybex_forge::{
     db, router,
 };
 use tokio::net::TcpListener;
+use tokio::process::Command as TokioCommand;
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -143,6 +145,7 @@ async fn run_server(
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
     info!(%listen_addr, "cybex-forge listening");
+    spawn_systemd_watchdog();
 
     axum_serve(
         listener,
@@ -151,6 +154,29 @@ async fn run_server(
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server failed")
+}
+
+fn spawn_systemd_watchdog() {
+    if std::env::var_os("NOTIFY_SOCKET").is_none() {
+        return;
+    }
+    tokio::spawn(async {
+        let _ = TokioCommand::new("systemd-notify")
+            .arg("--ready")
+            .status()
+            .await;
+        loop {
+            sleep(Duration::from_secs(10)).await;
+            if TokioCommand::new("systemd-notify")
+                .arg("WATCHDOG=1")
+                .status()
+                .await
+                .is_err()
+            {
+                warn!("failed to notify systemd watchdog");
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

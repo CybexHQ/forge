@@ -1,16 +1,23 @@
 [Unit]
 Description=Cybex Forge iPXE control service
-After=network-online.target
-Wants=network-online.target
+After=network-online.target systemd-resolved.service
+Wants=network-online.target systemd-resolved.service
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+WatchdogSec=30s
 User=cybex-forge
 Group=cybex-forge
 ExecStart=/usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml serve
 WorkingDirectory=/var/lib/cybex-forge
-Restart=on-failure
+Restart=always
 RestartSec=3
+Slice=cybex-forge-control.slice
+CPUWeight=1000
+IOWeight=1000
+OOMScoreAdjust=-500
 StateDirectory=cybex-forge
 ReadWritePaths=/var/lib/cybex-forge /srv/cybex-forge
 UMask=0077

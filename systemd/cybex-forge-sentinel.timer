@@ -1,0 +1,12 @@
+[Unit]
+Description=Continuously verify and repair Cybex Forge availability
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=cybex-forge-sentinel.service
+
+[Install]
+WantedBy=timers.target

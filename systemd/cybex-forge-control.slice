@@ -1,0 +1,7 @@
+[Unit]
+Description=Cybex Forge latency-sensitive services
+Before=slices.target
+
+[Slice]
+CPUWeight=1000
+IOWeight=1000

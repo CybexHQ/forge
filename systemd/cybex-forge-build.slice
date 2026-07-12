@@ -1,0 +1,9 @@
+[Unit]
+Description=Cybex Forge resource-intensive build and cache work
+Before=slices.target
+
+[Slice]
+CPUWeight=25
+IOWeight=25
+MemoryHigh=80%
+MemoryMax=90%
