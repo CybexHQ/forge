@@ -461,7 +461,17 @@ pub fn spawn(state: AppState) {
             let interval = match sync_once_with_outcome(&state).await {
                 Ok(outcome) => {
                     consecutive_failures = 0;
-                    managed_sync_interval_seconds(&state.config.manage, outcome)
+                    let normal_interval =
+                        managed_sync_interval_seconds(&state.config.manage, outcome);
+                    match db::active_build_job_count(&state.db).await {
+                        Ok(active_builds) => {
+                            active_managed_sync_interval_seconds(normal_interval, active_builds > 0)
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "failed to inspect active Forge builds for managed sync cadence");
+                            normal_interval
+                        }
+                    }
                 }
                 Err(err) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -3261,6 +3271,14 @@ fn managed_sync_interval_seconds(config: &ManageConfig, outcome: SyncOutcome) ->
     }
 }
 
+fn active_managed_sync_interval_seconds(normal_interval: u64, has_active_builds: bool) -> u64 {
+    if has_active_builds {
+        normal_interval.min(5)
+    } else {
+        normal_interval
+    }
+}
+
 /// Exponential backoff after failed syncs: retry quickly at first (a
 /// transient blip should not cost a full sync interval), never slower than
 /// the normal cadence.
@@ -4868,9 +4886,10 @@ mod tests {
         MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
         ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
         NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest,
-        NormalizedManagedSettings, SyncOutcome, append_bounded_response_chunk_with_limit,
-        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
-        clean_optional, failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
+        NormalizedManagedSettings, SyncOutcome, active_managed_sync_interval_seconds,
+        append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
+        bounded_error_message, bounded_http_timeout_seconds, clean_optional,
+        failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
         generated_iso_raw_script_can_be_preserved, has_unreported_known_profile_events,
         managed_profile_map, managed_profile_needs_iso_sync, managed_profile_raw_script,
         managed_sync_interval_seconds, nixos_netboot_fstab, normalize_managed_settings,
@@ -4946,6 +4965,13 @@ mod tests {
         assert_eq!(failed_sync_interval_seconds(&config, 3), 20);
         assert_eq!(failed_sync_interval_seconds(&config, 4), 30);
         assert_eq!(failed_sync_interval_seconds(&config, 100), 30);
+    }
+
+    #[test]
+    fn active_builds_accelerate_managed_status_sync() {
+        assert_eq!(active_managed_sync_interval_seconds(30, true), 5);
+        assert_eq!(active_managed_sync_interval_seconds(5, true), 5);
+        assert_eq!(active_managed_sync_interval_seconds(30, false), 30);
     }
 
     #[test]
