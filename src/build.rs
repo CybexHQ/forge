@@ -28,6 +28,7 @@ use crate::{
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
+const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
 const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,6 +60,10 @@ pub struct BlueprintBuildInput {
     pub kind: String,
     pub generated_nix: String,
     #[serde(default)]
+    pub desktop_module_nix: Option<String>,
+    #[serde(default)]
+    pub expected_state: Option<Value>,
+    #[serde(default)]
     #[serde(alias = "desktop_experience_name")]
     pub blueprint_name: Option<String>,
     #[serde(default)]
@@ -82,6 +87,8 @@ struct ValidatedBuildSpec {
 #[derive(Clone, Debug)]
 struct ValidatedBlueprintBuildInput {
     generated_nix: String,
+    desktop_module_nix: Option<String>,
+    expected_state: Option<Value>,
     blueprint_name: Option<String>,
     blueprint_revision: Option<i64>,
 }
@@ -715,8 +722,33 @@ fn validate_blueprint_build_input(
     if input.generated_nix.bytes().any(|byte| byte == 0) {
         bail!("build_input.generated_nix must not contain NUL bytes");
     }
+    if let Some(desktop_module_nix) = input.desktop_module_nix.as_deref() {
+        if desktop_module_nix.trim().is_empty() {
+            bail!("build_input.desktop_module_nix must not be empty");
+        }
+        if desktop_module_nix.len() > MAX_DESKTOP_MODULE_NIX_BYTES {
+            bail!("build_input.desktop_module_nix is too large");
+        }
+        if desktop_module_nix.bytes().any(|byte| byte == 0) {
+            bail!("build_input.desktop_module_nix must not contain NUL bytes");
+        }
+        let expected_state = input
+            .expected_state
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("build_input.expected_state must be an object when desktop_module_nix is supplied"))?;
+        if expected_state.get("schema").and_then(Value::as_str)
+            != Some("cybex.blueprint.expected-state.v1")
+        {
+            bail!("build_input.expected_state has an unsupported schema");
+        }
+    } else if input.expected_state.is_some() {
+        bail!("build_input.expected_state requires desktop_module_nix");
+    }
     Ok(ValidatedBlueprintBuildInput {
         generated_nix: input.generated_nix,
+        desktop_module_nix: input.desktop_module_nix,
+        expected_state: input.expected_state,
         blueprint_name: input
             .blueprint_name
             .map(|value| bounded_metadata_text(&value, 200))
@@ -1027,13 +1059,21 @@ fn blueprint_nix_build_command(
     fs::create_dir_all(&input_dir)
         .with_context(|| format!("create build input directory {}", input_dir.display()))?;
     write_job_input_file(input_dir.join("blueprint.nix"), &build_input.generated_nix)?;
+    if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
+        write_job_input_file(input_dir.join("cybex-blueprints.nix"), desktop_module_nix)?;
+    }
+    if let Some(expected_state) = build_input.expected_state.as_ref() {
+        let expected_state = serde_json::to_string_pretty(expected_state)
+            .context("serialize Blueprint expected state")?;
+        write_job_input_file(input_dir.join("expected-state.json"), &expected_state)?;
+    }
     write_job_input_file(
         input_dir.join("cybex-compat-options.nix"),
-        blueprint_compat_module(),
+        blueprint_compat_module(build_input.desktop_module_nix.is_some()),
     )?;
     write_job_input_file(
         input_dir.join("configuration.nix"),
-        forge_nixos_configuration(),
+        &forge_nixos_configuration(build_input.desktop_module_nix.is_some()),
     )?;
     write_job_input_file(
         input_dir.join("flake.nix"),
@@ -1102,12 +1142,18 @@ fn forge_nixos_flake(
     )
 }
 
-fn forge_nixos_configuration() -> &'static str {
+fn forge_nixos_configuration(include_desktop_module: bool) -> String {
+    let desktop_module_import = if include_desktop_module {
+        "    ./cybex-blueprints.nix\n"
+    } else {
+        ""
+    };
     r#"{ lib, modulesPath, ... }:
 
 {
   imports = [
     ./cybex-compat-options.nix
+@DESKTOP_MODULE_IMPORT@
     ./blueprint.nix
   ];
 
@@ -1133,16 +1179,56 @@ fn forge_nixos_configuration() -> &'static str {
   systemd.services.systemd-udevd.restartTriggers = lib.mkForce [];
 }
 "#
+    .replace("@DESKTOP_MODULE_IMPORT@\n", desktop_module_import)
 }
 
-fn blueprint_compat_module() -> &'static str {
-    r#"{ lib, ... }:
+fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
+    if !include_desktop_module {
+        return r#"{ lib, ... }:
 
 {
   options.cybex = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
     description = "Cybex Blueprint metadata accepted while Forge prebuilds a generic NixOS closure.";
+  };
+
+  options.services.cybex-agent = lib.mkOption {
+    type = lib.types.attrsOf lib.types.anything;
+    default = {};
+    description = "Cybex Agent policy accepted while Forge prebuilds a generic NixOS closure.";
+  };
+}
+"#;
+    }
+    r#"{ lib, ... }:
+
+{
+  options.cybex.desktop.environment = lib.mkOption {
+    type = lib.types.str;
+    default = "";
+    description = "Cybex desktop environment metadata from the assigned Blueprint.";
+  };
+
+  options.cybex.catalog.applications = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.submodule {
+      options = {
+        package = lib.mkOption { type = lib.types.str; default = ""; };
+        source = lib.mkOption { type = lib.types.str; default = ""; };
+        policy = lib.mkOption { type = lib.types.str; default = ""; };
+        channel = lib.mkOption { type = lib.types.str; default = ""; };
+        version = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+        pinned = lib.mkOption { type = lib.types.bool; default = false; };
+      };
+    });
+    default = {};
+    description = "Cybex application metadata from the assigned Blueprint.";
+  };
+
+  options.cybex.security.luks.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = "Cybex disk-encryption intent metadata.";
   };
 
   options.services.cybex-agent = lib.mkOption {
@@ -1610,12 +1696,34 @@ mod tests {
             "build_input": {
                 "kind": "blueprint_nixos_module",
                 "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
+                "desktop_module_nix": "{ lib, ... }: { options.cybex.desktop.profile = lib.mkOption { type = lib.types.str; default = \"auto\"; }; }",
+                "expected_state": {
+                    "schema": "cybex.blueprint.expected-state.v1",
+                    "desktop": {"profile": "gnome"}
+                },
                 "blueprint_name": "Standard Workstation",
                 "blueprint_revision": 8
             }
         });
         let parsed = serde_json::from_value::<BuildSpec>(value).unwrap();
-        assert_eq!(parsed.build_input.unwrap().kind, BLUEPRINT_BUILD_INPUT_KIND);
+        let validated = validate_blueprint_build_input(parsed.build_input.unwrap()).unwrap();
+        assert!(validated.desktop_module_nix.is_some());
+        assert!(validated.expected_state.is_some());
+    }
+
+    #[test]
+    fn blueprint_build_input_requires_expected_state_with_real_desktop_module() {
+        let input = BlueprintBuildInput {
+            kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
+            generated_nix: "{ ... }: {}".to_string(),
+            desktop_module_nix: Some("{ ... }: {}".to_string()),
+            expected_state: None,
+            blueprint_name: None,
+            blueprint_revision: None,
+        };
+
+        let err = validate_blueprint_build_input(input).unwrap_err();
+        assert!(err.to_string().contains("expected_state must be an object"));
     }
 
     #[test]
@@ -1749,6 +1857,14 @@ mod tests {
             build_input: Some(ValidatedBlueprintBuildInput {
                 generated_nix: "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }"
                     .to_string(),
+                desktop_module_nix: Some(
+                    "{ lib, ... }: { options.cybex.desktop.profile = lib.mkOption { type = lib.types.str; default = \"auto\"; }; }"
+                        .to_string(),
+                ),
+                expected_state: Some(json!({
+                    "schema": "cybex.blueprint.expected-state.v1",
+                    "desktop": {"profile": "gnome"}
+                })),
                 blueprint_name: Some("Standard Workstation".to_string()),
                 blueprint_revision: Some(8),
             }),
@@ -1766,8 +1882,14 @@ mod tests {
         );
         assert!(root.join("work/job-42-input/flake.nix").is_file());
         assert!(root.join("work/job-42-input/blueprint.nix").is_file());
+        assert!(
+            root.join("work/job-42-input/cybex-blueprints.nix")
+                .is_file()
+        );
+        assert!(root.join("work/job-42-input/expected-state.json").is_file());
         let configuration =
             std::fs::read_to_string(root.join("work/job-42-input/configuration.nix")).unwrap();
+        assert!(configuration.contains("./cybex-blueprints.nix"));
         assert!(
             configuration
                 .contains("systemd.services.systemd-udevd.restartTriggers = lib.mkForce [];")
