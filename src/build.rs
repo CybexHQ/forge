@@ -737,9 +737,10 @@ fn validate_blueprint_build_input(
             .as_ref()
             .and_then(Value::as_object)
             .ok_or_else(|| anyhow!("build_input.expected_state must be an object when desktop_module_nix is supplied"))?;
-        if expected_state.get("schema").and_then(Value::as_str)
-            != Some("cybex.blueprint.expected-state.v1")
-        {
+        if !matches!(
+            expected_state.get("schema").and_then(Value::as_str),
+            Some("cybex.blueprint.expected-state.v1" | "cybex.blueprint.expected-state.v2")
+        ) {
             bail!("build_input.expected_state has an unsupported schema");
         }
     } else if input.expected_state.is_some() {
@@ -1204,13 +1205,19 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
     r#"{ lib, ... }:
 
 {
+  imports = [
+    (lib.mkAliasOptionModule
+      [ "cybex" "catalog" "applications" ]
+      [ "cybex" "blueprint" "applications" ])
+  ];
+
   options.cybex.desktop.environment = lib.mkOption {
     type = lib.types.str;
     default = "";
     description = "Cybex desktop environment metadata from the assigned Blueprint.";
   };
 
-  options.cybex.catalog.applications = lib.mkOption {
+  options.cybex.blueprint.applications = lib.mkOption {
     type = lib.types.attrsOf (lib.types.submodule {
       options = {
         package = lib.mkOption { type = lib.types.str; default = ""; };
@@ -1698,8 +1705,10 @@ mod tests {
                 "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
                 "desktop_module_nix": "{ lib, ... }: { options.cybex.desktop.profile = lib.mkOption { type = lib.types.str; default = \"auto\"; }; }",
                 "expected_state": {
-                    "schema": "cybex.blueprint.expected-state.v1",
-                    "desktop": {"profile": "gnome"}
+                    "schema": "cybex.blueprint.expected-state.v2",
+                    "compiler_version": 2,
+                    "desktop": {"profile": "gnome"},
+                    "checks": []
                 },
                 "blueprint_name": "Standard Workstation",
                 "blueprint_revision": 8
@@ -1899,6 +1908,11 @@ mod tests {
         assert!(configuration.contains("boot.initrd.availableKernelModules = lib.mkForce [];"));
         assert!(configuration.contains("boot.kernelModules = lib.mkForce [];"));
         assert!(configuration.contains("security.lockKernelModules = lib.mkForce false;"));
+        let compatibility =
+            std::fs::read_to_string(root.join("work/job-42-input/cybex-compat-options.nix"))
+                .unwrap();
+        assert!(compatibility.contains("options.cybex.blueprint.applications"));
+        assert!(compatibility.contains("lib.mkAliasOptionModule"));
         let flake = std::fs::read_to_string(root.join("work/job-42-input/flake.nix")).unwrap();
         assert!(flake.contains(r#"inputs.nixpkgs.url = "/srv/cybex-forge/build-inputs/cybex";"#));
         assert!(!flake.contains("nixos-26.05"));
