@@ -86,6 +86,21 @@ all managed configuration files, installs changes atomically, validates nginx,
 restarts and verifies all local boot services, probes cached PXE, and restores
 the previous files and services if any stage fails.
 
+Managed ISO synchronization runs in a durable worker separate from the control
+and report loop. Each desired profile carries a generation and operation UUID;
+local state transitions and reports use both values, so a late completion can
+never overwrite a newer request. The worker recovers interrupted `syncing`
+state, retries temporary failures with bounded backoff, resumes a stable partial
+file with HTTP Range, verifies the expected size and SHA-256, fsyncs it, and
+atomically promotes a content-addressed filename before updating Boot config.
+Control-plane heartbeats continue while a multi-gigabyte ISO is downloading.
+
+Manage and Forge exchange protocol compatibility version 2 in both config and
+reports. Forge validates the allowed version range before applying desired
+state, while Manage records and rejects incompatible reports. The checked-in
+`protocol/compatibility.json` manifest is the release contract and is tested
+against runtime constants in both repositories.
+
 The self-healing units, slices, resolver/service drop-ins, and sentinel script
 are embedded in the Forge binary's privileged runtime apply plan. Existing
 managed nodes therefore adopt the same availability baseline after a verified

@@ -19,7 +19,10 @@ use base64::{
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
-use reqwest::{Client, Method, header::CONTENT_TYPE};
+use reqwest::{
+    Client, Method,
+    header::{CONTENT_RANGE, CONTENT_TYPE, IF_RANGE, RANGE},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -47,6 +50,9 @@ const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_UPDATER_V1: &str = "updater_v1";
+const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 2;
+const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 1;
+const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 2;
 const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
 const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
@@ -144,7 +150,18 @@ struct EnrollmentStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ComponentCompatibilityContract {
+    protocol_version: u32,
+    minimum_forge_protocol: u32,
+    maximum_forge_protocol: u32,
+    manage_version: String,
+    manage_release: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AgentBootConfigResponse {
+    #[serde(default)]
+    compatibility: Option<ComponentCompatibilityContract>,
     settings: ManagedBootSettings,
     profiles: Vec<ManagedBootProfile>,
     #[serde(default)]
@@ -160,6 +177,8 @@ struct AgentBootConfigResponse {
 
 #[derive(Debug, Deserialize)]
 struct AgentForgeConfigResponse {
+    #[serde(default)]
+    compatibility: Option<ComponentCompatibilityContract>,
     #[serde(default)]
     build_jobs: Vec<ManagedBuildJob>,
     #[serde(default)]
@@ -240,6 +259,10 @@ struct ManagedBootProfile {
     desired_iso_url: String,
     #[serde(default)]
     desired_iso_download_url: String,
+    #[serde(default)]
+    sync_generation: i64,
+    #[serde(default)]
+    sync_operation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +281,7 @@ struct ManagedBootClient {
 
 #[derive(Clone, Debug, Serialize)]
 struct BootAgentReportRequest {
+    protocol_version: u32,
     settings: BootAgentSettingsReport,
     profile_sync: Vec<BootAgentProfileSyncReport>,
     clients: Vec<BootAgentClientReport>,
@@ -313,6 +337,8 @@ struct BootAgentEventReport {
 #[derive(Clone, Debug, Serialize)]
 struct BootAgentProfileSyncReport {
     profile_id: String,
+    sync_generation: i64,
+    sync_operation_id: String,
     state: String,
     progress_percent: Option<i32>,
     bytes_downloaded: Option<i64>,
@@ -329,6 +355,7 @@ struct BootAgentProfileSyncReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct ForgeAgentReportRequest {
+    protocol_version: u32,
     capabilities: Vec<&'static str>,
     cache: crate::cache::CacheStatusReport,
     update: Option<ForgeUpdateStatusReport>,
@@ -466,6 +493,18 @@ struct BootEventReportRow {
 struct ManagedIsoSyncTarget {
     local_id: i64,
     profile_id: String,
+    sync_generation: i64,
+    sync_operation_id: String,
+    sync_state: String,
+    sync_progress_percent: i32,
+    sync_bytes_downloaded: i64,
+    sync_total_bytes: i64,
+    sync_attempts: i64,
+    sync_next_attempt_at: Option<String>,
+    sync_error: String,
+    sync_started_at: Option<String>,
+    sync_completed_at: Option<String>,
+    sync_failed_at: Option<String>,
     profile_type: String,
     desired_iso_artifact_id: String,
     desired_iso_filename: String,
@@ -498,6 +537,10 @@ struct NormalizedManagedSettings {
 }
 
 pub fn spawn(state: AppState) {
+    let iso_worker_state = state.clone();
+    tokio::spawn(async move {
+        run_managed_iso_sync_worker(iso_worker_state).await;
+    });
     tokio::spawn(async move {
         let mut consecutive_failures: u32 = 0;
         loop {
@@ -614,7 +657,7 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     }
     let config = fetch_boot_config(state, &managed).await?;
     apply_boot_config(state, &config).await?;
-    let profile_sync = sync_desired_profile_isos(state, &managed).await?;
+    let profile_sync = current_profile_sync_reports(&state.db).await?;
     report_boot_state(state, &mut managed, profile_sync).await?;
     sync_forge_foundation(state, &managed).await?;
     save_managed_state(state, &managed)?;
@@ -733,7 +776,11 @@ async fn fetch_boot_config_for_config(
         .send()
         .await
         .context("fetch managed boot config request failed")?;
-    parse_success_json(response, "fetch managed boot config").await
+    let mut config: AgentBootConfigResponse =
+        parse_success_json(response, "fetch managed boot config").await?;
+    validate_component_compatibility(config.compatibility.as_ref())?;
+    normalize_legacy_boot_config(&mut config);
+    Ok(config)
 }
 
 async fn report_boot_state(
@@ -774,6 +821,7 @@ async fn report_boot_state(
         reliability_state,
     );
     let body = BootAgentReportRequest {
+        protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
         settings: BootAgentSettingsReport {
             public_base_url: runtime.public_base_url,
             listen_addr: state.config.server.listen_addr.clone(),
@@ -890,7 +938,10 @@ async fn fetch_forge_config(
         .send()
         .await
         .context("fetch managed forge config request failed")?;
-    parse_success_json(response, "fetch managed forge config").await
+    let config: AgentForgeConfigResponse =
+        parse_success_json(response, "fetch managed forge config").await?;
+    validate_component_compatibility(config.compatibility.as_ref())?;
+    Ok(config)
 }
 
 async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<()> {
@@ -899,6 +950,7 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
     let cache = crate::cache::status_report(&state.config, &state.db).await;
     let update = crate::updater::status_report(&state.config).await?;
     let body = ForgeAgentReportRequest {
+        protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
         capabilities: forge_capabilities(&state.config),
         cache,
         update,
@@ -1038,11 +1090,10 @@ async fn apply_boot_config(state: &AppState, config: &AgentBootConfigResponse) -
     Ok(())
 }
 
-async fn sync_desired_profile_isos(
-    state: &AppState,
-    managed: &ManagedState,
+async fn current_profile_sync_reports(
+    pool: &SqlitePool,
 ) -> Result<Vec<BootAgentProfileSyncReport>> {
-    let targets = list_desired_profile_iso_targets(&state.db).await?;
+    let targets = list_desired_profile_iso_targets(pool).await?;
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
         if optional_report_uuid(Some(target.profile_id.clone())).is_none() {
@@ -1052,26 +1103,151 @@ async fn sync_desired_profile_isos(
             );
             continue;
         }
-        let started_at = Utc::now();
-        match sync_desired_profile_iso(state, managed, &target, started_at).await {
-            Ok(report) => reports.push(report),
+        reports.push(profile_sync_report_from_target(&target));
+    }
+    Ok(reports)
+}
+
+async fn run_managed_iso_sync_worker(state: AppState) {
+    if let Err(err) = recover_interrupted_profile_syncs(&state.db).await {
+        warn!(error = %safe_error(&err), "failed to recover interrupted managed ISO syncs");
+    }
+    loop {
+        match process_next_managed_iso_sync(&state).await {
+            Ok(true) => continue,
+            Ok(false) => sleep(Duration::from_secs(1)).await,
             Err(err) => {
-                warn!(
-                    profile_id = %target.profile_id,
-                    error = %safe_error(&err),
-                    "managed ISO profile sync failed"
-                );
-                reports.push(profile_sync_failed_report(&target, started_at, err));
+                warn!(error = %safe_error(&err), "managed ISO worker iteration failed");
+                sleep(Duration::from_secs(5)).await;
             }
         }
     }
-    Ok(reports)
+}
+
+async fn recover_interrupted_profile_syncs(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "UPDATE boot_profiles
+         SET sync_state = 'queued', sync_next_attempt_at = ?,
+             sync_error = 'Forge restarted while synchronizing; retrying'
+         WHERE sync_state IN ('preparing', 'downloading', 'verifying')",
+    )
+    .bind(db::now_rfc3339())
+    .execute(pool)
+    .await
+    .context("recover interrupted managed ISO profile syncs")?;
+    Ok(())
+}
+
+async fn process_next_managed_iso_sync(state: &AppState) -> Result<bool> {
+    let managed = load_managed_state(state)?;
+    if managed.device_id.as_deref().is_none_or(str::is_empty)
+        || managed.private_key_b64.as_deref().is_none_or(str::is_empty)
+    {
+        return Ok(false);
+    }
+    let Some(target) = claim_next_managed_iso_sync(&state.db).await? else {
+        return Ok(false);
+    };
+    let started_at = Utc::now();
+    match sync_desired_profile_iso(state, &managed, &target, started_at).await {
+        Ok(report) => {
+            persist_profile_sync_report(&state.db, target.local_id, &report, None).await?;
+            info!(
+                profile_id = %target.profile_id,
+                sync_generation = target.sync_generation,
+                "managed ISO profile sync completed"
+            );
+        }
+        Err(err) => {
+            let retry_delay = managed_iso_retry_delay_seconds(target.sync_attempts);
+            let terminal = target.sync_attempts >= 5;
+            let safe = bounded_error_message(safe_error(&err));
+            let report = profile_sync_failed_report(&target, started_at, err);
+            persist_profile_sync_report(
+                &state.db,
+                target.local_id,
+                &report,
+                (!terminal).then_some(retry_delay),
+            )
+            .await?;
+            warn!(
+                profile_id = %target.profile_id,
+                sync_generation = target.sync_generation,
+                attempts = target.sync_attempts,
+                terminal,
+                retry_in_seconds = (!terminal).then_some(retry_delay),
+                error = %safe,
+                "managed ISO profile sync failed"
+            );
+        }
+    }
+    Ok(true)
+}
+
+async fn claim_next_managed_iso_sync(pool: &SqlitePool) -> Result<Option<ManagedIsoSyncTarget>> {
+    let now = db::now_rfc3339();
+    for mut target in list_desired_profile_iso_targets(pool).await? {
+        if target.sync_state != "queued"
+            || target
+                .sync_next_attempt_at
+                .as_deref()
+                .is_some_and(|next| next > now.as_str())
+        {
+            continue;
+        }
+        let result = sqlx::query(
+            "UPDATE boot_profiles
+             SET sync_state = 'downloading', sync_progress_percent = 0,
+                 sync_bytes_downloaded = 0, sync_total_bytes = ?,
+                 sync_attempts = sync_attempts + 1, sync_next_attempt_at = NULL,
+                 sync_error = '', sync_started_at = COALESCE(sync_started_at, ?),
+                 sync_completed_at = NULL, sync_failed_at = NULL
+             WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?
+               AND sync_state = 'queued'",
+        )
+        .bind(target.desired_iso_size_bytes.max(0))
+        .bind(&now)
+        .bind(target.local_id)
+        .bind(target.sync_generation)
+        .bind(&target.sync_operation_id)
+        .execute(pool)
+        .await
+        .context("claim managed ISO profile sync")?;
+        if result.rows_affected() == 1 {
+            target.sync_state = "downloading".to_string();
+            target.sync_attempts = target.sync_attempts.saturating_add(1);
+            target.sync_started_at = Some(now);
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn managed_iso_retry_delay_seconds(attempts: i64) -> i64 {
+    match attempts {
+        i64::MIN..=1 => 5,
+        2 => 15,
+        3 => 30,
+        _ => 60,
+    }
 }
 
 async fn list_desired_profile_iso_targets(pool: &SqlitePool) -> Result<Vec<ManagedIsoSyncTarget>> {
     sqlx::query_as::<_, ManagedIsoSyncTarget>(
         "SELECT id AS local_id,
                 managed_profile_id AS profile_id,
+                sync_generation,
+                sync_operation_id,
+                sync_state,
+                sync_progress_percent,
+                sync_bytes_downloaded,
+                sync_total_bytes,
+                sync_attempts,
+                sync_next_attempt_at,
+                sync_error,
+                sync_started_at,
+                sync_completed_at,
+                sync_failed_at,
                 profile_type,
                 desired_iso_artifact_id,
                 desired_iso_filename,
@@ -1104,8 +1280,10 @@ async fn sync_desired_profile_iso(
 ) -> Result<BootAgentProfileSyncReport> {
     validate_managed_iso_target(target, state)?;
     let filename = managed_iso_filename(&target.desired_iso_filename)?;
-    let relative_path = managed_iso_relative_path(&filename);
-    let path = state.config.paths.iso_dir.join(&filename);
+    let expected_sha = target.desired_iso_sha256.to_ascii_lowercase();
+    let local_filename = format!("{expected_sha}-{filename}");
+    let relative_path = managed_iso_relative_path(&local_filename);
+    let path = state.config.paths.iso_dir.join(&local_filename);
 
     tokio_fs::create_dir_all(&state.config.paths.iso_dir)
         .await
@@ -1117,11 +1295,9 @@ async fn sync_desired_profile_iso(
         })?;
 
     let expected_size = target.desired_iso_size_bytes;
-    let expected_sha = target.desired_iso_sha256.to_ascii_lowercase();
     if cached_iso_matches(&path, expected_size, &expected_sha).await? {
         let boot_script = ensure_nixos_netboot_boot_script(state, &path, &expected_sha).await?;
-        set_profile_iso_boot_script(&state.db, target.local_id, &relative_path, &boot_script)
-            .await?;
+        set_profile_iso_boot_script(&state.db, target, &relative_path, &boot_script).await?;
         return Ok(profile_sync_ready_report(
             target,
             filename,
@@ -1139,10 +1315,11 @@ async fn sync_desired_profile_iso(
         &path,
         expected_size,
         &expected_sha,
+        target,
     )
     .await?;
     let boot_script = ensure_nixos_netboot_boot_script(state, &path, &expected_sha).await?;
-    set_profile_iso_boot_script(&state.db, target.local_id, &relative_path, &boot_script).await?;
+    set_profile_iso_boot_script(&state.db, target, &relative_path, &boot_script).await?;
 
     Ok(profile_sync_ready_report(
         target,
@@ -1155,20 +1332,26 @@ async fn sync_desired_profile_iso(
 
 async fn set_profile_iso_boot_script(
     pool: &SqlitePool,
-    profile_id: i64,
+    target: &ManagedIsoSyncTarget,
     iso_path: &str,
     raw_script: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE boot_profiles SET iso_path = ?, raw_script = ?, updated_at = ? WHERE id = ?",
+    let result = sqlx::query(
+        "UPDATE boot_profiles SET iso_path = ?, raw_script = ?, updated_at = ?
+         WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?",
     )
     .bind(iso_path)
     .bind(raw_script)
     .bind(db::now_rfc3339())
-    .bind(profile_id)
+    .bind(target.local_id)
+    .bind(target.sync_generation)
+    .bind(&target.sync_operation_id)
     .execute(pool)
     .await
     .context("update managed ISO profile boot script")?;
+    if result.rows_affected() != 1 {
+        bail!("managed ISO sync operation was superseded before boot script promotion");
+    }
     Ok(())
 }
 
@@ -2446,10 +2629,37 @@ async fn download_managed_iso(
     path: &Path,
     expected_size: i64,
     expected_sha: &str,
+    target: &ManagedIsoSyncTarget,
 ) -> Result<()> {
     crate::disk::ensure_headroom(path, expected_size.max(0) as u64, "managed ISO download")?;
-    let mut response = signed_download_request(state, managed, download_path)
-        .await?
+    let partial_path = managed_iso_partial_path(path)?;
+    let mut resume_from = match tokio_fs::metadata(&partial_path).await {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= expected_size as u64 => {
+            metadata.len()
+        }
+        Ok(_) => {
+            tokio_fs::remove_file(&partial_path).await.ok();
+            0
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err).context("inspect partial managed ISO download"),
+    };
+    if resume_from == expected_size as u64 {
+        if sha256_file(&partial_path).await? == expected_sha {
+            promote_managed_iso_download(state, target, &partial_path, path).await?;
+            return Ok(());
+        }
+        tokio_fs::remove_file(&partial_path).await.ok();
+        resume_from = 0;
+    }
+
+    let mut request = signed_download_request(state, managed, download_path).await?;
+    if resume_from > 0 {
+        request = request
+            .header(RANGE, format!("bytes={resume_from}-"))
+            .header(IF_RANGE, format!("\"{expected_sha}\""));
+    }
+    let mut response = request
         .send()
         .await
         .context("download managed ISO request failed")?;
@@ -2457,40 +2667,129 @@ async fn download_managed_iso(
     if !status.is_success() {
         bail!("download managed ISO failed with HTTP {status}");
     }
+    if resume_from > 0 {
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !content_range.starts_with(&format!("bytes {resume_from}-")) {
+                bail!("managed ISO resume response had an invalid Content-Range");
+            }
+            tracing::info!(
+                profile_id = %target.profile_id,
+                sync_generation = target.sync_generation,
+                resume_from_bytes = resume_from,
+                "resuming managed ISO download"
+            );
+        } else if status == reqwest::StatusCode::OK {
+            tokio_fs::remove_file(&partial_path).await.ok();
+            resume_from = 0;
+        } else {
+            bail!("managed ISO resume failed with HTTP {status}");
+        }
+    }
     if response
         .content_length()
-        .is_some_and(|len| len > expected_size as u64)
+        .is_some_and(|len| len.saturating_add(resume_from) > expected_size as u64)
     {
         bail!("download managed ISO response exceeded expected size");
     }
 
-    let tmp = managed_iso_tmp_path(path)?;
-    let download_result =
-        download_managed_iso_to_tmp(&mut response, &tmp, expected_size, expected_sha).await;
-    if download_result.is_err() {
-        let _ = tokio_fs::remove_file(&tmp).await;
+    download_managed_iso_to_partial(
+        &state.db,
+        target,
+        &mut response,
+        &partial_path,
+        resume_from,
+        expected_size,
+        expected_sha,
+    )
+    .await?;
+    promote_managed_iso_download(state, target, &partial_path, path).await
+}
+
+async fn promote_managed_iso_download(
+    state: &AppState,
+    target: &ManagedIsoSyncTarget,
+    partial_path: &Path,
+    path: &Path,
+) -> Result<()> {
+    if !profile_sync_operation_is_current(&state.db, target).await? {
+        tokio_fs::remove_file(partial_path).await.ok();
+        bail!("managed ISO sync operation was superseded before artifact promotion");
     }
-    download_result?;
-    tokio_fs::rename(&tmp, path)
+    tokio_fs::rename(partial_path, path)
         .await
         .with_context(|| format!("replace managed ISO {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("managed ISO path has no parent"))?
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync managed ISO directory {}", parent.display()))
+    })
+    .await
+    .context("join managed ISO directory sync")??;
     Ok(())
 }
 
-async fn download_managed_iso_to_tmp(
+async fn profile_sync_operation_is_current(
+    pool: &SqlitePool,
+    target: &ManagedIsoSyncTarget,
+) -> Result<bool> {
+    let matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM boot_profiles
+         WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?",
+    )
+    .bind(target.local_id)
+    .bind(target.sync_generation)
+    .bind(&target.sync_operation_id)
+    .fetch_one(pool)
+    .await
+    .context("verify managed ISO sync operation")?;
+    Ok(matches == 1)
+}
+
+async fn download_managed_iso_to_partial(
+    pool: &SqlitePool,
+    target: &ManagedIsoSyncTarget,
     response: &mut reqwest::Response,
-    tmp: &Path,
+    partial_path: &Path,
+    resume_from: u64,
     expected_size: i64,
     expected_sha: &str,
 ) -> Result<()> {
     let mut file = tokio_fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
-        .open(tmp)
+        .create(true)
+        .append(resume_from > 0)
+        .truncate(resume_from == 0)
+        .open(partial_path)
         .await
-        .with_context(|| format!("create temporary ISO {}", tmp.display()))?;
+        .with_context(|| format!("open partial ISO {}", partial_path.display()))?;
     let mut hasher = Sha256::new();
-    let mut downloaded = 0i64;
+    if resume_from > 0 {
+        let mut existing = tokio_fs::File::open(partial_path)
+            .await
+            .context("open existing partial managed ISO")?;
+        let mut buffer = vec![0u8; 1024 * 128];
+        loop {
+            let read = existing
+                .read(&mut buffer)
+                .await
+                .context("hash existing partial managed ISO")?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    let mut downloaded = resume_from as i64;
+    let mut next_progress_update = downloaded.saturating_add(16 * 1024 * 1024);
 
     while let Some(chunk) = response
         .chunk()
@@ -2507,6 +2806,10 @@ async fn download_managed_iso_to_tmp(
         file.write_all(&chunk)
             .await
             .context("write managed ISO download")?;
+        if downloaded >= next_progress_update {
+            update_profile_sync_progress(pool, target, "downloading", downloaded).await?;
+            next_progress_update = downloaded.saturating_add(16 * 1024 * 1024);
+        }
     }
     file.sync_all().await.context("sync managed ISO download")?;
     drop(file);
@@ -2514,9 +2817,49 @@ async fn download_managed_iso_to_tmp(
     if downloaded != expected_size {
         bail!("managed ISO download size mismatch");
     }
+    update_profile_sync_progress(pool, target, "verifying", downloaded).await?;
     let actual_sha = hex::encode(hasher.finalize());
     if actual_sha != expected_sha {
+        tokio_fs::remove_file(partial_path).await.ok();
         bail!("managed ISO checksum mismatch");
+    }
+    Ok(())
+}
+
+async fn update_profile_sync_progress(
+    pool: &SqlitePool,
+    target: &ManagedIsoSyncTarget,
+    state: &str,
+    downloaded: i64,
+) -> Result<()> {
+    let progress = if target.desired_iso_size_bytes > 0 {
+        downloaded
+            .saturating_mul(100)
+            .checked_div(target.desired_iso_size_bytes)
+            .unwrap_or(0)
+            .clamp(0, 99) as i32
+    } else {
+        0
+    };
+    let result = sqlx::query(
+        "UPDATE boot_profiles
+         SET sync_state = ?, sync_progress_percent = ?, sync_bytes_downloaded = ?,
+             sync_total_bytes = ?, updated_at = ?
+         WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?",
+    )
+    .bind(state)
+    .bind(progress)
+    .bind(downloaded.max(0))
+    .bind(target.desired_iso_size_bytes.max(0))
+    .bind(db::now_rfc3339())
+    .bind(target.local_id)
+    .bind(target.sync_generation)
+    .bind(&target.sync_operation_id)
+    .execute(pool)
+    .await
+    .context("update managed ISO sync progress")?;
+    if result.rows_affected() != 1 {
+        bail!("managed ISO sync operation was superseded during download");
     }
     Ok(())
 }
@@ -2549,6 +2892,8 @@ fn profile_sync_ready_report(
 ) -> BootAgentProfileSyncReport {
     BootAgentProfileSyncReport {
         profile_id: target.profile_id.clone(),
+        sync_generation: target.sync_generation,
+        sync_operation_id: target.sync_operation_id.clone(),
         state: "ready".to_string(),
         progress_percent: Some(100),
         bytes_downloaded: Some(size_bytes),
@@ -2564,6 +2909,82 @@ fn profile_sync_ready_report(
     }
 }
 
+fn profile_sync_report_from_target(target: &ManagedIsoSyncTarget) -> BootAgentProfileSyncReport {
+    BootAgentProfileSyncReport {
+        profile_id: target.profile_id.clone(),
+        sync_generation: target.sync_generation,
+        sync_operation_id: target.sync_operation_id.clone(),
+        state: target.sync_state.clone(),
+        progress_percent: Some(target.sync_progress_percent.clamp(0, 100)),
+        bytes_downloaded: Some(target.sync_bytes_downloaded.max(0)),
+        total_bytes: Some(
+            target
+                .sync_total_bytes
+                .max(target.desired_iso_size_bytes)
+                .max(0),
+        ),
+        artifact_id: Some(target.desired_iso_artifact_id.clone()),
+        filename: Some(target.desired_iso_filename.clone()),
+        size_bytes: Some(target.desired_iso_size_bytes.max(0)),
+        sha256: valid_sha256(&target.desired_iso_sha256),
+        error: (!target.sync_error.is_empty()).then(|| target.sync_error.clone()),
+        started_at: parse_sync_timestamp(target.sync_started_at.as_deref()),
+        completed_at: parse_sync_timestamp(target.sync_completed_at.as_deref()),
+        failed_at: parse_sync_timestamp(target.sync_failed_at.as_deref()),
+    }
+}
+
+fn parse_sync_timestamp(value: Option<&str>) -> Option<chrono::DateTime<Utc>> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+async fn persist_profile_sync_report(
+    pool: &SqlitePool,
+    local_id: i64,
+    report: &BootAgentProfileSyncReport,
+    retry_after_seconds: Option<i64>,
+) -> Result<bool> {
+    let now = Utc::now();
+    let state = if retry_after_seconds.is_some() {
+        "queued"
+    } else {
+        report.state.as_str()
+    };
+    let next_attempt_at = retry_after_seconds
+        .map(|seconds| (now + chrono::Duration::seconds(seconds.max(1))).to_rfc3339());
+    let completed_at = report.completed_at.map(|value| value.to_rfc3339());
+    let failed_at = if state == "failed" {
+        Some(report.failed_at.unwrap_or(now).to_rfc3339())
+    } else {
+        None
+    };
+    let result = sqlx::query(
+        "UPDATE boot_profiles
+         SET sync_state = ?, sync_progress_percent = ?, sync_bytes_downloaded = ?,
+             sync_total_bytes = ?, sync_next_attempt_at = ?, sync_error = ?,
+             sync_completed_at = ?, sync_failed_at = ?, updated_at = ?
+         WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?",
+    )
+    .bind(state)
+    .bind(report.progress_percent.unwrap_or(0).clamp(0, 100))
+    .bind(report.bytes_downloaded.unwrap_or(0).max(0))
+    .bind(report.total_bytes.unwrap_or(0).max(0))
+    .bind(next_attempt_at)
+    .bind(report.error.clone().unwrap_or_default())
+    .bind(completed_at)
+    .bind(failed_at)
+    .bind(now.to_rfc3339())
+    .bind(local_id)
+    .bind(report.sync_generation)
+    .bind(&report.sync_operation_id)
+    .execute(pool)
+    .await
+    .context("persist managed ISO profile sync result")?;
+    Ok(result.rows_affected() == 1)
+}
+
 fn profile_sync_failed_report(
     target: &ManagedIsoSyncTarget,
     started_at: chrono::DateTime<Utc>,
@@ -2571,6 +2992,8 @@ fn profile_sync_failed_report(
 ) -> BootAgentProfileSyncReport {
     BootAgentProfileSyncReport {
         profile_id: target.profile_id.clone(),
+        sync_generation: target.sync_generation,
+        sync_operation_id: target.sync_operation_id.clone(),
         state: "failed".to_string(),
         progress_percent: Some(0),
         bytes_downloaded: Some(0),
@@ -2587,6 +3010,11 @@ fn profile_sync_failed_report(
 }
 
 fn validate_managed_iso_target(target: &ManagedIsoSyncTarget, state: &AppState) -> Result<()> {
+    if target.sync_generation < 0 {
+        bail!("managed ISO sync generation must not be negative");
+    }
+    Uuid::parse_str(target.sync_operation_id.trim())
+        .context("managed ISO sync operation id must be a UUID")?;
     BootProfileType::from_str(&target.profile_type)
         .map_err(|err| anyhow!("invalid managed ISO profile type: {err}"))?;
     managed_iso_filename(&target.desired_iso_filename)?;
@@ -2621,18 +3049,12 @@ fn managed_iso_relative_path(filename: &str) -> String {
     format!("isos/{filename}")
 }
 
-fn managed_iso_tmp_path(path: &Path) -> Result<PathBuf> {
+fn managed_iso_partial_path(path: &Path) -> Result<PathBuf> {
     let filename = path
         .file_name()
         .ok_or_else(|| anyhow!("managed ISO path has no filename"))?
         .to_string_lossy();
-    let mut random = [0u8; 8];
-    OsRng.fill_bytes(&mut random);
-    Ok(path.with_file_name(format!(
-        ".{filename}.{}.{}.tmp",
-        std::process::id(),
-        hex::encode(random)
-    )))
+    Ok(path.with_file_name(format!(".{filename}.part")))
 }
 
 fn managed_iso_download_path(value: &str, state: &AppState) -> Result<String> {
@@ -2675,13 +3097,27 @@ async fn sync_profiles(
         let profile_type = BootProfileType::from_str(&profile.profile_type)
             .map_err(|err| anyhow!("invalid managed profile type: {err}"))?;
         let now = db::now_rfc3339();
-        let existing: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, iso_path, raw_script FROM boot_profiles WHERE managed_profile_id = ?",
-        )
-        .bind(&profile.id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some((id, existing_iso_path, existing_raw_script)) = existing {
+        let existing: Option<(i64, Option<String>, Option<String>, i64, String, String)> =
+            sqlx::query_as(
+                "SELECT id, iso_path, raw_script, sync_generation, sync_operation_id,
+                    desired_iso_artifact_id
+             FROM boot_profiles WHERE managed_profile_id = ?",
+            )
+            .bind(&profile.id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if let Some((
+            id,
+            existing_iso_path,
+            existing_raw_script,
+            existing_generation,
+            existing_operation_id,
+            existing_artifact_id,
+        )) = existing
+        {
+            let sync_intent_changed = existing_generation != profile.sync_generation
+                || existing_operation_id != profile.sync_operation_id
+                || existing_artifact_id != profile.desired_iso_artifact_id;
             let raw_script = managed_profile_raw_script(profile, existing_raw_script.as_deref());
             let iso_path = managed_profile_iso_path(
                 profile,
@@ -2695,6 +3131,7 @@ async fn sync_profiles(
                      iso_path = ?, cmdline = ?, raw_script = ?, desired_iso_artifact_id = ?,
                      desired_iso_filename = ?, desired_iso_size_bytes = ?, desired_iso_sha256 = ?,
                      desired_iso_built_at = ?, desired_iso_url = ?, desired_iso_download_url = ?,
+                     sync_generation = ?, sync_operation_id = ?,
                      updated_at = ?
                  WHERE id = ?",
             )
@@ -2719,10 +3156,15 @@ async fn sync_profiles(
             .bind(clean_optional(profile.desired_iso_built_at.clone()))
             .bind(clean_string(&profile.desired_iso_url))
             .bind(clean_string(&profile.desired_iso_download_url))
+            .bind(profile.sync_generation.max(0))
+            .bind(clean_string(&profile.sync_operation_id))
             .bind(&now)
             .bind(id)
             .execute(&mut **tx)
             .await?;
+            if sync_intent_changed {
+                reset_profile_sync_state(tx, id, profile).await?;
+            }
         } else {
             let raw_script = managed_profile_raw_script(profile, None);
             let iso_path = managed_profile_iso_path(profile, None, raw_script.as_deref())?;
@@ -2732,8 +3174,9 @@ async fn sync_profiles(
                   enabled, is_default, one_time, kernel_path, initrd_path, iso_path, cmdline,
                   raw_script, desired_iso_artifact_id, desired_iso_filename,
                   desired_iso_size_bytes, desired_iso_sha256, desired_iso_built_at,
-                  desired_iso_url, desired_iso_download_url, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  desired_iso_url, desired_iso_download_url, sync_generation,
+                  sync_operation_id, sync_state, sync_total_bytes, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&profile.id)
             .bind(profile.name.trim())
@@ -2757,6 +3200,14 @@ async fn sync_profiles(
             .bind(clean_optional(profile.desired_iso_built_at.clone()))
             .bind(clean_string(&profile.desired_iso_url))
             .bind(clean_string(&profile.desired_iso_download_url))
+            .bind(profile.sync_generation.max(0))
+            .bind(clean_string(&profile.sync_operation_id))
+            .bind(if managed_profile_needs_iso_sync(profile) {
+                "queued"
+            } else {
+                "idle"
+            })
+            .bind(profile.desired_iso_size_bytes.max(0))
             .bind(&now)
             .bind(&now)
             .execute(&mut **tx)
@@ -2779,6 +3230,32 @@ async fn sync_profiles(
         }
     }
     prune_seeded_local_disk_profile(tx, profiles).await?;
+    Ok(())
+}
+
+async fn reset_profile_sync_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    profile_id: i64,
+    profile: &ManagedBootProfile,
+) -> Result<()> {
+    let state = if managed_profile_needs_iso_sync(profile) {
+        "queued"
+    } else {
+        "idle"
+    };
+    sqlx::query(
+        "UPDATE boot_profiles
+         SET sync_state = ?, sync_progress_percent = 0, sync_bytes_downloaded = 0,
+             sync_total_bytes = ?, sync_attempts = 0, sync_next_attempt_at = NULL,
+             sync_error = '', sync_started_at = NULL, sync_completed_at = NULL,
+             sync_failed_at = NULL
+         WHERE id = ?",
+    )
+    .bind(state)
+    .bind(profile.desired_iso_size_bytes.max(0))
+    .bind(profile_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -3494,6 +3971,11 @@ fn virtualization() -> Option<String> {
 
 fn validate_profile(profile: &ManagedBootProfile) -> Result<()> {
     validate_managed_id(&profile.id, "managed boot profile id")?;
+    if profile.sync_generation < 0 {
+        bail!("managed boot profile sync_generation must not be negative");
+    }
+    Uuid::parse_str(profile.sync_operation_id.trim())
+        .context("managed boot profile sync_operation_id must be a UUID")?;
     if profile.name.trim().is_empty() {
         bail!("managed boot profile name is required");
     }
@@ -3597,6 +4079,46 @@ fn validate_boot_config(config: &AgentBootConfigResponse) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_component_compatibility(
+    contract: Option<&ComponentCompatibilityContract>,
+) -> Result<()> {
+    let Some(contract) = contract else {
+        // Absence is the protocol-v1 wire shape. This compatibility window is
+        // intentional so Forge can be upgraded before or after Manage.
+        return Ok(());
+    };
+    if !(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION..=CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION)
+        .contains(&contract.protocol_version)
+        || !(contract.minimum_forge_protocol..=contract.maximum_forge_protocol)
+            .contains(&CYBEX_COMPONENT_PROTOCOL_VERSION)
+    {
+        bail!(
+            "incompatible Manage protocol {} (Forge protocol {}, supported Forge range {} through {}, Manage version {}, release {})",
+            contract.protocol_version,
+            CYBEX_COMPONENT_PROTOCOL_VERSION,
+            contract.minimum_forge_protocol,
+            contract.maximum_forge_protocol,
+            clean_string(&contract.manage_version),
+            clean_string(&contract.manage_release),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_legacy_boot_config(config: &mut AgentBootConfigResponse) {
+    if config.compatibility.is_some() {
+        return;
+    }
+    // Protocol-v1 Manage did not provide operation UUIDs. A nil UUID keeps
+    // local durable state coherent during a rolling upgrade; protocol-v2
+    // Manage will replace it with the authoritative fenced operation.
+    for profile in &mut config.profiles {
+        if profile.sync_operation_id.trim().is_empty() {
+            profile.sync_operation_id = Uuid::nil().to_string();
+        }
+    }
 }
 
 fn validate_client_metadata(client: &ManagedBootClient) -> Result<()> {
@@ -5221,26 +5743,28 @@ fn safe_error(err: &anyhow::Error) -> String {
 mod tests {
     use super::{
         AgentBootConfigResponse, BootAgentAssetReport, BootAgentClientReport, BootAgentEventReport,
-        BootAgentReportRequest, BootAgentSettingsReport, MAX_DEVICE_HOSTNAME_CHARS,
-        MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
-        MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
-        ManagedBootClient, ManagedBootProfile, ManagedBootSettings, ManagedState,
-        NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest,
-        NormalizedManagedSettings, SyncOutcome, active_managed_sync_interval_seconds,
-        append_bounded_response_chunk_with_limit, asset_scan_report, boot_report_state,
-        bounded_error_message, bounded_http_timeout_seconds, clean_optional,
-        failed_sync_interval_seconds, fit_boot_report_body, forge_capabilities,
-        generated_iso_raw_script_can_be_preserved, has_unreported_known_profile_events,
-        managed_profile_map, managed_profile_needs_iso_sync, managed_profile_raw_script,
-        managed_sync_interval_seconds, nixos_netboot_fstab, normalize_managed_settings,
+        BootAgentReportRequest, BootAgentSettingsReport, CYBEX_COMPONENT_PROTOCOL_VERSION,
+        CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract,
+        MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS,
+        MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS,
+        MAX_PROFILE_RAW_SCRIPT_BYTES, ManagedBootClient, ManagedBootProfile, ManagedBootSettings,
+        ManagedState, NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
+        NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
+        active_managed_sync_interval_seconds, append_bounded_response_chunk_with_limit,
+        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
+        clean_optional, current_profile_sync_reports, failed_sync_interval_seconds,
+        fit_boot_report_body, forge_capabilities, generated_iso_raw_script_can_be_preserved,
+        has_unreported_known_profile_events, managed_iso_retry_delay_seconds, managed_profile_map,
+        managed_profile_needs_iso_sync, managed_profile_raw_script, managed_sync_interval_seconds,
+        nixos_netboot_fstab, normalize_legacy_boot_config, normalize_managed_settings,
         optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
         parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
         patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
         read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
         render_managed_config, render_nixos_netboot_script,
         rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
-        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles,
-        sync_desired_profile_isos, sync_profiles, validate_boot_config, validate_profile,
+        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_profiles,
+        validate_boot_config, validate_component_compatibility, validate_profile,
         write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
@@ -5257,6 +5781,7 @@ mod tests {
         io::{BufReader, Read},
         path::{Path, PathBuf},
     };
+    use uuid::Uuid;
 
     fn sample_netboot_manifest(
         iso_sha256: &str,
@@ -5813,6 +6338,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let body = BootAgentReportRequest {
+            protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
             settings,
             profile_sync: Vec::new(),
             clients,
@@ -5862,6 +6388,8 @@ mod tests {
             desired_iso_built_at: None,
             desired_iso_url: String::new(),
             desired_iso_download_url: String::new(),
+            sync_generation: 1,
+            sync_operation_id: "00000000-0000-4000-8000-000000000001".to_string(),
         };
 
         let err = validate_profile(&profile).unwrap_err();
@@ -6997,9 +7525,7 @@ mod tests {
         tx.commit().await.unwrap();
         let state = AppState::new(AppConfig::default(), pool);
 
-        let reports = sync_desired_profile_isos(&state, &ManagedState::default())
-            .await
-            .unwrap();
+        let reports = current_profile_sync_reports(&state.db).await.unwrap();
 
         assert!(reports.is_empty());
     }
@@ -7093,6 +7619,13 @@ mod tests {
 
     fn sample_boot_config() -> AgentBootConfigResponse {
         AgentBootConfigResponse {
+            compatibility: Some(ComponentCompatibilityContract {
+                protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
+                minimum_forge_protocol: 1,
+                maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
+                manage_version: "0.1.0".to_string(),
+                manage_release: "test".to_string(),
+            }),
             settings: ManagedBootSettings {
                 public_base_url: "http://127.0.0.1".to_string(),
                 listen_addr: "127.0.0.1:8080".to_string(),
@@ -7108,6 +7641,55 @@ mod tests {
             deleted_client_ids: vec![],
             clients_complete: true,
         }
+    }
+
+    #[test]
+    fn component_manifest_and_runtime_contract_are_compatible() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../protocol/compatibility.json")).unwrap();
+        assert_eq!(
+            manifest["protocol_version"].as_u64(),
+            Some(u64::from(CYBEX_COMPONENT_PROTOCOL_VERSION))
+        );
+        assert_eq!(
+            manifest["forge"]["minimum_manage_protocol"].as_u64(),
+            Some(u64::from(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION))
+        );
+        let config = sample_boot_config();
+        validate_component_compatibility(config.compatibility.as_ref()).unwrap();
+        validate_component_compatibility(None).unwrap();
+
+        let incompatible = ComponentCompatibilityContract {
+            protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            minimum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            manage_version: "future".to_string(),
+            manage_release: "future".to_string(),
+        };
+        assert!(validate_component_compatibility(Some(&incompatible)).is_err());
+    }
+
+    #[test]
+    fn legacy_manage_config_gets_a_safe_local_operation_fence() {
+        let mut config = sample_boot_config();
+        config.compatibility = None;
+        config.profiles[0].sync_operation_id.clear();
+
+        normalize_legacy_boot_config(&mut config);
+
+        assert_eq!(
+            config.profiles[0].sync_operation_id,
+            Uuid::nil().to_string()
+        );
+        validate_boot_config(&config).unwrap();
+    }
+
+    #[test]
+    fn managed_iso_retry_is_bounded() {
+        assert_eq!(managed_iso_retry_delay_seconds(1), 5);
+        assert_eq!(managed_iso_retry_delay_seconds(2), 15);
+        assert_eq!(managed_iso_retry_delay_seconds(3), 30);
+        assert_eq!(managed_iso_retry_delay_seconds(i64::MAX), 60);
     }
 
     async fn managed_test_pool() -> sqlx::SqlitePool {
@@ -7150,6 +7732,8 @@ mod tests {
             desired_iso_built_at: None,
             desired_iso_url: String::new(),
             desired_iso_download_url: String::new(),
+            sync_generation: 1,
+            sync_operation_id: "00000000-0000-4000-8000-000000000001".to_string(),
         }
     }
 
@@ -7190,6 +7774,8 @@ mod tests {
             desired_iso_built_at: None,
             desired_iso_url: String::new(),
             desired_iso_download_url: String::new(),
+            sync_generation: 1,
+            sync_operation_id: "00000000-0000-4000-8000-000000000001".to_string(),
         }
     }
 
