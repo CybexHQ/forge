@@ -812,8 +812,8 @@ fn kernel_sysinfo_capacity() -> Option<BuildCapacity> {
     }
     let info = unsafe { info.assume_init() };
     Some(capacity_from_sysinfo_values(
-        info.totalram as u64,
-        info.totalswap as u64,
+        info.totalram,
+        info.totalswap,
         u64::from(info.mem_unit),
     ))
 }

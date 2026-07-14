@@ -39,14 +39,14 @@ pub fn stats(path: &Path) -> io::Result<DiskStats> {
         return Err(io::Error::last_os_error());
     }
     let frsize = if vfs.f_frsize > 0 {
-        vfs.f_frsize as u64
+        vfs.f_frsize
     } else {
-        vfs.f_bsize as u64
+        vfs.f_bsize
     };
     Ok(DiskStats {
         path: probe.display().to_string(),
-        total_bytes: (vfs.f_blocks as u64).saturating_mul(frsize),
-        available_bytes: (vfs.f_bavail as u64).saturating_mul(frsize),
+        total_bytes: vfs.f_blocks.saturating_mul(frsize),
+        available_bytes: vfs.f_bavail.saturating_mul(frsize),
     })
 }
 

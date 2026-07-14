@@ -3085,6 +3085,8 @@ fn managed_iso_download_path_with_base(value: &str, api_base: Option<&str>) -> R
     Ok(path)
 }
 
+type ExistingManagedProfileRow = (i64, Option<String>, Option<String>, i64, String, String);
+
 async fn sync_profiles(
     tx: &mut Transaction<'_, Sqlite>,
     profiles: &[ManagedBootProfile],
@@ -3097,15 +3099,14 @@ async fn sync_profiles(
         let profile_type = BootProfileType::from_str(&profile.profile_type)
             .map_err(|err| anyhow!("invalid managed profile type: {err}"))?;
         let now = db::now_rfc3339();
-        let existing: Option<(i64, Option<String>, Option<String>, i64, String, String)> =
-            sqlx::query_as(
-                "SELECT id, iso_path, raw_script, sync_generation, sync_operation_id,
+        let existing: Option<ExistingManagedProfileRow> = sqlx::query_as(
+            "SELECT id, iso_path, raw_script, sync_generation, sync_operation_id,
                     desired_iso_artifact_id
              FROM boot_profiles WHERE managed_profile_id = ?",
-            )
-            .bind(&profile.id)
-            .fetch_optional(&mut **tx)
-            .await?;
+        )
+        .bind(&profile.id)
+        .fetch_optional(&mut **tx)
+        .await?;
         if let Some((
             id,
             existing_iso_path,
@@ -5823,8 +5824,10 @@ mod tests {
 
     #[test]
     fn failed_sync_backoff_grows_and_caps_at_normal_interval() {
-        let mut config = ManageConfig::default();
-        config.sync_interval_seconds = 30;
+        let config = ManageConfig {
+            sync_interval_seconds: 30,
+            ..ManageConfig::default()
+        };
 
         assert_eq!(failed_sync_interval_seconds(&config, 1), 5);
         assert_eq!(failed_sync_interval_seconds(&config, 2), 10);
