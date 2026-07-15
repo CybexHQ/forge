@@ -257,6 +257,45 @@ struct IsoAssetRow {
     updated_at: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IsoAssetFileIdentity {
+    pub size_bytes: i64,
+    pub device: i64,
+    pub inode: i64,
+    pub mtime_seconds: i64,
+    pub mtime_nanoseconds: i64,
+    pub ctime_seconds: i64,
+    pub ctime_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, FromRow)]
+pub struct IsoAssetScanState {
+    pub relative_path: String,
+    pub checksum_sha256: String,
+    pub checksum_verified_at: Option<String>,
+    size_bytes: i64,
+    file_device: Option<i64>,
+    file_inode: Option<i64>,
+    file_mtime_seconds: Option<i64>,
+    file_mtime_nanoseconds: Option<i64>,
+    file_ctime_seconds: Option<i64>,
+    file_ctime_nanoseconds: Option<i64>,
+}
+
+impl IsoAssetScanState {
+    pub fn file_identity(&self) -> Option<IsoAssetFileIdentity> {
+        Some(IsoAssetFileIdentity {
+            size_bytes: self.size_bytes,
+            device: self.file_device?,
+            inode: self.file_inode?,
+            mtime_seconds: self.file_mtime_seconds?,
+            mtime_nanoseconds: self.file_mtime_nanoseconds?,
+            ctime_seconds: self.file_ctime_seconds?,
+            ctime_nanoseconds: self.file_ctime_nanoseconds?,
+        })
+    }
+}
+
 impl From<IsoAssetRow> for IsoAsset {
     fn from(row: IsoAssetRow) -> Self {
         Self {
@@ -975,29 +1014,59 @@ pub async fn list_iso_assets(pool: &SqlitePool) -> AppResult<Vec<IsoAsset>> {
     Ok(rows.into_iter().map(IsoAsset::from).collect())
 }
 
+pub async fn list_iso_asset_scan_states(pool: &SqlitePool) -> AppResult<Vec<IsoAssetScanState>> {
+    Ok(sqlx::query_as::<_, IsoAssetScanState>(
+        "SELECT relative_path, checksum_sha256, checksum_verified_at,
+                size_bytes, file_device, file_inode,
+                file_mtime_seconds, file_mtime_nanoseconds,
+                file_ctime_seconds, file_ctime_nanoseconds
+         FROM iso_assets",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn upsert_iso_asset(
     pool: &SqlitePool,
     filename: &str,
     relative_path: &str,
-    size_bytes: i64,
+    identity: IsoAssetFileIdentity,
     checksum_sha256: &str,
+    checksum_verified_at: &str,
 ) -> AppResult<IsoAsset> {
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO iso_assets
-         (filename, relative_path, size_bytes, checksum_sha256, last_scanned_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         (filename, relative_path, size_bytes, checksum_sha256,
+          file_device, file_inode, file_mtime_seconds, file_mtime_nanoseconds,
+          file_ctime_seconds, file_ctime_nanoseconds, checksum_verified_at,
+          last_scanned_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(relative_path) DO UPDATE SET
              filename = excluded.filename,
              size_bytes = excluded.size_bytes,
              checksum_sha256 = excluded.checksum_sha256,
+             file_device = excluded.file_device,
+             file_inode = excluded.file_inode,
+             file_mtime_seconds = excluded.file_mtime_seconds,
+             file_mtime_nanoseconds = excluded.file_mtime_nanoseconds,
+             file_ctime_seconds = excluded.file_ctime_seconds,
+             file_ctime_nanoseconds = excluded.file_ctime_nanoseconds,
+             checksum_verified_at = excluded.checksum_verified_at,
              last_scanned_at = excluded.last_scanned_at,
              updated_at = excluded.updated_at",
     )
     .bind(filename)
     .bind(relative_path)
-    .bind(size_bytes)
+    .bind(identity.size_bytes)
     .bind(checksum_sha256)
+    .bind(identity.device)
+    .bind(identity.inode)
+    .bind(identity.mtime_seconds)
+    .bind(identity.mtime_nanoseconds)
+    .bind(identity.ctime_seconds)
+    .bind(identity.ctime_nanoseconds)
+    .bind(checksum_verified_at)
     .bind(&now)
     .bind(&now)
     .bind(&now)
@@ -3251,12 +3320,38 @@ mod tests {
     #[tokio::test]
     async fn prune_missing_iso_assets_removes_unseen_rows() {
         let pool = test_pool().await;
-        upsert_iso_asset(&pool, "keep.iso", "keep.iso", 10, &"a".repeat(64))
-            .await
-            .unwrap();
-        upsert_iso_asset(&pool, "stale.iso", "nested/stale.iso", 20, &"b".repeat(64))
-            .await
-            .unwrap();
+        let identity = IsoAssetFileIdentity {
+            size_bytes: 10,
+            device: 1,
+            inode: 2,
+            mtime_seconds: 3,
+            mtime_nanoseconds: 4,
+            ctime_seconds: 5,
+            ctime_nanoseconds: 6,
+        };
+        upsert_iso_asset(
+            &pool,
+            "keep.iso",
+            "keep.iso",
+            identity,
+            &"a".repeat(64),
+            "2026-07-15T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        upsert_iso_asset(
+            &pool,
+            "stale.iso",
+            "nested/stale.iso",
+            IsoAssetFileIdentity {
+                size_bytes: 20,
+                ..identity
+            },
+            &"b".repeat(64),
+            "2026-07-15T00:00:00Z",
+        )
+        .await
+        .unwrap();
 
         let removed = prune_missing_iso_assets(&pool, &["keep.iso".to_string()])
             .await

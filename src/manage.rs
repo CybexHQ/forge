@@ -802,7 +802,11 @@ async fn report_boot_state(
     managed: &mut ManagedState,
     profile_sync: Vec<BootAgentProfileSyncReport>,
 ) -> Result<()> {
-    let asset_scan = asset_scan_report(assets::scan_iso_dir(&state.config, &state.db).await);
+    let asset_scan = asset_scan_report(
+        assets::scan_iso_dir(&state.config, &state.db)
+            .await
+            .map(|summary| summary.discovered),
+    );
     if let Some(error) = &asset_scan.error {
         warn!(error = %error, "managed ISO asset scan failed");
     }

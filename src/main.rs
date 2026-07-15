@@ -65,10 +65,15 @@ async fn main() -> anyhow::Result<()> {
             db::migrate(&pool)
                 .await
                 .context("database migration failed")?;
-            let count = assets::scan_iso_dir(&config, &pool)
+            let summary = assets::scan_iso_dir(&config, &pool)
                 .await
                 .context("ISO scan failed")?;
-            info!(count, "ISO scan completed");
+            info!(
+                count = summary.discovered,
+                hashed = summary.hashed,
+                reused = summary.reused,
+                "ISO scan completed"
+            );
             Ok(())
         }
         Command::Enroll => {

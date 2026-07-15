@@ -108,6 +108,13 @@ cannot evict rollout-critical artifacts. Bounded cache scrubs remove invalid
 NAR/NARInfo rows for automatic rebuild. Managed Organization ISOs retry
 transient failures with capped backoff, periodically reverify ready bytes, and
 garbage-collect only unreferenced content-addressed files after a grace period.
+Boot asset inventory scans persist each ISO's device, inode, size, modification
+time, change time, and last checksum-verification time. New, replaced, or
+modified media is SHA-256 hashed immediately; unchanged media reuses its durable
+checksum, with periodic full verification bounded to one unchanged ISO per
+inventory pass. This keeps the 30-second control heartbeat lightweight even
+while multiple multi-gigabyte ISO generations are inside the garbage-collection
+grace period.
 
 The self-healing units, slices, resolver/service drop-ins, and sentinel script
 are embedded in the Forge binary's privileged runtime apply plan. Existing
