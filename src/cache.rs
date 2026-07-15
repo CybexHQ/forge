@@ -331,6 +331,7 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
         return Ok(());
     }
     let build_jobs = db::list_build_jobs(pool).await?;
+    let managed_protections = db::list_managed_cache_protections(pool).await?;
     let mut protected_sources = HashSet::new();
     for job in build_jobs
         .iter()
@@ -358,6 +359,11 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
         while next_index < candidates.len() && estimated_freed <= excess {
             let artifact = &candidates[next_index];
             next_index += 1;
+            if managed_protections
+                .contains(&(artifact.artifact_type.clone(), artifact.hash.clone()))
+            {
+                continue;
+            }
             if artifact
                 .source_build_job_id
                 .as_deref()
@@ -386,6 +392,68 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
         total = cache_disk_usage(config).await;
     }
     Ok(())
+}
+
+/// Verify a bounded, oldest-verified-first cache batch. Invalid local rows are
+/// removed immediately; the next generation-fenced full inventory makes the
+/// loss visible to Manage, whose desired-state controller queues a repair.
+pub async fn scrub_cache_artifacts(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    limit: i64,
+) -> Result<u64> {
+    let candidates = db::cache_artifacts_due_for_verification(pool, limit).await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut invalid_ids = HashSet::new();
+    for artifact in &candidates {
+        let valid = verify_cache_artifact(artifact).await.unwrap_or(false);
+        if valid {
+            db::mark_cache_artifact_verified(pool, artifact.id).await?;
+        } else {
+            tracing::warn!(
+                artifact_id = artifact.id,
+                artifact_type = %artifact.artifact_type,
+                hash = %artifact.hash,
+                "removing missing or corrupt Forge cache artifact for automatic repair"
+            );
+            db::delete_cache_artifact(pool, artifact.id).await?;
+            invalid_ids.insert(artifact.id);
+        }
+    }
+    if !invalid_ids.is_empty() {
+        let retained = db::list_cache_artifacts(pool)
+            .await?
+            .iter()
+            .map(RetainedArtifactFiles::from)
+            .collect::<Vec<_>>();
+        sweep_unreachable(config, retained).await?;
+    }
+    Ok(invalid_ids.len() as u64)
+}
+
+async fn verify_cache_artifact(artifact: &crate::models::CacheArtifact) -> Result<bool> {
+    let nar_metadata = match tokio::fs::metadata(&artifact.path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(false),
+    };
+    if artifact.size_bytes > 0 && nar_metadata.len() != artifact.size_bytes as u64 {
+        return Ok(false);
+    }
+    let narinfo_raw = match tokio::fs::read_to_string(&artifact.narinfo_path).await {
+        Ok(raw) => raw,
+        Err(_) => return Ok(false),
+    };
+    let narinfo = match parse_narinfo(&narinfo_raw) {
+        Ok(narinfo) => narinfo,
+        Err(_) => return Ok(false),
+    };
+    Ok(narinfo.store_path == artifact.store_path
+        && narinfo.url == artifact.nar_url
+        && narinfo.file_hash == artifact.file_hash
+        && narinfo.nar_hash == artifact.nar_hash
+        && (artifact.nar_size_bytes <= 0 || narinfo.nar_size == artifact.nar_size_bytes))
 }
 
 #[derive(Clone, Debug)]

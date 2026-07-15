@@ -50,9 +50,9 @@ const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_UPDATER_V1: &str = "updater_v1";
-const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 2;
+const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 3;
 const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 1;
-const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 2;
+const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 3;
 const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
 const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
@@ -188,11 +188,21 @@ struct AgentForgeConfigResponse {
     #[serde(default)]
     deleted_cache_artifacts: Vec<ManagedDeletedCacheArtifact>,
     #[serde(default)]
+    protected_cache_artifacts: Vec<ManagedProtectedCacheArtifact>,
+    #[serde(default)]
+    protected_cache_artifacts_complete: bool,
+    #[serde(default)]
     update: Option<ManagedUpdateRequest>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManagedDeletedCacheArtifact {
+    artifact_type: String,
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedProtectedCacheArtifact {
     artifact_type: String,
     hash: String,
 }
@@ -361,6 +371,9 @@ struct ForgeAgentReportRequest {
     update: Option<ForgeUpdateStatusReport>,
     build_jobs: Vec<ForgeBuildJobReport>,
     cache_artifacts: Vec<ForgeCacheArtifactReport>,
+    cache_inventory_instance_id: String,
+    cache_inventory_generation: i64,
+    cache_artifacts_complete: bool,
     disk: Option<crate::disk::DiskStats>,
 }
 
@@ -505,6 +518,7 @@ struct ManagedIsoSyncTarget {
     sync_started_at: Option<String>,
     sync_completed_at: Option<String>,
     sync_failed_at: Option<String>,
+    sync_last_verified_at: Option<String>,
     profile_type: String,
     desired_iso_artifact_id: String,
     desired_iso_filename: String,
@@ -922,6 +936,18 @@ async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Resu
         .map(|artifact| (artifact.artifact_type, artifact.hash))
         .collect::<Vec<_>>();
     crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await?;
+    let protected_keys = desired
+        .protected_cache_artifacts
+        .into_iter()
+        .map(|artifact| (artifact.artifact_type, artifact.hash))
+        .collect::<Vec<_>>();
+    db::replace_managed_cache_protections(
+        &state.db,
+        &protected_keys,
+        desired.protected_cache_artifacts_complete,
+    )
+    .await?;
+    crate::cache::enforce_retention(&state.db, &state.config).await?;
     crate::updater::store_update_request(&state.config, desired.update).await?;
 
     report_forge_state(state, managed).await
@@ -946,7 +972,12 @@ async fn fetch_forge_config(
 
 async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<()> {
     let build_jobs = db::list_build_jobs(&state.db).await?;
+    if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
+        warn!(error = %err, "Forge cache integrity scrub failed");
+    }
     let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
+    let cache_inventory = db::cache_inventory_state(&state.db).await?;
+    let cache_artifacts_complete = cache_artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
     let cache = crate::cache::status_report(&state.config, &state.db).await;
     let update = crate::updater::status_report(&state.config).await?;
     let body = ForgeAgentReportRequest {
@@ -964,6 +995,9 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
             .take(MAX_REPORT_CACHE_ARTIFACTS)
             .map(ForgeCacheArtifactReport::from)
             .collect(),
+        cache_inventory_instance_id: cache_inventory.instance_id,
+        cache_inventory_generation: cache_inventory.generation,
+        cache_artifacts_complete,
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
     };
     let body_bytes = serialize_forge_report_body(&body)?;
@@ -1112,10 +1146,24 @@ async fn run_managed_iso_sync_worker(state: AppState) {
     if let Err(err) = recover_interrupted_profile_syncs(&state.db).await {
         warn!(error = %safe_error(&err), "failed to recover interrupted managed ISO syncs");
     }
+    let mut last_gc = None;
     loop {
         match process_next_managed_iso_sync(&state).await {
             Ok(true) => continue,
-            Ok(false) => sleep(Duration::from_secs(1)).await,
+            Ok(false) => {
+                if let Err(err) = verify_next_ready_managed_iso(&state).await {
+                    warn!(error = %safe_error(&err), "managed ISO integrity verification failed");
+                }
+                if last_gc.is_none_or(|last: tokio::time::Instant| {
+                    last.elapsed() >= Duration::from_secs(60 * 60)
+                }) {
+                    if let Err(err) = garbage_collect_managed_isos(&state).await {
+                        warn!(error = %safe_error(&err), "managed ISO garbage collection failed");
+                    }
+                    last_gc = Some(tokio::time::Instant::now());
+                }
+                sleep(Duration::from_secs(1)).await
+            }
             Err(err) => {
                 warn!(error = %safe_error(&err), "managed ISO worker iteration failed");
                 sleep(Duration::from_secs(5)).await;
@@ -1151,7 +1199,8 @@ async fn process_next_managed_iso_sync(state: &AppState) -> Result<bool> {
     let started_at = Utc::now();
     match sync_desired_profile_iso(state, &managed, &target, started_at).await {
         Ok(report) => {
-            persist_profile_sync_report(&state.db, target.local_id, &report, None).await?;
+            persist_profile_sync_report(&state.db, target.local_id, &report, None, "", true)
+                .await?;
             info!(
                 profile_id = %target.profile_id,
                 sync_generation = target.sync_generation,
@@ -1160,22 +1209,26 @@ async fn process_next_managed_iso_sync(state: &AppState) -> Result<bool> {
         }
         Err(err) => {
             let retry_delay = managed_iso_retry_delay_seconds(target.sync_attempts);
-            let terminal = target.sync_attempts >= 5;
             let safe = bounded_error_message(safe_error(&err));
+            let retryable = managed_iso_error_is_retryable(&safe);
+            let failure_kind = managed_iso_failure_kind(&safe);
             let report = profile_sync_failed_report(&target, started_at, err);
             persist_profile_sync_report(
                 &state.db,
                 target.local_id,
                 &report,
-                (!terminal).then_some(retry_delay),
+                retryable.then_some(retry_delay),
+                failure_kind,
+                retryable,
             )
             .await?;
             warn!(
                 profile_id = %target.profile_id,
                 sync_generation = target.sync_generation,
                 attempts = target.sync_attempts,
-                terminal,
-                retry_in_seconds = (!terminal).then_some(retry_delay),
+                terminal = !retryable,
+                failure_kind,
+                retry_in_seconds = retryable.then_some(retry_delay),
                 error = %safe,
                 "managed ISO profile sync failed"
             );
@@ -1200,7 +1253,8 @@ async fn claim_next_managed_iso_sync(pool: &SqlitePool) -> Result<Option<Managed
              SET sync_state = 'downloading', sync_progress_percent = 0,
                  sync_bytes_downloaded = 0, sync_total_bytes = ?,
                  sync_attempts = sync_attempts + 1, sync_next_attempt_at = NULL,
-                 sync_error = '', sync_started_at = COALESCE(sync_started_at, ?),
+                 sync_error = '', sync_failure_kind = '', sync_retryable = 1,
+                 sync_started_at = COALESCE(sync_started_at, ?),
                  sync_completed_at = NULL, sync_failed_at = NULL
              WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?
                AND sync_state = 'queued'",
@@ -1224,11 +1278,35 @@ async fn claim_next_managed_iso_sync(pool: &SqlitePool) -> Result<Option<Managed
 }
 
 fn managed_iso_retry_delay_seconds(attempts: i64) -> i64 {
-    match attempts {
-        i64::MIN..=1 => 5,
-        2 => 15,
-        3 => 30,
-        _ => 60,
+    let exponent = attempts.saturating_sub(1).clamp(0, 10) as u32;
+    5_i64.saturating_mul(1_i64 << exponent).min(3600)
+}
+
+fn managed_iso_error_is_retryable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    !error.contains("sync generation must not be negative")
+        && !error.contains("sync operation id must be a uuid")
+        && !error.contains("invalid managed iso profile type")
+        && !error.contains("filename must be a simple .iso filename")
+        && !error.contains("managed iso size must be positive")
+        && !error.contains("checksum must be 64 hex characters")
+        && !error.contains("download url must be a manage api path")
+}
+
+fn managed_iso_failure_kind(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if !managed_iso_error_is_retryable(&error) {
+        "invalid_desired_state"
+    } else if error.contains("checksum") || error.contains("size mismatch") {
+        "integrity_mismatch"
+    } else if error.contains("no space") || error.contains("headroom") {
+        "insufficient_disk_space"
+    } else if error.contains("http 401") || error.contains("http 403") {
+        "authorization_failed"
+    } else if error.contains("http") || error.contains("request") {
+        "network_or_server"
+    } else {
+        "local_io_or_processing"
     }
 }
 
@@ -1248,6 +1326,7 @@ async fn list_desired_profile_iso_targets(pool: &SqlitePool) -> Result<Vec<Manag
                 sync_started_at,
                 sync_completed_at,
                 sync_failed_at,
+                sync_last_verified_at,
                 profile_type,
                 desired_iso_artifact_id,
                 desired_iso_filename,
@@ -1270,6 +1349,119 @@ async fn list_desired_profile_iso_targets(pool: &SqlitePool) -> Result<Vec<Manag
     .fetch_all(pool)
     .await
     .context("list desired managed ISO profiles")
+}
+
+async fn verify_next_ready_managed_iso(state: &AppState) -> Result<bool> {
+    let cutoff = Utc::now() - chrono::Duration::hours(6);
+    let Some(target) = list_desired_profile_iso_targets(&state.db)
+        .await?
+        .into_iter()
+        .find(|target| {
+            target.sync_state == "ready"
+                && target
+                    .sync_last_verified_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .is_none_or(|verified| verified.with_timezone(&Utc) <= cutoff)
+        })
+    else {
+        return Ok(false);
+    };
+    let filename = managed_iso_filename(&target.desired_iso_filename)?;
+    let expected_sha = target.desired_iso_sha256.to_ascii_lowercase();
+    let path = state
+        .config
+        .paths
+        .iso_dir
+        .join(format!("{expected_sha}-{filename}"));
+    let valid = cached_iso_matches(&path, target.desired_iso_size_bytes, &expected_sha)
+        .await
+        .unwrap_or(false);
+    let now = db::now_rfc3339();
+    if valid {
+        sqlx::query(
+            "UPDATE boot_profiles SET sync_last_verified_at = ?, updated_at = ?
+             WHERE id = ? AND sync_generation = ? AND sync_operation_id = ? AND sync_state = 'ready'",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(target.local_id)
+        .bind(target.sync_generation)
+        .bind(&target.sync_operation_id)
+        .execute(&state.db)
+        .await?;
+    } else {
+        tokio_fs::remove_file(&path).await.ok();
+        sqlx::query(
+            "UPDATE boot_profiles
+             SET sync_state = 'queued', sync_progress_percent = 0,
+                 sync_bytes_downloaded = 0, sync_attempts = 0,
+                 sync_next_attempt_at = ?, sync_error = 'Cached ISO is missing or corrupt; repairing automatically',
+                 sync_failure_kind = 'integrity_mismatch', sync_retryable = 1,
+                 sync_completed_at = NULL, sync_failed_at = NULL,
+                 sync_last_verified_at = ?, updated_at = ?
+             WHERE id = ? AND sync_generation = ? AND sync_operation_id = ? AND sync_state = 'ready'",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(target.local_id)
+        .bind(target.sync_generation)
+        .bind(&target.sync_operation_id)
+        .execute(&state.db)
+        .await?;
+        warn!(
+            profile_id = %target.profile_id,
+            sync_generation = target.sync_generation,
+            "cached managed ISO is missing or corrupt; queued automatic repair"
+        );
+    }
+    Ok(true)
+}
+
+async fn garbage_collect_managed_isos(state: &AppState) -> Result<u64> {
+    let targets = list_desired_profile_iso_targets(&state.db).await?;
+    let live = targets
+        .iter()
+        .filter_map(|target| {
+            let filename = managed_iso_filename(&target.desired_iso_filename).ok()?;
+            valid_sha256(&target.desired_iso_sha256).map(|sha| format!("{sha}-{filename}"))
+        })
+        .collect::<HashSet<_>>();
+    let mut entries = match tokio_fs::read_dir(&state.config.paths.iso_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).context("read managed ISO cache directory"),
+    };
+    let mut removed = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let final_name = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".part"));
+        let candidate = final_name.unwrap_or(&name);
+        let managed = candidate.split_once('-').is_some_and(|(sha, rest)| {
+            sha.len() == 64
+                && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && rest.to_ascii_lowercase().ends_with(".iso")
+        });
+        if !managed || live.contains(candidate) {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60));
+        if old_enough && tokio_fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!(removed, "garbage-collected unreferenced managed ISO files");
+    }
+    Ok(removed)
 }
 
 async fn sync_desired_profile_iso(
@@ -2945,6 +3137,8 @@ async fn persist_profile_sync_report(
     local_id: i64,
     report: &BootAgentProfileSyncReport,
     retry_after_seconds: Option<i64>,
+    failure_kind: &str,
+    retryable: bool,
 ) -> Result<bool> {
     let now = Utc::now();
     let state = if retry_after_seconds.is_some() {
@@ -2964,7 +3158,10 @@ async fn persist_profile_sync_report(
         "UPDATE boot_profiles
          SET sync_state = ?, sync_progress_percent = ?, sync_bytes_downloaded = ?,
              sync_total_bytes = ?, sync_next_attempt_at = ?, sync_error = ?,
-             sync_completed_at = ?, sync_failed_at = ?, updated_at = ?
+             sync_completed_at = ?, sync_failed_at = ?,
+             sync_failure_kind = ?, sync_retryable = ?,
+             sync_last_verified_at = CASE WHEN ? = 'ready' THEN ? ELSE sync_last_verified_at END,
+             updated_at = ?
          WHERE id = ? AND sync_generation = ? AND sync_operation_id = ?",
     )
     .bind(state)
@@ -2975,6 +3172,10 @@ async fn persist_profile_sync_report(
     .bind(report.error.clone().unwrap_or_default())
     .bind(completed_at)
     .bind(failed_at)
+    .bind(failure_kind)
+    .bind(i64::from(retryable))
+    .bind(state)
+    .bind(now.to_rfc3339())
     .bind(now.to_rfc3339())
     .bind(local_id)
     .bind(report.sync_generation)
@@ -3249,7 +3450,8 @@ async fn reset_profile_sync_state(
          SET sync_state = ?, sync_progress_percent = 0, sync_bytes_downloaded = 0,
              sync_total_bytes = ?, sync_attempts = 0, sync_next_attempt_at = NULL,
              sync_error = '', sync_started_at = NULL, sync_completed_at = NULL,
-             sync_failed_at = NULL
+             sync_failed_at = NULL, sync_failure_kind = '', sync_retryable = 1,
+             sync_last_verified_at = NULL
          WHERE id = ?",
     )
     .bind(state)
@@ -5755,18 +5957,19 @@ mod tests {
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
         clean_optional, current_profile_sync_reports, failed_sync_interval_seconds,
         fit_boot_report_body, forge_capabilities, generated_iso_raw_script_can_be_preserved,
-        has_unreported_known_profile_events, managed_iso_retry_delay_seconds, managed_profile_map,
-        managed_profile_needs_iso_sync, managed_profile_raw_script, managed_sync_interval_seconds,
-        nixos_netboot_fstab, normalize_legacy_boot_config, normalize_managed_settings,
-        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
-        parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
-        patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
-        read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
-        render_managed_config, render_nixos_netboot_script,
-        rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
-        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_profiles,
-        validate_boot_config, validate_component_compatibility, validate_profile,
-        write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
+        has_unreported_known_profile_events, managed_iso_error_is_retryable,
+        managed_iso_retry_delay_seconds, managed_profile_map, managed_profile_needs_iso_sync,
+        managed_profile_raw_script, managed_sync_interval_seconds, nixos_netboot_fstab,
+        normalize_legacy_boot_config, normalize_managed_settings, optional_report_uuid,
+        parse_nixos_netboot_ipxe_cmdline, parse_nixos_netboot_split_squashfs_capability,
+        patch_nixos_netboot_squashfs_fstab, patch_nixos_netboot_squashfs_graphical_kiosk,
+        patch_nixos_netboot_squashfs_injected_config, read_newc_entry_start,
+        read_valid_netboot_manifest, render_check_service, render_managed_config,
+        render_nixos_netboot_script, rewrite_newc_archive_with_netboot_files,
+        runtime_managed_files, serialize_boot_report_body, skip_padding, sync_clients,
+        sync_deleted_clients, sync_deleted_profiles, sync_profiles, validate_boot_config,
+        validate_component_compatibility, validate_profile, write_newc_file_from_bytes,
+        write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -7688,11 +7891,17 @@ mod tests {
     }
 
     #[test]
-    fn managed_iso_retry_is_bounded() {
+    fn managed_iso_retry_is_exponential_and_bounded() {
         assert_eq!(managed_iso_retry_delay_seconds(1), 5);
-        assert_eq!(managed_iso_retry_delay_seconds(2), 15);
-        assert_eq!(managed_iso_retry_delay_seconds(3), 30);
-        assert_eq!(managed_iso_retry_delay_seconds(i64::MAX), 60);
+        assert_eq!(managed_iso_retry_delay_seconds(2), 10);
+        assert_eq!(managed_iso_retry_delay_seconds(3), 20);
+        assert_eq!(managed_iso_retry_delay_seconds(i64::MAX), 3600);
+        assert!(managed_iso_error_is_retryable(
+            "download managed ISO request failed"
+        ));
+        assert!(!managed_iso_error_is_retryable(
+            "managed ISO checksum must be 64 hex characters"
+        ));
     }
 
     async fn managed_test_pool() -> sqlx::SqlitePool {

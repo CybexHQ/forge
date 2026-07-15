@@ -1540,6 +1540,91 @@ pub async fn list_cache_artifacts(pool: &SqlitePool) -> AppResult<Vec<CacheArtif
     cache_artifact_rows_to_models(rows)
 }
 
+#[derive(Clone, Debug, FromRow)]
+pub struct CacheInventoryState {
+    pub instance_id: String,
+    pub generation: i64,
+}
+
+pub async fn cache_inventory_state(pool: &SqlitePool) -> AppResult<CacheInventoryState> {
+    sqlx::query_as::<_, CacheInventoryState>(
+        "SELECT instance_id, generation FROM cache_inventory_state WHERE singleton = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from)
+}
+
+pub async fn replace_managed_cache_protections(
+    pool: &SqlitePool,
+    keys: &[(String, String)],
+    complete: bool,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    let now = now_rfc3339();
+    for (artifact_type, hash) in keys {
+        let artifact_type = normalize_artifact_type(artifact_type, "artifact_type")?;
+        let hash = normalize_sha256(hash, "hash", false)?;
+        sqlx::query(
+            "INSERT INTO managed_cache_protections (artifact_type, hash, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(artifact_type, hash) DO UPDATE SET updated_at = excluded.updated_at",
+        )
+        .bind(artifact_type)
+        .bind(hash)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if complete {
+        sqlx::query("DELETE FROM managed_cache_protections WHERE updated_at <> ?")
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn list_managed_cache_protections(
+    pool: &SqlitePool,
+) -> AppResult<HashSet<(String, String)>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT artifact_type, hash FROM managed_cache_protections",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+pub async fn cache_artifacts_due_for_verification(
+    pool: &SqlitePool,
+    limit: i64,
+) -> AppResult<Vec<CacheArtifact>> {
+    let rows = sqlx::query_as::<_, CacheArtifactRow>(
+        "SELECT * FROM forge_cache_artifacts
+         ORDER BY COALESCE(last_verified_at, '') ASC, created_at ASC, id ASC
+         LIMIT ?",
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    cache_artifact_rows_to_models(rows)
+}
+
+pub async fn mark_cache_artifact_verified(pool: &SqlitePool, id: i64) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE forge_cache_artifacts
+         SET verification_status = 'ready', last_verified_at = ?, updated_at = updated_at
+         WHERE id = ?",
+    )
+    .bind(now_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn delete_cache_artifact(pool: &SqlitePool, id: i64) -> AppResult<()> {
     sqlx::query("DELETE FROM forge_cache_artifacts WHERE id = ?")
         .bind(id)
@@ -3750,5 +3835,63 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("tag"));
+    }
+
+    #[tokio::test]
+    async fn cache_inventory_generation_and_protections_are_durable() {
+        let pool = test_pool().await;
+        let initial = cache_inventory_state(&pool).await.unwrap();
+        assert!(!initial.instance_id.is_empty());
+        assert_eq!(initial.generation, 0);
+
+        let artifact = upsert_cache_artifact(
+            &pool,
+            None,
+            "nixos_closure",
+            &"a".repeat(64),
+            1,
+            "/cache/nar/a.nar.zst",
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-example",
+            "/cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+            "nar/a.nar.zst",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+            1,
+            1,
+            "zstd",
+            Some(json!([])),
+            "https://forge.test/cache/nar/a.nar.zst",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let inserted = cache_inventory_state(&pool).await.unwrap();
+        assert_eq!(inserted.instance_id, initial.instance_id);
+        assert!(inserted.generation > initial.generation);
+
+        replace_managed_cache_protections(&pool, &[("nixos_closure".into(), "a".repeat(64))], true)
+            .await
+            .unwrap();
+        assert!(
+            list_managed_cache_protections(&pool)
+                .await
+                .unwrap()
+                .contains(&("nixos_closure".into(), "a".repeat(64)))
+        );
+
+        delete_cache_artifact(&pool, artifact.id).await.unwrap();
+        let deleted = cache_inventory_state(&pool).await.unwrap();
+        assert!(deleted.generation > inserted.generation);
+        replace_managed_cache_protections(&pool, &[], true)
+            .await
+            .unwrap();
+        assert!(
+            list_managed_cache_protections(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

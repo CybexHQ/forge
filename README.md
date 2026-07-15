@@ -95,11 +95,19 @@ file with HTTP Range, verifies the expected size and SHA-256, fsyncs it, and
 atomically promotes a content-addressed filename before updating Boot config.
 Control-plane heartbeats continue while a multi-gigabyte ISO is downloading.
 
-Manage and Forge exchange protocol compatibility version 2 in both config and
+Manage and Forge exchange protocol compatibility version 3 in both config and
 reports. Forge validates the allowed version range before applying desired
 state, while Manage records and rejects incompatible reports. The checked-in
 `protocol/compatibility.json` manifest is the release contract and is tested
 against runtime constants in both repositories.
+
+Forge reports a persistent cache-inventory instance and mutation generation,
+and marks a snapshot complete only when every artifact fits in the signed
+report. Manage returns protected current-Blueprint keys, so local retention
+cannot evict rollout-critical artifacts. Bounded cache scrubs remove invalid
+NAR/NARInfo rows for automatic rebuild. Managed Organization ISOs retry
+transient failures with capped backoff, periodically reverify ready bytes, and
+garbage-collect only unreferenced content-addressed files after a grace period.
 
 The self-healing units, slices, resolver/service drop-ins, and sentinel script
 are embedded in the Forge binary's privileged runtime apply plan. Existing
