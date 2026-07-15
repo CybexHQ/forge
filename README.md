@@ -112,7 +112,10 @@ Boot asset inventory scans persist each ISO's device, inode, size, modification
 time, change time, and last checksum-verification time. New, replaced, or
 modified media is SHA-256 hashed immediately; unchanged media reuses its durable
 checksum, with periodic full verification bounded to one unchanged ISO per
-inventory pass. This keeps the 30-second control heartbeat lightweight even
+inventory pass. Reports include the exact normalized absolute path and the
+Forge-local first-discovery time for each ISO so Manage can present copyable
+filesystem identity without treating its own receipt time as file creation.
+This keeps the 30-second control heartbeat lightweight even
 while multiple multi-gigabyte ISO generations are inside the garbage-collection
 grace period.
 

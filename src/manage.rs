@@ -326,9 +326,11 @@ struct BootAgentClientReport {
 struct BootAgentAssetReport {
     filename: String,
     relative_path: String,
+    absolute_path: String,
     size_bytes: i64,
     checksum_sha256: String,
     last_scanned_at: String,
+    created_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -868,11 +870,19 @@ async fn report_boot_state(
             .into_iter()
             .take(MAX_REPORT_ASSETS)
             .map(|asset| BootAgentAssetReport {
+                absolute_path: state
+                    .config
+                    .paths
+                    .iso_dir
+                    .join(&asset.relative_path)
+                    .display()
+                    .to_string(),
                 filename: asset.filename,
                 relative_path: asset.relative_path,
                 size_bytes: asset.size_bytes,
                 checksum_sha256: asset.checksum_sha256,
                 last_scanned_at: asset.last_scanned_at,
+                created_at: asset.created_at,
             })
             .collect(),
         events: events
@@ -6529,9 +6539,14 @@ mod tests {
             .map(|idx| BootAgentAssetReport {
                 filename: format!("installer-{idx}.iso"),
                 relative_path: format!("isos/installer-{idx}-{}", "x".repeat(512)),
+                absolute_path: format!(
+                    "/srv/cybex-forge/www/isos/installer-{idx}-{}",
+                    "x".repeat(512)
+                ),
                 size_bytes: 1024,
                 checksum_sha256: "a".repeat(64),
                 last_scanned_at: "2026-07-01T00:00:00Z".to_string(),
+                created_at: "2026-07-01T00:00:00Z".to_string(),
             })
             .collect::<Vec<_>>();
         let events = (1..=2)
