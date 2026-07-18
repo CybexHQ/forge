@@ -10,6 +10,8 @@ pub mod manage;
 pub mod models;
 pub(crate) mod redact;
 pub mod routes;
+pub mod system_release;
+pub(crate) mod system_release_compiler_v3;
 pub mod updater;
 
 use std::sync::{Arc, RwLock};

@@ -4,7 +4,7 @@ set -euo pipefail
 FORGE_GIT_URL_DEFAULT="https://github.com/CybexHQ/forge.git"
 FORGE_REF_DEFAULT="main"
 FORGE_SOURCE_DIR_DEFAULT="/root/forge"
-NIXPKGS_REVISION="74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+NIXPKGS_REVISION="8eeec934ae0dbeca3d7868c059568a65c08b2fc3"
 NIXPKGS_FLAKE="github:NixOS/nixpkgs/$NIXPKGS_REVISION"
 
 usage() {
@@ -29,6 +29,28 @@ Options:
   --http-root PATH          HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME         UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage; 0 disables it (default: 0)
+  --enable-system-releases  Enable protocol-5 Verified System Release builds; requires every
+                            managed-agent bundle option below and an HTTPS Manage API URL
+  --agent-version VERSION   Exact managed Cybex Agent release version
+  --agent-package PATH      Immutable managed-agent Nix store package path
+  --agent-package-sha256 HEX
+                            SHA-256 from: nix hash path --type sha256 --base16 PATH
+  --agent-module FILE       Trusted cybex-agent-module.nix source file to install locally
+  --agent-module-sha256 HEX Raw SHA-256 of --agent-module
+  --transition-helper FILE  Trusted cybex-release-transition.sh source file
+  --transition-helper-sha256 HEX
+                            Raw SHA-256 of --transition-helper
+  --release-watchdog FILE   Trusted cybex-release-watchdog.sh source file
+  --release-watchdog-sha256 HEX
+                            Raw SHA-256 of --release-watchdog
+  --test-only-release-source-bundle DIR
+                            Build the managed agent from a byte-pinned source bundle staged in
+                            DIR. Requires the test hook owner and forbids production bundle inputs.
+  --test-only-release-source-manifest-sha256 HEX
+                            SHA-256 of DIR/cybex-verified-release-source-bundle.sha256
+  --test-only-release-hook-owner RUN_ID
+                            Install the root-only Verified Releases fault hook for a disposable
+                            lab-RUN_ID Forge instance. Disabled by default and refused elsewhere.
   --dry-run, --validate-only
                             Validate inputs/environment without installing or enrolling
   -h, --help                Show this help
@@ -38,7 +60,15 @@ Environment alternatives:
   CYBEX_FORGE_PUBLIC_BASE_URL, CYBEX_FORGE_SOURCE_DIR, CYBEX_FORGE_GIT_URL,
   CYBEX_FORGE_REF, CYBEX_FORGE_LISTEN_ADDR, CYBEX_FORGE_TFTP_ROOT,
   CYBEX_FORGE_HTTP_ROOT, CYBEX_FORGE_BOOTLOADER_FILENAME,
-  CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS
+  CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS, CYBEX_FORGE_SYSTEM_RELEASES_ENABLED,
+  CYBEX_FORGE_AGENT_VERSION, CYBEX_FORGE_AGENT_PACKAGE_STORE_PATH,
+  CYBEX_FORGE_AGENT_PACKAGE_SHA256, CYBEX_FORGE_AGENT_MODULE_FILE,
+  CYBEX_FORGE_AGENT_MODULE_SHA256, CYBEX_FORGE_TRANSITION_HELPER_FILE,
+  CYBEX_FORGE_TRANSITION_HELPER_SHA256, CYBEX_FORGE_RELEASE_WATCHDOG_FILE,
+  CYBEX_FORGE_RELEASE_WATCHDOG_SHA256,
+  CYBEX_FORGE_TEST_RELEASE_SOURCE_BUNDLE,
+  CYBEX_FORGE_TEST_RELEASE_SOURCE_MANIFEST_SHA256,
+  CYBEX_FORGE_TEST_RELEASE_HOOK_OWNER_RUN_ID
 EOF
 }
 
@@ -54,6 +84,21 @@ tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
 http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
+system_releases_enabled="${CYBEX_FORGE_SYSTEM_RELEASES_ENABLED:-0}"
+managed_agent_version="${CYBEX_FORGE_AGENT_VERSION:-}"
+managed_agent_package_store_path="${CYBEX_FORGE_AGENT_PACKAGE_STORE_PATH:-}"
+managed_agent_package_sha256="${CYBEX_FORGE_AGENT_PACKAGE_SHA256:-}"
+managed_agent_module_file="${CYBEX_FORGE_AGENT_MODULE_FILE:-}"
+managed_agent_module_sha256="${CYBEX_FORGE_AGENT_MODULE_SHA256:-}"
+transition_helper_file="${CYBEX_FORGE_TRANSITION_HELPER_FILE:-}"
+transition_helper_sha256="${CYBEX_FORGE_TRANSITION_HELPER_SHA256:-}"
+release_watchdog_file="${CYBEX_FORGE_RELEASE_WATCHDOG_FILE:-}"
+release_watchdog_sha256="${CYBEX_FORGE_RELEASE_WATCHDOG_SHA256:-}"
+release_test_target_hook_file=""
+release_test_target_hook_sha256=""
+release_test_source_bundle="${CYBEX_FORGE_TEST_RELEASE_SOURCE_BUNDLE:-}"
+release_test_source_manifest_sha256="${CYBEX_FORGE_TEST_RELEASE_SOURCE_MANIFEST_SHA256:-}"
+release_test_hook_owner_run_id="${CYBEX_FORGE_TEST_RELEASE_HOOK_OWNER_RUN_ID:-}"
 dry_run=0
 
 while [ "$#" -gt 0 ]; do
@@ -70,6 +115,19 @@ while [ "$#" -gt 0 ]; do
     --http-root) http_root="${2:-}"; shift 2 ;;
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
+    --enable-system-releases) system_releases_enabled=1; shift ;;
+    --agent-version) managed_agent_version="${2:-}"; shift 2 ;;
+    --agent-package) managed_agent_package_store_path="${2:-}"; shift 2 ;;
+    --agent-package-sha256) managed_agent_package_sha256="${2:-}"; shift 2 ;;
+    --agent-module) managed_agent_module_file="${2:-}"; shift 2 ;;
+    --agent-module-sha256) managed_agent_module_sha256="${2:-}"; shift 2 ;;
+    --transition-helper) transition_helper_file="${2:-}"; shift 2 ;;
+    --transition-helper-sha256) transition_helper_sha256="${2:-}"; shift 2 ;;
+    --release-watchdog) release_watchdog_file="${2:-}"; shift 2 ;;
+    --release-watchdog-sha256) release_watchdog_sha256="${2:-}"; shift 2 ;;
+    --test-only-release-source-bundle) release_test_source_bundle="${2:-}"; shift 2 ;;
+    --test-only-release-source-manifest-sha256) release_test_source_manifest_sha256="${2:-}"; shift 2 ;;
+    --test-only-release-hook-owner) release_test_hook_owner_run_id="${2:-}"; shift 2 ;;
     --dry-run|--validate-only) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -287,6 +345,333 @@ validate_menu_timeout() {
   fi
 }
 
+validate_sha256() {
+  local name="$1"
+  local value="$2"
+  if ! printf '%s' "$value" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$'; then
+    echo "$name must be exact lowercase SHA-256 hex" >&2
+    exit 2
+  fi
+}
+
+validate_bundle_file() {
+  local name="$1"
+  local path="$2"
+  local expected="$3"
+  validate_absolute_path "$name" "$path"
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
+    echo "$name must be a direct regular file" >&2
+    exit 2
+  fi
+  local actual
+  actual="$(sha256sum "$path" | awk '{print $1}')"
+  if [ "$actual" != "$expected" ]; then
+    echo "$name does not match its pinned SHA-256" >&2
+    exit 2
+  fi
+}
+
+system_release_source_bundle_expected_files() {
+  cat <<'EOF'
+Cargo.toml
+agent/cybex-agent/Cargo.lock
+agent/cybex-agent/Cargo.toml
+agent/cybex-agent/src/main.rs
+agent/cybex-agent/src/verified_releases.rs
+deploy/nixos/cybex-agent-module.nix
+deploy/nixos/cybex-blueprints.nix
+deploy/nixos/cybex-release-test-hook.sh
+deploy/nixos/cybex-release-transition.sh
+deploy/nixos/cybex-release-watchdog.sh
+protocol/system-release-compiler-v3-standard-source.json
+protocol/system-release-supported-nixpkgs-pin.json
+src/lib.rs
+src/system_release_compiler_v3.rs
+src/system_releases.rs
+EOF
+}
+
+validate_test_system_release_source_bundle() {
+  [ -n "$release_test_source_bundle" ] || return 0
+  validate_absolute_path "--test-only-release-source-bundle" "$release_test_source_bundle"
+  validate_sha256 \
+    "--test-only-release-source-manifest-sha256" \
+    "$release_test_source_manifest_sha256"
+  if [ ! -d "$release_test_source_bundle" ] || [ -L "$release_test_source_bundle" ]; then
+    echo "--test-only-release-source-bundle must be a direct directory" >&2
+    exit 2
+  fi
+  local manifest="$release_test_source_bundle/cybex-verified-release-source-bundle.sha256"
+  if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+    echo "the test release source bundle is missing its direct regular manifest" >&2
+    exit 2
+  fi
+  local actual_manifest_sha256
+  actual_manifest_sha256="$(sha256sum "$manifest" | awk '{print $1}')"
+  if [ "$actual_manifest_sha256" != "$release_test_source_manifest_sha256" ]; then
+    echo "the test release source manifest does not match its pinned SHA-256" >&2
+    exit 2
+  fi
+  if [ "$(sed -n '1p' "$manifest")" != "CYBEX_VERIFIED_RELEASE_SOURCE_BUNDLE_V1" ]; then
+    echo "the test release source manifest schema is unsupported" >&2
+    exit 2
+  fi
+  if find "$release_test_source_bundle" -mindepth 1 -type l -print -quit | grep -q .; then
+    echo "the test release source bundle must not contain symbolic links" >&2
+    exit 2
+  fi
+  if find "$release_test_source_bundle" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
+    echo "the test release source bundle contains an unsupported filesystem object" >&2
+    exit 2
+  fi
+
+  local expected_paths actual_paths listed_paths relative expected actual count
+  expected_paths="$(system_release_source_bundle_expected_files)"
+  actual_paths="$(
+    find "$release_test_source_bundle" -mindepth 1 -type f -printf '%P\n' |
+      LC_ALL=C sort |
+      grep -v '^cybex-verified-release-source-bundle\.sha256$'
+  )"
+  if [ "$actual_paths" != "$expected_paths" ]; then
+    echo "the test release source bundle file set is not the exact protocol-v5 bundle" >&2
+    exit 2
+  fi
+  listed_paths="$(sed -n '2,$p' "$manifest" | cut -c67- | LC_ALL=C sort)"
+  if [ "$listed_paths" != "$expected_paths" ]; then
+    echo "the test release source manifest file set is not exact" >&2
+    exit 2
+  fi
+  if [ "$(wc -l < "$manifest")" -ne 16 ]; then
+    echo "the test release source manifest must contain exactly fifteen file records" >&2
+    exit 2
+  fi
+
+  while IFS= read -r relative; do
+    if ! printf '%s' "$relative" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
+      echo "the test release source manifest contains an unsafe path" >&2
+      exit 2
+    fi
+    count="$(grep -Ec "^[0-9a-f]{64}  ${relative}$" "$manifest" || true)"
+    if [ "$count" -ne 1 ]; then
+      echo "the test release source manifest contains a malformed or duplicate record" >&2
+      exit 2
+    fi
+    expected="$(grep -E "^[0-9a-f]{64}  ${relative}$" "$manifest" | cut -c1-64)"
+    actual="$(sha256sum "$release_test_source_bundle/$relative" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+      echo "test release source file $relative does not match its manifest" >&2
+      exit 2
+    fi
+  done <<EOF
+$expected_paths
+EOF
+}
+
+validate_system_release_bundle_inputs() {
+  case "$system_releases_enabled" in
+    1|true|yes) system_releases_enabled=1 ;;
+    0|false|no|'') system_releases_enabled=0 ;;
+    *) echo "CYBEX_FORGE_SYSTEM_RELEASES_ENABLED must be 0 or 1" >&2; exit 2 ;;
+  esac
+  if [ "$system_releases_enabled" -eq 1 ]; then
+    case "$api_url" in
+      https://*) ;;
+      *)
+        echo "--api-url must use HTTPS when Verified System Releases are enabled" >&2
+        exit 2
+        ;;
+    esac
+  fi
+  if [ "$system_releases_enabled" -eq 0 ]; then
+    for value in \
+      "$managed_agent_version" \
+      "$managed_agent_package_store_path" \
+      "$managed_agent_package_sha256" \
+      "$managed_agent_module_file" \
+      "$managed_agent_module_sha256" \
+      "$transition_helper_file" \
+      "$transition_helper_sha256" \
+      "$release_watchdog_file" \
+      "$release_watchdog_sha256" \
+      "$release_test_source_bundle" \
+      "$release_test_source_manifest_sha256"; do
+      if [ -n "$value" ]; then
+        echo "managed-agent bundle options require --enable-system-releases" >&2
+        exit 2
+      fi
+    done
+    return
+  fi
+
+  require_value "--agent-version" "$managed_agent_version"
+  validate_plain_value "--agent-version" "$managed_agent_version"
+  if ! printf '%s' "$managed_agent_version" | LC_ALL=C grep -Eq '^[A-Za-z0-9._+-]{1,128}$'; then
+    echo "--agent-version is not a safe exact release version" >&2
+    exit 2
+  fi
+  if [ -n "$release_test_source_bundle" ] || [ -n "$release_test_source_manifest_sha256" ]; then
+    require_value "--test-only-release-source-bundle" "$release_test_source_bundle"
+    require_value \
+      "--test-only-release-source-manifest-sha256" \
+      "$release_test_source_manifest_sha256"
+    require_value "--test-only-release-hook-owner" "$release_test_hook_owner_run_id"
+    for value in \
+      "$managed_agent_package_store_path" \
+      "$managed_agent_package_sha256" \
+      "$managed_agent_module_file" \
+      "$managed_agent_module_sha256" \
+      "$transition_helper_file" \
+      "$transition_helper_sha256" \
+      "$release_watchdog_file" \
+      "$release_watchdog_sha256"; do
+      if [ -n "$value" ]; then
+        echo "test source bundle and production managed-agent bundle inputs are mutually exclusive" >&2
+        exit 2
+      fi
+    done
+    validate_test_system_release_source_bundle
+    return
+  fi
+
+  require_value "--agent-package" "$managed_agent_package_store_path"
+  require_value "--agent-package-sha256" "$managed_agent_package_sha256"
+  require_value "--agent-module" "$managed_agent_module_file"
+  require_value "--agent-module-sha256" "$managed_agent_module_sha256"
+  require_value "--transition-helper" "$transition_helper_file"
+  require_value "--transition-helper-sha256" "$transition_helper_sha256"
+  require_value "--release-watchdog" "$release_watchdog_file"
+  require_value "--release-watchdog-sha256" "$release_watchdog_sha256"
+  validate_absolute_path "--agent-package" "$managed_agent_package_store_path"
+  if ! printf '%s' "$managed_agent_package_store_path" | LC_ALL=C grep -Eq '^/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-[^/]+$'; then
+    echo "--agent-package must be a direct canonical Nix store path" >&2
+    exit 2
+  fi
+  validate_sha256 "--agent-package-sha256" "$managed_agent_package_sha256"
+  validate_sha256 "--agent-module-sha256" "$managed_agent_module_sha256"
+  validate_sha256 "--transition-helper-sha256" "$transition_helper_sha256"
+  validate_sha256 "--release-watchdog-sha256" "$release_watchdog_sha256"
+  validate_bundle_file "--agent-module" "$managed_agent_module_file" "$managed_agent_module_sha256"
+  validate_bundle_file "--transition-helper" "$transition_helper_file" "$transition_helper_sha256"
+  validate_bundle_file "--release-watchdog" "$release_watchdog_file" "$release_watchdog_sha256"
+}
+
+validate_release_test_hook_input() {
+  [ -n "$release_test_hook_owner_run_id" ] || return 0
+  if ! printf '%s' "$release_test_hook_owner_run_id" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+    echo "--test-only-release-hook-owner is invalid" >&2
+    exit 2
+  fi
+  local instance_name
+  instance_name="$(hostname)"
+  case "$instance_name" in
+    "lab-$release_test_hook_owner_run_id"|"lab-$release_test_hook_owner_run_id-"*) ;;
+    *)
+      echo "the test-only release hook is restricted to a lab-RUN_ID disposable hostname" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$system_releases_enabled" -ne 1 ]; then
+    echo "the test-only release hook requires --enable-system-releases" >&2
+    exit 2
+  fi
+  if [ ! -f "$source_dir/install/cybex-forge-release-test-hook" ] ||
+     [ -L "$source_dir/install/cybex-forge-release-test-hook" ]; then
+    echo "the Forge source omits the test-only release hook" >&2
+    exit 2
+  fi
+}
+
+verify_system_release_agent_package() {
+  [ "$system_releases_enabled" -eq 1 ] || return 0
+  local nix_binary="/nix/var/nix/profiles/default/bin/nix"
+  if [ ! -d "$managed_agent_package_store_path" ] || [ -L "$managed_agent_package_store_path" ]; then
+    echo "managed-agent package is not an installed direct Nix store directory" >&2
+    exit 1
+  fi
+  local actual
+  actual="$(runuser -u cybex-forge -- "$nix_binary" hash path --type sha256 --base16 "$managed_agent_package_store_path")"
+  if [ "$actual" != "$managed_agent_package_sha256" ]; then
+    echo "managed-agent package does not match --agent-package-sha256" >&2
+    exit 1
+  fi
+}
+
+prepare_test_system_release_source_bundle() {
+  [ -n "$release_test_source_bundle" ] || return 0
+  local profile_nix="/nix/var/nix/profiles/default/bin/nix"
+  local staging_root="/opt/cybex-forge/releases/cybex-verified-release-source-v1"
+  local source_store_path build_expression output_path actual_version relative
+  rm -rf "$staging_root"
+  install -m 0555 -o root -g root -d "$staging_root"
+  while IFS= read -r relative; do
+    install -D -m 0444 -o root -g root \
+      "$release_test_source_bundle/$relative" "$staging_root/$relative"
+  done <<EOF
+$(system_release_source_bundle_expected_files)
+EOF
+  source_store_path="$("$profile_nix" store add-path "$staging_root")"
+  if ! printf '%s' "$source_store_path" | LC_ALL=C grep -Eq '^/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-cybex-verified-release-source-v1$'; then
+    echo "Nix did not produce a canonical test release source store path" >&2
+    exit 1
+  fi
+  build_expression="let
+    nixpkgs = builtins.getFlake \"github:NixOS/nixpkgs/$NIXPKGS_REVISION\";
+    pkgs = import nixpkgs.outPath { system = \"x86_64-linux\"; };
+    swaggerUi = pkgs.fetchurl {
+      url = \"https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip\";
+      hash = \"sha256-SBJE0IEgl7Efuu73n3HZQrFxYX+cn5UU5jrL4T5xzNw=\";
+    };
+    source = $source_store_path;
+  in pkgs.rustPlatform.buildRustPackage {
+    pname = \"cybex-agent\";
+    version = \"$managed_agent_version\";
+    src = source;
+    cargoLock.lockFile = source + \"/agent/cybex-agent/Cargo.lock\";
+    cargoRoot = \"agent/cybex-agent\";
+    buildAndTestSubdir = \"agent/cybex-agent\";
+    doCheck = false;
+    env.SWAGGER_UI_DOWNLOAD_URL = \"file://\${swaggerUi}\";
+  }"
+  # The only impure input is the already-added, byte-manifested local store path.
+  # nixpkgs, the target system, Cargo lock, and Swagger archive remain hash-pinned.
+  output_path="$(
+    "$profile_nix" build --impure --no-link --print-out-paths --expr "$build_expression"
+  )"
+  case "$output_path" in
+    *$'\n'*)
+      echo "the test release source build produced multiple outputs" >&2
+      exit 1
+      ;;
+  esac
+  if ! printf '%s' "$output_path" | LC_ALL=C grep -Eq '^/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-cybex-agent-[A-Za-z0-9._+-]+$'; then
+    echo "the test release source build did not produce a canonical agent package" >&2
+    exit 1
+  fi
+  if [ ! -x "$output_path/bin/cybex-agent" ] || [ -L "$output_path/bin/cybex-agent" ]; then
+    echo "the test release source build is missing its direct agent executable" >&2
+    exit 1
+  fi
+  actual_version="$("$output_path/bin/cybex-agent" --version)"
+  if [ "$actual_version" != "cybex-agent $managed_agent_version" ]; then
+    echo "the test release source agent version does not match --agent-version" >&2
+    exit 1
+  fi
+
+  managed_agent_package_store_path="$output_path"
+  managed_agent_package_sha256="$(
+    "$profile_nix" hash path --type sha256 --base16 "$output_path"
+  )"
+  managed_agent_module_file="$source_store_path/deploy/nixos/cybex-agent-module.nix"
+  transition_helper_file="$source_store_path/deploy/nixos/cybex-release-transition.sh"
+  release_watchdog_file="$source_store_path/deploy/nixos/cybex-release-watchdog.sh"
+  release_test_target_hook_file="$source_store_path/deploy/nixos/cybex-release-test-hook.sh"
+  managed_agent_module_sha256="$(sha256sum "$managed_agent_module_file" | awk '{print $1}')"
+  transition_helper_sha256="$(sha256sum "$transition_helper_file" | awk '{print $1}')"
+  release_watchdog_sha256="$(sha256sum "$release_watchdog_file" | awk '{print $1}')"
+  release_test_target_hook_sha256="$(sha256sum "$release_test_target_hook_file" | awk '{print $1}')"
+  rm -rf "$staging_root"
+}
+
 validate_forge_ref() {
   validate_plain_value "--forge-ref" "$forge_ref"
   if [ -z "$forge_ref" ]; then
@@ -316,6 +701,7 @@ installer_preflight() {
   require_root
   require_command apt-get
   require_command systemctl
+  require_command sha256sum
   if [ ! -d /run/systemd/system ]; then
     echo "systemd is not running inside this LXC" >&2
     exit 1
@@ -581,6 +967,8 @@ verify_source_compatibility() {
   require_source_file_contains "$source_dir/src/manage.rs" "managed runtime configuration is pending adoption; skipping apply" "pending runtime apply no-op"
   require_source_file_contains "$source_dir/src/config.rs" "organization_id" "managed organization id enrollment"
   require_source_file_contains "$source_dir/src/config.rs" "forge_install_code" "managed Forge install code enrollment"
+  require_source_file_contains "$source_dir/src/system_release.rs" "SYSTEM_RELEASE_BUILDER_CAPABILITY" "protocol-5 System Release builder"
+  require_source_file_contains "$source_dir/src/system_release.rs" "verify_trusted_managed_agent_bundle" "trusted managed-agent bundle verification"
 }
 
 install_binary() {
@@ -608,6 +996,19 @@ prepare_user_and_dirs() {
   chown -R cybex-forge:cybex-forge /var/lib/cybex-forge "$http_root"
   chmod 0700 /var/lib/cybex-forge
   chmod 0755 "$http_root" "$http_root/isos" "$http_root/assets" "$http_root/cache"
+  install -m 0700 -o cybex-forge -g cybex-forge -d \
+    "$http_root/cache/.cybex-forge-private" \
+    "$http_root/cache/.cybex-forge-private/release-test-faults"
+  local cache_mutation_lock=/var/lib/cybex-forge/cache/cache-mutation.lock
+  if [ -L "$cache_mutation_lock" ] || { [ -e "$cache_mutation_lock" ] && [ ! -f "$cache_mutation_lock" ]; }; then
+    echo "refusing unsafe Forge cache mutation lock" >&2
+    exit 1
+  fi
+  if [ ! -e "$cache_mutation_lock" ]; then
+    install -m 0600 -o cybex-forge -g cybex-forge /dev/null "$cache_mutation_lock"
+  fi
+  chown cybex-forge:cybex-forge "$cache_mutation_lock"
+  chmod 0600 "$cache_mutation_lock"
   find "$http_root" -xdev \( -type f -o -type d \) \( -perm -020 -o -perm -002 \) -exec chmod go-w {} +
   rm -f "$http_root/boot.ipxe"
   find "$http_root" -maxdepth 1 \( -type f -o -type l \) -name '.cybex-check.*' -delete
@@ -620,6 +1021,81 @@ prepare_user_and_dirs() {
   harden_tftp_tree
 }
 
+install_system_release_bundle() {
+  local bundle_dir="/etc/cybex-forge/system-release"
+  if [ "$system_releases_enabled" -eq 0 ]; then
+    return 0
+  fi
+  install -m 0750 -o root -g cybex-forge -d "$bundle_dir"
+  install -m 0440 -o root -g cybex-forge \
+    "$managed_agent_module_file" "$bundle_dir/managed-agent.nix"
+  install -m 0550 -o root -g cybex-forge \
+    "$transition_helper_file" "$bundle_dir/cybex-release-transition.sh"
+  install -m 0550 -o root -g cybex-forge \
+    "$release_watchdog_file" "$bundle_dir/cybex-release-watchdog.sh"
+  if [ -n "$release_test_target_hook_file" ]; then
+    install -m 0550 -o root -g cybex-forge \
+      "$release_test_target_hook_file" "$bundle_dir/cybex-release-test-hook.sh"
+  else
+    rm -f "$bundle_dir/cybex-release-test-hook.sh"
+  fi
+
+  local gcroot_dir="/nix/var/nix/gcroots/cybex-forge"
+  local gcroot="$gcroot_dir/managed-agent"
+  local staged_root="$gcroot.tmp.$$"
+  install -m 0755 -o root -g root -d "$gcroot_dir"
+  rm -f "$staged_root"
+  ln -s "$managed_agent_package_store_path" "$staged_root"
+  mv -Tf "$staged_root" "$gcroot"
+}
+
+install_release_test_hook() {
+  local hook_path="/usr/local/libexec/cybex-forge-release-test-hook"
+  local hook_config="/etc/cybex-forge/verified-release-test-hook.conf"
+  local hook_state_dir="/var/lib/cybex-forge/verified-release-test-hook"
+  if [ -e "$hook_state_dir/armed" ] || [ -e "$hook_state_dir/original" ]; then
+    echo "refusing to replace or disable an armed Verified Releases test hook; reset the exact owned fault first" >&2
+    exit 1
+  fi
+  if [ -L "$hook_state_dir" ]; then
+    echo "refusing unsafe Verified Releases test-hook state directory" >&2
+    exit 1
+  fi
+  rm -f "$hook_path" "$hook_config"
+  [ -n "$release_test_hook_owner_run_id" ] || return 0
+
+  local instance_name owner_nonce_hex owner_binding_sha256 temporary
+  instance_name="$(hostname)"
+  owner_nonce_hex="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  owner_binding_sha256="$(printf '%s\n%s\n%s' \
+    "$release_test_hook_owner_run_id" "$instance_name" "$owner_nonce_hex" |
+    sha256sum | awk '{print $1}')"
+  temporary="$(mktemp /etc/cybex-forge/.verified-release-test-hook.XXXXXX)"
+  cat >"$temporary" <<EOF
+enabled=true
+production_mode=false
+owner_run_id=$release_test_hook_owner_run_id
+owner_nonce_hex=$owner_nonce_hex
+owner_binding_sha256=$owner_binding_sha256
+instance_name=$instance_name
+cache_root=$http_root/cache
+mutation_lock_path=/var/lib/cybex-forge/cache/cache-mutation.lock
+state_dir=$hook_state_dir
+EOF
+  chown root:root "$temporary"
+  chmod 0400 "$temporary"
+  mv -f "$temporary" "$hook_config"
+  install -m 0755 -o root -g root -d /usr/local/libexec
+  install -m 0700 -o root -g root \
+    "$source_dir/install/cybex-forge-release-test-hook" "$hook_path"
+  local capabilities
+  "$hook_path" --self-test >/dev/null
+  capabilities="$($hook_path capabilities --json)"
+  printf '%s' "$capabilities" | grep -F '"acceptance_run_id_required":true' >/dev/null
+  printf '%s' "$capabilities" | grep -F '"evidence_nonce_sha256_required":true' >/dev/null
+  printf '%s' "$capabilities" | grep -F '"boot_id_bound":true' >/dev/null
+}
+
 install_theme_assets() {
   local menu_background="$source_dir/assets/pxe-menu.png"
   if [ -f "$menu_background" ]; then
@@ -629,7 +1105,11 @@ install_theme_assets() {
 
 write_config() {
   local config_path="/etc/cybex-forge/config.toml"
-  local config_tmp
+  local config_tmp release_test_target_hook_config=""
+  if [ -n "$release_test_target_hook_file" ]; then
+    release_test_target_hook_config="release_test_hook_path = \"/etc/cybex-forge/system-release/cybex-release-test-hook.sh\"
+release_test_hook_sha256 = \"$release_test_target_hook_sha256\""
+  fi
   install -m 0750 -o root -g cybex-forge -d /etc/cybex-forge
   config_tmp="$(mktemp "$config_path.tmp.XXXXXX")"
   trap 'if [ -n "${config_tmp:-}" ]; then rm -f "$config_tmp"; fi' RETURN
@@ -675,11 +1155,27 @@ attr = "packages.x86_64-linux.desktop-experience"
 [cache]
 enabled = true
 root_dir = "$http_root/cache"
+mutation_lock_path = "/var/lib/cybex-forge/cache/cache-mutation.lock"
 signing_key_name = "cybex-forge-cache"
 private_key_path = "/var/lib/cybex-forge/cache/cache-priv-key.pem"
 public_key_path = "/var/lib/cybex-forge/cache/cache-pub-key.pem"
 max_bytes = 68719476736
 retain_recent_builds = 50
+
+[system_release]
+enabled = $( [ "$system_releases_enabled" -eq 1 ] && printf true || printf false )
+attestation_private_key_path = "/var/lib/cybex-forge/system-release/attestation-private.key"
+attestation_public_key_path = "/var/lib/cybex-forge/system-release/attestation-public.key"
+managed_agent_version = "$managed_agent_version"
+managed_agent_package_store_path = "${managed_agent_package_store_path:-/nix/store/00000000000000000000000000000000-cybex-agent-unconfigured}"
+managed_agent_package_sha256 = "$managed_agent_package_sha256"
+managed_agent_module_path = "/etc/cybex-forge/system-release/managed-agent.nix"
+managed_agent_module_sha256 = "$managed_agent_module_sha256"
+transition_helper_path = "/etc/cybex-forge/system-release/cybex-release-transition.sh"
+transition_helper_sha256 = "$transition_helper_sha256"
+watchdog_path = "/etc/cybex-forge/system-release/cybex-release-watchdog.sh"
+watchdog_sha256 = "$release_watchdog_sha256"
+$release_test_target_hook_config
 
 [update]
 enabled = true
@@ -1366,6 +1862,8 @@ validate_runtime_roots
 validate_bootloader_filename
 validate_menu_timeout
 validate_forge_ref
+validate_system_release_bundle_inputs
+validate_release_test_hook_input
 if [ "$dry_run" -eq 1 ]; then
   echo "Cybex Forge LXC installer validation passed."
   echo "Source: $git_url"
@@ -1374,6 +1872,8 @@ if [ "$dry_run" -eq 1 ]; then
   echo "Manage API: $api_url"
   echo "Organization: $organization_id"
   echo "Public Boot URL: $public_base_url"
+  echo "Verified System Releases: $( [ "$system_releases_enabled" -eq 1 ] && printf enabled || printf disabled )"
+  echo "Verified Releases test hook: $( [ -n "$release_test_hook_owner_run_id" ] && printf enabled || printf disabled )"
   exit 0
 fi
 install_packages
@@ -1385,6 +1885,10 @@ install_binary
 prepare_user_and_dirs
 install_theme_assets
 validate_pinned_build_inputs
+prepare_test_system_release_source_bundle
+verify_system_release_agent_package
+install_system_release_bundle
+install_release_test_hook
 write_config
 install_systemd
 install_maintenance_tools

@@ -20,7 +20,7 @@ use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::{
-    Client, Method,
+    Client, Method, Response, StatusCode, Url,
     header::{CONTENT_RANGE, CONTENT_TYPE, IF_RANGE, RANGE},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -39,7 +39,8 @@ use crate::{
     AppState, RuntimeSettings, assets,
     config::{
         AppConfig, ManageConfig, normalize_absolute_config_path, normalize_bootloader_filename,
-        normalize_http_url, normalize_listen_addr, validate_menu_timeout_ms,
+        normalize_http_url, normalize_listen_addr, require_authenticated_system_release_manage_url,
+        validate_menu_timeout_ms,
     },
     db,
     models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
@@ -50,9 +51,11 @@ const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_UPDATER_V1: &str = "updater_v1";
-const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 3;
+const CAPABILITY_SYSTEM_RELEASE_BUILDER_V3: &str = "system_release_builder_v3";
+const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 5;
+const CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION: u32 = 3;
 const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 1;
-const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 3;
+const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 5;
 const PXE_MENU_BACKGROUND_ASSET: &[u8] = include_bytes!("../assets/pxe-menu.png");
 const PXE_MENU_BACKGROUND_FILENAME: &str = "pxe-menu.png";
 const MAX_MANAGED_PROFILES: usize = 1_000;
@@ -67,6 +70,12 @@ const MAX_REPORT_BUILD_JOBS: usize = 500;
 const MAX_REPORT_CACHE_ARTIFACTS: usize = 2_000;
 const MAX_MANAGED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
+const FORGE_REPORTING_SCHEMA: &str = "cybex.forge-reporting.v1";
+const FORGE_REPORTING_VERSION: u32 = 1;
+const FORGE_REPORT_CACHE_PAGE_SIZE: usize = 500;
+const SYSTEM_RELEASE_CLOSURE_UPLOADS_PER_REPORT: usize = 4;
+const FORGE_REPORT_LOG_BYTES: usize = 4 * 1024;
+const RETAIN_ACKNOWLEDGED_TERMINAL_JOBS: usize = 100;
 const MAX_DEVICE_HOSTNAME_CHARS: usize = 253;
 const MAX_DEVICE_SERIAL_CHARS: usize = 128;
 const MAX_DEVICE_NOTES_CHARS: usize = 2_000;
@@ -132,6 +141,10 @@ struct ManagedState {
     device_id: Option<String>,
     managed_token: Option<String>,
     last_reported_event_id: Option<i64>,
+    forge_reporting_version: Option<u32>,
+    cache_report_instance_id: Option<String>,
+    cache_report_generation: Option<i64>,
+    cache_report_cursor: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +193,8 @@ struct AgentForgeConfigResponse {
     #[serde(default)]
     compatibility: Option<ComponentCompatibilityContract>,
     #[serde(default)]
+    reporting: Option<ManagedForgeReportingContract>,
+    #[serde(default)]
     build_jobs: Vec<ManagedBuildJob>,
     #[serde(default)]
     deleted_build_job_ids: Vec<String>,
@@ -192,13 +207,34 @@ struct AgentForgeConfigResponse {
     #[serde(default)]
     protected_cache_artifacts_complete: bool,
     #[serde(default)]
+    protected_cache_artifact_page: Option<ManagedProtectedCacheArtifactPage>,
+    #[serde(default)]
     update: Option<ManagedUpdateRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedForgeReportingContract {
+    schema: String,
+    version: u32,
+    max_report_body_bytes: usize,
+    cache_inventory_page_size: usize,
+    protected_artifact_page_size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedProtectedCacheArtifactPage {
+    snapshot_id: String,
+    cursor: i64,
+    total_items: i64,
+    complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManagedDeletedCacheArtifact {
     artifact_type: String,
     hash: String,
+    expected_cache_inventory_instance_id: String,
+    expected_cache_inventory_generation: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,7 +404,10 @@ struct BootAgentProfileSyncReport {
 #[derive(Clone, Debug, Serialize)]
 struct ForgeAgentReportRequest {
     protocol_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_contract_version: Option<u32>,
     capabilities: Vec<&'static str>,
+    system_release_capability: Option<SystemReleaseCapabilityReport>,
     cache: crate::cache::CacheStatusReport,
     update: Option<ForgeUpdateStatusReport>,
     build_jobs: Vec<ForgeBuildJobReport>,
@@ -376,7 +415,86 @@ struct ForgeAgentReportRequest {
     cache_inventory_instance_id: String,
     cache_inventory_generation: i64,
     cache_artifacts_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_inventory_page: Option<ForgeCacheInventoryPage>,
     disk: Option<crate::disk::DiskStats>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForgeCacheInventoryPage {
+    cursor: usize,
+    total_items: usize,
+    complete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgeAgentReportAck {
+    #[serde(default)]
+    report_contract_version: Option<u32>,
+    #[serde(default)]
+    acked_terminal_build_job_ids: Vec<String>,
+    #[serde(default)]
+    cache_inventory_ack: Option<ForgeCacheInventoryAck>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgeCacheInventoryAck {
+    inventory_instance_id: String,
+    inventory_generation: i64,
+    cursor: usize,
+    next_cursor: usize,
+    total_items: usize,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SystemReleaseCapabilityReport {
+    schema: &'static str,
+    attestation_public_key: String,
+    attestation_key_id: String,
+    managed_agent: crate::system_release::ManagedAgentInputV1,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemReleaseClosureResultMetadata {
+    schema: String,
+    organization_id: String,
+    release_id: String,
+    variant_id: String,
+    forge_node_id: String,
+    forge_build_job_id: String,
+    forge_artifact_id: String,
+    build_spec_sha256: String,
+    closure: SystemReleaseClosureResultLocation,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemReleaseClosureResultLocation {
+    relative_path: String,
+    path: String,
+    sha256: String,
+    size_bytes: usize,
+}
+
+#[derive(Debug)]
+struct SystemReleaseClosureUploadMaterial {
+    local_artifact_id: i64,
+    managed_artifact_id: String,
+    managed_job_id: String,
+    build_spec_sha256: String,
+    closure_sha256: String,
+    closure_size_bytes: usize,
+    canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemReleaseClosureUploadAck {
+    schema: String,
+    forge_artifact_id: String,
+    forge_build_job_id: String,
+    closure_sha256: String,
+    closure_size_bytes: usize,
+    status: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -384,7 +502,8 @@ struct ForgeBuildJobReport {
     local_id: i64,
     managed_job_id: Option<String>,
     requested_artifact_type: String,
-    build_spec: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_spec: Option<Value>,
     target: String,
     system: String,
     input_revision: String,
@@ -399,7 +518,8 @@ struct ForgeBuildJobReport {
     output_sha256: String,
     output_size_bytes: i64,
     exit_code: Option<i64>,
-    cache_metadata: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_metadata: Option<Value>,
     started_at: Option<String>,
     completed_at: Option<String>,
     cancel_requested_at: Option<String>,
@@ -438,7 +558,7 @@ impl From<BuildJob> for ForgeBuildJobReport {
             local_id: job.id,
             managed_job_id: optional_report_uuid(job.managed_job_id),
             requested_artifact_type: job.requested_artifact_type,
-            build_spec: job.build_spec,
+            build_spec: Some(job.build_spec),
             target: job.target,
             system: job.system,
             input_revision: job.input_revision,
@@ -453,7 +573,7 @@ impl From<BuildJob> for ForgeBuildJobReport {
             output_sha256: job.output_sha256,
             output_size_bytes: job.output_size_bytes,
             exit_code: job.exit_code,
-            cache_metadata: job.cache_metadata,
+            cache_metadata: Some(job.cache_metadata),
             started_at: job.started_at,
             completed_at: job.completed_at,
             cancel_requested_at: job.cancel_requested_at,
@@ -675,7 +795,7 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     apply_boot_config(state, &config).await?;
     let profile_sync = current_profile_sync_reports(&state.db).await?;
     report_boot_state(state, &mut managed, profile_sync).await?;
-    sync_forge_foundation(state, &managed).await?;
+    sync_forge_foundation(state, &mut managed).await?;
     save_managed_state(state, &managed)?;
     Ok(SyncOutcome::Synced)
 }
@@ -723,13 +843,14 @@ async fn submit_enrollment(state: &AppState, managed: &mut ManagedState) -> Resu
     let body = enrollment_body(state, managed)?;
     let endpoint = api_url(state, "/v1/agent/enrollments")?;
     let response = http_client(state)?
-        .post(endpoint)
+        .post(&endpoint)
         .header("x-cybex-organization", organization_header(&state.config)?)
         .header(CONTENT_TYPE, "application/json")
         .json(&body)
         .send()
         .await
         .context("submit managed enrollment request failed")?;
+    require_exact_managed_response_url(&response, &endpoint, "submit managed enrollment")?;
     let response: EnrollmentResponse =
         parse_success_json(response, "submit managed enrollment").await?;
     if response.status != "pending" {
@@ -765,12 +886,13 @@ async fn poll_enrollment(
         &format!("/v1/agent/enrollments/{enrollment_id}/status"),
     )?;
     let response = http_client(state)?
-        .get(endpoint)
+        .get(&endpoint)
         .header("x-cybex-organization", organization_header(&state.config)?)
         .header("x-cybex-enrollment-token", secret)
         .send()
         .await
         .context("poll managed enrollment request failed")?;
+    require_exact_managed_response_url(&response, &endpoint, "poll managed enrollment")?;
     parse_success_json(response, "poll managed enrollment").await
 }
 
@@ -792,11 +914,14 @@ async fn fetch_boot_config_for_config(
         .send()
         .await
         .context("fetch managed boot config request failed")?;
-    let mut config: AgentBootConfigResponse =
+    let expected_endpoint = api_url_for_config(config, &path)?;
+    require_exact_managed_response_url(&response, &expected_endpoint, "fetch managed boot config")?;
+    let protocol_version = forge_protocol_version(config);
+    let mut response_config: AgentBootConfigResponse =
         parse_success_json(response, "fetch managed boot config").await?;
-    validate_component_compatibility(config.compatibility.as_ref())?;
-    normalize_legacy_boot_config(&mut config);
-    Ok(config)
+    validate_component_compatibility(response_config.compatibility.as_ref(), protocol_version)?;
+    normalize_legacy_boot_config(&mut response_config);
+    Ok(response_config)
 }
 
 async fn report_boot_state(
@@ -841,7 +966,7 @@ async fn report_boot_state(
         reliability_state,
     );
     let body = BootAgentReportRequest {
-        protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
+        protocol_version: forge_protocol_version(&state.config),
         settings: BootAgentSettingsReport {
             public_base_url: runtime.public_base_url,
             listen_addr: state.config.server.listen_addr.clone(),
@@ -910,6 +1035,8 @@ async fn report_boot_state(
         .send()
         .await
         .context("report managed boot state request failed")?;
+    let expected_endpoint = api_url(state, &path)?;
+    require_exact_managed_response_url(&response, &expected_endpoint, "report managed boot state")?;
     parse_success_json::<Value>(response, "report managed boot state").await?;
     if let Some(max_event_id) = max_event_id {
         managed.last_reported_event_id = Some(max_event_id);
@@ -917,8 +1044,14 @@ async fn report_boot_state(
     Ok(())
 }
 
-async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Result<()> {
+async fn sync_forge_foundation(state: &AppState, managed: &mut ManagedState) -> Result<()> {
+    let local_protocol_version = forge_protocol_version(&state.config);
+    if local_protocol_version < CYBEX_COMPONENT_PROTOCOL_VERSION {
+        managed.forge_reporting_version = None;
+    }
     let desired = fetch_forge_config(state, managed).await?;
+    managed.forge_reporting_version =
+        accepted_forge_reporting_version(local_protocol_version, desired.reporting.as_ref())?;
     if desired.build_jobs.len() > MAX_MANAGED_BUILD_JOBS {
         bail!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs");
     }
@@ -944,27 +1077,135 @@ async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Resu
         db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await?;
     }
     db::cancel_managed_build_jobs(&state.db, &desired.deleted_build_job_ids).await?;
-    let deletion_keys = desired
-        .deleted_cache_artifacts
-        .into_iter()
-        .map(|artifact| (artifact.artifact_type, artifact.hash))
-        .collect::<Vec<_>>();
-    crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await?;
     let protected_keys = desired
         .protected_cache_artifacts
         .into_iter()
         .map(|artifact| (artifact.artifact_type, artifact.hash))
         .collect::<Vec<_>>();
-    db::replace_managed_cache_protections(
-        &state.db,
-        &protected_keys,
-        desired.protected_cache_artifacts_complete,
-    )
-    .await?;
-    crate::cache::enforce_retention(&state.db, &state.config).await?;
+    // Protection replacement, inventory-fenced deletion, and retention are a
+    // single cache mutation decision. Acquiring before the SQLite writes makes
+    // the complete desired-replica set authoritative for every following file
+    // deletion and prevents a concurrent publisher from appearing between the
+    // row snapshot and sweep.
+    let Some(cache_lease) = crate::cache::try_acquire_mutation_lease(&state.config).await? else {
+        // A long-running cache publication already owns the mutation domain.
+        // Keep the last complete protection set (fail closed), defer desired
+        // deletions/retention, and preserve the signed liveness heartbeat so
+        // Manage does not reap queued work behind the active export.
+        crate::updater::store_update_request(&state.config, desired.update).await?;
+        return report_forge_state(state, managed).await;
+    };
+    if managed.forge_reporting_version == Some(FORGE_REPORTING_VERSION) {
+        if let Some(page) = desired.protected_cache_artifact_page.as_ref() {
+            db::apply_managed_cache_protection_page(
+                &state.db,
+                &page.snapshot_id,
+                page.cursor,
+                page.total_items,
+                &protected_keys,
+                page.complete,
+            )
+            .await?;
+        } else {
+            db::replace_managed_cache_protections(
+                &state.db,
+                &protected_keys,
+                desired.protected_cache_artifacts_complete,
+            )
+            .await?;
+        }
+    } else {
+        db::replace_managed_cache_protections(
+            &state.db,
+            &protected_keys,
+            desired.protected_cache_artifacts_complete,
+        )
+        .await?;
+    }
+    let deletion_commands = desired.deleted_cache_artifacts;
+    if let Some(first) = deletion_commands.first() {
+        if first.expected_cache_inventory_instance_id.trim().is_empty()
+            || first.expected_cache_inventory_generation < 0
+            || deletion_commands.iter().any(|artifact| {
+                artifact.expected_cache_inventory_instance_id
+                    != first.expected_cache_inventory_instance_id
+                    || artifact.expected_cache_inventory_generation
+                        != first.expected_cache_inventory_generation
+            })
+        {
+            bail!("managed cache deletion commands have an invalid or mixed inventory fence");
+        }
+        let expected = db::CacheInventoryFence {
+            instance_id: first.expected_cache_inventory_instance_id.clone(),
+            generation: first.expected_cache_inventory_generation,
+        };
+        let deletion_keys = deletion_commands
+            .iter()
+            .map(|artifact| (artifact.artifact_type.clone(), artifact.hash.clone()))
+            .collect::<Vec<_>>();
+        let outcome = crate::cache::remove_artifacts_by_key_under_lease(
+            &state.db,
+            &state.config,
+            &expected,
+            &deletion_keys,
+            &cache_lease,
+        )
+        .await?;
+        if !outcome.inventory_matched {
+            warn!(
+                expected_instance_id = %expected.instance_id,
+                expected_generation = expected.generation,
+                current_instance_id = %outcome.current_inventory.instance_id,
+                current_generation = outcome.current_inventory.generation,
+                "ignored stale managed cache deletion command"
+            );
+        }
+        if !outcome.protected.is_empty() {
+            warn!(
+                protected_artifact_count = outcome.protected.len(),
+                "refused to delete managed cache artifacts protected by a desired replica"
+            );
+        }
+        if !outcome.deleted.is_empty() {
+            info!(
+                deleted_artifact_count = outcome.deleted.len(),
+                "applied inventory-bound managed cache deletions"
+            );
+        }
+    }
+    crate::cache::enforce_retention_under_lease(&state.db, &state.config, &cache_lease).await?;
+    drop(cache_lease);
     crate::updater::store_update_request(&state.config, desired.update).await?;
 
     report_forge_state(state, managed).await
+}
+
+fn accepted_forge_reporting_version(
+    local_protocol_version: u32,
+    reporting: Option<&ManagedForgeReportingContract>,
+) -> Result<Option<u32>> {
+    if local_protocol_version < CYBEX_COMPONENT_PROTOCOL_VERSION {
+        return Ok(None);
+    }
+    let Some(reporting) = reporting else {
+        return Ok(None);
+    };
+    validate_forge_reporting_contract(reporting)?;
+    Ok(Some(FORGE_REPORTING_VERSION))
+}
+
+fn validate_forge_reporting_contract(contract: &ManagedForgeReportingContract) -> Result<()> {
+    if contract.schema != FORGE_REPORTING_SCHEMA
+        || contract.version != FORGE_REPORTING_VERSION
+        || contract.max_report_body_bytes != MAX_REPORT_BODY_BYTES
+        || contract.cache_inventory_page_size == 0
+        || contract.cache_inventory_page_size > FORGE_REPORT_CACHE_PAGE_SIZE
+        || contract.protected_artifact_page_size == 0
+        || contract.protected_artifact_page_size > FORGE_REPORT_CACHE_PAGE_SIZE
+    {
+        bail!("Manage offered an unsupported Forge reporting contract");
+    }
+    Ok(())
 }
 
 async fn fetch_forge_config(
@@ -972,50 +1213,335 @@ async fn fetch_forge_config(
     managed: &ManagedState,
 ) -> Result<AgentForgeConfigResponse> {
     let device_id = managed_device_id(managed)?;
-    let path = format!("/v1/agent/devices/{device_id}/forge/config");
+    let mut path = format!("/v1/agent/devices/{device_id}/forge/config");
+    if managed.forge_reporting_version == Some(FORGE_REPORTING_VERSION) {
+        let page = db::managed_cache_protection_page_request(&state.db).await?;
+        path.push_str(&format!(
+            "?report_contract_version={FORGE_REPORTING_VERSION}&protection_cursor={}",
+            page.next_cursor
+        ));
+        if !page.snapshot_id.is_empty() {
+            path.push_str("&protection_snapshot_id=");
+            path.push_str(&page.snapshot_id);
+        }
+    }
     let response = signed_request(state, managed, Method::GET, &path, Vec::new())
         .await?
         .send()
         .await
         .context("fetch managed forge config request failed")?;
+    let expected_endpoint = api_url(state, &path)?;
+    require_exact_managed_response_url(
+        &response,
+        &expected_endpoint,
+        "fetch managed forge config",
+    )?;
     let config: AgentForgeConfigResponse =
         parse_success_json(response, "fetch managed forge config").await?;
-    validate_component_compatibility(config.compatibility.as_ref())?;
+    validate_component_compatibility(
+        config.compatibility.as_ref(),
+        forge_protocol_version(&state.config),
+    )?;
     Ok(config)
 }
 
-async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<()> {
-    let build_jobs = db::list_build_jobs(&state.db).await?;
-    if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
+fn system_release_closure_upload_material(
+    config: &AppConfig,
+    device_id: &str,
+    artifact: &CacheArtifact,
+) -> Result<Option<SystemReleaseClosureUploadMaterial>> {
+    if artifact.artifact_type != "system_generation" {
+        return Ok(None);
+    }
+    let managed_artifact_id = artifact
+        .managed_artifact_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("System Release cache artifact has no managed artifact UUID"))?;
+    let managed_artifact_id = Uuid::parse_str(managed_artifact_id)
+        .context("System Release managed artifact ID is not a UUID")?
+        .hyphenated()
+        .to_string();
+    let managed_job_id = artifact
+        .source_build_job_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("System Release cache artifact has no source job UUID"))?;
+    let managed_job_id = Uuid::parse_str(managed_job_id)
+        .context("System Release source job ID is not a UUID")?
+        .hyphenated()
+        .to_string();
+    let result: SystemReleaseClosureResultMetadata = serde_json::from_value(
+        artifact
+            .cache_metadata
+            .get("system_release")
+            .cloned()
+            .ok_or_else(|| anyhow!("System Release cache artifact omitted result metadata"))?,
+    )
+    .context("parse System Release closure upload metadata")?;
+    let build_spec_sha256 = valid_sha256(&result.build_spec_sha256)
+        .filter(|normalized| normalized == &result.build_spec_sha256)
+        .ok_or_else(|| anyhow!("System Release build_spec_sha256 is not canonical"))?;
+    let closure_sha256 = valid_sha256(&result.closure.sha256)
+        .filter(|normalized| normalized == &result.closure.sha256)
+        .ok_or_else(|| anyhow!("System Release closure SHA-256 is not canonical"))?;
+    if result.schema != "cybex.forge.system-release-result.v1"
+        || result.organization_id != config.manage.organization_id
+        || result.forge_node_id != device_id
+        || result.forge_build_job_id != managed_job_id
+        || result.forge_artifact_id != managed_artifact_id
+    {
+        bail!("System Release closure upload metadata identity is inconsistent");
+    }
+    let canonical_bytes = crate::system_release::load_published_system_release_closure(
+        config,
+        &result.organization_id,
+        &result.release_id,
+        &result.variant_id,
+        &result.forge_artifact_id,
+        &result.closure.relative_path,
+        &result.closure.path,
+        result.closure.size_bytes,
+        &closure_sha256,
+    )?;
+    Ok(Some(SystemReleaseClosureUploadMaterial {
+        local_artifact_id: artifact.id,
+        managed_artifact_id,
+        managed_job_id,
+        build_spec_sha256,
+        closure_sha256,
+        closure_size_bytes: canonical_bytes.len(),
+        canonical_bytes,
+    }))
+}
+
+async fn system_release_closure_upload_is_acknowledged(
+    pool: &SqlitePool,
+    material: &SystemReleaseClosureUploadMaterial,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM managed_system_release_closure_uploads
+               WHERE local_artifact_id = ?1
+                 AND managed_artifact_id = ?2
+                 AND managed_job_id = ?3
+                 AND build_spec_sha256 = ?4
+                 AND closure_sha256 = ?5
+                 AND closure_size_bytes = ?6
+           )"#,
+    )
+    .bind(material.local_artifact_id)
+    .bind(&material.managed_artifact_id)
+    .bind(&material.managed_job_id)
+    .bind(&material.build_spec_sha256)
+    .bind(&material.closure_sha256)
+    .bind(i64::try_from(material.closure_size_bytes)?)
+    .fetch_one(pool)
+    .await
+    .context("read managed System Release closure upload acknowledgement")
+}
+
+async fn record_system_release_closure_upload_ack(
+    pool: &SqlitePool,
+    material: &SystemReleaseClosureUploadMaterial,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO managed_system_release_closure_uploads (
+               local_artifact_id, managed_artifact_id, managed_job_id,
+               build_spec_sha256, closure_sha256, closure_size_bytes,
+               uploaded_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT (local_artifact_id, managed_job_id, closure_sha256)
+           DO NOTHING"#,
+    )
+    .bind(material.local_artifact_id)
+    .bind(&material.managed_artifact_id)
+    .bind(&material.managed_job_id)
+    .bind(&material.build_spec_sha256)
+    .bind(&material.closure_sha256)
+    .bind(i64::try_from(material.closure_size_bytes)?)
+    .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+    .execute(pool)
+    .await
+    .context("record managed System Release closure upload acknowledgement")?;
+    if !system_release_closure_upload_is_acknowledged(pool, material).await? {
+        bail!("retained System Release closure upload acknowledgement conflicts");
+    }
+    Ok(())
+}
+
+async fn clear_system_release_closure_upload_acks(
+    pool: &SqlitePool,
+    artifacts: &[ForgeCacheArtifactReport],
+) -> Result<()> {
+    for artifact in artifacts {
+        if artifact.artifact_type != "system_generation" {
+            continue;
+        }
+        sqlx::query(
+            "DELETE FROM managed_system_release_closure_uploads WHERE local_artifact_id = ?1",
+        )
+        .bind(artifact.local_id)
+        .execute(pool)
+        .await
+        .context("clear stale managed System Release closure upload acknowledgement")?;
+    }
+    Ok(())
+}
+
+async fn upload_system_release_closure(
+    state: &AppState,
+    managed: &ManagedState,
+    device_id: &str,
+    material: &SystemReleaseClosureUploadMaterial,
+) -> Result<()> {
+    let path = format!(
+        "/v1/agent/devices/{device_id}/system-release/forge-closures/{}?forge_build_job_id={}&build_spec_sha256={}&closure_sha256={}&closure_size_bytes={}",
+        material.managed_artifact_id,
+        material.managed_job_id,
+        material.build_spec_sha256,
+        material.closure_sha256,
+        material.closure_size_bytes,
+    );
+    let response = signed_request(
+        state,
+        managed,
+        Method::POST,
+        &path,
+        material.canonical_bytes.clone(),
+    )
+    .await?
+    .header(CONTENT_TYPE, "application/json")
+    .send()
+    .await
+    .context("upload managed System Release closure request failed")?;
+    let expected_endpoint = api_url(state, &path)?;
+    require_exact_managed_response_url(
+        &response,
+        &expected_endpoint,
+        "upload managed System Release closure",
+    )?;
+    let ack: SystemReleaseClosureUploadAck =
+        parse_success_json(response, "upload managed System Release closure").await?;
+    if ack.schema != "cybex.forge-system-release-closure-upload-ack.v1"
+        || ack.forge_artifact_id != material.managed_artifact_id
+        || ack.forge_build_job_id != material.managed_job_id
+        || ack.closure_sha256 != material.closure_sha256
+        || ack.closure_size_bytes != material.closure_size_bytes
+        || !matches!(ack.status.as_str(), "uploaded" | "already_uploaded")
+    {
+        bail!("Manage returned a mismatched System Release closure upload acknowledgement");
+    }
+    record_system_release_closure_upload_ack(&state.db, material).await
+}
+
+async fn report_forge_state(state: &AppState, managed: &mut ManagedState) -> Result<()> {
+    let reporting_v1 = managed.forge_reporting_version == Some(FORGE_REPORTING_VERSION);
+    let system_release = match crate::system_release::capability_context(&state.config) {
+        Ok(context) => Some(context),
+        Err(err) if reporting_v1 => {
+            return Err(err).context(
+                "negotiated Forge reporting requires the protocol-5 System Release capability",
+            );
+        }
+        Err(_) => None,
+    };
+    let build_jobs = if reporting_v1 {
+        db::list_build_jobs_for_manage_report(&state.db).await?
+    } else {
+        db::list_build_jobs(&state.db).await?
+    };
+    if let Err(err) = crate::cache::try_scrub_cache_artifacts(&state.db, &state.config, 8).await {
         warn!(error = %err, "Forge cache integrity scrub failed");
     }
-    let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
-    let cache_inventory = db::cache_inventory_state(&state.db).await?;
-    let cache_artifacts_complete = cache_artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
+    let cache_inventory = db::cache_inventory_snapshot(&state.db).await?;
+    let cache_artifacts = cache_inventory.artifacts;
+    let device_id = managed_device_id(managed)?.to_owned();
     let cache = crate::cache::status_report(&state.config, &state.db).await;
     let update = crate::updater::status_report(&state.config).await?;
-    let body = ForgeAgentReportRequest {
-        protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
-        capabilities: forge_capabilities(&state.config),
-        cache,
-        update,
-        build_jobs: build_jobs
+    let (reported_cache_artifacts, cache_artifacts_complete, cache_inventory_page) = if reporting_v1
+    {
+        if managed.cache_report_instance_id.as_deref()
+            != Some(cache_inventory.state.instance_id.as_str())
+            || managed.cache_report_generation != Some(cache_inventory.state.generation)
+            || managed.cache_report_cursor > cache_artifacts.len()
+        {
+            managed.cache_report_instance_id = Some(cache_inventory.state.instance_id.clone());
+            managed.cache_report_generation = Some(cache_inventory.state.generation);
+            managed.cache_report_cursor = 0;
+        }
+        let cursor = managed.cache_report_cursor;
+        let mut end = cursor
+            .saturating_add(FORGE_REPORT_CACHE_PAGE_SIZE)
+            .min(cache_artifacts.len());
+        let mut uploaded_this_report = 0usize;
+        for (offset, artifact) in cache_artifacts[cursor..end].iter().enumerate() {
+            let Some(material) =
+                system_release_closure_upload_material(&state.config, &device_id, artifact)?
+            else {
+                continue;
+            };
+            if system_release_closure_upload_is_acknowledged(&state.db, &material).await? {
+                continue;
+            }
+            if uploaded_this_report >= SYSTEM_RELEASE_CLOSURE_UPLOADS_PER_REPORT {
+                end = cursor + offset;
+                break;
+            }
+            upload_system_release_closure(state, managed, &device_id, &material).await?;
+            uploaded_this_report += 1;
+        }
+        (
+            cache_artifacts[cursor..end]
+                .iter()
+                .cloned()
+                .map(ForgeCacheArtifactReport::from)
+                .collect(),
+            false,
+            Some(ForgeCacheInventoryPage {
+                cursor,
+                total_items: cache_artifacts.len(),
+                complete: end == cache_artifacts.len(),
+            }),
+        )
+    } else {
+        let complete = cache_artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
+        (
+            cache_artifacts
+                .into_iter()
+                .take(MAX_REPORT_CACHE_ARTIFACTS)
+                .map(ForgeCacheArtifactReport::from)
+                .collect(),
+            complete,
+            None,
+        )
+    };
+    let reported_build_jobs = if reporting_v1 {
+        build_jobs
+            .into_iter()
+            .map(compact_forge_build_job_report)
+            .collect()
+    } else {
+        build_jobs
             .into_iter()
             .take(MAX_REPORT_BUILD_JOBS)
             .map(ForgeBuildJobReport::from)
-            .collect(),
-        cache_artifacts: cache_artifacts
-            .into_iter()
-            .take(MAX_REPORT_CACHE_ARTIFACTS)
-            .map(ForgeCacheArtifactReport::from)
-            .collect(),
-        cache_inventory_instance_id: cache_inventory.instance_id,
-        cache_inventory_generation: cache_inventory.generation,
+            .collect()
+    };
+    let body = ForgeAgentReportRequest {
+        protocol_version: forge_protocol_version_for(system_release.as_ref()),
+        report_contract_version: reporting_v1.then_some(FORGE_REPORTING_VERSION),
+        capabilities: forge_capabilities_for(&state.config, system_release.as_ref()),
+        system_release_capability: system_release_capability_report_for(system_release.as_ref()),
+        cache,
+        update,
+        build_jobs: reported_build_jobs,
+        cache_artifacts: reported_cache_artifacts,
+        cache_inventory_instance_id: cache_inventory.state.instance_id,
+        cache_inventory_generation: cache_inventory.state.generation,
         cache_artifacts_complete,
+        cache_inventory_page,
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
     };
-    let body_bytes = serialize_forge_report_body(&body)?;
-    let device_id = managed_device_id(managed)?;
+    let (body, body_bytes) = fit_forge_report_body(body, MAX_REPORT_BODY_BYTES)?;
     let path = format!("/v1/agent/devices/{device_id}/forge/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)
         .await?
@@ -1023,16 +1549,187 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
         .send()
         .await
         .context("report managed forge state request failed")?;
-    parse_success_json::<Value>(response, "report managed forge state").await?;
+    let expected_endpoint = api_url(state, &path)?;
+    require_exact_managed_response_url(
+        &response,
+        &expected_endpoint,
+        "report managed forge state",
+    )?;
+    if response.status() == StatusCode::PRECONDITION_REQUIRED {
+        clear_system_release_closure_upload_acks(&state.db, &body.cache_artifacts).await?;
+        bail!(
+            "Manage lost a retained System Release closure upload; local acknowledgements were cleared for exact retry"
+        );
+    }
+    if reporting_v1 {
+        let ack: ForgeAgentReportAck =
+            parse_success_json(response, "report managed forge state").await?;
+        apply_forge_report_ack(&state.db, managed, &body, ack).await?;
+    } else {
+        parse_success_json::<Value>(response, "report managed forge state").await?;
+    }
     Ok(())
 }
 
-fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
-    let body = serde_json::to_vec(body).context("serialize managed forge report")?;
-    if body.len() > MAX_REPORT_BODY_BYTES {
-        bail!("managed forge report exceeded {MAX_REPORT_BODY_BYTES} bytes");
+fn compact_forge_build_job_report(job: BuildJob) -> ForgeBuildJobReport {
+    let mut report = ForgeBuildJobReport::from(job);
+    // Manage already owns every managed job's immutable BuildSpec and ignores
+    // unmanaged local jobs. Omitting it from negotiated reports leaves room
+    // for all active status and new terminal evidence without weakening
+    // Manage's stored identity fence.
+    report.build_spec = None;
+    report.logs = truncate_utf8_bytes(&report.logs, FORGE_REPORT_LOG_BYTES);
+    report.error = truncate_utf8_bytes(&report.error, 2_048);
+    report.progress_stage = report
+        .progress_stage
+        .map(|value| truncate_utf8_bytes(&value, 128));
+    report.progress_message = report
+        .progress_message
+        .map(|value| truncate_utf8_bytes(&value, 1_024));
+    if !forge_build_report_is_terminal(&report) {
+        report.cache_metadata = None;
     }
-    Ok(body)
+    report
+}
+
+fn forge_build_report_is_terminal(report: &ForgeBuildJobReport) -> bool {
+    matches!(report.status.as_str(), "succeeded" | "failed" | "cancelled")
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+fn fit_forge_report_body(
+    mut body: ForgeAgentReportRequest,
+    max_bytes: usize,
+) -> Result<(ForgeAgentReportRequest, Vec<u8>)> {
+    let original_jobs = body.build_jobs.len();
+    let original_artifacts = body.cache_artifacts.len();
+    let mut body_bytes = serialize_forge_report_body(&body)?;
+    if body_bytes.len() <= max_bytes {
+        return Ok((body, body_bytes));
+    }
+
+    for job in &mut body.build_jobs {
+        job.logs.clear();
+    }
+    body_bytes = serialize_forge_report_body(&body)?;
+    while body_bytes.len() > max_bytes {
+        let Some(index) = body
+            .build_jobs
+            .iter()
+            .rposition(forge_build_report_is_terminal)
+        else {
+            break;
+        };
+        body.build_jobs.remove(index);
+        body_bytes = serialize_forge_report_body(&body)?;
+    }
+
+    if body_bytes.len() > max_bytes && !body.cache_artifacts.is_empty() {
+        let fitting = max_fitting_prefix_len(body.cache_artifacts.len(), |count| {
+            let mut candidate = body.clone();
+            candidate.cache_artifacts.truncate(count);
+            update_forge_inventory_page_completion(&mut candidate);
+            serialize_forge_report_body(&candidate).is_ok_and(|bytes| bytes.len() <= max_bytes)
+        });
+        body.cache_artifacts.truncate(fitting);
+        update_forge_inventory_page_completion(&mut body);
+        body_bytes = serialize_forge_report_body(&body)?;
+    }
+    if original_artifacts > 0
+        && body.cache_artifacts.is_empty()
+        && body
+            .cache_inventory_page
+            .as_ref()
+            .is_some_and(|page| page.cursor < page.total_items)
+    {
+        bail!("managed Forge report cannot fit one bounded cache artifact beside active job state");
+    }
+    if body_bytes.len() > max_bytes {
+        bail!("managed forge report base body exceeded {max_bytes} bytes");
+    }
+    warn!(
+        jobs_sent = body.build_jobs.len(),
+        jobs_total = original_jobs,
+        cache_artifacts_sent = body.cache_artifacts.len(),
+        cache_artifacts_total = original_artifacts,
+        max_bytes,
+        "managed forge report trimmed to fit request budget"
+    );
+    Ok((body, body_bytes))
+}
+
+fn update_forge_inventory_page_completion(body: &mut ForgeAgentReportRequest) {
+    if let Some(page) = body.cache_inventory_page.as_mut() {
+        page.complete = page
+            .cursor
+            .checked_add(body.cache_artifacts.len())
+            .is_some_and(|end| end == page.total_items);
+    }
+}
+
+fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
+    serde_json::to_vec(body).context("serialize managed forge report")
+}
+
+async fn apply_forge_report_ack(
+    pool: &SqlitePool,
+    managed: &mut ManagedState,
+    sent: &ForgeAgentReportRequest,
+    ack: ForgeAgentReportAck,
+) -> Result<()> {
+    if ack.report_contract_version != Some(FORGE_REPORTING_VERSION) {
+        bail!("Manage omitted the negotiated Forge reporting acknowledgement");
+    }
+    let sent_terminal_ids = sent
+        .build_jobs
+        .iter()
+        .filter(|job| forge_build_report_is_terminal(job))
+        .filter_map(|job| job.managed_job_id.as_deref())
+        .collect::<HashSet<_>>();
+    if ack
+        .acked_terminal_build_job_ids
+        .iter()
+        .any(|id| !sent_terminal_ids.contains(id.as_str()))
+    {
+        bail!("Manage acknowledged a terminal Forge job absent from this report");
+    }
+    db::acknowledge_terminal_build_jobs(pool, &ack.acked_terminal_build_job_ids).await?;
+    db::prune_acknowledged_terminal_build_jobs(pool, RETAIN_ACKNOWLEDGED_TERMINAL_JOBS).await?;
+
+    let sent_page = sent
+        .cache_inventory_page
+        .as_ref()
+        .ok_or_else(|| anyhow!("negotiated Forge report omitted its inventory page"))?;
+    let inventory_ack = ack
+        .cache_inventory_ack
+        .ok_or_else(|| anyhow!("Manage omitted the Forge inventory page acknowledgement"))?;
+    let expected_next = sent_page
+        .cursor
+        .checked_add(sent.cache_artifacts.len())
+        .ok_or_else(|| anyhow!("Forge inventory acknowledgement cursor overflowed"))?;
+    if inventory_ack.inventory_instance_id != sent.cache_inventory_instance_id
+        || inventory_ack.inventory_generation != sent.cache_inventory_generation
+        || inventory_ack.cursor != sent_page.cursor
+        || inventory_ack.next_cursor != expected_next
+        || inventory_ack.total_items != sent_page.total_items
+        || inventory_ack.complete != sent_page.complete
+    {
+        bail!("Manage returned a mismatched Forge inventory page acknowledgement");
+    }
+    managed.cache_report_instance_id = Some(inventory_ack.inventory_instance_id);
+    managed.cache_report_generation = Some(inventory_ack.inventory_generation);
+    managed.cache_report_cursor = inventory_ack.next_cursor;
+    Ok(())
 }
 
 fn fit_boot_report_body(
@@ -1227,7 +1924,7 @@ async fn process_next_managed_iso_sync(state: &AppState) -> Result<bool> {
             let retryable = managed_iso_error_is_retryable(&safe);
             let failure_kind = managed_iso_failure_kind(&safe);
             let report = profile_sync_failed_report(&target, started_at, err);
-            persist_profile_sync_report(
+            let persisted = persist_profile_sync_report(
                 &state.db,
                 target.local_id,
                 &report,
@@ -1236,16 +1933,24 @@ async fn process_next_managed_iso_sync(state: &AppState) -> Result<bool> {
                 retryable,
             )
             .await?;
-            warn!(
-                profile_id = %target.profile_id,
-                sync_generation = target.sync_generation,
-                attempts = target.sync_attempts,
-                terminal = !retryable,
-                failure_kind,
-                retry_in_seconds = retryable.then_some(retry_delay),
-                error = %safe,
-                "managed ISO profile sync failed"
-            );
+            if persisted {
+                warn!(
+                    profile_id = %target.profile_id,
+                    sync_generation = target.sync_generation,
+                    attempts = target.sync_attempts,
+                    terminal = !retryable,
+                    failure_kind,
+                    retry_in_seconds = retryable.then_some(retry_delay),
+                    error = %safe,
+                    "managed ISO profile sync failed"
+                );
+            } else {
+                info!(
+                    profile_id = %target.profile_id,
+                    sync_generation = target.sync_generation,
+                    "ignored managed ISO profile sync result after supersession"
+                );
+            }
         }
     }
     Ok(true)
@@ -2869,6 +3574,8 @@ async fn download_managed_iso(
         .send()
         .await
         .context("download managed ISO request failed")?;
+    let expected_endpoint = api_url(state, download_path)?;
+    require_exact_managed_response_url(&response, &expected_endpoint, "download managed ISO")?;
     let status = response.status();
     if !status.is_success() {
         bail!("download managed ISO failed with HTTP {status}");
@@ -3749,6 +4456,51 @@ async fn signed_download_request(
         .header("x-cybex-signature", signature))
 }
 
+pub(crate) async fn download_system_release_material(
+    config: &AppConfig,
+    sha256: &str,
+) -> Result<Vec<u8>> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("System Release material digest is invalid");
+    }
+    let managed = load_managed_state_from_config(config)?;
+    let device_id = managed_device_id(&managed)?;
+    let path = format!("/v1/agent/devices/{device_id}/system-release/materials/{sha256}");
+    let expected_endpoint = api_url_for_config(config, &path)?;
+    let response = signed_request_for_config(config, &managed, Method::GET, &path, Vec::new())
+        .await?
+        .send()
+        .await
+        .context("download System Release material")?;
+    if response.url().as_str() != expected_endpoint {
+        bail!("System Release material download redirected outside its exact endpoint");
+    }
+    if !response.status().is_success() {
+        bail!(
+            "System Release material download failed with HTTP {}",
+            response.status()
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size == 0 || size > 4 * 1024 * 1024)
+    {
+        bail!("System Release material response exceeds its byte bound");
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .context("read System Release material")?;
+    if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 || sha256_hex(&bytes) != sha256 {
+        bail!("System Release material does not match its content-addressed identity");
+    }
+    Ok(bytes.to_vec())
+}
+
 fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
     let public_key = managed
         .public_key_b64
@@ -3760,6 +4512,9 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
         .ok_or_else(|| anyhow!("missing public key fingerprint"))?;
     let hostname = hostname();
     let machine_id_hash = machine_id_hash(&hostname);
+    let system_release = crate::system_release::capability_context(&state.config).ok();
+    let capabilities = forge_capabilities_for(&state.config, system_release.as_ref());
+    let system_release_report = system_release_capability_report_for(system_release.as_ref());
     Ok(json!({
         "organization_id": organization_id(&state.config)?,
         "forge_install_code": forge_install_code(&state.config)?,
@@ -3771,7 +4526,7 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
         "kernel_version": kernel_version(),
         "virtualization": virtualization(),
         "device_kind": "cybex-forge",
-        "capabilities": forge_capabilities(&state.config),
+        "capabilities": capabilities,
         "unsupported_capabilities": [],
         "public_key": public_key,
         "public_key_fingerprint": public_key_fingerprint,
@@ -3789,12 +4544,22 @@ fn enrollment_body(state: &AppState, managed: &ManagedState) -> Result<Value> {
             "http_root": state.config.paths.boot_assets_dir.display().to_string(),
             "bootloader_filename": state.config.boot.bootloader_filename.clone(),
             "menu_timeout_ms": state.config.boot.menu_timeout_ms,
-            "capabilities": forge_capabilities(&state.config),
+            "capabilities": capabilities,
+            "system_release_capability": system_release_report,
         }
     }))
 }
 
+#[cfg(test)]
 fn forge_capabilities(config: &AppConfig) -> Vec<&'static str> {
+    let system_release = crate::system_release::capability_context(config).ok();
+    forge_capabilities_for(config, system_release.as_ref())
+}
+
+fn forge_capabilities_for(
+    config: &AppConfig,
+    system_release: Option<&crate::system_release::CapabilityContext>,
+) -> Vec<&'static str> {
     let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
@@ -3803,7 +4568,41 @@ fn forge_capabilities(config: &AppConfig) -> Vec<&'static str> {
     if crate::updater::capabilities_enabled(config) {
         capabilities.push(CAPABILITY_UPDATER_V1);
     }
+    if system_release.is_some() {
+        capabilities.insert(
+            capabilities
+                .binary_search(&CAPABILITY_SYSTEM_RELEASE_BUILDER_V3)
+                .unwrap_or_else(|index| index),
+            CAPABILITY_SYSTEM_RELEASE_BUILDER_V3,
+        );
+    }
     capabilities
+}
+
+fn forge_protocol_version(config: &AppConfig) -> u32 {
+    let system_release = crate::system_release::capability_context(config).ok();
+    forge_protocol_version_for(system_release.as_ref())
+}
+
+fn forge_protocol_version_for(
+    system_release: Option<&crate::system_release::CapabilityContext>,
+) -> u32 {
+    if system_release.is_some() {
+        CYBEX_COMPONENT_PROTOCOL_VERSION
+    } else {
+        CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION
+    }
+}
+
+fn system_release_capability_report_for(
+    context: Option<&crate::system_release::CapabilityContext>,
+) -> Option<SystemReleaseCapabilityReport> {
+    context.map(|context| SystemReleaseCapabilityReport {
+        schema: "cybex.forge-system-release-capability.v2",
+        attestation_public_key: context.attestation_public_key.clone(),
+        attestation_key_id: context.attestation_key_id.clone(),
+        managed_agent: context.managed_agent.clone(),
+    })
 }
 
 fn optional_report_uuid(value: Option<String>) -> Option<String> {
@@ -3951,10 +4750,43 @@ async fn parse_success_json<T: DeserializeOwned>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
-        bail!("{context} failed with HTTP {status}");
+        let detail = read_bounded_response_body(&mut response, context)
+            .await
+            .ok()
+            .and_then(|body| managed_api_error_detail(&body))
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        bail!("{context} failed with HTTP {status}{detail}");
     }
     let body = read_bounded_response_body(&mut response, context).await?;
     serde_json::from_slice::<T>(&body).with_context(|| format!("parse {context} response failed"))
+}
+
+fn managed_api_error_detail(body: &[u8]) -> Option<String> {
+    let body = serde_json::from_slice::<Value>(body).ok()?;
+    let error = body.get("error")?.as_str()?;
+    if error.is_empty()
+        || error != error.trim()
+        || error.chars().count() > 240
+        || error.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let lowercase = error.to_ascii_lowercase();
+    if [
+        "token",
+        "secret",
+        "password",
+        "private_key",
+        "authorization",
+        "cookie",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return None;
+    }
+    Some(error.to_string())
 }
 
 async fn read_bounded_response_body(
@@ -4010,10 +4842,14 @@ fn http_client(state: &AppState) -> Result<Client> {
 }
 
 fn http_client_for_config(config: &AppConfig) -> Result<Client> {
+    if config.manage.enabled && config.system_release.enabled {
+        require_authenticated_system_release_manage_url(&config.manage.api_url)?;
+    }
     let timeout = Duration::from_secs(bounded_http_timeout_seconds(
         config.manage.http_timeout_seconds,
     ));
     Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(10)))
         .build()
@@ -4021,6 +4857,9 @@ fn http_client_for_config(config: &AppConfig) -> Result<Client> {
 }
 
 fn http_download_client(state: &AppState) -> Result<Client> {
+    if state.config.manage.enabled && state.config.system_release.enabled {
+        require_authenticated_system_release_manage_url(&state.config.manage.api_url)?;
+    }
     let connect_timeout = Duration::from_secs(bounded_http_timeout_seconds(
         state.config.manage.http_timeout_seconds,
     ))
@@ -4029,10 +4868,24 @@ fn http_download_client(state: &AppState) -> Result<Client> {
     // read timeout still fails a stalled transfer, which would otherwise hang
     // the single sync loop indefinitely.
     Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .read_timeout(Duration::from_secs(60))
         .build()
         .context("failed to build managed ISO download HTTP client")
+}
+
+fn require_exact_managed_response_url(
+    response: &Response,
+    expected_endpoint: &str,
+    context: &str,
+) -> Result<()> {
+    let expected =
+        Url::parse(expected_endpoint).with_context(|| format!("build exact {context} endpoint"))?;
+    if response.url() != &expected {
+        bail!("{context} response came from an unexpected endpoint");
+    }
+    Ok(())
 }
 
 fn bounded_http_timeout_seconds(value: u64) -> u64 {
@@ -4300,6 +5153,7 @@ fn validate_boot_config(config: &AgentBootConfigResponse) -> Result<()> {
 
 fn validate_component_compatibility(
     contract: Option<&ComponentCompatibilityContract>,
+    forge_protocol: u32,
 ) -> Result<()> {
     let Some(contract) = contract else {
         // Absence is the protocol-v1 wire shape. This compatibility window is
@@ -4309,12 +5163,12 @@ fn validate_component_compatibility(
     if !(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION..=CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION)
         .contains(&contract.protocol_version)
         || !(contract.minimum_forge_protocol..=contract.maximum_forge_protocol)
-            .contains(&CYBEX_COMPONENT_PROTOCOL_VERSION)
+            .contains(&forge_protocol)
     {
         bail!(
             "incompatible Manage protocol {} (Forge protocol {}, supported Forge range {} through {}, Manage version {}, release {})",
             contract.protocol_version,
-            CYBEX_COMPONENT_PROTOCOL_VERSION,
+            forge_protocol,
             contract.minimum_forge_protocol,
             contract.maximum_forge_protocol,
             clean_string(&contract.manage_version),
@@ -4963,6 +5817,19 @@ fn render_managed_config(
          public_key_path = {cache_public_key_path}\n\
          max_bytes = {cache_max_bytes}\n\
          retain_recent_builds = {cache_retain_recent_builds}\n\n\
+         [system_release]\n\
+         enabled = {system_release_enabled}\n\
+         attestation_private_key_path = {attestation_private_key_path}\n\
+         attestation_public_key_path = {attestation_public_key_path}\n\
+         managed_agent_version = {managed_agent_version}\n\
+         managed_agent_package_store_path = {managed_agent_package_store_path}\n\
+         managed_agent_package_sha256 = {managed_agent_package_sha256}\n\
+         managed_agent_module_path = {managed_agent_module_path}\n\
+         managed_agent_module_sha256 = {managed_agent_module_sha256}\n\
+         transition_helper_path = {transition_helper_path}\n\
+         transition_helper_sha256 = {transition_helper_sha256}\n\
+         watchdog_path = {watchdog_path}\n\
+         watchdog_sha256 = {watchdog_sha256}\n\n\
          [update]\n\
          enabled = {update_enabled}\n\
          work_dir = {update_work_dir}\n\
@@ -5009,6 +5876,50 @@ fn render_managed_config(
         cache_public_key_path = toml_string(&config.cache.public_key_path.display().to_string())?,
         cache_max_bytes = config.cache.max_bytes,
         cache_retain_recent_builds = config.cache.retain_recent_builds,
+        system_release_enabled = config.system_release.enabled,
+        attestation_private_key_path = toml_string(
+            &config
+                .system_release
+                .attestation_private_key_path
+                .display()
+                .to_string(),
+        )?,
+        attestation_public_key_path = toml_string(
+            &config
+                .system_release
+                .attestation_public_key_path
+                .display()
+                .to_string(),
+        )?,
+        managed_agent_version = toml_string(&config.system_release.managed_agent_version)?,
+        managed_agent_package_store_path = toml_string(
+            &config
+                .system_release
+                .managed_agent_package_store_path
+                .display()
+                .to_string(),
+        )?,
+        managed_agent_package_sha256 =
+            toml_string(&config.system_release.managed_agent_package_sha256,)?,
+        managed_agent_module_path = toml_string(
+            &config
+                .system_release
+                .managed_agent_module_path
+                .display()
+                .to_string(),
+        )?,
+        managed_agent_module_sha256 =
+            toml_string(&config.system_release.managed_agent_module_sha256,)?,
+        transition_helper_path = toml_string(
+            &config
+                .system_release
+                .transition_helper_path
+                .display()
+                .to_string(),
+        )?,
+        transition_helper_sha256 = toml_string(&config.system_release.transition_helper_sha256,)?,
+        watchdog_path = toml_string(&config.system_release.watchdog_path.display().to_string(),)?,
+        watchdog_sha256 = toml_string(&config.system_release.watchdog_sha256)?,
         update_enabled = config.update.enabled,
         update_work_dir = toml_string(&config.update.work_dir.display().to_string())?,
         update_releases_dir = toml_string(&config.update.releases_dir.display().to_string())?,
@@ -5961,27 +6872,34 @@ mod tests {
     use super::{
         AgentBootConfigResponse, BootAgentAssetReport, BootAgentClientReport, BootAgentEventReport,
         BootAgentReportRequest, BootAgentSettingsReport, CYBEX_COMPONENT_PROTOCOL_VERSION,
-        CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract,
-        MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS,
-        MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS,
-        MAX_PROFILE_RAW_SCRIPT_BYTES, ManagedBootClient, ManagedBootProfile, ManagedBootSettings,
-        ManagedState, NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
-        NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
+        CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION, CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION,
+        ComponentCompatibilityContract, ForgeAgentReportRequest, ForgeBuildJobReport,
+        ForgeCacheInventoryPage, MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS,
+        MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES,
+        MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES, ManagedBootClient,
+        ManagedBootProfile, ManagedBootSettings, ManagedForgeReportingContract, ManagedState,
+        NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest,
+        NormalizedManagedSettings, SyncOutcome, accepted_forge_reporting_version,
         active_managed_sync_interval_seconds, append_bounded_response_chunk_with_limit,
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
-        clean_optional, current_profile_sync_reports, failed_sync_interval_seconds,
-        fit_boot_report_body, forge_capabilities, generated_iso_raw_script_can_be_preserved,
-        has_unreported_known_profile_events, managed_iso_error_is_retryable,
+        clean_optional, clear_system_release_closure_upload_acks, current_profile_sync_reports,
+        failed_sync_interval_seconds, fit_boot_report_body, fit_forge_report_body,
+        forge_capabilities, forge_capabilities_for, forge_protocol_version_for,
+        generated_iso_raw_script_can_be_preserved, has_unreported_known_profile_events,
+        http_client_for_config, managed_api_error_detail, managed_iso_error_is_retryable,
         managed_iso_retry_delay_seconds, managed_profile_map, managed_profile_needs_iso_sync,
         managed_profile_raw_script, managed_sync_interval_seconds, nixos_netboot_fstab,
         normalize_legacy_boot_config, normalize_managed_settings, optional_report_uuid,
         parse_nixos_netboot_ipxe_cmdline, parse_nixos_netboot_split_squashfs_capability,
         patch_nixos_netboot_squashfs_fstab, patch_nixos_netboot_squashfs_graphical_kiosk,
         patch_nixos_netboot_squashfs_injected_config, read_newc_entry_start,
-        read_valid_netboot_manifest, render_check_service, render_managed_config,
-        render_nixos_netboot_script, rewrite_newc_archive_with_netboot_files,
-        runtime_managed_files, serialize_boot_report_body, skip_padding, sync_clients,
-        sync_deleted_clients, sync_deleted_profiles, sync_profiles, validate_boot_config,
+        read_valid_netboot_manifest, record_system_release_closure_upload_ack,
+        render_check_service, render_managed_config, render_nixos_netboot_script,
+        require_exact_managed_response_url, rewrite_newc_archive_with_netboot_files,
+        runtime_managed_files, serialize_boot_report_body, sha256_hex, skip_padding, sync_clients,
+        sync_deleted_clients, sync_deleted_profiles, sync_profiles,
+        system_release_capability_report_for, system_release_closure_upload_is_acknowledged,
+        system_release_closure_upload_material, validate_boot_config,
         validate_component_compatibility, validate_profile, write_newc_file_from_bytes,
         write_newc_trailer, write_secure_json,
     };
@@ -5990,14 +6908,20 @@ mod tests {
         AppState, boot,
         config::{AppConfig, ManageConfig},
         db,
-        models::{CreateDeviceRequest, NewBootEvent},
+        models::{CacheArtifact, CreateDeviceRequest, NewBootEvent},
     };
     use rand::{RngCore, rngs::OsRng};
     use std::{
         collections::HashMap,
         fs,
-        io::{BufReader, Read},
+        io::{BufReader, Read, Write},
+        net::TcpListener,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use uuid::Uuid;
 
@@ -6513,6 +7437,57 @@ mod tests {
     }
 
     #[test]
+    fn managed_api_error_detail_is_bounded_and_secret_safe() {
+        assert_eq!(
+            managed_api_error_detail(
+                br#"{"error":"facts.system_release_capability has invalid fields"}"#
+            )
+            .as_deref(),
+            Some("facts.system_release_capability has invalid fields")
+        );
+        for body in [
+            br#"{"error":"enrollment token=secret-value is invalid"}"#.as_slice(),
+            br#"{"error":"private_key is invalid"}"#.as_slice(),
+            br#"{"error":"line one\nline two"}"#.as_slice(),
+        ] {
+            assert!(managed_api_error_detail(body).is_none());
+        }
+        let oversized = serde_json::to_vec(&serde_json::json!({
+            "error": "x".repeat(241),
+        }))
+        .unwrap();
+        assert!(managed_api_error_detail(&oversized).is_none());
+    }
+
+    #[test]
+    fn forge_reporting_v1_is_negotiated_only_with_component_protocol_five() {
+        let contract = ManagedForgeReportingContract {
+            schema: super::FORGE_REPORTING_SCHEMA.to_string(),
+            version: super::FORGE_REPORTING_VERSION,
+            max_report_body_bytes: super::MAX_REPORT_BODY_BYTES,
+            cache_inventory_page_size: super::FORGE_REPORT_CACHE_PAGE_SIZE,
+            protected_artifact_page_size: super::FORGE_REPORT_CACHE_PAGE_SIZE,
+        };
+        assert_eq!(
+            accepted_forge_reporting_version(
+                CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION,
+                Some(&contract)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            accepted_forge_reporting_version(CYBEX_COMPONENT_PROTOCOL_VERSION, Some(&contract))
+                .unwrap(),
+            Some(super::FORGE_REPORTING_VERSION)
+        );
+        assert_eq!(
+            accepted_forge_reporting_version(CYBEX_COMPONENT_PROTOCOL_VERSION, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn boot_report_body_fitter_trims_inventory_before_events() {
         let settings = BootAgentSettingsReport {
             public_base_url: "http://127.0.0.1".to_string(),
@@ -6587,6 +7562,94 @@ mod tests {
                 .map(|event| event.source_event_id)
                 .collect::<Vec<_>>(),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn forge_report_fitter_preserves_active_jobs_and_release_evidence_priority() {
+        fn job(
+            managed_job_id: &str,
+            artifact_type: &str,
+            status: &str,
+            metadata_bytes: usize,
+        ) -> ForgeBuildJobReport {
+            ForgeBuildJobReport {
+                local_id: 1,
+                managed_job_id: Some(managed_job_id.to_string()),
+                requested_artifact_type: artifact_type.to_string(),
+                build_spec: None,
+                target: "desktop_experience".to_string(),
+                system: "x86_64-linux".to_string(),
+                input_revision: "revision".to_string(),
+                input_config_hash: "a".repeat(64),
+                status: status.to_string(),
+                progress_percent: Some(50),
+                progress_stage: Some("building".to_string()),
+                progress_message: Some("Building".to_string()),
+                logs: "log".repeat(4_000),
+                error: String::new(),
+                output_path: String::new(),
+                output_sha256: String::new(),
+                output_size_bytes: 0,
+                exit_code: None,
+                cache_metadata: Some(serde_json::json!({
+                    "evidence": "x".repeat(metadata_bytes)
+                })),
+                started_at: None,
+                completed_at: None,
+                cancel_requested_at: None,
+                created_at: "2026-07-16T00:00:00Z".to_string(),
+                updated_at: "2026-07-16T00:00:00Z".to_string(),
+            }
+        }
+
+        let body = ForgeAgentReportRequest {
+            protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
+            report_contract_version: Some(super::FORGE_REPORTING_VERSION),
+            capabilities: vec![super::CAPABILITY_BUILDER_V1],
+            system_release_capability: None,
+            cache: crate::cache::CacheStatusReport {
+                enabled: true,
+                status: "ready".to_string(),
+                public_key: String::new(),
+                public_key_fingerprint: String::new(),
+                base_url: String::new(),
+                total_size_bytes: 0,
+                artifact_count: 0,
+                error: String::new(),
+            },
+            update: None,
+            build_jobs: vec![
+                job("active", "nixos_closure", "running", 0),
+                job("release", "system_generation", "succeeded", 256),
+                job("old", "nixos_closure", "failed", 32_000),
+            ],
+            cache_artifacts: Vec::new(),
+            cache_inventory_instance_id: "inventory".to_string(),
+            cache_inventory_generation: 7,
+            cache_artifacts_complete: false,
+            cache_inventory_page: Some(ForgeCacheInventoryPage {
+                cursor: 0,
+                total_items: 0,
+                complete: true,
+            }),
+            disk: None,
+        };
+
+        let (fitted, bytes) = fit_forge_report_body(body, 16 * 1024).unwrap();
+        assert!(bytes.len() <= 16 * 1024);
+        assert!(fitted.build_jobs.iter().any(|job| {
+            job.managed_job_id.as_deref() == Some("active") && job.status == "running"
+        }));
+        assert!(fitted.build_jobs.iter().any(|job| {
+            job.managed_job_id.as_deref() == Some("release")
+                && job.requested_artifact_type == "system_generation"
+        }));
+        assert!(
+            !fitted
+                .build_jobs
+                .iter()
+                .any(|job| job.managed_job_id.as_deref() == Some("old"))
         );
     }
 
@@ -6821,6 +7884,12 @@ mod tests {
     fn managed_config_derives_update_health_url_from_listen_addr() {
         let mut config = AppConfig::default();
         config.manage.organization_id = "org-1".to_string();
+        config.system_release.enabled = true;
+        config.system_release.managed_agent_version = "1.2.3".to_string();
+        config.system_release.managed_agent_package_sha256 = "a".repeat(64);
+        config.system_release.managed_agent_module_sha256 = "b".repeat(64);
+        config.system_release.transition_helper_sha256 = "c".repeat(64);
+        config.system_release.watchdog_sha256 = "d".repeat(64);
         let settings = NormalizedManagedSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:9181".to_string(),
@@ -6833,6 +7902,22 @@ mod tests {
         let rendered = render_managed_config(&config, &settings).unwrap();
 
         assert!(rendered.contains("health_url = \"http://127.0.0.1:9181/healthz\""));
+        assert!(rendered.contains("[system_release]\nenabled = true"));
+        assert!(rendered.contains("managed_agent_version = \"1.2.3\""));
+        assert!(rendered.contains(&format!(
+            "managed_agent_package_sha256 = \"{}\"",
+            "a".repeat(64)
+        )));
+        assert!(rendered.contains(&format!(
+            "managed_agent_module_sha256 = \"{}\"",
+            "b".repeat(64)
+        )));
+        assert!(rendered.contains(&format!(
+            "transition_helper_sha256 = \"{}\"",
+            "c".repeat(64)
+        )));
+        assert!(rendered.contains(&format!("watchdog_sha256 = \"{}\"", "d".repeat(64))));
+        toml::from_str::<toml::Value>(&rendered).unwrap();
     }
 
     #[test]
@@ -7720,6 +8805,55 @@ mod tests {
         assert_eq!(bounded_http_timeout_seconds(600), 300);
     }
 
+    #[tokio::test]
+    async fn managed_http_client_rejects_release_http_and_never_follows_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_requests.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let response = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{address}/substituted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut config = AppConfig::default();
+        config.manage.enabled = true;
+        config.manage.api_url = format!("http://{address}");
+        config.manage.organization_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let endpoint = format!("http://{address}/original");
+        let response = http_client_for_config(&config)
+            .unwrap()
+            .get(&endpoint)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(response.url().path(), "/original");
+        require_exact_managed_response_url(&response, &endpoint, "test redirect").unwrap();
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        config.system_release.enabled = true;
+        assert!(http_client_for_config(&config).is_err());
+    }
+
     #[test]
     fn forge_capabilities_report_build_and_cache() {
         let config = AppConfig::default();
@@ -7880,9 +9014,17 @@ mod tests {
             manifest["forge"]["minimum_manage_protocol"].as_u64(),
             Some(u64::from(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION))
         );
+        assert_eq!(
+            manifest["forge"]["maximum_manage_protocol"].as_u64(),
+            Some(u64::from(CYBEX_COMPONENT_PROTOCOL_VERSION))
+        );
         let config = sample_boot_config();
-        validate_component_compatibility(config.compatibility.as_ref()).unwrap();
-        validate_component_compatibility(None).unwrap();
+        validate_component_compatibility(
+            config.compatibility.as_ref(),
+            CYBEX_COMPONENT_PROTOCOL_VERSION,
+        )
+        .unwrap();
+        validate_component_compatibility(None, CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION).unwrap();
 
         let incompatible = ComponentCompatibilityContract {
             protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
@@ -7891,7 +9033,57 @@ mod tests {
             manage_version: "future".to_string(),
             manage_release: "future".to_string(),
         };
-        assert!(validate_component_compatibility(Some(&incompatible)).is_err());
+        assert!(
+            validate_component_compatibility(Some(&incompatible), CYBEX_COMPONENT_PROTOCOL_VERSION)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn system_release_capability_atomically_controls_protocol_and_advertisement() {
+        let config = AppConfig::default();
+        assert_eq!(
+            forge_protocol_version_for(None),
+            CYBEX_LEGACY_COMPONENT_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            forge_capabilities_for(&config, None),
+            vec!["boot_v1", "builder_v1", "cache_v1", "updater_v1"]
+        );
+        assert!(system_release_capability_report_for(None).is_none());
+
+        let context = crate::system_release::CapabilityContext {
+            forge_node_id: "forge-node".to_string(),
+            attestation_public_key: "public-key".to_string(),
+            attestation_key_id: "a".repeat(64),
+            managed_agent: crate::system_release::ManagedAgentInputV1 {
+                schema: crate::system_release::SYSTEM_RELEASE_MANAGED_AGENT_SCHEMA.to_string(),
+                version: "1.2.3".to_string(),
+                package_sha256: "b".repeat(64),
+                module_sha256: "c".repeat(64),
+                transition_helper_sha256: "d".repeat(64),
+                watchdog_sha256: "e".repeat(64),
+            },
+        };
+        assert_eq!(
+            forge_protocol_version_for(Some(&context)),
+            CYBEX_COMPONENT_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            forge_capabilities_for(&config, Some(&context)),
+            vec![
+                "boot_v1",
+                "builder_v1",
+                "cache_v1",
+                "system_release_builder_v3",
+                "updater_v1"
+            ]
+        );
+        let report = system_release_capability_report_for(Some(&context)).unwrap();
+        assert_eq!(report.schema, "cybex.forge-system-release-capability.v2");
+        assert_eq!(report.attestation_public_key, "public-key");
+        assert_eq!(report.attestation_key_id, "a".repeat(64));
+        assert_eq!(report.managed_agent, context.managed_agent);
     }
 
     #[test]
@@ -7927,6 +9119,175 @@ mod tests {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
         pool
+    }
+
+    fn system_release_cache_artifact(
+        config: &AppConfig,
+        local_id: i64,
+    ) -> (CacheArtifact, Vec<u8>) {
+        let organization_id = "018f6b61-a646-7f7c-a651-7ee13ad42f84";
+        let release_id = "018f6b61-a646-7f7c-a651-7ee13ad42f85";
+        let variant_id = "018f6b61-a646-7f7c-a651-7ee13ad42f88";
+        let managed_job_id = "018f6b61-a646-7f7c-a651-7ee13ad42f90";
+        let managed_artifact_id = "018f6b61-a646-7f7c-a651-7ee13ad42f91";
+        let target_store_path = "/nix/store/00000000000000000000000000000000-system";
+        let manifest = crate::system_release::SystemReleaseClosureManifestV1 {
+            schema: crate::system_release::SYSTEM_RELEASE_CLOSURE_SCHEMA.into(),
+            organization_id: organization_id.into(),
+            release_id: release_id.into(),
+            variant_id: variant_id.into(),
+            target_store_path: target_store_path.into(),
+            members: vec![crate::system_release::SystemReleaseClosureMemberV1 {
+                store_path: target_store_path.into(),
+                nar_hash: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                nar_size_bytes: 4096,
+                references: Vec::new(),
+            }],
+        };
+        let canonical = manifest.canonical_bytes().unwrap();
+        let closure_sha256 = sha256_hex(&canonical);
+        let relative_path = format!(
+            "system-releases/{organization_id}/{release_id}/{variant_id}/{managed_artifact_id}/closure.json"
+        );
+        let path = config.cache.root_dir.join(&relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &canonical).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let now = "2026-07-16T00:00:00Z".to_string();
+        (
+            CacheArtifact {
+                id: local_id,
+                managed_artifact_id: Some(managed_artifact_id.into()),
+                artifact_type: "system_generation".into(),
+                hash: "artifact-hash".into(),
+                size_bytes: 4096,
+                path: "/cache/artifact.nar.zst".into(),
+                store_path: target_store_path.into(),
+                narinfo_path: "/cache/artifact.narinfo".into(),
+                nar_url: "nar/artifact.nar.zst".into(),
+                file_hash: "sha256-file".into(),
+                nar_hash: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                nar_size_bytes: 4096,
+                closure_size_bytes: 4096,
+                closure_file_size_bytes: 4096,
+                compression: "zstd".into(),
+                references: serde_json::json!([]),
+                serving_url: "https://forge.example/artifact.nar.zst".into(),
+                source_build_job_id: Some(managed_job_id.into()),
+                cache_metadata: serde_json::json!({
+                    "system_release": {
+                        "schema": "cybex.forge.system-release-result.v1",
+                        "organization_id": organization_id,
+                        "release_id": release_id,
+                        "variant_id": variant_id,
+                        "forge_node_id": "018f6b61-a646-7f7c-a651-7ee13ad42f92",
+                        "forge_build_job_id": managed_job_id,
+                        "forge_artifact_id": managed_artifact_id,
+                        "build_spec_sha256": "a".repeat(64),
+                        "closure": {
+                            "relative_path": relative_path,
+                            "path": path.display().to_string(),
+                            "sha256": closure_sha256,
+                            "size_bytes": canonical.len()
+                        }
+                    }
+                }),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            canonical,
+        )
+    }
+
+    #[test]
+    fn system_release_closure_upload_material_is_exact_local_canonical_evidence() {
+        let root = temp_state_dir();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = root.clone();
+        config.manage.organization_id = "018f6b61-a646-7f7c-a651-7ee13ad42f84".into();
+        let device_id = "018f6b61-a646-7f7c-a651-7ee13ad42f92";
+        let (artifact, canonical) = system_release_cache_artifact(&config, 42);
+        let report_metadata = serde_json::to_vec(&artifact.cache_metadata).unwrap();
+        assert!(report_metadata.len() < 1024 * 1024);
+        assert!(
+            artifact
+                .cache_metadata
+                .pointer("/system_release/closure/manifest")
+                .is_none()
+        );
+        assert!(
+            !String::from_utf8(report_metadata)
+                .unwrap()
+                .contains("\"members\"")
+        );
+
+        let material = system_release_closure_upload_material(&config, device_id, &artifact)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(material.local_artifact_id, 42);
+        assert_eq!(material.canonical_bytes, canonical);
+        assert_eq!(material.closure_size_bytes, canonical.len());
+        let mut wrong_identity = artifact;
+        wrong_identity.cache_metadata["system_release"]["forge_node_id"] =
+            serde_json::json!("018f6b61-a646-7f7c-a651-7ee13ad42f93");
+        assert!(
+            system_release_closure_upload_material(&config, device_id, &wrong_identity).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_release_closure_upload_ack_is_idempotent_and_recoverable() {
+        let pool = managed_test_pool().await;
+        sqlx::query(
+            r#"INSERT INTO forge_cache_artifacts (
+                   id, artifact_type, hash, path, created_at, updated_at
+               ) VALUES (42, 'system_generation', 'artifact-hash', '/cache/artifact',
+                         '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let root = temp_state_dir();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = root.clone();
+        config.manage.organization_id = "018f6b61-a646-7f7c-a651-7ee13ad42f84".into();
+        let (artifact, _) = system_release_cache_artifact(&config, 42);
+        let material = system_release_closure_upload_material(
+            &config,
+            "018f6b61-a646-7f7c-a651-7ee13ad42f92",
+            &artifact,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            !system_release_closure_upload_is_acknowledged(&pool, &material)
+                .await
+                .unwrap()
+        );
+        record_system_release_closure_upload_ack(&pool, &material)
+            .await
+            .unwrap();
+        record_system_release_closure_upload_ack(&pool, &material)
+            .await
+            .unwrap();
+        assert!(
+            system_release_closure_upload_is_acknowledged(&pool, &material)
+                .await
+                .unwrap()
+        );
+        let report_artifact = super::ForgeCacheArtifactReport::from(artifact);
+        clear_system_release_closure_upload_acks(&pool, &[report_artifact])
+            .await
+            .unwrap();
+        assert!(
+            !system_release_closure_upload_is_acknowledged(&pool, &material)
+                .await
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn temp_state_dir() -> PathBuf {

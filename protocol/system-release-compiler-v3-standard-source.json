@@ -1,0 +1,69 @@
+{
+  "local_account_profile_selection_mode": "explicit",
+  "settings": {
+    "network": {
+      "manager": { "value": "NetworkManager" },
+      "dns": { "value": "1.1.1.1, 1.0.0.1" }
+    },
+    "desktop": {
+      "profile": { "value": "Taskbar" },
+      "de": { "value": "KDE Plasma" },
+      "greeter": { "value": "SDDM (Wayland)" },
+      "layout": { "value": "Taskbar" },
+      "overview": { "value": "Application launcher, task switcher, and visible system tray" },
+      "panel": { "value": "Bottom taskbar with launcher, pinned apps, tray, and clock" },
+      "terminal": { "value": "Konsole" },
+      "screenshots": { "value": "Spectacle" },
+      "portal": { "value": "KDE portal" },
+      "login": { "value": "Greeter - no autologin" },
+      "browser": { "value": "Firefox ESR" },
+      "theme": { "value": "Cybex Graphite" },
+      "icons": { "value": "Papirus Dark" },
+      "cursor": { "value": "Bibata Modern Ice" },
+      "wallpaper": { "value": "Cybex Graphite Ribbon" },
+      "dock": { "value": "Files · Browser · Mail · Settings · Terminal · Screenshot" },
+      "audio": { "value": "PipeWire + WirePlumber" },
+      "bluetooth": { "value": "Enabled" },
+      "language": { "value": "en-US" },
+      "keyboard": { "value": "US" },
+      "timezone": { "value": "UTC" }
+    },
+    "security": {
+      "encryption": { "value": "LUKS2 - required" },
+      "firewall": { "value": "nftables - default-deny inbound" },
+      "screenlock": { "value": "10 min" },
+      "sudo": { "value": "No local admin" },
+      "usb": { "value": "Read-only" }
+    },
+    "updates": {
+      "oschannel": { "value": "nixpkgs 26.05 stable" },
+      "cadence": { "value": "Weekly" },
+      "window": { "value": "Off-hours" },
+      "rollback": { "value": "Keep previous generations for rollback" }
+    },
+    "printing": {
+      "printervis": { "value": "Show assigned only" }
+    },
+    "monitoring": {
+      "logs": { "value": "errors + audit" }
+    }
+  },
+  "lists": {
+    "apps": {
+      "installed": {
+        "title": "Installed applications",
+        "icon": "ph-app-window",
+        "items": [
+          { "id": "exp-app-0", "label": "Cybex Agent", "package_ref": "cybex-agent", "package_source": "nixpkgs", "meta": "nixpkgs · cybex-agent", "icon": "ph-shield-check", "source": "Blueprint" },
+          { "id": "exp-app-1", "label": "Firefox ESR", "package_ref": "firefox-esr", "package_source": "nixpkgs", "meta": "nixpkgs · firefox-esr", "icon": "ph-globe", "source": "Blueprint" },
+          { "id": "exp-app-2", "label": "Dolphin", "package_ref": "kdePackages.dolphin", "package_source": "nixpkgs", "meta": "nixpkgs · kdePackages.dolphin", "icon": "ph-folder-open", "source": "Blueprint" },
+          { "id": "exp-app-3", "label": "Konsole", "package_ref": "kdePackages.konsole", "package_source": "nixpkgs", "meta": "nixpkgs · kdePackages.konsole", "icon": "ph-terminal-window", "source": "Blueprint" },
+          { "id": "exp-app-4", "label": "System Settings", "package_ref": "kdePackages.systemsettings", "package_source": "nixpkgs", "meta": "nixpkgs · kdePackages.systemsettings", "icon": "ph-sliders-horizontal", "source": "Blueprint" },
+          { "id": "exp-app-5", "label": "Spectacle", "package_ref": "kdePackages.spectacle", "package_source": "nixpkgs", "meta": "nixpkgs · kdePackages.spectacle", "icon": "ph-camera", "source": "Blueprint" },
+          { "id": "exp-app-6", "label": "LibreOffice", "package_ref": "libreoffice", "package_source": "nixpkgs", "meta": "nixpkgs · libreoffice", "icon": "ph-file-text", "source": "Blueprint" },
+          { "id": "exp-app-7", "label": "Thunderbird", "package_ref": "thunderbird", "package_source": "nixpkgs", "meta": "nixpkgs · thunderbird", "icon": "ph-envelope-simple", "source": "Blueprint" }
+        ]
+      }
+    }
+  }
+}

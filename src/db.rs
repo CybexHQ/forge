@@ -33,6 +33,7 @@ const MAX_BUILD_ERROR_CHARS: usize = 2_000;
 const MAX_BUILD_PROGRESS_STAGE_CHARS: usize = 48;
 const MAX_BUILD_PROGRESS_MESSAGE_CHARS: usize = 160;
 const MAX_CACHE_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_MANAGED_CACHE_ARTIFACT_REPORT_BYTES: usize = 1536 * 1024;
 const ALLOWED_BUILD_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "cancelled"];
 
 pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
@@ -1110,6 +1111,82 @@ pub async fn list_build_jobs(pool: &SqlitePool) -> AppResult<Vec<BuildJob>> {
     build_job_rows_to_models(rows)
 }
 
+/// Report every active job and every managed terminal job not yet durably
+/// acknowledged by Manage. Acknowledged terminal history is intentionally
+/// omitted so old history can never crowd current evidence out of a report.
+pub async fn list_build_jobs_for_manage_report(pool: &SqlitePool) -> AppResult<Vec<BuildJob>> {
+    let rows = sqlx::query_as::<_, BuildJobRow>(
+        r#"SELECT job.*
+           FROM forge_build_jobs job
+           LEFT JOIN managed_build_job_report_acks ack
+             ON ack.managed_job_id = job.managed_job_id
+           WHERE job.status IN ('queued', 'running')
+              OR (job.managed_job_id IS NOT NULL
+                  AND job.status IN ('succeeded', 'failed', 'cancelled')
+                  AND ack.managed_job_id IS NULL)
+           ORDER BY CASE
+                        WHEN job.status IN ('queued', 'running') THEN 0
+                        WHEN job.requested_artifact_type = 'system_generation' THEN 1
+                        ELSE 2
+                    END,
+                    job.updated_at DESC,
+                    job.id DESC"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    build_job_rows_to_models(rows)
+}
+
+pub async fn acknowledge_terminal_build_jobs(
+    pool: &SqlitePool,
+    managed_job_ids: &[String],
+) -> AppResult<usize> {
+    let mut tx = pool.begin().await?;
+    let now = now_rfc3339();
+    let mut acknowledged = 0usize;
+    for managed_job_id in managed_job_ids {
+        let managed_job_id = normalize_managed_id(managed_job_id, "managed_job_id")?;
+        let result = sqlx::query(
+            r#"INSERT INTO managed_build_job_report_acks (managed_job_id, acknowledged_at)
+               SELECT managed_job_id, ?
+               FROM forge_build_jobs
+               WHERE managed_job_id = ?
+                 AND status IN ('succeeded', 'failed', 'cancelled')
+               ON CONFLICT(managed_job_id) DO UPDATE
+               SET acknowledged_at = excluded.acknowledged_at"#,
+        )
+        .bind(&now)
+        .bind(&managed_job_id)
+        .execute(&mut *tx)
+        .await?;
+        acknowledged += result.rows_affected() as usize;
+    }
+    tx.commit().await?;
+    Ok(acknowledged)
+}
+
+pub async fn prune_acknowledged_terminal_build_jobs(
+    pool: &SqlitePool,
+    retain: usize,
+) -> AppResult<usize> {
+    let result = sqlx::query(
+        r#"DELETE FROM forge_build_jobs
+           WHERE id IN (
+               SELECT job.id
+               FROM forge_build_jobs job
+               JOIN managed_build_job_report_acks ack
+                 ON ack.managed_job_id = job.managed_job_id
+               WHERE job.status IN ('succeeded', 'failed', 'cancelled')
+               ORDER BY ack.acknowledged_at DESC, job.id DESC
+               LIMIT -1 OFFSET ?
+           )"#,
+    )
+    .bind(i64::try_from(retain).unwrap_or(i64::MAX))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as usize)
+}
+
 pub async fn create_build_job(
     pool: &SqlitePool,
     input: CreateBuildJobRequest,
@@ -1615,6 +1692,208 @@ pub struct CacheInventoryState {
     pub generation: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct CacheInventorySnapshot {
+    pub state: CacheInventoryState,
+    pub artifacts: Vec<CacheArtifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheInventoryFence {
+    pub instance_id: String,
+    pub generation: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CacheArtifactRemovalOutcome {
+    pub inventory_matched: bool,
+    pub current_inventory: CacheInventoryState,
+    pub retained: Vec<CacheArtifact>,
+    pub deleted: Vec<(String, String)>,
+    pub protected: Vec<(String, String)>,
+    pub missing: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedCacheProtectionPageRequest {
+    pub snapshot_id: String,
+    pub next_cursor: i64,
+}
+
+pub async fn managed_cache_protection_page_request(
+    pool: &SqlitePool,
+) -> AppResult<ManagedCacheProtectionPageRequest> {
+    sqlx::query_as::<_, (String, i64)>(
+        r#"SELECT staging_snapshot_id, staging_next_cursor
+           FROM managed_cache_protection_state
+           WHERE singleton = 1"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map(
+        |(snapshot_id, next_cursor)| ManagedCacheProtectionPageRequest {
+            snapshot_id,
+            next_cursor,
+        },
+    )
+    .map_err(AppError::from)
+}
+
+pub async fn managed_cache_protections_authoritative(pool: &SqlitePool) -> AppResult<bool> {
+    let authoritative: i64 = sqlx::query_scalar(
+        "SELECT authoritative FROM managed_cache_protection_state WHERE singleton = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(authoritative == 1)
+}
+
+pub async fn apply_managed_cache_protection_page(
+    pool: &SqlitePool,
+    snapshot_id: &str,
+    cursor: i64,
+    total_items: i64,
+    keys: &[(String, String)],
+    complete: bool,
+) -> AppResult<bool> {
+    let snapshot_id = normalize_sha256(snapshot_id, "protection_snapshot_id", false)?;
+    if cursor < 0 || total_items < 0 || cursor > total_items {
+        return Err(AppError::Validation(
+            "managed protection page cursor is invalid".to_string(),
+        ));
+    }
+    let page_end = cursor
+        .checked_add(i64::try_from(keys.len()).map_err(|_| {
+            AppError::Validation("managed protection page is too large".to_string())
+        })?)
+        .ok_or_else(|| AppError::Validation("managed protection cursor overflowed".to_string()))?;
+    if page_end > total_items || complete != (page_end == total_items) {
+        return Err(AppError::Validation(
+            "managed protection page completion fence is invalid".to_string(),
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(keys.len());
+    for (artifact_type, hash) in keys {
+        normalized.push((
+            normalize_artifact_type(artifact_type, "artifact_type")?,
+            normalize_sha256(hash, "hash", false)?,
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    // Acquire SQLite's write lock before inspecting or replacing staging.
+    sqlx::query(
+        "UPDATE managed_cache_protection_state SET updated_at = updated_at WHERE singleton = 1",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let (current_snapshot, current_cursor, current_total): (String, i64, i64) = sqlx::query_as(
+        r#"SELECT staging_snapshot_id, staging_next_cursor, staging_total_items
+               FROM managed_cache_protection_state WHERE singleton = 1"#,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if current_snapshot != snapshot_id {
+        if cursor != 0 {
+            return Err(AppError::Validation(
+                "changed managed protection snapshot must restart at cursor zero".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM managed_cache_protection_staging")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"UPDATE managed_cache_protection_state
+               SET staging_snapshot_id = ?, staging_next_cursor = 0,
+                   staging_total_items = ?, authoritative = 0, updated_at = ?
+               WHERE singleton = 1"#,
+        )
+        .bind(&snapshot_id)
+        .bind(total_items)
+        .bind(now_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    } else if current_total != total_items {
+        return Err(AppError::Validation(
+            "managed protection snapshot changed its total item count".to_string(),
+        ));
+    } else if cursor != current_cursor {
+        return Err(AppError::Validation(format!(
+            "managed protection page is out of order; expected cursor {current_cursor}"
+        )));
+    }
+
+    for (offset, (artifact_type, hash)) in normalized.iter().enumerate() {
+        let position = cursor + i64::try_from(offset).unwrap_or(i64::MAX);
+        sqlx::query(
+            r#"INSERT INTO managed_cache_protection_staging
+               (snapshot_id, position, artifact_type, hash)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(snapshot_id, position) DO UPDATE SET
+                   artifact_type = excluded.artifact_type,
+                   hash = excluded.hash"#,
+        )
+        .bind(&snapshot_id)
+        .bind(position)
+        .bind(artifact_type)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let now = now_rfc3339();
+    sqlx::query(
+        r#"UPDATE managed_cache_protection_state
+           SET staging_next_cursor = ?, authoritative = 0, updated_at = ?
+           WHERE singleton = 1"#,
+    )
+    .bind(page_end)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    if complete {
+        let staged_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM managed_cache_protection_staging WHERE snapshot_id = ?",
+        )
+        .bind(&snapshot_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if staged_count != total_items {
+            return Err(AppError::Validation(
+                "managed protection snapshot is missing staged entries".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM managed_cache_protections")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO managed_cache_protections (artifact_type, hash, updated_at)
+               SELECT artifact_type, hash, ?
+               FROM managed_cache_protection_staging
+               WHERE snapshot_id = ?
+               ORDER BY position"#,
+        )
+        .bind(&now)
+        .bind(&snapshot_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE managed_cache_protection_state
+               SET authoritative = 1, authoritative_snapshot_id = ?, updated_at = ?
+               WHERE singleton = 1"#,
+        )
+        .bind(&snapshot_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(complete)
+}
+
 pub async fn cache_inventory_state(pool: &SqlitePool) -> AppResult<CacheInventoryState> {
     sqlx::query_as::<_, CacheInventoryState>(
         "SELECT instance_id, generation FROM cache_inventory_state WHERE singleton = 1",
@@ -1622,6 +1901,27 @@ pub async fn cache_inventory_state(pool: &SqlitePool) -> AppResult<CacheInventor
     .fetch_one(pool)
     .await
     .map_err(AppError::from)
+}
+
+/// Return the reported rows and their epoch/generation from one SQLite read
+/// snapshot. Reporting them through separate pool reads can pair a pre-mutation
+/// row set with a post-mutation generation (or the reverse), defeating Manage's
+/// complete-inventory fence.
+pub async fn cache_inventory_snapshot(pool: &SqlitePool) -> AppResult<CacheInventorySnapshot> {
+    let mut tx = pool.begin().await?;
+    let state = sqlx::query_as::<_, CacheInventoryState>(
+        "SELECT instance_id, generation FROM cache_inventory_state WHERE singleton = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let rows = sqlx::query_as::<_, CacheArtifactRow>(
+        "SELECT * FROM forge_cache_artifacts ORDER BY created_at DESC, id DESC",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let artifacts = cache_artifact_rows_to_models(rows)?;
+    tx.commit().await?;
+    Ok(CacheInventorySnapshot { state, artifacts })
 }
 
 pub async fn replace_managed_cache_protections(
@@ -1651,6 +1951,17 @@ pub async fn replace_managed_cache_protections(
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::query(
+        r#"UPDATE managed_cache_protection_state
+           SET authoritative = ?, authoritative_snapshot_id = CASE WHEN ? THEN 'legacy' ELSE '' END,
+               updated_at = ?
+           WHERE singleton = 1"#,
+    )
+    .bind(if complete { 1_i64 } else { 0_i64 })
+    .bind(complete)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1664,6 +1975,126 @@ pub async fn list_managed_cache_protections(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().collect())
+}
+
+/// Deletes management-requested artifacts only when the command is bound to
+/// the exact inventory snapshot last reported to Manage. The no-op update is
+/// intentional: it acquires SQLite's write lock before either the inventory or
+/// the protection set is read, so a concurrent retention/protection update
+/// cannot race this decision.
+pub async fn remove_cache_artifacts_if_current_and_unprotected(
+    pool: &SqlitePool,
+    expected: &CacheInventoryFence,
+    keys: &[(String, String)],
+) -> AppResult<CacheArtifactRemovalOutcome> {
+    let mut normalized = Vec::with_capacity(keys.len());
+    for (artifact_type, hash) in keys {
+        let key = (
+            normalize_artifact_type(artifact_type, "artifact_type")?,
+            normalize_sha256(hash, "hash", false)?,
+        );
+        if !normalized.contains(&key) {
+            normalized.push(key);
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE cache_inventory_state SET generation = generation WHERE singleton = 1")
+        .execute(&mut *tx)
+        .await?;
+    let current_inventory = sqlx::query_as::<_, CacheInventoryState>(
+        "SELECT instance_id, generation FROM cache_inventory_state WHERE singleton = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if current_inventory.instance_id != expected.instance_id
+        || current_inventory.generation != expected.generation
+    {
+        tx.commit().await?;
+        return Ok(CacheArtifactRemovalOutcome {
+            inventory_matched: false,
+            current_inventory,
+            retained: Vec::new(),
+            deleted: Vec::new(),
+            protected: Vec::new(),
+            missing: normalized,
+        });
+    }
+
+    let protections_authoritative: i64 = sqlx::query_scalar(
+        "SELECT authoritative FROM managed_cache_protection_state WHERE singleton = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if protections_authoritative != 1 {
+        tx.commit().await?;
+        return Ok(CacheArtifactRemovalOutcome {
+            inventory_matched: false,
+            current_inventory,
+            retained: Vec::new(),
+            deleted: Vec::new(),
+            protected: Vec::new(),
+            missing: normalized,
+        });
+    }
+
+    let protected = sqlx::query_as::<_, (String, String)>(
+        "SELECT artifact_type, hash FROM managed_cache_protections",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let rows = sqlx::query_as::<_, CacheArtifactRow>(
+        "SELECT * FROM forge_cache_artifacts ORDER BY created_at DESC, id DESC",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let artifacts = cache_artifact_rows_to_models(rows)?;
+    let artifacts_by_key = artifacts
+        .iter()
+        .map(|artifact| {
+            (
+                (artifact.artifact_type.clone(), artifact.hash.clone()),
+                artifact.id,
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut deleted = Vec::new();
+    let mut protected_requested = Vec::new();
+    let mut missing = Vec::new();
+    let mut doomed_ids = HashSet::new();
+    for key in normalized {
+        if protected.contains(&key) {
+            protected_requested.push(key);
+        } else if let Some(id) = artifacts_by_key.get(&key) {
+            doomed_ids.insert(*id);
+            deleted.push(key);
+        } else {
+            missing.push(key);
+        }
+    }
+    for id in &doomed_ids {
+        sqlx::query("DELETE FROM forge_cache_artifacts WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let retained = artifacts
+        .into_iter()
+        .filter(|artifact| !doomed_ids.contains(&artifact.id))
+        .collect();
+    tx.commit().await?;
+
+    Ok(CacheArtifactRemovalOutcome {
+        inventory_matched: true,
+        current_inventory,
+        retained,
+        deleted,
+        protected: protected_requested,
+        missing,
+    })
 }
 
 pub async fn cache_artifacts_due_for_verification(
@@ -1700,6 +2131,33 @@ pub async fn delete_cache_artifact(pool: &SqlitePool, id: i64) -> AppResult<()> 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Retention-only deletion fence. The desired-replica table is checked in the
+/// same SQLite statement as the row deletion so a protection refresh cannot
+/// be separated from the destructive decision even if a future caller omits
+/// the outer filesystem lease.
+pub async fn delete_cache_artifact_if_unprotected(pool: &SqlitePool, id: i64) -> AppResult<bool> {
+    let result = sqlx::query(
+        "DELETE FROM forge_cache_artifacts
+         WHERE id = ?
+           AND EXISTS (
+             SELECT 1
+             FROM managed_cache_protection_state state
+             WHERE state.singleton = 1
+               AND state.authoritative = 1
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM managed_cache_protections protected
+             WHERE protected.artifact_type = forge_cache_artifacts.artifact_type
+               AND protected.hash = forge_cache_artifacts.hash
+           )",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn create_cache_artifact(
@@ -1775,6 +2233,38 @@ pub async fn upsert_cache_artifact(
         .transpose()?;
     let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
     let now = now_rfc3339();
+    let report_shape = json!({
+        "local_id": 0,
+        "managed_artifact_id": &managed_artifact_id,
+        "artifact_type": &artifact_type,
+        "hash": &hash,
+        "size_bytes": size_bytes,
+        "path": &path,
+        "store_path": &store_path,
+        "narinfo_path": &narinfo_path,
+        "nar_url": &nar_url,
+        "file_hash": &file_hash,
+        "nar_hash": &nar_hash,
+        "nar_size_bytes": nar_size_bytes,
+        "closure_size_bytes": closure_size_bytes,
+        "closure_file_size_bytes": closure_file_size_bytes,
+        "compression": &compression,
+        "references": serde_json::from_str::<Value>(&references_json)
+            .map_err(|error| AppError::Validation(error.to_string()))?,
+        "serving_url": &serving_url,
+        "source_build_job_id": &source_build_job_id,
+        "cache_metadata": serde_json::from_str::<Value>(&cache_metadata)
+            .map_err(|error| AppError::Validation(error.to_string()))?,
+        "created_at": &now,
+        "updated_at": &now,
+    });
+    let report_bytes = serde_json::to_vec(&report_shape)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
+    if report_bytes.len() > MAX_MANAGED_CACHE_ARTIFACT_REPORT_BYTES {
+        return Err(AppError::Validation(format!(
+            "cache artifact managed-report payload must be {MAX_MANAGED_CACHE_ARTIFACT_REPORT_BYTES} bytes or fewer"
+        )));
+    }
     sqlx::query(
         "INSERT INTO forge_cache_artifacts
          (managed_artifact_id, artifact_type, hash, size_bytes, path, store_path, narinfo_path, nar_url, file_hash, nar_hash, nar_size_bytes, closure_size_bytes, closure_file_size_bytes, compression, references_json, serving_url, source_build_job_id, cache_metadata, created_at, updated_at)
@@ -3965,6 +4455,11 @@ mod tests {
         let inserted = cache_inventory_state(&pool).await.unwrap();
         assert_eq!(inserted.instance_id, initial.instance_id);
         assert!(inserted.generation > initial.generation);
+        let inserted_snapshot = cache_inventory_snapshot(&pool).await.unwrap();
+        assert_eq!(inserted_snapshot.state.instance_id, inserted.instance_id);
+        assert_eq!(inserted_snapshot.state.generation, inserted.generation);
+        assert_eq!(inserted_snapshot.artifacts.len(), 1);
+        assert_eq!(inserted_snapshot.artifacts[0].id, artifact.id);
 
         replace_managed_cache_protections(&pool, &[("nixos_closure".into(), "a".repeat(64))], true)
             .await
@@ -3979,6 +4474,9 @@ mod tests {
         delete_cache_artifact(&pool, artifact.id).await.unwrap();
         let deleted = cache_inventory_state(&pool).await.unwrap();
         assert!(deleted.generation > inserted.generation);
+        let deleted_snapshot = cache_inventory_snapshot(&pool).await.unwrap();
+        assert_eq!(deleted_snapshot.state.generation, deleted.generation);
+        assert!(deleted_snapshot.artifacts.is_empty());
         replace_managed_cache_protections(&pool, &[], true)
             .await
             .unwrap();
@@ -3988,5 +4486,230 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn managed_protection_pages_replace_only_after_exact_final_page() {
+        let pool = test_pool().await;
+        let keys = (0..1_201)
+            .map(|index| ("nixos_closure".to_string(), format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        let snapshot_id = "a".repeat(64);
+
+        assert!(
+            !apply_managed_cache_protection_page(
+                &pool,
+                &snapshot_id,
+                0,
+                keys.len() as i64,
+                &keys[..500],
+                false,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !managed_cache_protections_authoritative(&pool)
+                .await
+                .unwrap()
+        );
+        assert!(
+            list_managed_cache_protections(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let unprotected = upsert_cache_artifact(
+            &pool,
+            None,
+            "nixos_closure",
+            &"f".repeat(64),
+            1,
+            "/cache/unprotected.nar",
+            "",
+            "",
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+            "",
+            None,
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !delete_cache_artifact_if_unprotected(&pool, unprotected.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            apply_managed_cache_protection_page(
+                &pool,
+                &snapshot_id,
+                1_000,
+                keys.len() as i64,
+                &keys[1_000..],
+                true,
+            )
+            .await
+            .is_err()
+        );
+
+        apply_managed_cache_protection_page(
+            &pool,
+            &snapshot_id,
+            500,
+            keys.len() as i64,
+            &keys[500..1_000],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            apply_managed_cache_protection_page(
+                &pool,
+                &snapshot_id,
+                1_000,
+                keys.len() as i64,
+                &keys[1_000..],
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            managed_cache_protections_authoritative(&pool)
+                .await
+                .unwrap()
+        );
+        assert!(
+            delete_cache_artifact_if_unprotected(&pool, unprotected.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            list_managed_cache_protections(&pool).await.unwrap().len(),
+            keys.len()
+        );
+
+        let replacement = vec![("system_generation".to_string(), "f".repeat(64))];
+        apply_managed_cache_protection_page(&pool, &"b".repeat(64), 0, 1, &replacement, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_managed_cache_protections(&pool).await.unwrap(),
+            replacement.into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_jobs_remain_reportable_until_durable_ack_then_prune() {
+        let pool = test_pool().await;
+        let job = upsert_managed_build_job(
+            &pool,
+            "managed-terminal-1",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "revision-1",
+            &"c".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE forge_build_jobs SET status = 'succeeded', completed_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(now_rfc3339())
+        .bind(now_rfc3339())
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            list_build_jobs_for_manage_report(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        acknowledge_terminal_build_jobs(&pool, &["managed-terminal-1".to_string()])
+            .await
+            .unwrap();
+        // The ACK is independent of the JSON ManagedState file. If Forge
+        // crashes before that file is saved, the committed SQLite row still
+        // prevents terminal evidence from being retransmitted and makes the
+        // following prune safe.
+        let durable_ack_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM managed_build_job_report_acks")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(durable_ack_count, 1);
+        assert!(
+            list_build_jobs_for_manage_report(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            prune_acknowledged_terminal_build_jobs(&pool, 0)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(get_build_job(&pool, job.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_artifact_producer_rejects_oversized_managed_report_payload() {
+        let pool = test_pool().await;
+        let reference = format!("/nix/store/{}-{}", "a".repeat(32), "x".repeat(3_950));
+        let error = create_cache_artifact(
+            &pool,
+            CreateCacheArtifactRequest {
+                artifact_type: "nixos_closure".to_string(),
+                hash: "d".repeat(64),
+                size_bytes: 1,
+                path: "/cache/oversized.nar.zst".to_string(),
+                store_path: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-output".to_string()),
+                narinfo_path: None,
+                nar_url: None,
+                file_hash: None,
+                nar_hash: None,
+                nar_size_bytes: None,
+                closure_size_bytes: None,
+                closure_file_size_bytes: None,
+                compression: None,
+                references: Some(Value::Array(
+                    (0..400).map(|_| Value::String(reference.clone())).collect(),
+                )),
+                serving_url: None,
+                source_build_job_id: None,
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("managed-report payload"));
+        assert!(list_cache_artifacts(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_reporting_migration_has_valid_sqlite_foreign_keys() {
+        let pool = test_pool().await;
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(violations.is_empty());
     }
 }

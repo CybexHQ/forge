@@ -1,12 +1,12 @@
 {
   "schema": "cybex.component-compatibility.v1",
-  "protocol_version": 3,
+  "protocol_version": 5,
   "manage": {
     "minimum_forge_protocol": 1,
-    "maximum_forge_protocol": 3
+    "maximum_forge_protocol": 5
   },
   "forge": {
     "minimum_manage_protocol": 1,
-    "maximum_manage_protocol": 3
+    "maximum_manage_protocol": 5
   }
 }

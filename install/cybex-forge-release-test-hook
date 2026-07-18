@@ -1,0 +1,514 @@
+#!/bin/sh
+set -eu
+
+SCHEMA='cybex.verified-release-test-hook.v1'
+SENTINEL_SCHEMA='cybex.forge-release-test-fault-sentinel.v1'
+CONFIG='/etc/cybex-forge/verified-release-test-hook.conf'
+SELF_TEST=false
+
+fail() {
+  printf '%s\n' "cybex-forge-release-test-hook: $*" >&2
+  exit 1
+}
+
+require_root() {
+  [ "$(id -u)" = 0 ] || fail 'root is required'
+}
+
+safe_id() {
+  value=$1
+  [ -n "$value" ] && [ "${#value}" -le 128 ] &&
+    ! printf '%s' "$value" | LC_ALL=C grep -q '[^A-Za-z0-9._-]'
+}
+
+canonical_uuid() {
+  value=$1
+  printf '%s' "$value" | LC_ALL=C grep -Eq \
+    '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' &&
+    [ "$value" != '00000000-0000-0000-0000-000000000000' ]
+}
+
+lower_sha256() {
+  value=$1
+  printf '%s' "$value" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$'
+}
+
+read_boot_id() {
+  [ -f /proc/sys/kernel/random/boot_id ] || fail 'kernel boot ID is unavailable'
+  boot_id=$(tr -d '\n' </proc/sys/kernel/random/boot_id)
+  canonical_uuid "$boot_id" || fail 'kernel boot ID is not canonical'
+}
+
+sha256_file() {
+  sha256sum -- "$1" | awk '{print $1}'
+}
+
+load_config() {
+  require_root
+  [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail 'test hook is disabled'
+  mode=$(stat -c '%a' -- "$CONFIG")
+  owner=$(stat -c '%u:%g' -- "$CONFIG")
+  [ "$mode" = 400 ] && [ "$owner" = '0:0' ] || fail 'unsafe test-hook configuration'
+
+  enabled=$(sed -n 's/^enabled=//p' "$CONFIG")
+  production_mode=$(sed -n 's/^production_mode=//p' "$CONFIG")
+  owner_run_id=$(sed -n 's/^owner_run_id=//p' "$CONFIG")
+  owner_nonce_hex=$(sed -n 's/^owner_nonce_hex=//p' "$CONFIG")
+  owner_binding_sha256=$(sed -n 's/^owner_binding_sha256=//p' "$CONFIG")
+  instance_name=$(sed -n 's/^instance_name=//p' "$CONFIG")
+  cache_root=$(sed -n 's/^cache_root=//p' "$CONFIG")
+  mutation_lock_path=$(sed -n 's/^mutation_lock_path=//p' "$CONFIG")
+  state_dir=$(sed -n 's/^state_dir=//p' "$CONFIG")
+
+  [ "$enabled" = true ] || fail 'test hook is disabled'
+  [ "$production_mode" = false ] || fail 'test hook is forbidden in production mode'
+  safe_id "$owner_run_id" || fail 'invalid provisioned owner run ID'
+  safe_id "$instance_name" || fail 'invalid provisioned instance name'
+  case "$instance_name" in
+    "lab-$owner_run_id"|"lab-$owner_run_id-"*) ;;
+    *) fail 'instance is not owned by the provisioned test run' ;;
+  esac
+  [ "$(hostname)" = "$instance_name" ] || fail 'provisioned instance binding does not match hostname'
+  printf '%s' "$owner_binding_sha256" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+    fail 'invalid provisioned owner binding'
+  printf '%s' "$owner_nonce_hex" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+    fail 'invalid provisioned owner nonce'
+  expected_binding=$(printf '%s\n%s\n%s' "$owner_run_id" "$instance_name" "$owner_nonce_hex" |
+    sha256sum | awk '{print $1}')
+  [ "$expected_binding" = "$owner_binding_sha256" ] || fail 'provisioned owner binding is invalid'
+  case "$cache_root" in /*) ;; *) fail 'cache root is not absolute' ;; esac
+  case "$mutation_lock_path" in /*) ;; *) fail 'cache mutation lock is not absolute' ;; esac
+  case "$state_dir" in
+    /var/lib/cybex-forge/verified-release-test-hook) ;;
+    *) fail 'state directory is outside the private persistent test-hook state' ;;
+  esac
+  [ -d "$cache_root" ] && [ ! -L "$cache_root" ] || fail 'cache root is unavailable'
+  [ -f "$mutation_lock_path" ] && [ ! -L "$mutation_lock_path" ] ||
+    fail 'cache mutation lock is unavailable or unsafe'
+  [ "$(stat -c '%a' -- "$mutation_lock_path")" = 600 ] &&
+    [ "$(stat -c '%h' -- "$mutation_lock_path")" = 1 ] &&
+    [ "$(stat -c '%u' -- "$mutation_lock_path")" = "$(stat -c '%u' -- "$cache_root")" ] ||
+    fail 'cache mutation lock ownership or mode is unsafe'
+  sentinel_private_dir="$cache_root/.cybex-forge-private"
+  sentinel_dir="$sentinel_private_dir/release-test-faults"
+  sentinel_file="$sentinel_dir/pending"
+  for directory in "$sentinel_private_dir" "$sentinel_dir"; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] &&
+      [ "$(stat -c '%a' -- "$directory")" = 700 ] &&
+      [ "$(stat -c '%u' -- "$directory")" = "$(stat -c '%u' -- "$cache_root")" ] ||
+      fail 'release-test fault sentinel directory is unsafe'
+  done
+  install -d -m 0700 -o root -g root -- "$state_dir"
+  [ ! -L "$state_dir" ] && [ "$(stat -c '%u:%g' -- "$state_dir")" = '0:0' ] &&
+    [ "$(stat -c '%a' -- "$state_dir")" = 700 ] || fail 'unsafe test-hook state directory'
+  state_file="$state_dir/armed"
+  backup_file="$state_dir/original"
+  read_boot_id
+}
+
+acquire_mutation_lease() {
+  [ -f "$mutation_lock_path" ] && [ ! -L "$mutation_lock_path" ] ||
+    fail 'cache mutation lock changed type'
+  exec 9<>"$mutation_lock_path"
+  flock -x 9 || fail 'could not acquire cache mutation lease'
+  [ -f "$mutation_lock_path" ] && [ ! -L "$mutation_lock_path" ] &&
+    [ "$(stat -Lc '%d:%i' -- /proc/self/fd/9)" = "$(stat -c '%d:%i' -- "$mutation_lock_path")" ] &&
+    [ "$(stat -Lc '%a' -- /proc/self/fd/9)" = 600 ] &&
+    [ "$(stat -Lc '%h' -- /proc/self/fd/9)" = 1 ] &&
+    [ "$(stat -Lc '%u' -- /proc/self/fd/9)" = "$(stat -c '%u' -- "$cache_root")" ] ||
+    fail 'cache mutation lock changed while acquiring it'
+}
+
+release_mutation_lease() {
+  flock -u 9 || fail 'could not release cache mutation lease'
+  exec 9>&-
+}
+
+json_capabilities() {
+  printf '{"schema":"%s","test_only":true,"run_id_required":true,"acceptance_run_id_required":true,"evidence_nonce_sha256_required":true,"attempt_id_required":true,"boot_id_bound":true,"owner_bound":true,"single_use":true,"consumption_proof":true,"owner_binding_sha256":"%s","supported_faults":["corrupt_closure_manifest","corrupt_nar","invalid_cache_signature"]}\n' \
+    "$SCHEMA" "$owner_binding_sha256"
+}
+
+require_run() {
+  safe_id "$run_id" || fail 'invalid --run-id'
+  [ "$run_id" = "$owner_run_id" ] || fail 'run ID does not match the provisioned owner'
+}
+
+find_release_closure() {
+  matches=$(find "$cache_root/system-releases" -xdev -type f \
+    -path "*/$release_id/*/*/closure.json" -print 2>/dev/null || true)
+  [ -n "$matches" ] || fail 'release closure was not found'
+  [ "$(printf '%s\n' "$matches" | wc -l)" -eq 1 ] || fail 'release closure is ambiguous'
+  closure_path=$matches
+  case "$closure_path" in "$cache_root"/*) ;; *) fail 'closure escaped cache root' ;; esac
+  [ -f "$closure_path" ] && [ ! -L "$closure_path" ] || fail 'closure is unsafe'
+}
+
+target_cache_files() {
+  target_store_path=$(sed -n 's/.*"target_store_path":"\([^"]*\)".*/\1/p' "$closure_path")
+  case "$target_store_path" in /nix/store/[0-9a-z]*-*) ;; *) fail 'closure target store path is invalid' ;; esac
+  store_name=${target_store_path#/nix/store/}
+  store_hash=${store_name%%-*}
+  [ "${#store_hash}" -eq 32 ] || fail 'closure target store hash is invalid'
+  narinfo_path="$cache_root/$store_hash.narinfo"
+  [ -f "$narinfo_path" ] && [ ! -L "$narinfo_path" ] || fail 'target narinfo is unsafe or missing'
+  nar_url=$(sed -n 's/^URL: //p' "$narinfo_path" | head -n 1)
+  case "$nar_url" in ''|/*|*..*) fail 'target NAR URL is unsafe' ;; esac
+  nar_path="$cache_root/$nar_url"
+  case "$nar_path" in "$cache_root"/*) ;; *) fail 'target NAR escaped cache root' ;; esac
+  [ -f "$nar_path" ] && [ ! -L "$nar_path" ] || fail 'target NAR is unsafe or missing'
+}
+
+record_state() {
+  target=$1
+  before=$2
+  after=$3
+  consumed=$4
+  temporary="$state_file.tmp.$$"
+  umask 077
+  printf '%s\n' \
+    "schema=$SCHEMA" \
+    "owner_run_id=$owner_run_id" \
+    "run_id=$run_id" \
+    "acceptance_run_id=$acceptance_run_id" \
+    "evidence_nonce_sha256=$evidence_nonce_sha256" \
+    "boot_id=$boot_id" \
+    "fault=$fault" \
+    "release_id=$release_id" \
+    "deployment_id=$deployment_id" \
+    "attempt_id=$attempt_id" \
+    "target=$target" \
+    "before_sha256=$before" \
+    "after_sha256=$after" \
+    "owner_binding_sha256=$owner_binding_sha256" \
+    "consumed=$consumed" >"$temporary"
+  chmod 0600 "$temporary"
+  if [ "$SELF_TEST" = false ]; then
+    chown root:root "$temporary"
+  fi
+  sync -f "$temporary"
+  mv -f -- "$temporary" "$state_file"
+  sync -f "$state_dir"
+}
+
+record_sentinel() {
+  consumed=$1
+  if [ -e "$sentinel_file" ]; then
+    [ -f "$sentinel_file" ] && [ ! -L "$sentinel_file" ] ||
+      fail 'fault sentinel is unsafe'
+    recorded_sentinel_owner=$(sed -n 's/^owner_run_id=//p' "$sentinel_file")
+    recorded_sentinel_attempt=$(sed -n 's/^attempt_id=//p' "$sentinel_file")
+    [ "$recorded_sentinel_owner" = "$owner_run_id" ] &&
+      [ "$recorded_sentinel_attempt" = "$attempt_id" ] ||
+      fail 'fault sentinel belongs to another run or attempt'
+  fi
+  temporary=$(mktemp "$sentinel_dir/.pending.tmp.XXXXXX") ||
+    fail 'could not allocate fault sentinel staging file'
+  umask 022
+  printf '%s\n' \
+    "schema=$SENTINEL_SCHEMA" \
+    "owner_run_id=$owner_run_id" \
+    "run_id=$run_id" \
+    "acceptance_run_id=$acceptance_run_id" \
+    "evidence_nonce_sha256=$evidence_nonce_sha256" \
+    "boot_id=$boot_id" \
+    "fault=$fault" \
+    "release_id=$release_id" \
+    "deployment_id=$deployment_id" \
+    "attempt_id=$attempt_id" \
+    "owner_binding_sha256=$owner_binding_sha256" \
+    "consumed=$consumed" >"$temporary"
+  chmod 0644 "$temporary"
+  if [ "$SELF_TEST" = false ]; then
+    chown root:root "$temporary"
+  fi
+  sync -f "$temporary"
+  mv -f -- "$temporary" "$sentinel_file"
+  sync -f "$sentinel_dir"
+}
+
+arm_fault() {
+  require_run
+  canonical_uuid "$acceptance_run_id" || fail 'invalid canonical --acceptance-run-id UUID'
+  lower_sha256 "$evidence_nonce_sha256" || fail 'invalid --evidence-nonce-sha256'
+  canonical_uuid "$release_id" || fail 'invalid canonical --release-id UUID'
+  canonical_uuid "$deployment_id" || fail 'invalid canonical --deployment-id UUID'
+  canonical_uuid "$attempt_id" || fail 'invalid canonical --attempt-id UUID'
+  acquire_mutation_lease
+  [ ! -e "$state_file" ] && [ ! -e "$backup_file" ] && [ ! -e "$sentinel_file" ] ||
+    fail 'a single-use fault is already consumed; reset first'
+  find_release_closure
+  target_cache_files
+
+  case "$fault" in
+    corrupt_closure_manifest) target=$closure_path ;;
+    corrupt_nar) target=$nar_path ;;
+    invalid_cache_signature) target=$narinfo_path ;;
+    *) fail 'unsupported fault' ;;
+  esac
+  [ -f "$target" ] && [ ! -L "$target" ] || fail 'fault target is unsafe'
+  cp --preserve=mode,ownership,timestamps -- "$target" "$backup_file"
+  [ -f "$backup_file" ] && [ ! -L "$backup_file" ] || fail 'fault backup is unsafe'
+  chmod 0600 "$backup_file"
+  if [ "$SELF_TEST" = false ]; then
+    chown root:root "$backup_file"
+  fi
+  before=$(sha256_file "$target")
+  sync -f "$backup_file"
+  # Persist a recoverable prepared record before changing shared cache bytes.
+  # Reset can restore the exact backup even if this hook is killed mid-write.
+  record_state "$target" "$before" '' false
+  # This bounded, non-secret sentinel is readable by the Forge service and is
+  # committed before any shared cache byte changes. A killed hook therefore
+  # leaves subsequent System Release publication failed closed until reset.
+  record_sentinel false
+
+  case "$fault" in
+    corrupt_closure_manifest|corrupt_nar)
+      [ "$(stat -c '%s' -- "$target")" -gt 0 ] || fail 'fault target is empty'
+      printf '!' | dd of="$target" bs=1 seek=0 conv=notrunc status=none
+      ;;
+    invalid_cache_signature)
+      temporary="$state_dir/mutated.$$"
+      awk 'BEGIN { changed=0 }
+        /^Sig: / && changed == 0 {
+          print "Sig: cybex-forge-cache:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+          changed=1; next
+        }
+        { print }
+        END { if (changed == 0) exit 42 }' "$target" >"$temporary" || {
+          rm -f -- "$temporary"
+          fail 'target narinfo has no signature'
+        }
+      chmod --reference="$target" "$temporary"
+      chown --reference="$target" "$temporary"
+      mv -f -- "$temporary" "$target"
+      ;;
+  esac
+  sync -f "$target"
+  after=$(sha256_file "$target")
+  [ "$after" != "$before" ] || fail 'fault did not change target bytes'
+  record_state "$target" "$before" "$after" true
+  record_sentinel true
+  release_mutation_lease
+  printf '{"schema":"%s","test_only":true,"run_id_required":true,"acceptance_run_id_required":true,"evidence_nonce_sha256_required":true,"attempt_id_required":true,"boot_id_bound":true,"armed":true,"consumed":true,"owner_run_id":"%s","run_id":"%s","acceptance_run_id":"%s","evidence_nonce_sha256":"%s","boot_id":"%s","fault":"%s","release_id":"%s","deployment_id":"%s","attempt_id":"%s","before_sha256":"%s","after_sha256":"%s"}\n' \
+    "$SCHEMA" "$owner_run_id" "$run_id" "$acceptance_run_id" "$evidence_nonce_sha256" "$boot_id" "$fault" "$release_id" "$deployment_id" "$attempt_id" "$before" "$after"
+}
+
+reset_fault() {
+  require_run
+  canonical_uuid "$acceptance_run_id" || fail 'invalid canonical --acceptance-run-id UUID'
+  lower_sha256 "$evidence_nonce_sha256" || fail 'invalid --evidence-nonce-sha256'
+  canonical_uuid "$attempt_id" || fail 'invalid canonical --attempt-id UUID'
+  acquire_mutation_lease
+  if [ ! -e "$state_file" ] && [ ! -e "$backup_file" ] && [ ! -e "$sentinel_file" ]; then
+    release_mutation_lease
+    printf '{"schema":"%s","test_only":true,"run_id_required":true,"acceptance_run_id_required":true,"evidence_nonce_sha256_required":true,"attempt_id_required":true,"boot_id_bound":true,"reset":true,"changed":false,"owner_run_id":"%s","run_id":"%s","acceptance_run_id":"%s","evidence_nonce_sha256":"%s","boot_id":"%s","attempt_id":"%s"}\n' \
+      "$SCHEMA" "$owner_run_id" "$run_id" "$acceptance_run_id" "$evidence_nonce_sha256" "$boot_id" "$attempt_id"
+    return
+  fi
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] && [ -f "$backup_file" ] &&
+    [ ! -L "$backup_file" ] && [ -f "$sentinel_file" ] && [ ! -L "$sentinel_file" ] ||
+    fail 'fault state or publication sentinel is incomplete or unsafe'
+  recorded_owner=$(sed -n 's/^owner_run_id=//p' "$state_file")
+  recorded_schema=$(sed -n 's/^schema=//p' "$state_file")
+  recorded_run=$(sed -n 's/^run_id=//p' "$state_file")
+  recorded_acceptance=$(sed -n 's/^acceptance_run_id=//p' "$state_file")
+  recorded_nonce=$(sed -n 's/^evidence_nonce_sha256=//p' "$state_file")
+  recorded_boot=$(sed -n 's/^boot_id=//p' "$state_file")
+  recorded_attempt=$(sed -n 's/^attempt_id=//p' "$state_file")
+  recorded_binding=$(sed -n 's/^owner_binding_sha256=//p' "$state_file")
+  recorded_fault=$(sed -n 's/^fault=//p' "$state_file")
+  recorded_release=$(sed -n 's/^release_id=//p' "$state_file")
+  recorded_deployment=$(sed -n 's/^deployment_id=//p' "$state_file")
+  sentinel_owner=$(sed -n 's/^owner_run_id=//p' "$sentinel_file")
+  sentinel_schema=$(sed -n 's/^schema=//p' "$sentinel_file")
+  sentinel_run=$(sed -n 's/^run_id=//p' "$sentinel_file")
+  sentinel_acceptance=$(sed -n 's/^acceptance_run_id=//p' "$sentinel_file")
+  sentinel_nonce=$(sed -n 's/^evidence_nonce_sha256=//p' "$sentinel_file")
+  sentinel_boot=$(sed -n 's/^boot_id=//p' "$sentinel_file")
+  sentinel_attempt=$(sed -n 's/^attempt_id=//p' "$sentinel_file")
+  sentinel_binding=$(sed -n 's/^owner_binding_sha256=//p' "$sentinel_file")
+  sentinel_fault=$(sed -n 's/^fault=//p' "$sentinel_file")
+  sentinel_release=$(sed -n 's/^release_id=//p' "$sentinel_file")
+  sentinel_deployment=$(sed -n 's/^deployment_id=//p' "$sentinel_file")
+  target=$(sed -n 's/^target=//p' "$state_file")
+  before=$(sed -n 's/^before_sha256=//p' "$state_file")
+  [ "$recorded_schema" = "$SCHEMA" ] &&
+    [ "$recorded_owner" = "$owner_run_id" ] && [ "$recorded_run" = "$run_id" ] &&
+    [ "$recorded_acceptance" = "$acceptance_run_id" ] &&
+    [ "$recorded_nonce" = "$evidence_nonce_sha256" ] &&
+    [ "$recorded_boot" = "$boot_id" ] && [ "$recorded_attempt" = "$attempt_id" ] &&
+    [ "$recorded_binding" = "$owner_binding_sha256" ] ||
+    fail 'fault state ownership does not match'
+  [ "$sentinel_schema" = "$SENTINEL_SCHEMA" ] &&
+    [ "$sentinel_owner" = "$owner_run_id" ] && [ "$sentinel_run" = "$run_id" ] &&
+    [ "$sentinel_acceptance" = "$acceptance_run_id" ] &&
+    [ "$sentinel_nonce" = "$evidence_nonce_sha256" ] &&
+    [ "$sentinel_boot" = "$boot_id" ] && [ "$sentinel_attempt" = "$attempt_id" ] &&
+    [ "$sentinel_binding" = "$owner_binding_sha256" ] ||
+    fail 'fault sentinel ownership does not match'
+  [ "$recorded_fault" = "$sentinel_fault" ] &&
+    [ "$recorded_release" = "$sentinel_release" ] &&
+    [ "$recorded_deployment" = "$sentinel_deployment" ] ||
+    fail 'fault state and sentinel target identity do not match'
+  case "$recorded_fault" in
+    corrupt_closure_manifest|corrupt_nar|invalid_cache_signature) ;;
+    *) fail 'recorded fault identity is invalid' ;;
+  esac
+  canonical_uuid "$recorded_release" || fail 'recorded release identity is invalid'
+  canonical_uuid "$recorded_deployment" || fail 'recorded deployment identity is invalid'
+  case "$target" in "$cache_root"/*) ;; *) fail 'recorded target escaped cache root' ;; esac
+  [ -f "$target" ] && [ ! -L "$target" ] || fail 'recorded target is unsafe'
+  cp --preserve=mode,ownership,timestamps -- "$backup_file" "$target"
+  sync -f "$target"
+  [ "$(sha256_file "$target")" = "$before" ] || fail 'fault reset did not restore exact bytes'
+  rm -f -- "$sentinel_file"
+  sync -f "$sentinel_dir"
+  rm -f -- "$backup_file" "$state_file"
+  sync -f "$state_dir"
+  release_mutation_lease
+  printf '{"schema":"%s","test_only":true,"run_id_required":true,"acceptance_run_id_required":true,"evidence_nonce_sha256_required":true,"attempt_id_required":true,"boot_id_bound":true,"reset":true,"changed":true,"owner_run_id":"%s","run_id":"%s","acceptance_run_id":"%s","evidence_nonce_sha256":"%s","boot_id":"%s","attempt_id":"%s"}\n' \
+    "$SCHEMA" "$owner_run_id" "$run_id" "$acceptance_run_id" "$evidence_nonce_sha256" "$boot_id" "$attempt_id"
+}
+
+run_self_test() {
+  SELF_TEST=true
+  temporary_root=$(mktemp -d)
+  trap 'rm -rf -- "$temporary_root"' EXIT HUP INT TERM
+  owner_run_id='bench-owner'
+  run_id=$owner_run_id
+  acceptance_run_id='018f6b61-a646-7f7c-a651-7ee13ad42f84'
+  evidence_nonce_sha256=$(printf 'a%.0s' $(seq 1 64))
+  release_id='018f6b61-a646-7f7c-a651-7ee13ad42f85'
+  deployment_id='018f6b61-a646-7f7c-a651-7ee13ad42f86'
+  attempt_id='018f6b61-a646-7f7c-a651-7ee13ad42f87'
+  owner_binding_sha256=$(printf 'b%.0s' $(seq 1 64))
+  cache_root="$temporary_root/cache"
+  mutation_lock_path="$temporary_root/cache-mutation.lock"
+  sentinel_private_dir="$cache_root/.cybex-forge-private"
+  sentinel_dir="$sentinel_private_dir/release-test-faults"
+  sentinel_file="$sentinel_dir/pending"
+  state_dir="$temporary_root/state"
+  state_file="$state_dir/armed"
+  backup_file="$state_dir/original"
+  install -d -m 0700 -- "$state_dir" \
+    "$sentinel_private_dir" "$sentinel_dir" \
+    "$cache_root/system-releases/$release_id/cohort/variant" \
+    "$cache_root/nar"
+  : >"$mutation_lock_path"
+  chmod 0600 "$mutation_lock_path"
+  read_boot_id
+
+  store_hash='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  closure_path="$cache_root/system-releases/$release_id/cohort/variant/closure.json"
+  printf '{"target_store_path":"/nix/store/%s-system"}\n' "$store_hash" >"$closure_path"
+  printf 'URL: nar/test.nar\nSig: cybex-forge-cache:test\n' >"$cache_root/$store_hash.narinfo"
+  printf 'original-nar-bytes\n' >"$cache_root/nar/test.nar"
+  original=$(sha256_file "$cache_root/nar/test.nar")
+  fault='corrupt_nar'
+  lease_ready="$temporary_root/lease-ready"
+  lease_release="$temporary_root/lease-release"
+  arm_started="$temporary_root/arm-started"
+  armed_output="$temporary_root/armed-output"
+  mkfifo "$lease_release"
+  (
+    exec 8<>"$mutation_lock_path"
+    flock -x 8
+    : >"$lease_ready"
+    read -r _ <"$lease_release"
+  ) &
+  lease_holder=$!
+  count=0
+  while [ ! -e "$lease_ready" ]; do
+    count=$((count + 1))
+    [ "$count" -lt 500 ] || fail 'self-test lease holder did not start'
+    sleep 0.01
+  done
+  (
+    : >"$arm_started"
+    arm_fault >"$armed_output"
+  ) &
+  arm_process=$!
+  count=0
+  while [ ! -e "$arm_started" ]; do
+    count=$((count + 1))
+    [ "$count" -lt 500 ] || fail 'self-test fault arm did not start'
+    sleep 0.01
+  done
+  [ "$(sha256_file "$cache_root/nar/test.nar")" = "$original" ] &&
+    [ ! -e "$state_file" ] && [ ! -e "$sentinel_file" ] ||
+    fail 'self-test fault mutation escaped the cache lease'
+  printf 'release\n' >"$lease_release"
+  wait "$lease_holder"
+  wait "$arm_process"
+  armed=$(cat "$armed_output")
+  printf '%s' "$armed" | grep -Fq '"armed":true' || fail 'self-test did not arm'
+  printf '%s' "$armed" | grep -Fq "\"acceptance_run_id\":\"$acceptance_run_id\"" ||
+    fail 'self-test arm omitted acceptance identity'
+  [ "$(sha256_file "$cache_root/nar/test.nar")" != "$original" ] ||
+    fail 'self-test did not corrupt target bytes'
+  [ -f "$sentinel_file" ] && [ ! -L "$sentinel_file" ] ||
+    fail 'self-test did not publish the fault sentinel'
+
+  saved_nonce=$evidence_nonce_sha256
+  evidence_nonce_sha256=$(printf 'c%.0s' $(seq 1 64))
+  if (reset_fault) >/dev/null 2>&1; then
+    fail 'self-test accepted a mismatched evidence nonce'
+  fi
+  evidence_nonce_sha256=$saved_nonce
+  saved_boot=$boot_id
+  boot_id='99999999-9999-4999-8999-999999999999'
+  if (reset_fault) >/dev/null 2>&1; then
+    fail 'self-test accepted state from another boot'
+  fi
+  boot_id=$saved_boot
+  reset=$(reset_fault)
+  printf '%s' "$reset" | grep -Fq '"reset":true' || fail 'self-test did not reset'
+  [ "$(sha256_file "$cache_root/nar/test.nar")" = "$original" ] ||
+    fail 'self-test did not restore exact target bytes'
+  [ ! -e "$state_file" ] && [ ! -e "$backup_file" ] ||
+    fail 'self-test left private hook state behind'
+  [ ! -e "$sentinel_file" ] || fail 'self-test left publication sentinel behind'
+  printf '%s\n' 'cybex-forge-release-test-hook self-test passed'
+}
+
+if [ "${1:-}" = '--self-test' ]; then
+  shift
+  [ "$#" -eq 0 ] || fail '--self-test takes no arguments'
+  run_self_test
+  exit 0
+fi
+
+command=${1:-}
+[ -n "$command" ] || fail 'command is required'
+shift || true
+json=false
+run_id=''
+acceptance_run_id=''
+evidence_nonce_sha256=''
+fault=''
+release_id=''
+deployment_id=''
+attempt_id=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) json=true; shift ;;
+    --run-id) run_id=${2:-}; shift 2 ;;
+    --acceptance-run-id) acceptance_run_id=${2:-}; shift 2 ;;
+    --evidence-nonce-sha256) evidence_nonce_sha256=${2:-}; shift 2 ;;
+    --fault) fault=${2:-}; shift 2 ;;
+    --release-id) release_id=${2:-}; shift 2 ;;
+    --deployment-id) deployment_id=${2:-}; shift 2 ;;
+    --attempt-id) attempt_id=${2:-}; shift 2 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+[ "$json" = true ] || fail '--json is required'
+load_config
+case "$command" in
+  capabilities) [ -z "$run_id$acceptance_run_id$evidence_nonce_sha256$fault$release_id$deployment_id$attempt_id" ] || fail 'capabilities takes no identity arguments'; json_capabilities ;;
+  arm) arm_fault ;;
+  reset) [ -z "$fault$release_id$deployment_id" ] || fail 'reset accepts only --run-id, --acceptance-run-id, --evidence-nonce-sha256, and --attempt-id'; reset_fault ;;
+  *) fail 'command must be capabilities, arm, or reset' ;;
+esac

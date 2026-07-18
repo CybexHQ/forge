@@ -140,6 +140,9 @@ async fn run_server(
         // rewrites nix-cache-info, so the cache can still heal later.
         warn!(error = %err, "Forge Cache initialization failed; substituters will reject this cache until resolved");
     }
+    if let Err(err) = cybex_forge::system_release::initialize_attestation_key(&state.config) {
+        warn!(error = %err, "Verified Releases attestation initialization failed; Forge will remain on protocol 3");
+    }
     cybex_forge::build::spawn(state.clone());
     if state.config.manage.enabled {
         cybex_forge::manage::spawn(state.clone());

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NIXPKGS_REVISION="74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+NIXPKGS_REVISION="8eeec934ae0dbeca3d7868c059568a65c08b2fc3"
 failures=0
 quiet=0
 skip_managed_sync=0

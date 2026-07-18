@@ -20,6 +20,7 @@ IOWeight=1000
 OOMScoreAdjust=-500
 StateDirectory=cybex-forge
 ReadWritePaths=/var/lib/cybex-forge /srv/cybex-forge
+ReadOnlyPaths=-/etc/cybex-forge/system-release
 UMask=0077
 CapabilityBoundingSet=
 AmbientCapabilities=

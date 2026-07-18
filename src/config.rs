@@ -46,6 +46,7 @@ pub struct AppConfig {
     pub boot: BootConfig,
     pub build: BuildConfig,
     pub cache: CacheConfig,
+    pub system_release: SystemReleaseConfig,
     pub update: UpdateConfig,
     pub manage: ManageConfig,
 }
@@ -116,11 +117,31 @@ pub struct BuildTargetConfig {
 pub struct CacheConfig {
     pub enabled: bool,
     pub root_dir: PathBuf,
+    pub mutation_lock_path: PathBuf,
     pub signing_key_name: String,
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
     pub max_bytes: u64,
     pub retain_recent_builds: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SystemReleaseConfig {
+    pub enabled: bool,
+    pub attestation_private_key_path: PathBuf,
+    pub attestation_public_key_path: PathBuf,
+    pub managed_agent_version: String,
+    pub managed_agent_package_store_path: PathBuf,
+    pub managed_agent_package_sha256: String,
+    pub managed_agent_module_path: PathBuf,
+    pub managed_agent_module_sha256: String,
+    pub transition_helper_path: PathBuf,
+    pub transition_helper_sha256: String,
+    pub watchdog_path: PathBuf,
+    pub watchdog_sha256: String,
+    pub release_test_hook_path: Option<PathBuf>,
+    pub release_test_hook_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -225,6 +246,10 @@ impl AppConfig {
         }
         self.cache.root_dir =
             normalize_absolute_config_path("cache.root_dir", &self.cache.root_dir)?;
+        self.cache.mutation_lock_path = normalize_absolute_config_path(
+            "cache.mutation_lock_path",
+            &self.cache.mutation_lock_path,
+        )?;
         self.cache.private_key_path =
             normalize_absolute_config_path("cache.private_key_path", &self.cache.private_key_path)?;
         self.cache.public_key_path =
@@ -236,6 +261,104 @@ impl AppConfig {
             .max_bytes
             .clamp(16 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
         self.cache.retain_recent_builds = self.cache.retain_recent_builds.clamp(1, 10_000);
+        self.system_release.attestation_private_key_path = normalize_absolute_config_path(
+            "system_release.attestation_private_key_path",
+            &self.system_release.attestation_private_key_path,
+        )?;
+        self.system_release.attestation_public_key_path = normalize_absolute_config_path(
+            "system_release.attestation_public_key_path",
+            &self.system_release.attestation_public_key_path,
+        )?;
+        self.system_release.managed_agent_package_store_path = normalize_absolute_config_path(
+            "system_release.managed_agent_package_store_path",
+            &self.system_release.managed_agent_package_store_path,
+        )?;
+        self.system_release.managed_agent_module_path = normalize_absolute_config_path(
+            "system_release.managed_agent_module_path",
+            &self.system_release.managed_agent_module_path,
+        )?;
+        self.system_release.release_test_hook_path = self
+            .system_release
+            .release_test_hook_path
+            .take()
+            .map(|path| {
+                normalize_absolute_config_path("system_release.release_test_hook_path", &path)
+            })
+            .transpose()?;
+        self.system_release.transition_helper_path = normalize_absolute_config_path(
+            "system_release.transition_helper_path",
+            &self.system_release.transition_helper_path,
+        )?;
+        self.system_release.watchdog_path = normalize_absolute_config_path(
+            "system_release.watchdog_path",
+            &self.system_release.watchdog_path,
+        )?;
+        self.system_release.managed_agent_version =
+            self.system_release.managed_agent_version.trim().to_string();
+        self.system_release.managed_agent_package_sha256 = normalize_optional_sha256(
+            "system_release.managed_agent_package_sha256",
+            &self.system_release.managed_agent_package_sha256,
+        )?;
+        self.system_release.managed_agent_module_sha256 = normalize_optional_sha256(
+            "system_release.managed_agent_module_sha256",
+            &self.system_release.managed_agent_module_sha256,
+        )?;
+        self.system_release.transition_helper_sha256 = normalize_optional_sha256(
+            "system_release.transition_helper_sha256",
+            &self.system_release.transition_helper_sha256,
+        )?;
+        self.system_release.watchdog_sha256 = normalize_optional_sha256(
+            "system_release.watchdog_sha256",
+            &self.system_release.watchdog_sha256,
+        )?;
+        self.system_release.release_test_hook_sha256 = normalize_optional_sha256(
+            "system_release.release_test_hook_sha256",
+            &self.system_release.release_test_hook_sha256,
+        )?;
+        if self.system_release.release_test_hook_path.is_some()
+            != !self.system_release.release_test_hook_sha256.is_empty()
+        {
+            bail!(
+                "system_release.release_test_hook_path and release_test_hook_sha256 must be configured together"
+            );
+        }
+        if self.system_release.enabled {
+            if !self
+                .system_release
+                .managed_agent_package_store_path
+                .starts_with("/nix/store")
+            {
+                bail!(
+                    "system_release.managed_agent_package_store_path must be an absolute Nix store path"
+                );
+            }
+            normalize_required_release_version(
+                "system_release.managed_agent_version",
+                &self.system_release.managed_agent_version,
+            )?;
+            for (field, value) in [
+                (
+                    "system_release.managed_agent_package_sha256",
+                    self.system_release.managed_agent_package_sha256.as_str(),
+                ),
+                (
+                    "system_release.managed_agent_module_sha256",
+                    self.system_release.managed_agent_module_sha256.as_str(),
+                ),
+                (
+                    "system_release.transition_helper_sha256",
+                    self.system_release.transition_helper_sha256.as_str(),
+                ),
+                (
+                    "system_release.watchdog_sha256",
+                    self.system_release.watchdog_sha256.as_str(),
+                ),
+            ] {
+                if value.is_empty() {
+                    bail!("{field} is required when System Releases are enabled");
+                }
+            }
+        }
         self.update.work_dir =
             normalize_absolute_config_path("update.work_dir", &self.update.work_dir)?;
         self.update.releases_dir =
@@ -276,6 +399,9 @@ impl AppConfig {
         }
         if self.manage.enabled && self.manage.organization_id.is_empty() {
             bail!("manage.organization_id is required when managed mode is enabled");
+        }
+        if self.manage.enabled && self.system_release.enabled {
+            require_authenticated_system_release_manage_url(&self.manage.api_url)?;
         }
         Ok(())
     }
@@ -344,6 +470,14 @@ pub(crate) fn normalize_http_url(field: &str, value: &str) -> anyhow::Result<Str
     Ok(url)
 }
 
+pub(crate) fn require_authenticated_system_release_manage_url(value: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(value).context("parse Verified Releases Manage transport URL")?;
+    if parsed.scheme() != "https" {
+        bail!("manage.api_url must use HTTPS when managed System Releases are enabled");
+    }
+    Ok(())
+}
+
 fn local_health_url_from_listen_addr(listen_addr: &str) -> anyhow::Result<String> {
     let parsed: SocketAddr = listen_addr.parse().with_context(
         || "server.listen_addr must be an IP socket address such as 127.0.0.1:8080",
@@ -389,6 +523,29 @@ fn normalize_optional_public_key_text(field: &str, value: &str) -> anyhow::Resul
         bail!("{field} is invalid");
     }
     Ok(value.to_string())
+}
+
+fn normalize_optional_sha256(field: &str, value: &str) -> anyhow::Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(value);
+    }
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{field} must be a lowercase 64-character SHA-256 digest");
+    }
+    Ok(value)
+}
+
+fn normalize_required_release_version(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        bail!("{field} must be a safe non-empty release version");
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_bootloader_filename(value: &str) -> anyhow::Result<String> {
@@ -689,11 +846,45 @@ impl Default for CacheConfig {
         Self {
             enabled: true,
             root_dir: PathBuf::from("/srv/cybex-forge/www/cache"),
+            mutation_lock_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-mutation.lock"),
             signing_key_name: "cybex-forge-cache".to_string(),
             private_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-priv-key.pem"),
             public_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-pub-key.pem"),
             max_bytes: 64 * 1024 * 1024 * 1024,
             retain_recent_builds: 50,
+        }
+    }
+}
+
+impl Default for SystemReleaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            attestation_private_key_path: PathBuf::from(
+                "/var/lib/cybex-forge/system-release/attestation-private.key",
+            ),
+            attestation_public_key_path: PathBuf::from(
+                "/var/lib/cybex-forge/system-release/attestation-public.key",
+            ),
+            managed_agent_version: String::new(),
+            managed_agent_package_store_path: PathBuf::from(
+                "/nix/store/00000000000000000000000000000000-cybex-agent-unconfigured",
+            ),
+            managed_agent_package_sha256: String::new(),
+            managed_agent_module_path: PathBuf::from(
+                "/etc/cybex-forge/system-release/managed-agent.nix",
+            ),
+            managed_agent_module_sha256: String::new(),
+            transition_helper_path: PathBuf::from(
+                "/etc/cybex-forge/system-release/cybex-release-transition.sh",
+            ),
+            transition_helper_sha256: String::new(),
+            watchdog_path: PathBuf::from(
+                "/etc/cybex-forge/system-release/cybex-release-watchdog.sh",
+            ),
+            watchdog_sha256: String::new(),
+            release_test_hook_path: None,
+            release_test_hook_sha256: String::new(),
         }
     }
 }
@@ -733,6 +924,21 @@ impl Default for ManageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supported_system_release_nixpkgs_commit() -> String {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../protocol/system-release-supported-nixpkgs-pin.json"
+        ))
+        .expect("shared supported System Release nixpkgs pin fixture");
+        assert_eq!(
+            fixture["schema"],
+            "cybex.system-release-supported-nixpkgs-pin-fixture.v1"
+        );
+        fixture["pin"]["nixpkgs_commit"]
+            .as_str()
+            .expect("fixture nixpkgs commit")
+            .to_string()
+    }
 
     #[test]
     fn print_config_view_redacts_admin_token() {
@@ -792,12 +998,115 @@ mod tests {
     fn blueprint_build_targets_require_immutable_nixpkgs_commits() {
         assert!(pinned_nixpkgs_revision("github:NixOS/nixpkgs/nixos-unstable").is_err());
         assert!(pinned_nixpkgs_revision("github:NixOS/nixpkgs/abc123").is_err());
+        let commit = supported_system_release_nixpkgs_commit();
+        let flake = format!("github:NixOS/nixpkgs/{commit}");
+        assert_eq!(pinned_nixpkgs_revision(&flake).unwrap(), commit);
+        for infrastructure_source in [
+            include_str!("../install/cybex-forge-lxc-install.sh"),
+            include_str!("../install/cybex-forge-check"),
+            include_str!("../examples/config.toml"),
+        ] {
+            assert!(infrastructure_source.contains(&commit));
+        }
+    }
+
+    #[test]
+    fn installer_accepts_the_complete_protocol_v5_release_source_bundle() {
+        let installer = include_str!("../install/cybex-forge-lxc-install.sh");
+        let bundle = installer
+            .split_once("system_release_source_bundle_expected_files() {\n  cat <<'EOF'\n")
+            .expect("installer source-bundle function")
+            .1
+            .split_once("\nEOF\n}")
+            .expect("installer source-bundle here document")
+            .0;
+        let expected = [
+            "Cargo.toml",
+            "agent/cybex-agent/Cargo.lock",
+            "agent/cybex-agent/Cargo.toml",
+            "agent/cybex-agent/src/main.rs",
+            "agent/cybex-agent/src/verified_releases.rs",
+            "deploy/nixos/cybex-agent-module.nix",
+            "deploy/nixos/cybex-blueprints.nix",
+            "deploy/nixos/cybex-release-test-hook.sh",
+            "deploy/nixos/cybex-release-transition.sh",
+            "deploy/nixos/cybex-release-watchdog.sh",
+            "protocol/system-release-compiler-v3-standard-source.json",
+            "protocol/system-release-supported-nixpkgs-pin.json",
+            "src/lib.rs",
+            "src/system_release_compiler_v3.rs",
+            "src/system_releases.rs",
+        ];
+        assert_eq!(bundle.lines().collect::<Vec<_>>(), expected);
+        assert!(installer.contains(
+            "the test release source manifest must contain exactly fifteen file records"
+        ));
+        assert!(
+            installer.contains("pkgs = import nixpkgs.outPath { system = \\\"x86_64-linux\\\"; };")
+        );
+        assert!(installer.contains(
+            "\"$profile_nix\" build --impure --no-link --print-out-paths --expr \"$build_expression\""
+        ));
+        assert!(installer.contains("cargoRoot = \\\"agent/cybex-agent\\\";"));
+        assert!(installer.contains(
+            "url = \\\"https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip\\\";"
+        ));
+        assert!(
+            installer
+                .contains("hash = \\\"sha256-SBJE0IEgl7Efuu73n3HZQrFxYX+cn5UU5jrL4T5xzNw=\\\";")
+        );
+        assert!(installer.contains("env.SWAGGER_UI_DOWNLOAD_URL = \\\"file://\\${swaggerUi}\\\";"));
+    }
+
+    #[test]
+    fn enabled_system_releases_require_a_complete_pinned_agent_bundle() {
+        let path = write_temp_config(
+            r#"
+[system_release]
+enabled = true
+managed_agent_version = ""
+"#,
+        );
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(err.to_string().contains("managed_agent_version"));
+    }
+
+    #[test]
+    fn system_release_bundle_digests_are_normalized_and_paths_are_fixed_inputs() {
+        let path = write_temp_config(&format!(
+            r#"
+[system_release]
+enabled = true
+managed_agent_version = " 1.2.3 "
+managed_agent_package_store_path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-cybex-agent"
+managed_agent_package_sha256 = "{}"
+managed_agent_module_path = "/etc/cybex-forge/system-release/managed-agent.nix"
+managed_agent_module_sha256 = "{}"
+transition_helper_path = "/etc/cybex-forge/system-release/cybex-release-transition.sh"
+transition_helper_sha256 = "{}"
+watchdog_path = "/etc/cybex-forge/system-release/cybex-release-watchdog.sh"
+watchdog_sha256 = "{}"
+"#,
+            "A".repeat(64),
+            "B".repeat(64),
+            "C".repeat(64),
+            "D".repeat(64),
+        ));
+
+        let config = AppConfig::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.system_release.managed_agent_version, "1.2.3");
         assert_eq!(
-            pinned_nixpkgs_revision(
-                "github:NixOS/nixpkgs/74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
-            )
-            .unwrap(),
-            "74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+            config.system_release.managed_agent_package_sha256,
+            "a".repeat(64)
+        );
+        assert_eq!(
+            config.system_release.transition_helper_path,
+            PathBuf::from("/etc/cybex-forge/system-release/cybex-release-transition.sh")
         );
     }
 
@@ -896,6 +1205,36 @@ organization_id = "550e8400-e29b-41d4-a716-446655440000"
         let _ = fs::remove_file(&path);
 
         assert!(err.to_string().contains("manage.api_url"));
+    }
+
+    #[test]
+    fn managed_system_releases_require_https_manage_transport() {
+        let path = write_temp_config(&format!(
+            r#"
+[manage]
+enabled = true
+api_url = "http://10.10.0.7:8080"
+organization_id = "550e8400-e29b-41d4-a716-446655440000"
+
+[system_release]
+enabled = true
+managed_agent_version = "1.2.3"
+managed_agent_package_store_path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-cybex-agent"
+managed_agent_package_sha256 = "{}"
+managed_agent_module_sha256 = "{}"
+transition_helper_sha256 = "{}"
+watchdog_sha256 = "{}"
+"#,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        ));
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(err.to_string().contains("must use HTTPS"));
     }
 
     #[test]

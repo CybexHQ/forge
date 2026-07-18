@@ -1,0 +1,14 @@
+{
+  "schema": "cybex.system-release-supported-nixpkgs-pin-fixture.v1",
+  "pin": {
+    "label": "NixOS 26.05 channel release 4937",
+    "nixpkgs_commit": "8eeec934ae0dbeca3d7868c059568a65c08b2fc3",
+    "nixos_release": "26.05",
+    "channel": "nixos-26.05",
+    "source_url": "https://channels.nixos.org/nixos-26.05",
+    "captured_at": "2026-07-15T00:00:00Z",
+    "support_ends_at": "2026-12-31T23:59:59Z",
+    "state": "supported",
+    "is_default": true
+  }
+}

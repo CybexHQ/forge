@@ -40,17 +40,35 @@ nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 # artifact_type = "nixos_closure"
 # target = "blueprint"
 # system = "x86_64-linux"
-# flake = "github:NixOS/nixpkgs/74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
+# flake = "github:NixOS/nixpkgs/8eeec934ae0dbeca3d7868c059568a65c08b2fc3"
 # attr = "packages.x86_64-linux.desktop-experience"
 
 [cache]
 enabled = true
 root_dir = "/srv/cybex-forge/www/cache"
+mutation_lock_path = "/var/lib/cybex-forge/cache/cache-mutation.lock"
 signing_key_name = "cybex-forge-cache"
 private_key_path = "/var/lib/cybex-forge/cache/cache-priv-key.pem"
 public_key_path = "/var/lib/cybex-forge/cache/cache-pub-key.pem"
 max_bytes = 68719476736
 retain_recent_builds = 50
+
+[system_release]
+# Protocol v5 and system_release_builder_v3 are advertised only when this is
+# enabled and every key, managed-state, cache-signing, Nix, and agent-bundle
+# prerequisite validates. Keep disabled until all pinned values are installed.
+enabled = false
+attestation_private_key_path = "/var/lib/cybex-forge/system-release/attestation-private.key"
+attestation_public_key_path = "/var/lib/cybex-forge/system-release/attestation-public.key"
+managed_agent_version = ""
+managed_agent_package_store_path = "/nix/store/00000000000000000000000000000000-cybex-agent-unconfigured"
+managed_agent_package_sha256 = ""
+managed_agent_module_path = "/etc/cybex-forge/system-release/managed-agent.nix"
+managed_agent_module_sha256 = ""
+transition_helper_path = "/etc/cybex-forge/system-release/cybex-release-transition.sh"
+transition_helper_sha256 = ""
+watchdog_path = "/etc/cybex-forge/system-release/cybex-release-watchdog.sh"
+watchdog_sha256 = ""
 
 [update]
 enabled = true
@@ -70,6 +88,8 @@ trusted_public_key = ""
 
 [manage]
 enabled = false
+# HTTPS is mandatory when system_release.enabled is true. Managed requests do
+# not follow redirects, so configure the canonical Manage endpoint directly.
 api_url = "https://manage.example.com"
 organization_slug = "default"
 state_path = "/var/lib/cybex-forge/manage-state.json"

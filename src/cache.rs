@@ -1,7 +1,10 @@
 use std::{
-    collections::HashSet,
-    fs,
-    os::unix::fs::PermissionsExt,
+    collections::{HashMap, HashSet},
+    fs::{self, OpenOptions},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Command,
 };
@@ -13,6 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::task;
+use uuid::Uuid;
 
 use crate::{config::AppConfig, db, models::BuildJob, redact::redact_sensitive_key_values};
 
@@ -29,7 +33,152 @@ pub struct CacheStatusReport {
 }
 
 #[derive(Clone, Debug)]
+pub struct CacheSigningIdentity {
+    pub public_key: String,
+    pub key_id: String,
+    pub fingerprint: String,
+}
+
+/// Process-external serialization for every mutation of the served cache and
+/// its inventory rows. The descriptor owns the advisory `flock`; callers must
+/// keep this value alive until filesystem publication and the matching SQLite
+/// commit are both complete.
+#[derive(Debug)]
+pub struct CacheMutationLease {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl CacheMutationLease {
+    fn ensure_matches(&self, config: &AppConfig) -> Result<()> {
+        if self.path != config.cache.mutation_lock_path {
+            bail!("cache mutation lease does not match configured lock path");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CacheMutationLease {
+    fn drop(&mut self) {
+        // A crashed process releases the kernel lock automatically. Explicitly
+        // unlock on the ordinary path so waiting hook/build processes wake as
+        // soon as the guard leaves scope.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub async fn acquire_mutation_lease(config: &AppConfig) -> Result<CacheMutationLease> {
+    let lock_path = config.cache.mutation_lock_path.clone();
+    let cache_root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || acquire_mutation_lease_blocking(&lock_path, &cache_root))
+        .await
+        .context("join cache mutation lease task")?
+}
+
+pub async fn try_acquire_mutation_lease(config: &AppConfig) -> Result<Option<CacheMutationLease>> {
+    let lock_path = config.cache.mutation_lock_path.clone();
+    let cache_root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || {
+        acquire_mutation_lease_blocking_inner(&lock_path, &cache_root, true)
+    })
+    .await
+    .context("join non-blocking cache mutation lease task")?
+}
+
+pub fn assert_mutation_lease(config: &AppConfig, lease: &CacheMutationLease) -> Result<()> {
+    lease.ensure_matches(config)
+}
+
+fn acquire_mutation_lease_blocking(
+    lock_path: &Path,
+    cache_root: &Path,
+) -> Result<CacheMutationLease> {
+    acquire_mutation_lease_blocking_inner(lock_path, cache_root, false)?
+        .ok_or_else(|| anyhow!("blocking cache mutation lease was not acquired"))
+}
+
+fn acquire_mutation_lease_blocking_inner(
+    lock_path: &Path,
+    cache_root: &Path,
+    nonblocking: bool,
+) -> Result<Option<CacheMutationLease>> {
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("create cache root {}", cache_root.display()))?;
+    let cache_root_metadata = fs::symlink_metadata(cache_root)
+        .with_context(|| format!("stat cache root {}", cache_root.display()))?;
+    if !cache_root_metadata.is_dir()
+        || cache_root_metadata.file_type().is_symlink()
+        || cache_root_metadata.mode() & 0o022 != 0
+    {
+        bail!("cache root ownership, type, or mode is unsafe for mutation locking");
+    }
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| anyhow!("cache mutation lock path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create cache mutation lock directory {}", parent.display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path)
+        .with_context(|| format!("open cache mutation lock {}", lock_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat cache mutation lock {}", lock_path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.uid() != cache_root_metadata.uid()
+    {
+        bail!("cache mutation lock ownership, type, or mode is unsafe");
+    }
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error).context("acquire cache mutation lease");
+    }
+    // A waiter can spend an arbitrary amount of time blocked in `flock`.
+    // Revalidate the pathname after acquisition so replacing the lock inode
+    // while this process waited cannot create two independent mutation
+    // domains (one on the unlinked inode and one on its replacement).
+    let locked_metadata = file
+        .metadata()
+        .with_context(|| format!("restat cache mutation lock {}", lock_path.display()))?;
+    let path_metadata = fs::symlink_metadata(lock_path)
+        .with_context(|| format!("restat cache mutation lock path {}", lock_path.display()))?;
+    let current_cache_metadata = fs::symlink_metadata(cache_root)
+        .with_context(|| format!("restat cache root {}", cache_root.display()))?;
+    if !path_metadata.file_type().is_file()
+        || path_metadata.file_type().is_symlink()
+        || path_metadata.dev() != locked_metadata.dev()
+        || path_metadata.ino() != locked_metadata.ino()
+        || locked_metadata.nlink() != 1
+        || locked_metadata.mode() & 0o777 != 0o600
+        || locked_metadata.uid() != current_cache_metadata.uid()
+        || !current_cache_metadata.is_dir()
+        || current_cache_metadata.file_type().is_symlink()
+        || current_cache_metadata.mode() & 0o022 != 0
+    {
+        bail!("cache mutation lock or cache root changed while acquiring the lease");
+    }
+    Ok(Some(CacheMutationLease {
+        file,
+        path: lock_path.to_path_buf(),
+    }))
+}
+
+#[derive(Clone, Debug)]
 pub struct CachedNixArtifact {
+    pub managed_artifact_id: Option<String>,
     pub artifact_hash: String,
     pub size_bytes: i64,
     pub nar_path: PathBuf,
@@ -111,6 +260,148 @@ pub async fn status_report(config: &AppConfig, pool: &SqlitePool) -> CacheStatus
 /// cache.nixos.org (Priority 40); the lower value prefers the LAN cache when
 /// both carry a path.
 const NIX_CACHE_INFO_CONTENTS: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
+const RELEASE_TEST_FAULT_SENTINEL_SCHEMA: &str = "cybex.forge-release-test-fault-sentinel.v1";
+const RELEASE_TEST_FAULT_PRIVATE_DIR: &str = ".cybex-forge-private";
+const RELEASE_TEST_FAULT_SENTINEL_DIR: &str = "release-test-faults";
+const RELEASE_TEST_FAULT_SENTINEL_FILE: &str = "pending";
+const MAX_RELEASE_TEST_FAULT_SENTINEL_BYTES: u64 = 16 * 1024;
+
+/// Refuse all System Release publication while the root-only acceptance hook
+/// has an active cache fault. NARs are shared across releases, so limiting the
+/// fence to the named release would allow another build to republish metadata
+/// over a deliberately corrupted shared member. The hook creates this
+/// non-secret sentinel before touching cache bytes and removes it only after an
+/// exact reset, all under the same interprocess lease.
+pub fn ensure_system_release_publication_allowed(
+    config: &AppConfig,
+    _release_id: &str,
+    lease: &CacheMutationLease,
+) -> Result<()> {
+    lease.ensure_matches(config)?;
+    let private_dir = config.cache.root_dir.join(RELEASE_TEST_FAULT_PRIVATE_DIR);
+    let sentinel_dir = private_dir.join(RELEASE_TEST_FAULT_SENTINEL_DIR);
+    let sentinel_path = sentinel_dir.join(RELEASE_TEST_FAULT_SENTINEL_FILE);
+    let sentinel_metadata = match fs::symlink_metadata(&sentinel_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "stat release-test fault sentinel {}",
+                    sentinel_path.display()
+                )
+            });
+        }
+    };
+    let cache_metadata = fs::symlink_metadata(&config.cache.root_dir)?;
+    for directory in [&private_dir, &sentinel_dir] {
+        let metadata = fs::symlink_metadata(directory).with_context(|| {
+            format!("stat release-test fault directory {}", directory.display())
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != cache_metadata.uid()
+            || metadata.mode() & 0o777 != 0o700
+        {
+            bail!("release-test fault sentinel directory is unsafe");
+        }
+    }
+    if !sentinel_metadata.file_type().is_file()
+        || sentinel_metadata.nlink() != 1
+        || sentinel_metadata.len() == 0
+        || sentinel_metadata.len() > MAX_RELEASE_TEST_FAULT_SENTINEL_BYTES
+        || sentinel_metadata.mode() & 0o777 != 0o644
+        || !matches!(sentinel_metadata.uid(), 0) && sentinel_metadata.uid() != cache_metadata.uid()
+    {
+        bail!("release-test fault sentinel ownership, type, mode, or size is unsafe");
+    }
+    let raw = fs::read_to_string(&sentinel_path).with_context(|| {
+        format!(
+            "read release-test fault sentinel {}",
+            sentinel_path.display()
+        )
+    })?;
+    validate_release_test_fault_sentinel(&raw)?;
+    bail!("an acceptance-test cache fault is pending exact reset");
+}
+
+fn validate_release_test_fault_sentinel(raw: &str) -> Result<()> {
+    let mut values = HashMap::new();
+    for line in raw.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow!("release-test fault sentinel line is invalid"))?;
+        if !matches!(
+            key,
+            "schema"
+                | "owner_run_id"
+                | "run_id"
+                | "acceptance_run_id"
+                | "evidence_nonce_sha256"
+                | "boot_id"
+                | "fault"
+                | "release_id"
+                | "deployment_id"
+                | "attempt_id"
+                | "owner_binding_sha256"
+                | "consumed"
+        ) || values.insert(key, value).is_some()
+        {
+            bail!("release-test fault sentinel has unknown or duplicate fields");
+        }
+    }
+    let required = |key: &str| {
+        values
+            .get(key)
+            .copied()
+            .ok_or_else(|| anyhow!("release-test fault sentinel omitted {key}"))
+    };
+    if required("schema")? != RELEASE_TEST_FAULT_SENTINEL_SCHEMA
+        || required("owner_run_id")? != required("run_id")?
+        || !safe_fault_sentinel_id(required("owner_run_id")?)
+        || !matches!(
+            required("fault")?,
+            "corrupt_closure_manifest" | "corrupt_nar" | "invalid_cache_signature"
+        )
+        || !matches!(required("consumed")?, "true" | "false")
+    {
+        bail!("release-test fault sentinel identity is invalid");
+    }
+    for key in [
+        "acceptance_run_id",
+        "boot_id",
+        "release_id",
+        "deployment_id",
+        "attempt_id",
+    ] {
+        let value = required(key)?;
+        let uuid = Uuid::parse_str(value)
+            .with_context(|| format!("release-test fault sentinel {key} is invalid"))?;
+        if uuid.is_nil() || uuid.hyphenated().to_string() != value {
+            bail!("release-test fault sentinel {key} is not canonical");
+        }
+    }
+    for key in ["evidence_nonce_sha256", "owner_binding_sha256"] {
+        if !is_lower_sha256(required(key)?) {
+            bail!("release-test fault sentinel {key} is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn safe_fault_sentinel_id(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
 
 /// Make the served cache root a valid Nix binary cache before the first build
 /// export. `nix copy` only writes `nix-cache-info` as a side effect of an
@@ -122,12 +413,54 @@ pub async fn initialize(config: &AppConfig) -> Result<()> {
     if !config.cache.enabled {
         return Ok(());
     }
+    let lease = acquire_mutation_lease(config).await?;
     let cache_dir = config.cache.root_dir.clone();
     task::spawn_blocking(move || initialize_cache_root_blocking(&cache_dir))
         .await
         .context("join cache init task")??;
+    drop(lease);
     ensure_signing_key(config).await?;
     Ok(())
+}
+
+pub fn signing_identity(config: &AppConfig) -> Result<CacheSigningIdentity> {
+    if !config.cache.enabled {
+        bail!("Forge Cache is disabled");
+    }
+    let private = fs::symlink_metadata(&config.cache.private_key_path).with_context(|| {
+        format!(
+            "stat cache private key {}",
+            config.cache.private_key_path.display()
+        )
+    })?;
+    let public = fs::symlink_metadata(&config.cache.public_key_path).with_context(|| {
+        format!(
+            "stat cache public key {}",
+            config.cache.public_key_path.display()
+        )
+    })?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !private.file_type().is_file()
+        || private.nlink() != 1
+        || private.uid() != effective_uid
+        || private.mode() & 0o777 != 0o600
+        || !public.file_type().is_file()
+        || public.nlink() != 1
+        || public.uid() != effective_uid
+        || public.mode() & 0o022 != 0
+    {
+        bail!("cache signing key ownership or mode is unsafe");
+    }
+    let public_key = read_public_key(&config.cache.public_key_path)?;
+    let fingerprint = public_key_fingerprint(&public_key);
+    if fingerprint.is_empty() {
+        bail!("cache public key material is invalid");
+    }
+    Ok(CacheSigningIdentity {
+        public_key,
+        key_id: fingerprint.clone(),
+        fingerprint,
+    })
 }
 
 fn initialize_cache_root_blocking(cache_dir: &Path) -> Result<()> {
@@ -155,10 +488,12 @@ pub async fn export_output(
     store_path: &str,
     artifact_hash: &str,
     closure_size_bytes: i64,
+    lease: &CacheMutationLease,
 ) -> Result<CachedNixArtifact> {
     if !config.cache.enabled {
         bail!("Forge Cache is disabled");
     }
+    lease.ensure_matches(config)?;
     crate::disk::ensure_headroom(
         &config.cache.root_dir,
         closure_size_bytes.max(0) as u64,
@@ -222,6 +557,7 @@ pub async fn export_output(
             "source_build_job_id": managed_job_id,
         });
         Ok(CachedNixArtifact {
+            managed_artifact_id: None,
             artifact_hash,
             size_bytes: nar_len as i64,
             nar_path,
@@ -248,7 +584,9 @@ pub async fn record_cached_artifact(
     job: &BuildJob,
     artifact_type: &str,
     artifact: CachedNixArtifact,
+    lease: &CacheMutationLease,
 ) -> Result<()> {
+    lease.ensure_matches(config)?;
     let serving_url = format!(
         "{}/{}",
         cache_base_url(config),
@@ -256,7 +594,7 @@ pub async fn record_cached_artifact(
     );
     db::upsert_cache_artifact(
         pool,
-        None,
+        artifact.managed_artifact_id.as_deref(),
         artifact_type,
         &artifact.artifact_hash,
         artifact.size_bytes,
@@ -277,7 +615,6 @@ pub async fn record_cached_artifact(
     )
     .await
     .map_err(anyhow::Error::from)?;
-    enforce_retention(pool, config).await?;
     Ok(())
 }
 
@@ -287,40 +624,81 @@ pub async fn record_cached_artifact(
 pub async fn remove_artifacts_by_key(
     pool: &SqlitePool,
     config: &AppConfig,
+    expected_inventory: &db::CacheInventoryFence,
     keys: &[(String, String)],
-) -> Result<()> {
+) -> Result<db::CacheArtifactRemovalOutcome> {
+    let lease = acquire_mutation_lease(config).await?;
+    remove_artifacts_by_key_under_lease(pool, config, expected_inventory, keys, &lease).await
+}
+
+pub async fn remove_artifacts_by_key_under_lease(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    expected_inventory: &db::CacheInventoryFence,
+    keys: &[(String, String)],
+    lease: &CacheMutationLease,
+) -> Result<db::CacheArtifactRemovalOutcome> {
+    lease.ensure_matches(config)?;
     if keys.is_empty() {
-        return Ok(());
+        bail!("cache deletion requires at least one inventory-bound artifact key");
     }
-    let artifacts = db::list_cache_artifacts(pool).await?;
-    let doomed = artifacts
+    let mut outcome =
+        db::remove_cache_artifacts_if_current_and_unprotected(pool, expected_inventory, keys)
+            .await?;
+    if outcome.inventory_matched && !outcome.deleted.is_empty() {
+        // Requery after the deletion transaction while the global lease still
+        // excludes publishers. Never sweep from the pre-delete snapshot
+        // returned for diagnostics.
+        outcome.retained = db::list_cache_artifacts(pool).await?;
+        let retained = outcome
+            .retained
+            .iter()
+            .map(RetainedArtifactFiles::from)
+            .collect::<Vec<_>>();
+        sweep_unreachable_under_lease(config, retained, lease).await?;
+    }
+    Ok(outcome)
+}
+
+pub async fn sweep_to_recorded_artifacts(pool: &SqlitePool, config: &AppConfig) -> Result<u64> {
+    let lease = acquire_mutation_lease(config).await?;
+    sweep_to_recorded_artifacts_under_lease(pool, config, &lease).await
+}
+
+pub async fn sweep_to_recorded_artifacts_under_lease(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    lease: &CacheMutationLease,
+) -> Result<u64> {
+    lease.ensure_matches(config)?;
+    let retained = db::list_cache_artifacts(pool)
+        .await?
         .iter()
-        .filter(|artifact| {
-            keys.iter().any(|(artifact_type, hash)| {
-                *artifact_type == artifact.artifact_type && *hash == artifact.hash
-            })
-        })
-        .map(|artifact| artifact.id)
-        .collect::<HashSet<_>>();
-    if doomed.is_empty() {
-        return Ok(());
-    }
-    for id in &doomed {
-        db::delete_cache_artifact(pool, *id).await?;
-    }
-    let retained = artifacts
-        .iter()
-        .filter(|artifact| !doomed.contains(&artifact.id))
         .map(RetainedArtifactFiles::from)
         .collect::<Vec<_>>();
-    sweep_unreachable(config, retained).await?;
-    Ok(())
+    sweep_unreachable_under_lease(config, retained, lease).await
 }
 
 pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
+    let lease = acquire_mutation_lease(config).await?;
+    enforce_retention_under_lease(pool, config, &lease).await
+}
+
+pub async fn enforce_retention_under_lease(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    lease: &CacheMutationLease,
+) -> Result<()> {
+    lease.ensure_matches(config)?;
     if config.cache.max_bytes == 0 {
         tracing::warn!(
             "cache.max_bytes is 0: Forge Cache retention is disabled and the cache root can grow without bound"
+        );
+        return Ok(());
+    }
+    if !db::managed_cache_protections_authoritative(pool).await? {
+        tracing::warn!(
+            "cache retention is inhibited until a complete managed protection snapshot is installed"
         );
         return Ok(());
     }
@@ -330,35 +708,43 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     if total <= config.cache.max_bytes {
         return Ok(());
     }
-    let build_jobs = db::list_build_jobs(pool).await?;
-    let managed_protections = db::list_managed_cache_protections(pool).await?;
-    let mut protected_sources = HashSet::new();
-    for job in build_jobs
-        .iter()
-        .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
-        .chain(build_jobs.iter().take(config.cache.retain_recent_builds))
-    {
-        if let Some(managed_job_id) = job.managed_job_id.as_deref() {
-            protected_sources.insert(managed_job_id.to_string());
-        }
-    }
-    let mut candidates = db::list_cache_artifacts(pool).await?;
-    candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    let mut evicted_ids: HashSet<i64> = HashSet::new();
     // Evict oldest-first in rounds: pick a batch whose estimated compressed
     // footprint covers the excess, then mark-and-sweep ONCE for the whole
     // batch. Closure sharing can make the estimate optimistic, so re-measure
     // disk usage and run another round while still over budget. This keeps
     // the expensive full-cache walks proportional to rounds (usually one),
     // not to the number of evicted artifacts.
-    let mut next_index = 0;
-    while total > config.cache.max_bytes && next_index < candidates.len() {
+    loop {
+        if total <= config.cache.max_bytes {
+            break;
+        }
+        // These are deliberately refreshed for every eviction round under the
+        // lease. A complete desired-replica update acquired this same lease,
+        // so no stale protection snapshot can be used for deletion.
+        let build_jobs = db::list_build_jobs(pool).await?;
+        let managed_protections = db::list_managed_cache_protections(pool).await?;
+        let mut protected_sources = HashSet::new();
+        for job in build_jobs
+            .iter()
+            .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
+            .chain(build_jobs.iter().take(config.cache.retain_recent_builds))
+        {
+            if let Some(managed_job_id) = job.managed_job_id.as_deref() {
+                protected_sources.insert(managed_job_id.to_string());
+            }
+        }
+        let mut candidates = db::list_cache_artifacts(pool).await?;
+        candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        if candidates.is_empty() {
+            break;
+        }
         let excess = total - config.cache.max_bytes;
         let mut estimated_freed: u64 = 0;
         let mut evicted_this_round = false;
-        while next_index < candidates.len() && estimated_freed <= excess {
-            let artifact = &candidates[next_index];
-            next_index += 1;
+        for artifact in &candidates {
+            if estimated_freed > excess {
+                break;
+            }
             if managed_protections
                 .contains(&(artifact.artifact_type.clone(), artifact.hash.clone()))
             {
@@ -371,8 +757,9 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
             {
                 continue;
             }
-            db::delete_cache_artifact(pool, artifact.id).await?;
-            evicted_ids.insert(artifact.id);
+            if !db::delete_cache_artifact_if_unprotected(pool, artifact.id).await? {
+                continue;
+            }
             evicted_this_round = true;
             let estimate = artifact
                 .closure_file_size_bytes
@@ -383,12 +770,12 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
         if !evicted_this_round {
             break;
         }
-        let retained = candidates
+        let retained = db::list_cache_artifacts(pool)
+            .await?
             .iter()
-            .filter(|candidate| !evicted_ids.contains(&candidate.id))
             .map(RetainedArtifactFiles::from)
             .collect::<Vec<_>>();
-        sweep_unreachable(config, retained).await?;
+        sweep_unreachable_under_lease(config, retained, lease).await?;
         total = cache_disk_usage(config).await;
     }
     Ok(())
@@ -402,6 +789,30 @@ pub async fn scrub_cache_artifacts(
     config: &AppConfig,
     limit: i64,
 ) -> Result<u64> {
+    let lease = acquire_mutation_lease(config).await?;
+    scrub_cache_artifacts_under_lease(pool, config, limit, &lease).await
+}
+
+pub async fn try_scrub_cache_artifacts(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    limit: i64,
+) -> Result<Option<u64>> {
+    let Some(lease) = try_acquire_mutation_lease(config).await? else {
+        return Ok(None);
+    };
+    scrub_cache_artifacts_under_lease(pool, config, limit, &lease)
+        .await
+        .map(Some)
+}
+
+async fn scrub_cache_artifacts_under_lease(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    limit: i64,
+    lease: &CacheMutationLease,
+) -> Result<u64> {
+    lease.ensure_matches(config)?;
     let candidates = db::cache_artifacts_due_for_verification(pool, limit).await?;
     if candidates.is_empty() {
         return Ok(0);
@@ -428,7 +839,7 @@ pub async fn scrub_cache_artifacts(
             .iter()
             .map(RetainedArtifactFiles::from)
             .collect::<Vec<_>>();
-        sweep_unreachable(config, retained).await?;
+        sweep_unreachable_under_lease(config, retained, lease).await?;
     }
     Ok(invalid_ids.len() as u64)
 }
@@ -462,23 +873,40 @@ struct RetainedArtifactFiles {
     nar_path: PathBuf,
     narinfo_path: PathBuf,
     nar_url: String,
+    evidence_relative_paths: Vec<String>,
 }
 
 impl From<&crate::models::CacheArtifact> for RetainedArtifactFiles {
     fn from(artifact: &crate::models::CacheArtifact) -> Self {
+        let evidence_relative_paths = [
+            artifact
+                .cache_metadata
+                .pointer("/system_release/closure/relative_path"),
+            artifact
+                .cache_metadata
+                .pointer("/system_release/provenance/relative_path"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
         Self {
             store_path: artifact.store_path.clone(),
             nar_path: PathBuf::from(&artifact.path),
             narinfo_path: PathBuf::from(&artifact.narinfo_path),
             nar_url: artifact.nar_url.trim_start_matches('/').to_string(),
+            evidence_relative_paths,
         }
     }
 }
 
-async fn sweep_unreachable(
+async fn sweep_unreachable_under_lease(
     config: &AppConfig,
     retained: Vec<RetainedArtifactFiles>,
+    lease: &CacheMutationLease,
 ) -> Result<u64> {
+    lease.ensure_matches(config)?;
     let cache_root = config.cache.root_dir.clone();
     task::spawn_blocking(move || sweep_unreachable_blocking(&cache_root, &retained))
         .await
@@ -496,6 +924,7 @@ fn sweep_unreachable_blocking(
     let mut live_files: HashSet<PathBuf> = HashSet::new();
     let mut live_nar_urls: HashSet<String> = HashSet::new();
     let mut live_narinfo_hashes: HashSet<String> = HashSet::new();
+    let mut retained_narinfo_paths: HashMap<String, PathBuf> = HashMap::new();
     let mut queue: Vec<String> = Vec::new();
     for artifact in retained {
         live_files.insert(artifact.nar_path.clone());
@@ -504,17 +933,27 @@ fn sweep_unreachable_blocking(
             live_nar_urls.insert(artifact.nar_url.clone());
         }
         if let Some(hash) = store_path_hash(&artifact.store_path) {
+            retained_narinfo_paths.insert(hash.clone(), artifact.narinfo_path.clone());
             queue.push(hash);
+        }
+        for relative in &artifact.evidence_relative_paths {
+            live_files.insert(safe_cache_member_path(cache_root, relative)?);
         }
     }
     while let Some(hash) = queue.pop() {
         if !live_narinfo_hashes.insert(hash.clone()) {
             continue;
         }
-        let narinfo_path = cache_root.join(format!("{hash}.narinfo"));
-        let Ok(contents) = fs::read_to_string(&narinfo_path) else {
-            continue;
-        };
+        let narinfo_path = retained_narinfo_paths
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| cache_root.join(format!("{hash}.narinfo")));
+        let contents = fs::read_to_string(&narinfo_path).with_context(|| {
+            format!(
+                "retained cache closure is missing narinfo {}",
+                narinfo_path.display()
+            )
+        })?;
         for line in contents.lines() {
             if let Some(url) = line.strip_prefix("URL:") {
                 live_nar_urls.insert(url.trim().trim_start_matches('/').to_string());
@@ -570,6 +1009,48 @@ fn sweep_unreachable_blocking(
             fs::remove_file(entry.path())
                 .with_context(|| format!("remove nar {}", entry.path().display()))?;
             freed = freed.saturating_add(metadata.len());
+        }
+    }
+    let evidence_root = cache_root.join("system-releases");
+    let mut directories = Vec::new();
+    let mut pending = vec![evidence_root.clone()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("scan {}", directory.display()));
+            }
+        };
+        directories.push(directory.clone());
+        for entry in entries {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                bail!("System Release cache evidence contains a symlink");
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() && !live_files.contains(&entry.path()) {
+                fs::remove_file(entry.path()).with_context(|| {
+                    format!("remove unreferenced evidence {}", entry.path().display())
+                })?;
+                freed = freed.saturating_add(metadata.len());
+            }
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        if directory != evidence_root {
+            match fs::remove_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("remove empty {}", directory.display()));
+                }
+            }
         }
     }
     Ok(freed)
@@ -926,6 +1407,71 @@ mod tests {
         path
     }
 
+    fn write_test_cache_artifact(
+        cache_root: &Path,
+        marker: char,
+        name: &str,
+        size_bytes: usize,
+    ) -> (String, PathBuf, PathBuf) {
+        let store_hash = marker.to_string().repeat(32);
+        let artifact_hash = marker.to_string().repeat(64);
+        let nar_url = format!("nar/{name}.nar.xz");
+        let nar_path = cache_root.join(&nar_url);
+        let narinfo_path = cache_root.join(format!("{store_hash}.narinfo"));
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::write(&nar_path, vec![marker as u8; size_bytes]).unwrap();
+        fs::write(
+            &narinfo_path,
+            format!(
+                "StorePath: /nix/store/{store_hash}-{name}\nURL: {nar_url}\nCompression: xz\nFileHash: sha256:{name}\nFileSize: {size_bytes}\nNarHash: sha256:{name}nar\nNarSize: {size_bytes}\nReferences: \nSig: cybex-forge-cache:test\n"
+            ),
+        )
+        .unwrap();
+        (artifact_hash, nar_path, narinfo_path)
+    }
+
+    async fn record_test_cache_artifact(
+        pool: &SqlitePool,
+        cache_root: &Path,
+        marker: char,
+        name: &str,
+        size_bytes: i64,
+    ) {
+        let store_hash = marker.to_string().repeat(32);
+        db::create_cache_artifact(
+            pool,
+            crate::models::CreateCacheArtifactRequest {
+                artifact_type: "nixos_closure".to_string(),
+                hash: marker.to_string().repeat(64),
+                size_bytes,
+                path: cache_root
+                    .join(format!("nar/{name}.nar.xz"))
+                    .display()
+                    .to_string(),
+                store_path: Some(format!("/nix/store/{store_hash}-{name}")),
+                narinfo_path: Some(
+                    cache_root
+                        .join(format!("{store_hash}.narinfo"))
+                        .display()
+                        .to_string(),
+                ),
+                nar_url: Some(format!("nar/{name}.nar.xz")),
+                file_hash: Some(format!("sha256:{name}")),
+                nar_hash: Some(format!("sha256:{name}nar")),
+                nar_size_bytes: Some(size_bytes),
+                closure_size_bytes: Some(size_bytes),
+                closure_file_size_bytes: Some(size_bytes),
+                compression: Some("xz".to_string()),
+                references: Some(json!([])),
+                serving_url: Some(format!("https://forge.test/cache/nar/{name}.nar.xz")),
+                source_build_job_id: None,
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn closure_file_size_sums_unique_reachable_narinfos() {
         let root = test_temp_dir("closure-file-size");
@@ -1131,6 +1677,111 @@ mod tests {
         assert!(safe_cache_member_path(root, "/nar/abc.nar.xz").is_err());
     }
 
+    #[test]
+    fn verified_release_retention_keeps_full_closure_and_evidence() {
+        let cache_root = test_temp_dir("verified-release-retention");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+        let hash_root = "a".repeat(32);
+        let hash_dep = "b".repeat(32);
+        let hash_stale = "c".repeat(32);
+        let root_store = format!("/nix/store/{hash_root}-system");
+        fs::write(
+            cache_root.join(format!("{hash_root}.narinfo")),
+            format!(
+                "StorePath: {root_store}\nURL: nar/root.nar.xz\nReferences: {hash_dep}-dependency\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cache_root.join(format!("{hash_dep}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_dep}-dependency\nURL: nar/dependency.nar.xz\nReferences: \n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cache_root.join(format!("{hash_stale}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_stale}-stale\nURL: nar/stale.nar.xz\nReferences: \n"
+            ),
+        )
+        .unwrap();
+        for name in ["root", "dependency", "stale"] {
+            fs::write(cache_root.join(format!("nar/{name}.nar.xz")), name).unwrap();
+        }
+        let evidence_dir = cache_root.join("system-releases/org/release/variant/artifact");
+        fs::create_dir_all(&evidence_dir).unwrap();
+        fs::write(evidence_dir.join("closure.json"), "closure").unwrap();
+        fs::write(evidence_dir.join("provenance-envelope.json"), "provenance").unwrap();
+        fs::write(evidence_dir.join("stale.json"), "stale").unwrap();
+        let retained = vec![RetainedArtifactFiles {
+            store_path: root_store,
+            nar_path: cache_root.join("nar/root.nar.xz"),
+            narinfo_path: cache_root.join(format!("{hash_root}.narinfo")),
+            nar_url: "nar/root.nar.xz".to_string(),
+            evidence_relative_paths: vec![
+                "system-releases/org/release/variant/artifact/closure.json".to_string(),
+                "system-releases/org/release/variant/artifact/provenance-envelope.json".to_string(),
+            ],
+        }];
+
+        sweep_unreachable_blocking(&cache_root, &retained).unwrap();
+
+        assert!(cache_root.join(format!("{hash_root}.narinfo")).exists());
+        assert!(cache_root.join(format!("{hash_dep}.narinfo")).exists());
+        assert!(cache_root.join("nar/root.nar.xz").exists());
+        assert!(cache_root.join("nar/dependency.nar.xz").exists());
+        assert!(evidence_dir.join("closure.json").exists());
+        assert!(evidence_dir.join("provenance-envelope.json").exists());
+        assert!(!cache_root.join(format!("{hash_stale}.narinfo")).exists());
+        assert!(!cache_root.join("nar/stale.nar.xz").exists());
+        assert!(!evidence_dir.join("stale.json").exists());
+        fs::remove_dir_all(cache_root).unwrap();
+    }
+
+    #[test]
+    fn verified_release_retention_fails_closed_on_incomplete_or_symlinked_state() {
+        let cache_root = test_temp_dir("verified-release-retention-invalid");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+        let hash_root = "a".repeat(32);
+        let hash_missing = "b".repeat(32);
+        let root_store = format!("/nix/store/{hash_root}-system");
+        fs::write(
+            cache_root.join(format!("{hash_root}.narinfo")),
+            format!(
+                "StorePath: {root_store}\nURL: nar/root.nar.xz\nReferences: {hash_missing}-missing\n"
+            ),
+        )
+        .unwrap();
+        fs::write(cache_root.join("nar/root.nar.xz"), "root").unwrap();
+        let retained = vec![RetainedArtifactFiles {
+            store_path: root_store,
+            nar_path: cache_root.join("nar/root.nar.xz"),
+            narinfo_path: cache_root.join(format!("{hash_root}.narinfo")),
+            nar_url: "nar/root.nar.xz".to_string(),
+            evidence_relative_paths: Vec::new(),
+        }];
+        assert!(sweep_unreachable_blocking(&cache_root, &retained).is_err());
+        assert!(cache_root.join("nar/root.nar.xz").exists());
+
+        fs::write(
+            cache_root.join(format!("{hash_missing}.narinfo")),
+            format!(
+                "StorePath: /nix/store/{hash_missing}-missing\nURL: nar/missing.nar.xz\nReferences: \n"
+            ),
+        )
+        .unwrap();
+        fs::write(cache_root.join("nar/missing.nar.xz"), "missing").unwrap();
+        fs::create_dir_all(cache_root.join("system-releases")).unwrap();
+        std::os::unix::fs::symlink(
+            cache_root.join("nar/root.nar.xz"),
+            cache_root.join("system-releases/unsafe"),
+        )
+        .unwrap();
+        assert!(sweep_unreachable_blocking(&cache_root, &retained).is_err());
+        fs::remove_dir_all(cache_root).unwrap();
+    }
+
     #[tokio::test]
     async fn status_report_includes_public_signing_key() {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
@@ -1180,12 +1831,17 @@ mod tests {
     async fn retention_sweeps_unreachable_closure_members_and_keeps_shared_ones() {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
+        db::replace_managed_cache_protections(&pool, &[], true)
+            .await
+            .unwrap();
         let root = test_temp_dir("closure-gc");
         let cache_root = root.join("cache");
         fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = AppConfig::default();
         config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
         config.cache.max_bytes = 1;
         config.cache.retain_recent_builds = 1;
 
@@ -1296,12 +1952,17 @@ mod tests {
     async fn retention_deletes_unprotected_cache_rows_and_files() {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
+        db::replace_managed_cache_protections(&pool, &[], true)
+            .await
+            .unwrap();
         let root = test_temp_dir("retention");
         let cache_root = root.join("cache");
         fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = AppConfig::default();
         config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
         config.cache.max_bytes = 25;
         config.cache.retain_recent_builds = 1;
 
@@ -1404,12 +2065,17 @@ mod tests {
     async fn remove_artifacts_by_key_deletes_rows_and_files() {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
+        db::replace_managed_cache_protections(&pool, &[], true)
+            .await
+            .unwrap();
         let root = test_temp_dir("remove-by-key");
         let cache_root = root.join("cache");
         fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = AppConfig::default();
         config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
 
         let kept_nar = cache_root.join("nar/kept.nar.xz");
         let kept_narinfo = cache_root.join("kept.narinfo");
@@ -1450,9 +2116,14 @@ mod tests {
             .unwrap();
         }
 
-        remove_artifacts_by_key(
+        let inventory = db::cache_inventory_state(&pool).await.unwrap();
+        let outcome = remove_artifacts_by_key(
             &pool,
             &config,
+            &db::CacheInventoryFence {
+                instance_id: inventory.instance_id,
+                generation: inventory.generation,
+            },
             &[
                 ("nixos_closure".to_string(), "c".repeat(64)),
                 ("nixos_closure".to_string(), "f".repeat(64)),
@@ -1460,6 +2131,9 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(outcome.inventory_matched);
+        assert_eq!(outcome.deleted.len(), 1);
+        assert_eq!(outcome.missing.len(), 1);
 
         assert!(kept_nar.exists());
         assert!(kept_narinfo.exists());
@@ -1468,6 +2142,311 @@ mod tests {
         let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].hash, "b".repeat(64));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn remove_artifacts_by_key_honors_protection_and_inventory_fence() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("remove-protected-by-key");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+        let nar = cache_root.join("nar/protected.nar.xz");
+        let narinfo = cache_root.join("protected.narinfo");
+        fs::write(&nar, vec![7u8; 20]).unwrap();
+        fs::write(&narinfo, "protected").unwrap();
+        let hash = "d".repeat(64);
+        db::create_cache_artifact(
+            &pool,
+            crate::models::CreateCacheArtifactRequest {
+                artifact_type: "nixos_closure".to_string(),
+                hash: hash.clone(),
+                size_bytes: 20,
+                path: nar.display().to_string(),
+                store_path: Some(format!("/nix/store/{}-protected", "d".repeat(32))),
+                narinfo_path: Some(narinfo.display().to_string()),
+                nar_url: Some("nar/protected.nar.xz".to_string()),
+                file_hash: Some("sha256:protected".to_string()),
+                nar_hash: Some("sha256:protectednar".to_string()),
+                nar_size_bytes: Some(20),
+                closure_size_bytes: Some(20),
+                closure_file_size_bytes: None,
+                compression: Some("xz".to_string()),
+                references: Some(json!([])),
+                serving_url: Some("http://forge.example/cache/nar/protected.nar.xz".to_string()),
+                source_build_job_id: None,
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::replace_managed_cache_protections(
+            &pool,
+            &[("nixos_closure".to_string(), hash.clone())],
+            true,
+        )
+        .await
+        .unwrap();
+        let current = db::cache_inventory_state(&pool).await.unwrap();
+        let stale = db::CacheInventoryFence {
+            instance_id: current.instance_id.clone(),
+            generation: current.generation - 1,
+        };
+        let stale_outcome = remove_artifacts_by_key(
+            &pool,
+            &config,
+            &stale,
+            &[("nixos_closure".into(), hash.clone())],
+        )
+        .await
+        .unwrap();
+        assert!(!stale_outcome.inventory_matched);
+        assert!(nar.exists());
+
+        let exact = db::CacheInventoryFence {
+            instance_id: current.instance_id,
+            generation: current.generation,
+        };
+        let protected_outcome = remove_artifacts_by_key(
+            &pool,
+            &config,
+            &exact,
+            &[("nixos_closure".into(), hash.clone())],
+        )
+        .await
+        .unwrap();
+        assert!(protected_outcome.inventory_matched);
+        assert_eq!(
+            protected_outcome.protected,
+            vec![("nixos_closure".into(), hash)]
+        );
+        assert!(protected_outcome.deleted.is_empty());
+        assert!(nar.exists());
+        assert!(narinfo.exists());
+        assert_eq!(db::list_cache_artifacts(&pool).await.unwrap().len(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn sweep_waits_for_publication_inventory_commit() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("publication-sweep-lease");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+
+        let lease = acquire_mutation_lease(&config).await.unwrap();
+        let (_, nar_path, narinfo_path) =
+            write_test_cache_artifact(&cache_root, 'a', "publishing", 32);
+        let task_pool = pool.clone();
+        let task_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut sweep = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            sweep_to_recorded_artifacts(&task_pool, &task_config).await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut sweep)
+                .await
+                .is_err(),
+            "sweep bypassed the publisher's cache mutation lease"
+        );
+
+        record_test_cache_artifact(&pool, &cache_root, 'a', "publishing", 32).await;
+        drop(lease);
+        tokio::time::timeout(std::time::Duration::from_secs(5), sweep)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(nar_path.exists());
+        assert!(narinfo_path.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn nonblocking_cache_lease_skips_active_publication() {
+        let root = test_temp_dir("nonblocking-publication-lease");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root;
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+
+        let publication = acquire_mutation_lease(&config).await.unwrap();
+        assert!(try_acquire_mutation_lease(&config).await.unwrap().is_none());
+        drop(publication);
+        assert!(try_acquire_mutation_lease(&config).await.unwrap().is_some());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn retention_requeries_protections_after_waiting_for_publication() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("publication-retention-lease");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+        config.cache.max_bytes = 1;
+        config.cache.retain_recent_builds = 0;
+
+        let (_, old_nar, old_narinfo) = write_test_cache_artifact(&cache_root, 'a', "old", 32);
+        record_test_cache_artifact(&pool, &cache_root, 'a', "old", 32).await;
+
+        let lease = acquire_mutation_lease(&config).await.unwrap();
+        let (new_hash, new_nar, new_narinfo) =
+            write_test_cache_artifact(&cache_root, 'b', "protected-new", 32);
+        let task_pool = pool.clone();
+        let task_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut retention = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            enforce_retention(&task_pool, &task_config).await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut retention)
+                .await
+                .is_err(),
+            "retention bypassed the publisher's cache mutation lease"
+        );
+
+        record_test_cache_artifact(&pool, &cache_root, 'b', "protected-new", 32).await;
+        db::replace_managed_cache_protections(
+            &pool,
+            &[("nixos_closure".to_string(), new_hash)],
+            true,
+        )
+        .await
+        .unwrap();
+        drop(lease);
+        tokio::time::timeout(std::time::Duration::from_secs(5), retention)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(new_nar.exists());
+        assert!(new_narinfo.exists());
+        assert!(!old_nar.exists());
+        assert!(!old_narinfo.exists());
+        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].hash, "b".repeat(64));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_removal_rejects_fence_staled_by_waiting_publication() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("publication-removal-lease");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+
+        let (old_hash, old_nar, old_narinfo) =
+            write_test_cache_artifact(&cache_root, 'a', "old", 32);
+        record_test_cache_artifact(&pool, &cache_root, 'a', "old", 32).await;
+        let inventory = db::cache_inventory_state(&pool).await.unwrap();
+        let fence = db::CacheInventoryFence {
+            instance_id: inventory.instance_id,
+            generation: inventory.generation,
+        };
+
+        let lease = acquire_mutation_lease(&config).await.unwrap();
+        let (_, new_nar, new_narinfo) = write_test_cache_artifact(&cache_root, 'b', "new", 32);
+        let task_pool = pool.clone();
+        let task_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut removal = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            remove_artifacts_by_key(
+                &task_pool,
+                &task_config,
+                &fence,
+                &[("nixos_closure".to_string(), old_hash)],
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "explicit removal bypassed the publisher's cache mutation lease"
+        );
+
+        record_test_cache_artifact(&pool, &cache_root, 'b', "new", 32).await;
+        drop(lease);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), removal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.inventory_matched);
+        assert!(outcome.deleted.is_empty());
+        assert!(old_nar.exists());
+        assert!(old_narinfo.exists());
+        assert!(new_nar.exists());
+        assert!(new_narinfo.exists());
+        assert_eq!(db::list_cache_artifacts(&pool).await.unwrap().len(), 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn release_fault_sentinel_fails_system_release_publication_closed() {
+        let root = test_temp_dir("release-fault-sentinel");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.mutation_lock_path = root.join("cache-mutation.lock");
+        let lease = acquire_mutation_lease(&config).await.unwrap();
+
+        ensure_system_release_publication_allowed(&config, "unused", &lease).unwrap();
+        let private_dir = cache_root.join(RELEASE_TEST_FAULT_PRIVATE_DIR);
+        let sentinel_dir = private_dir.join(RELEASE_TEST_FAULT_SENTINEL_DIR);
+        fs::create_dir(&private_dir).unwrap();
+        fs::create_dir(&sentinel_dir).unwrap();
+        fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&sentinel_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = sentinel_dir.join(RELEASE_TEST_FAULT_SENTINEL_FILE);
+        let valid = format!(
+            "schema={RELEASE_TEST_FAULT_SENTINEL_SCHEMA}\nowner_run_id=bench-owner\nrun_id=bench-owner\nacceptance_run_id=018f6b61-a646-7f7c-a651-7ee13ad42f84\nevidence_nonce_sha256={}\nboot_id=018f6b61-a646-7f7c-a651-7ee13ad42f85\nfault=corrupt_nar\nrelease_id=018f6b61-a646-7f7c-a651-7ee13ad42f86\ndeployment_id=018f6b61-a646-7f7c-a651-7ee13ad42f87\nattempt_id=018f6b61-a646-7f7c-a651-7ee13ad42f88\nowner_binding_sha256={}\nconsumed=true\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        fs::write(&sentinel, valid).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let error =
+            ensure_system_release_publication_allowed(&config, "unused", &lease).unwrap_err();
+        assert!(error.to_string().contains("pending exact reset"));
+
+        fs::write(&sentinel, "schema=unknown\n").unwrap();
+        assert!(ensure_system_release_publication_allowed(&config, "unused", &lease).is_err());
+        fs::remove_file(&sentinel).unwrap();
+        std::os::unix::fs::symlink(cache_root.join("nix-cache-info"), &sentinel).unwrap();
+        assert!(ensure_system_release_publication_allowed(&config, "unused", &lease).is_err());
+        drop(lease);
         fs::remove_dir_all(root).ok();
     }
 }

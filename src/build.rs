@@ -1,5 +1,8 @@
 use std::{
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -7,8 +10,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -16,6 +22,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     AppState, cache,
@@ -23,12 +30,21 @@ use crate::{
     db,
     models::BuildJob,
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
+    system_release::{
+        ForgeSystemReleaseProvenanceV1, RenderedSystemReleaseInputs,
+        SYSTEM_RELEASE_BUILD_SPEC_SCHEMA_VERSION, SYSTEM_RELEASE_FORGE_PROTOCOL,
+        SystemReleaseBuildSpecV3, SystemReleaseClosureManifestV1, SystemReleaseMarkerV3,
+        SystemReleaseMaterialBundle, normalize_nar_hash, publish_system_release_evidence,
+        render_system_release_inputs, sign_provenance, validate_store_path,
+    },
 };
 
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
+const MAX_BUILT_RELEASE_MARKER_BYTES: usize = 64 * 1024;
+const BUILT_RELEASE_MARKER_RELATIVE_PATH: &str = "etc/cybex/system-release/release-marker.json";
 const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -82,6 +98,7 @@ struct ValidatedBuildSpec {
     blueprint_revision_id: Option<String>,
     blueprint_revision_config_hash: Option<String>,
     build_input: Option<ValidatedBlueprintBuildInput>,
+    system_release: Option<SystemReleaseBuildSpecV3>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +115,24 @@ struct NixBuildCommand {
     program: String,
     args: Vec<String>,
     out_link: PathBuf,
+    input_dir: Option<PathBuf>,
+    release_marker_sha256: Option<String>,
+}
+
+struct PrivateInputGuard(Option<PathBuf>);
+
+impl PrivateInputGuard {
+    fn for_command(command: &NixBuildCommand) -> Self {
+        Self(command.input_dir.clone())
+    }
+}
+
+impl Drop for PrivateInputGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +141,19 @@ struct NixOutputInfo {
     output_sha256: String,
     output_size_bytes: i64,
     closure_size_bytes: i64,
+}
+
+#[derive(Clone, Debug)]
+struct InspectedSystemReleaseOutput {
+    closure: SystemReleaseClosureManifestV1,
+    canonical_closure: Vec<u8>,
+    closure_sha256: String,
+    kernel_store_path: String,
+    initrd_store_path: String,
+    kernel_version: String,
+    release_marker_sha256: String,
+    nix_version: String,
+    observed_nixpkgs_commit: String,
 }
 
 #[derive(Clone)]
@@ -430,7 +478,69 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         return Ok(());
     }
 
-    let command = nix_build_command(&state.config, &target, &spec, job.id)?;
+    let materials = if let Some(system_release) = spec.system_release.as_ref() {
+        db::update_build_job_progress(
+            &state.db,
+            job.id,
+            Some(18),
+            "downloading",
+            "Downloading content-addressed Blueprint materials",
+        )
+        .await?;
+        match download_system_release_materials(&state.config, system_release).await {
+            Ok(materials) => Some(materials),
+            Err(err) => {
+                db::finish_build_job(
+                    &state.db,
+                    job.id,
+                    "failed",
+                    "",
+                    &format!("build material download failed: {}", safe_error(&err)),
+                    "",
+                    "",
+                    0,
+                    None,
+                    Some(build_result_metadata(
+                        &state.config,
+                        &job,
+                        Some(&target),
+                        Some("material_download_failed"),
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    let command = match nix_build_command(&state.config, &target, &spec, job.id, materials.as_ref())
+    {
+        Ok(command) => command,
+        Err(err) => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                "",
+                &format!("build input preparation failed: {}", safe_error(&err)),
+                "",
+                "",
+                0,
+                None,
+                Some(build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some("input_preparation_failed"),
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let _private_input_guard = PrivateInputGuard::for_command(&command);
     let log = SharedLog::new(state.config.build.max_log_bytes);
     db::update_build_job_progress(
         &state.db,
@@ -499,6 +609,45 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 .await?;
                 return Ok(());
             }
+            let inspected_system_release =
+                if let Some(system_release) = spec.system_release.as_ref() {
+                    match inspect_system_release_output(
+                        &state.config,
+                        &command,
+                        system_release,
+                        &output_info.output_path,
+                    )
+                    .await
+                    {
+                        Ok(inspected) => Some(inspected),
+                        Err(err) => {
+                            db::finish_build_job(
+                                &state.db,
+                                job.id,
+                                "failed",
+                                &logs,
+                                &format!(
+                                    "System Release closure validation failed: {}",
+                                    safe_error(&err)
+                                ),
+                                &output_info.output_path,
+                                &output_info.output_sha256,
+                                output_info.output_size_bytes,
+                                Some(exit_code.into()),
+                                Some(build_result_metadata(
+                                    &state.config,
+                                    &job,
+                                    Some(&target),
+                                    Some("system_release_closure_invalid"),
+                                )),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
             db::update_build_job_progress(
                 &state.db,
                 job.id,
@@ -507,12 +656,64 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "Exporting closure to Forge cache",
             )
             .await?;
+            let cache_lease = match cache::acquire_mutation_lease(&state.config).await {
+                Ok(lease) => lease,
+                Err(err) => {
+                    db::finish_build_job(
+                        &state.db,
+                        job.id,
+                        "failed",
+                        &logs,
+                        &format!("cache publication lease failed: {}", safe_error(&err)),
+                        &output_info.output_path,
+                        &output_info.output_sha256,
+                        output_info.output_size_bytes,
+                        Some(exit_code.into()),
+                        Some(build_result_metadata(
+                            &state.config,
+                            &job,
+                            Some(&target),
+                            Some("cache_publication_lease_failed"),
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if let Some(system_release) = spec.system_release.as_ref() {
+                if let Err(err) = cache::ensure_system_release_publication_allowed(
+                    &state.config,
+                    &system_release.release_id,
+                    &cache_lease,
+                ) {
+                    db::finish_build_job(
+                        &state.db,
+                        job.id,
+                        "failed",
+                        &logs,
+                        &format!("System Release publication blocked: {}", safe_error(&err)),
+                        &output_info.output_path,
+                        &output_info.output_sha256,
+                        output_info.output_size_bytes,
+                        Some(exit_code.into()),
+                        Some(build_result_metadata(
+                            &state.config,
+                            &job,
+                            Some(&target),
+                            Some("system_release_fault_pending"),
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             let mut cached = match cache::export_output(
                 &state.config,
                 &job,
                 &output_info.output_path,
                 &output_info.output_sha256,
                 output_info.closure_size_bytes,
+                &cache_lease,
             )
             .await
             {
@@ -539,10 +740,88 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                     return Ok(());
                 }
             };
+            let system_release_metadata = match (
+                spec.system_release.as_ref(),
+                inspected_system_release.as_ref(),
+            ) {
+                (Some(system_release), Some(inspected)) => {
+                    match finalize_system_release_artifact(
+                        &state.config,
+                        &job,
+                        system_release,
+                        &output_info,
+                        inspected,
+                        &mut cached,
+                        &cache_lease,
+                    )
+                    .await
+                    {
+                        Ok(metadata) => Some(metadata),
+                        Err(err) => {
+                            let _ = cache::sweep_to_recorded_artifacts_under_lease(
+                                &state.db,
+                                &state.config,
+                                &cache_lease,
+                            )
+                            .await;
+                            db::finish_build_job(
+                                &state.db,
+                                job.id,
+                                "failed",
+                                &logs,
+                                &format!("System Release attestation failed: {}", safe_error(&err)),
+                                &output_info.output_path,
+                                &output_info.output_sha256,
+                                output_info.output_size_bytes,
+                                Some(exit_code.into()),
+                                Some(build_result_metadata(
+                                    &state.config,
+                                    &job,
+                                    Some(&target),
+                                    Some("system_release_attestation_failed"),
+                                )),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                (None, None) => None,
+                _ => {
+                    let _ = cache::sweep_to_recorded_artifacts_under_lease(
+                        &state.db,
+                        &state.config,
+                        &cache_lease,
+                    )
+                    .await;
+                    db::finish_build_job(
+                        &state.db,
+                        job.id,
+                        "failed",
+                        &logs,
+                        "System Release inspection state was inconsistent",
+                        &output_info.output_path,
+                        &output_info.output_sha256,
+                        output_info.output_size_bytes,
+                        Some(exit_code.into()),
+                        Some(build_result_metadata(
+                            &state.config,
+                            &job,
+                            Some(&target),
+                            Some("system_release_inspection_inconsistent"),
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             merge_build_metadata(
                 &mut cached.metadata,
                 &build_result_metadata(&state.config, &job, Some(&target), None),
             );
+            if let Some(metadata) = system_release_metadata.as_ref() {
+                merge_build_metadata(&mut cached.metadata, metadata);
+            }
             db::update_build_job_progress(
                 &state.db,
                 job.id,
@@ -557,8 +836,15 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 &job,
                 &spec.artifact_type,
                 cached,
+                &cache_lease,
             )
             .await?;
+            drop(cache_lease);
+            cache::enforce_retention(&state.db, &state.config).await?;
+            let mut success_metadata = success_result_metadata(&state.config, &job, &target, &spec);
+            if let Some(metadata) = system_release_metadata.as_ref() {
+                merge_build_metadata(&mut success_metadata, metadata);
+            }
             db::finish_build_job(
                 &state.db,
                 job.id,
@@ -569,7 +855,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 &output_info.output_sha256,
                 output_info.output_size_bytes,
                 Some(exit_code.into()),
-                Some(success_result_metadata(&state.config, &job, &target, &spec)),
+                Some(success_metadata),
             )
             .await?;
         }
@@ -644,6 +930,39 @@ fn capacity_meets_minimum(actual: u64, minimum: u64) -> bool {
 }
 
 fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBuildSpec> {
+    if job.build_spec.get("schema_version").and_then(Value::as_u64)
+        == Some(u64::from(SYSTEM_RELEASE_BUILD_SPEC_SCHEMA_VERSION))
+    {
+        let spec = SystemReleaseBuildSpecV3::parse(job.build_spec.clone())?;
+        if spec.artifact_type != job.requested_artifact_type
+            || spec.target != job.target
+            || spec.system != job.system
+            || spec.input_revision != job.input_revision
+            || spec.input_config_hash != job.input_config_hash
+        {
+            bail!("System Release BuildSpec does not match its immutable job row");
+        }
+        if !config
+            .build
+            .allowed_systems
+            .iter()
+            .any(|value| value == &spec.system)
+        {
+            bail!("System Release system is not allowed on this Forge node");
+        }
+        return Ok(ValidatedBuildSpec {
+            artifact_type: spec.artifact_type.clone(),
+            target: spec.target.clone(),
+            system: spec.system.clone(),
+            input_revision: spec.input_revision.clone(),
+            input_config_hash: spec.input_config_hash.clone(),
+            blueprint_id: Some(spec.blueprint.blueprint_id.clone()),
+            blueprint_revision_id: Some(spec.blueprint.blueprint_revision_id.clone()),
+            blueprint_revision_config_hash: Some(spec.blueprint.config_sha256.clone()),
+            build_input: None,
+            system_release: Some(spec),
+        });
+    }
     let spec: BuildSpec = serde_json::from_value(job.build_spec.clone())
         .context("build_spec does not match schema")?;
     if spec.schema_version != 1 {
@@ -700,6 +1019,7 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         blueprint_revision_id,
         blueprint_revision_config_hash,
         build_input,
+        system_release: None,
     })
 }
 
@@ -737,11 +1057,18 @@ fn validate_blueprint_build_input(
             .as_ref()
             .and_then(Value::as_object)
             .ok_or_else(|| anyhow!("build_input.expected_state must be an object when desktop_module_nix is supplied"))?;
+        let expected_state_schema = expected_state.get("schema").and_then(Value::as_str);
         if !matches!(
-            expected_state.get("schema").and_then(Value::as_str),
-            Some("cybex.blueprint.expected-state.v1" | "cybex.blueprint.expected-state.v2")
+            expected_state_schema,
+            Some(
+                "cybex.blueprint.expected-state.v1"
+                    | "cybex.blueprint.expected-state.v2"
+                    | "cybex.blueprint.expected-state.v3"
+            )
         ) {
-            bail!("build_input.expected_state has an unsupported schema");
+            bail!(
+                "build_input.expected_state schema {expected_state_schema:?} is unsupported; expected an immutable Cybex Blueprint expected-state v1, v2, or v3 artifact"
+            );
         }
     } else if input.expected_state.is_some() {
         bail!("build_input.expected_state requires desktop_module_nix");
@@ -758,10 +1085,16 @@ fn validate_blueprint_build_input(
     })
 }
 
-fn build_target<'a>(
-    config: &'a AppConfig,
-    spec: &ValidatedBuildSpec,
-) -> Result<&'a BuildTargetConfig> {
+fn build_target(config: &AppConfig, spec: &ValidatedBuildSpec) -> Result<BuildTargetConfig> {
+    if let Some(system_release) = spec.system_release.as_ref() {
+        return Ok(BuildTargetConfig {
+            artifact_type: system_release.artifact_type.clone(),
+            target: system_release.target.clone(),
+            system: system_release.system.clone(),
+            flake: format!("github:NixOS/nixpkgs/{}", system_release.nixpkgs_commit),
+            attr: "system-release".to_string(),
+        });
+    }
     config
         .build
         .targets
@@ -771,6 +1104,7 @@ fn build_target<'a>(
                 && build_target_names_compatible(&target.target, &spec.target)
                 && target.system == spec.system
         })
+        .cloned()
         .ok_or_else(|| {
             anyhow!("no configured build target matched artifact_type, target, and system")
         })
@@ -1019,12 +1353,82 @@ fn merge_build_metadata(destination: &mut Value, source: &Value) {
     }
 }
 
+async fn download_system_release_materials(
+    config: &AppConfig,
+    spec: &SystemReleaseBuildSpecV3,
+) -> Result<SystemReleaseMaterialBundle> {
+    let compiled_blueprint = crate::manage::download_system_release_material(
+        config,
+        &spec.blueprint.compiled_module_sha256,
+    )
+    .await?;
+    let asset_digests = spec
+        .blueprint
+        .asset_manifest
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("BuildSpec Blueprint asset manifest is malformed"))?
+        .iter()
+        .map(|asset| {
+            asset
+                .get("sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("BuildSpec Blueprint asset digest is missing"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let extension_digests = spec
+        .blueprint
+        .extension_manifest
+        .get("modules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("BuildSpec Blueprint extension manifest is malformed"))?
+        .iter()
+        .map(|module| {
+            module
+                .get("sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("BuildSpec Blueprint extension digest is missing"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut assets = BTreeMap::new();
+    for digest in asset_digests {
+        assets.insert(
+            digest.clone(),
+            crate::manage::download_system_release_material(config, &digest).await?,
+        );
+    }
+    let mut extensions = BTreeMap::new();
+    for digest in extension_digests {
+        extensions.insert(
+            digest.clone(),
+            crate::manage::download_system_release_material(config, &digest).await?,
+        );
+    }
+    Ok(SystemReleaseMaterialBundle {
+        compiled_blueprint,
+        assets,
+        extensions,
+    })
+}
+
 fn nix_build_command(
     config: &AppConfig,
     target: &BuildTargetConfig,
     spec: &ValidatedBuildSpec,
     job_id: i64,
+    materials: Option<&SystemReleaseMaterialBundle>,
 ) -> Result<NixBuildCommand> {
+    if let Some(system_release) = spec.system_release.as_ref() {
+        return system_release_nix_build_command(
+            config,
+            spec,
+            system_release,
+            job_id,
+            materials.ok_or_else(|| anyhow!("System Release material bundle is missing"))?,
+        );
+    }
     if let Some(build_input) = spec.build_input.as_ref() {
         return blueprint_nix_build_command(config, target, spec, build_input, job_id);
     }
@@ -1046,7 +1450,119 @@ fn nix_build_command(
             "--no-write-lock-file".to_string(),
         ],
         out_link,
+        input_dir: None,
+        release_marker_sha256: None,
     })
+}
+
+fn system_release_nix_build_command(
+    config: &AppConfig,
+    spec: &ValidatedBuildSpec,
+    system_release: &SystemReleaseBuildSpecV3,
+    job_id: i64,
+    materials: &SystemReleaseMaterialBundle,
+) -> Result<NixBuildCommand> {
+    if spec.artifact_type != "system_generation"
+        || spec.target != "system_release"
+        || spec.system != system_release.system
+    {
+        bail!("System Release target binding is inconsistent");
+    }
+    let rendered = render_system_release_inputs(config, system_release, materials)?;
+    let input_dir = config.build.work_dir.join(format!("job-{job_id}-input"));
+    write_private_job_inputs(&input_dir, &rendered)?;
+    let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
+    let out_link = job_dir.join("result");
+    Ok(NixBuildCommand {
+        program: config.build.nix_binary.clone(),
+        args: vec![
+            "build".to_string(),
+            format!("{}#system-release", input_dir.display()),
+            "--cores".to_string(),
+            config.build.max_build_cores.to_string(),
+            "--system".to_string(),
+            system_release.system.clone(),
+            "--out-link".to_string(),
+            out_link.display().to_string(),
+            "--print-build-logs".to_string(),
+            "--no-write-lock-file".to_string(),
+        ],
+        out_link,
+        input_dir: Some(input_dir),
+        release_marker_sha256: Some(rendered.release_marker_sha256),
+    })
+}
+
+fn write_private_job_inputs(dir: &Path, rendered: &RenderedSystemReleaseInputs) -> Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create build work directory {}", parent.display()))?;
+        let metadata = fs::symlink_metadata(parent)?;
+        let effective_uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!("build work directory ownership or mode is unsafe");
+        }
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(dir)
+        .with_context(|| format!("create private build input directory {}", dir.display()))?;
+    let result = (|| {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        for input in &rendered.files {
+            atomic_write_job_input(&dir.join(&input.name), &input.bytes, input.mode)?;
+        }
+        File::open(dir)
+            .with_context(|| format!("open private build input directory {}", dir.display()))?
+            .sync_all()
+            .with_context(|| format!("sync private build input directory {}", dir.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    result
+}
+
+fn atomic_write_job_input(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("build input path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("build input path has no filename"))?
+        .to_string_lossy();
+    let mut random = [0u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        hex::encode(random)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(&temporary)
+            .with_context(|| format!("create private build input {}", temporary.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .with_context(|| format!("publish private build input {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn blueprint_nix_build_command(
@@ -1097,6 +1613,8 @@ fn blueprint_nix_build_command(
             "--no-write-lock-file".to_string(),
         ],
         out_link,
+        input_dir: Some(input_dir),
+        release_marker_sha256: None,
     })
 }
 
@@ -1351,6 +1869,411 @@ async fn inspect_build_output(
         output_size_bytes,
         closure_size_bytes,
     })
+}
+
+async fn inspect_system_release_output(
+    config: &AppConfig,
+    command: &NixBuildCommand,
+    spec: &SystemReleaseBuildSpecV3,
+    output_path: &str,
+) -> Result<InspectedSystemReleaseOutput> {
+    let output = Command::new(&config.build.nix_binary)
+        .args(["path-info", "--json", "--recursive", output_path])
+        .output()
+        .await
+        .with_context(|| format!("run {} recursive path-info", config.build.nix_binary))?;
+    if !output.status.success() {
+        bail!(
+            "recursive nix path-info failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: Value =
+        serde_json::from_slice(&output.stdout).context("parse recursive nix path-info JSON")?;
+    let closure = SystemReleaseClosureManifestV1::from_nix_path_info(spec, output_path, &value)?;
+    let canonical_closure = closure.canonical_bytes()?;
+    let closure_sha256 = sha256_hex(&canonical_closure);
+    let (kernel_store_path, initrd_store_path, kernel_version) =
+        inspect_system_generation_paths(output_path).await?;
+    let release_marker_sha256 = inspect_built_release_marker(output_path, spec, &closure).await?;
+    if command.release_marker_sha256.as_deref() != Some(release_marker_sha256.as_str()) {
+        bail!("built System Release marker digest differs from the rendered build input");
+    }
+    let nix_version = observed_nix_version(config).await?;
+    let input_dir = command
+        .input_dir
+        .as_deref()
+        .ok_or_else(|| anyhow!("System Release build omitted its private flake input"))?;
+    let observed_nixpkgs_commit = observed_nixpkgs_commit(config, input_dir).await?;
+    if observed_nixpkgs_commit != spec.nixpkgs_commit {
+        bail!("observed nixpkgs revision differs from the BuildSpec pin");
+    }
+    Ok(InspectedSystemReleaseOutput {
+        closure,
+        canonical_closure,
+        closure_sha256,
+        kernel_store_path,
+        initrd_store_path,
+        kernel_version,
+        release_marker_sha256,
+        nix_version,
+        observed_nixpkgs_commit,
+    })
+}
+
+fn verify_built_release_marker_bytes(expected: &[u8], bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() || bytes.len() > MAX_BUILT_RELEASE_MARKER_BYTES {
+        bail!("built System Release marker has an invalid size");
+    }
+    if bytes != expected {
+        bail!("built System Release marker differs from the exact BuildSpec marker");
+    }
+    Ok(sha256_hex(bytes))
+}
+
+async fn inspect_built_release_marker(
+    output_path: &str,
+    spec: &SystemReleaseBuildSpecV3,
+    closure: &SystemReleaseClosureManifestV1,
+) -> Result<String> {
+    let marker_path = Path::new(output_path).join(BUILT_RELEASE_MARKER_RELATIVE_PATH);
+    let resolved = tokio::fs::canonicalize(&marker_path)
+        .await
+        .context("resolve built System Release marker")?;
+    let marker_store_path = enclosing_store_path(&resolved)?;
+    if !closure
+        .members
+        .iter()
+        .any(|member| member.store_path == marker_store_path)
+    {
+        bail!("built System Release marker is outside the inspected closure");
+    }
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .context("open built System Release marker")?;
+    let metadata = file
+        .metadata()
+        .await
+        .context("inspect built System Release marker")?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_BUILT_RELEASE_MARKER_BYTES as u64
+    {
+        bail!("built System Release marker is not a bounded regular file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_BUILT_RELEASE_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .context("read built System Release marker")?;
+    let expected = SystemReleaseMarkerV3::from_spec(spec)?.canonical_bytes()?;
+    verify_built_release_marker_bytes(&expected, &bytes)
+}
+
+async fn inspect_system_generation_paths(output_path: &str) -> Result<(String, String, String)> {
+    let target = Path::new(output_path);
+    let kernel = tokio::fs::canonicalize(target.join("kernel"))
+        .await
+        .context("resolve System Release kernel")?;
+    let initrd = tokio::fs::canonicalize(target.join("initrd"))
+        .await
+        .context("resolve System Release initrd")?;
+    let kernel_store_path = enclosing_store_path(&kernel)?;
+    let initrd_store_path = enclosing_store_path(&initrd)?;
+    let modules = target.join("kernel-modules/lib/modules");
+    let mut entries = tokio::fs::read_dir(&modules)
+        .await
+        .with_context(|| format!("read kernel module directory {}", modules.display()))?;
+    let mut versions = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            versions.push(
+                entry
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| anyhow!("kernel version is not UTF-8"))?
+                    .to_string(),
+            );
+        }
+    }
+    versions.sort();
+    if versions.len() != 1
+        || versions[0].is_empty()
+        || versions[0].len() > 128
+        || versions[0].chars().any(char::is_control)
+    {
+        bail!("System Release output did not contain exactly one safe kernel version");
+    }
+    Ok((kernel_store_path, initrd_store_path, versions.remove(0)))
+}
+
+fn enclosing_store_path(path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix("/nix/store")
+        .context("System Release component is outside the Nix store")?;
+    let component = relative
+        .components()
+        .next()
+        .ok_or_else(|| anyhow!("System Release component omitted a store object"))?;
+    let std::path::Component::Normal(component) = component else {
+        bail!("System Release component has an invalid store path");
+    };
+    let component = component
+        .to_str()
+        .ok_or_else(|| anyhow!("System Release store component is not UTF-8"))?;
+    let store_path = format!("/nix/store/{component}");
+    validate_store_path(&store_path)?;
+    Ok(store_path)
+}
+
+async fn observed_nix_version(config: &AppConfig) -> Result<String> {
+    let output = Command::new(&config.build.nix_binary)
+        .arg("--version")
+        .output()
+        .await
+        .with_context(|| format!("run {} --version", config.build.nix_binary))?;
+    if !output.status.success() {
+        bail!("could not observe Nix version");
+    }
+    let text = String::from_utf8(output.stdout)
+        .context("Nix version output is not UTF-8")?
+        .trim()
+        .to_string();
+    let version = text
+        .strip_prefix("nix (Nix) ")
+        .or_else(|| text.strip_prefix("nix "))
+        .ok_or_else(|| anyhow!("Nix version output has an unsupported shape"))?;
+    if version.is_empty()
+        || version.len() > 128
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        bail!("observed Nix version is unsafe");
+    }
+    Ok(version.to_string())
+}
+
+async fn observed_nixpkgs_commit(config: &AppConfig, input_dir: &Path) -> Result<String> {
+    let output = Command::new(&config.build.nix_binary)
+        .args(["flake", "metadata", "--json", "--no-write-lock-file"])
+        .arg(input_dir)
+        .output()
+        .await
+        .with_context(|| format!("inspect System Release flake {}", input_dir.display()))?;
+    if !output.status.success() {
+        bail!(
+            "nix flake metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).context("parse flake metadata")?;
+    let revision = value
+        .pointer("/locks/nodes/nixpkgs/locked/rev")
+        .or_else(|| value.pointer("/locked/rev"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("flake metadata omitted the locked nixpkgs revision"))?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("observed nixpkgs revision is not canonical lowercase hexadecimal");
+    }
+    Ok(revision.to_string())
+}
+
+async fn finalize_system_release_artifact(
+    config: &AppConfig,
+    job: &BuildJob,
+    spec: &SystemReleaseBuildSpecV3,
+    output: &NixOutputInfo,
+    inspected: &InspectedSystemReleaseOutput,
+    cached: &mut cache::CachedNixArtifact,
+    cache_lease: &cache::CacheMutationLease,
+) -> Result<Value> {
+    cache::assert_mutation_lease(config, cache_lease)?;
+    let managed_job_id = job
+        .managed_job_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("System Release build has no managed job UUID"))?;
+    let managed_job_id = Uuid::parse_str(managed_job_id)
+        .context("System Release managed job ID is not a UUID")?
+        .hyphenated()
+        .to_string();
+    let artifact_id = Uuid::parse_str(&spec.forge_artifact_id)
+        .context("System Release artifact ID is not a UUID")?
+        .hyphenated()
+        .to_string();
+    if cached.store_path != output.output_path {
+        bail!("cache export store path differs from the inspected generation");
+    }
+    let target = inspected.closure.target()?;
+    let cached_nar_hash = normalize_nar_hash(&cached.nar_hash)?;
+    if cached_nar_hash != target.nar_hash
+        || u64::try_from(cached.nar_size_bytes).ok() != Some(target.nar_size_bytes)
+    {
+        bail!("cache export NAR identity differs from recursive Nix path-info");
+    }
+    let capability = crate::system_release::capability_context(config)?;
+    let attestation = crate::system_release::load_attestation_identity(config)?;
+    if capability.attestation_key_id != attestation.key_id {
+        bail!("attestation identity changed during the build");
+    }
+    let cache_identity = cache::signing_identity(config)?;
+    let started = canonical_build_time(
+        job.started_at
+            .as_deref()
+            .ok_or_else(|| anyhow!("System Release build has no start time"))?,
+    )?;
+    let started_time = DateTime::parse_from_rfc3339(&started)?.with_timezone(&Utc);
+    let completed = canonical_completion_time_after(started_time).await?;
+    let build_spec_sha256 = spec.canonical_sha256()?;
+    let mut forge_capabilities = vec![
+        "boot_v1".to_string(),
+        "builder_v1".to_string(),
+        "cache_v1".to_string(),
+        "system_release_builder_v3".to_string(),
+    ];
+    if crate::updater::capabilities_enabled(config) {
+        forge_capabilities.push("updater_v1".to_string());
+    }
+    forge_capabilities.sort();
+    let release_marker_sha256 = &inspected.release_marker_sha256;
+    let provenance = ForgeSystemReleaseProvenanceV1 {
+        schema: crate::system_release::SYSTEM_RELEASE_PROVENANCE_SCHEMA.to_string(),
+        organization_id: spec.organization_id.clone(),
+        release_id: spec.release_id.clone(),
+        variant_id: spec.variant_id.clone(),
+        forge_node_id: capability.forge_node_id.clone(),
+        forge_build_job_id: managed_job_id.clone(),
+        forge_artifact_id: artifact_id.clone(),
+        forge_protocol: SYSTEM_RELEASE_FORGE_PROTOCOL,
+        forge_version: env!("CARGO_PKG_VERSION").to_string(),
+        forge_capabilities,
+        nixpkgs_commit: inspected.observed_nixpkgs_commit.clone(),
+        nix_version: inspected.nix_version.clone(),
+        system: spec.system.clone(),
+        baseline_version: spec.baseline_version.clone(),
+        compiler_version: spec.compiler_version.clone(),
+        input_manifest_sha256: spec.input_manifest_sha256.clone(),
+        build_spec_sha256: build_spec_sha256.clone(),
+        target_store_path: output.output_path.clone(),
+        target_output_sha256: output.output_sha256.clone(),
+        target_nar_hash: target.nar_hash.clone(),
+        target_nar_size_bytes: target.nar_size_bytes,
+        target_kernel_store_path: inspected.kernel_store_path.clone(),
+        target_initrd_store_path: inspected.initrd_store_path.clone(),
+        target_kernel_version: inspected.kernel_version.clone(),
+        release_marker_sha256: release_marker_sha256.clone(),
+        closure_digest_sha256: inspected.closure_sha256.clone(),
+        closure_manifest_sha256: inspected.closure_sha256.clone(),
+        closure_manifest_size_bytes: u64::try_from(inspected.canonical_closure.len())?,
+        closure_member_count: u64::try_from(inspected.closure.members.len())?,
+        closure_total_size_bytes: inspected.closure.total_nar_size_bytes(),
+        cache_key_id: cache_identity.key_id.clone(),
+        cache_key_fingerprint: cache_identity.fingerprint.clone(),
+        build_started_at: started,
+        build_completed_at: completed,
+        result: "succeeded".to_string(),
+    };
+    let provenance_bytes = provenance.canonical_bytes()?;
+    let envelope = sign_provenance(&provenance, &attestation.signing_key)?;
+    let envelope_bytes = envelope.canonical_bytes()?;
+    let envelope_sha256 = sha256_hex(&envelope_bytes);
+    let published = publish_system_release_evidence(
+        config,
+        spec,
+        &inspected.canonical_closure,
+        &envelope_bytes,
+    )?;
+    cache::assert_mutation_lease(config, cache_lease)?;
+    cached.managed_artifact_id = Some(artifact_id.clone());
+    let metadata = json!({
+        "system_release": {
+            "schema": "cybex.forge.system-release-result.v1",
+            "organization_id": spec.organization_id,
+            "release_id": spec.release_id,
+            "variant_id": spec.variant_id,
+            "forge_node_id": capability.forge_node_id,
+            "forge_build_job_id": managed_job_id,
+            "forge_artifact_id": artifact_id,
+            "build_spec_sha256": build_spec_sha256,
+            "input_manifest_sha256": spec.input_manifest_sha256,
+            "release_marker_sha256": release_marker_sha256,
+            "target": {
+                "store_path": output.output_path,
+                "output_sha256": output.output_sha256,
+                "nar_hash": target.nar_hash,
+                "nar_size_bytes": target.nar_size_bytes,
+                "kernel_store_path": inspected.kernel_store_path,
+                "initrd_store_path": inspected.initrd_store_path,
+                "kernel_version": inspected.kernel_version,
+            },
+            "closure": {
+                "url": published.closure_url,
+                "relative_path": published.closure_relative_path,
+                "path": published.closure_path.display().to_string(),
+                "sha256": inspected.closure_sha256,
+                "digest_sha256": inspected.closure_sha256,
+                "size_bytes": inspected.canonical_closure.len(),
+                "member_count": inspected.closure.members.len(),
+                "total_size_bytes": inspected.closure.total_nar_size_bytes(),
+            },
+            "provenance": {
+                "url": published.provenance_url,
+                "relative_path": published.provenance_relative_path,
+                "path": published.provenance_path.display().to_string(),
+                "canonical_sha256": envelope.canonical_sha256,
+                "envelope_sha256": envelope_sha256,
+                "canonical_bytes_b64": envelope.canonical_bytes_b64,
+                "signature": envelope.signatures[0].signature,
+                "envelope": envelope,
+                "size_bytes": envelope_bytes.len(),
+                "provenance_size_bytes": provenance_bytes.len(),
+            },
+            "attestation": {
+                "public_key": attestation.public_key,
+                "key_id": attestation.key_id,
+                "fingerprint": capability.attestation_key_id,
+            },
+            "cache": {
+                "public_key": cache_identity.public_key,
+                "key_id": cache_identity.key_id,
+                "fingerprint": cache_identity.fingerprint,
+                "substituter_url": cache::cache_base_url(config),
+            },
+        }
+    });
+    Ok(metadata)
+}
+
+fn canonical_build_time(value: &str) -> Result<String> {
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .context("parse System Release build start time")?
+        .with_timezone(&Utc);
+    Ok(parsed.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+async fn canonical_completion_time_after(started: DateTime<Utc>) -> Result<String> {
+    let now = Utc::now();
+    if now < started {
+        bail!("System Release build clock moved behind its recorded start time");
+    }
+    if now.timestamp() == started.timestamp() {
+        let wait_millis = 1_001u64.saturating_sub(u64::from(now.timestamp_subsec_millis()));
+        sleep(Duration::from_millis(wait_millis)).await;
+    }
+    let completed = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let completed_time = DateTime::parse_from_rfc3339(&completed)?.with_timezone(&Utc);
+    if completed_time <= started {
+        bail!("System Release build completion time is not after its start time");
+    }
+    Ok(completed)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 async fn run_nix_hash(config: &AppConfig, path: &str) -> Result<String> {
@@ -1651,6 +2574,165 @@ mod tests {
     }
 
     #[test]
+    fn private_system_release_inputs_use_strict_modes_and_are_guarded() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-private-input-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let input = work.join("job-1-input");
+        let rendered = RenderedSystemReleaseInputs {
+            files: vec![
+                crate::system_release::RenderedSystemReleaseFile {
+                    name: "configuration.nix".to_string(),
+                    bytes: b"{ ... }: {}".to_vec(),
+                    mode: 0o600,
+                },
+                crate::system_release::RenderedSystemReleaseFile {
+                    name: "cybex-release-transition.sh".to_string(),
+                    bytes: b"#!/bin/sh\nexit 0\n".to_vec(),
+                    mode: 0o700,
+                },
+            ],
+            release_marker_sha256: "a".repeat(64),
+        };
+
+        write_private_job_inputs(&input, &rendered).unwrap();
+        assert_eq!(
+            std::fs::metadata(&input).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(input.join("configuration.nix"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(input.join("cybex-release-transition.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let command = NixBuildCommand {
+            program: "nix".to_string(),
+            args: Vec::new(),
+            out_link: root.join("result"),
+            input_dir: Some(input.clone()),
+            release_marker_sha256: Some("a".repeat(64)),
+        };
+        drop(PrivateInputGuard::for_command(&command));
+        assert!(!input.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn built_release_marker_digest_requires_exact_output_bytes() {
+        let expected = br#"{"schema":"cybex.system-release-marker.v3"}"#;
+        assert_eq!(
+            verify_built_release_marker_bytes(expected, expected).unwrap(),
+            sha256_hex(expected)
+        );
+        assert!(verify_built_release_marker_bytes(expected, b"{}").is_err());
+        let mut newline = expected.to_vec();
+        newline.push(b'\n');
+        assert!(verify_built_release_marker_bytes(expected, &newline).is_err());
+        assert!(verify_built_release_marker_bytes(expected, &[]).is_err());
+        assert!(
+            verify_built_release_marker_bytes(
+                expected,
+                &vec![b'x'; MAX_BUILT_RELEASE_MARKER_BYTES + 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provenance_uses_the_marker_inspected_from_the_built_closure() {
+        let source = include_str!("build.rs");
+        let inspect_start = source
+            .find("async fn inspect_system_release_output")
+            .expect("System Release output inspector");
+        let inspect_end = source[inspect_start..]
+            .find("async fn inspect_system_generation_paths")
+            .map(|offset| inspect_start + offset)
+            .expect("output inspector boundary");
+        let inspect = &source[inspect_start..inspect_end];
+        assert!(inspect.contains("inspect_built_release_marker(output_path, spec, &closure)"));
+
+        let finalize_start = source
+            .find("async fn finalize_system_release_artifact")
+            .expect("System Release finalizer");
+        let finalize_end = source[finalize_start..]
+            .find("fn canonical_build_time")
+            .map(|offset| finalize_start + offset)
+            .expect("System Release finalizer boundary");
+        let finalize = &source[finalize_start..finalize_end];
+        assert!(finalize.contains("let release_marker_sha256 = &inspected.release_marker_sha256"));
+        assert!(!finalize.contains("command.release_marker_sha256"));
+    }
+
+    #[test]
+    fn failed_private_input_publication_removes_partial_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-private-input-failure-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let input = work.join("job-1-input");
+        let rendered = RenderedSystemReleaseInputs {
+            files: vec![crate::system_release::RenderedSystemReleaseFile {
+                name: "missing-parent/configuration.nix".to_string(),
+                bytes: b"{ ... }: {}".to_vec(),
+                mode: 0o600,
+            }],
+            release_marker_sha256: "a".repeat(64),
+        };
+
+        assert!(write_private_job_inputs(&input, &rendered).is_err());
+        assert!(!input.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn system_release_store_paths_are_strictly_canonical() {
+        assert!(
+            validate_store_path("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-cybex-system").is_ok()
+        );
+        assert!(validate_store_path("/nix/store/../../etc/passwd").is_err());
+        assert!(validate_store_path("/nix/store/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-system").is_err());
+        assert!(
+            validate_store_path(&format!(
+                "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-{}",
+                "a".repeat(4097)
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_store_path("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-not canonical")
+                .is_err()
+        );
+        assert!(validate_store_path("/tmp/not-store").is_err());
+    }
+
+    #[test]
     fn build_spec_rejects_unknown_fields() {
         let value = json!({
             "schema_version": 1,
@@ -1705,8 +2787,8 @@ mod tests {
                 "generated_nix": "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }",
                 "desktop_module_nix": "{ lib, ... }: { options.cybex.desktop.profile = lib.mkOption { type = lib.types.str; default = \"auto\"; }; }",
                 "expected_state": {
-                    "schema": "cybex.blueprint.expected-state.v2",
-                    "compiler_version": 2,
+                    "schema": "cybex.blueprint.expected-state.v3",
+                    "compiler_version": 3,
                     "desktop": {"profile": "gnome"},
                     "checks": []
                 },
@@ -1718,6 +2800,33 @@ mod tests {
         let validated = validate_blueprint_build_input(parsed.build_input.unwrap()).unwrap();
         assert!(validated.desktop_module_nix.is_some());
         assert!(validated.expected_state.is_some());
+    }
+
+    #[test]
+    fn blueprint_build_input_keeps_immutable_expected_state_v2_buildable() {
+        let input = BlueprintBuildInput {
+            kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
+            generated_nix: "{ ... }: {}".to_string(),
+            desktop_module_nix: Some("{ ... }: {}".to_string()),
+            expected_state: Some(json!({
+                "schema": "cybex.blueprint.expected-state.v2",
+                "desktop": {"profile": "kde"},
+                "checks": []
+            })),
+            blueprint_name: Some("Immutable v2 Blueprint".to_string()),
+            blueprint_revision: Some(2),
+        };
+
+        let validated = validate_blueprint_build_input(input).unwrap();
+
+        assert_eq!(
+            validated
+                .expected_state
+                .as_ref()
+                .and_then(|value| value.get("schema"))
+                .and_then(Value::as_str),
+            Some("cybex.blueprint.expected-state.v2")
+        );
     }
 
     #[test]
@@ -1786,9 +2895,10 @@ mod tests {
             blueprint_revision_id: None,
             blueprint_revision_config_hash: None,
             build_input: None,
+            system_release: None,
         };
 
-        let command = nix_build_command(&config, &target, &spec, 42).unwrap();
+        let command = nix_build_command(&config, &target, &spec, 42, None).unwrap();
 
         assert_eq!(command.program, "nix");
         assert_eq!(command.args[0], "build");
@@ -1877,9 +2987,10 @@ mod tests {
                 blueprint_name: Some("Standard Workstation".to_string()),
                 blueprint_revision: Some(8),
             }),
+            system_release: None,
         };
 
-        let command = nix_build_command(&config, &target, &spec, 42).unwrap();
+        let command = nix_build_command(&config, &target, &spec, 42, None).unwrap();
 
         assert_eq!(command.program, "nix");
         assert_eq!(command.args[0], "build");
