@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, path::Path, str::FromStr};
+use std::{collections::HashSet, fs, path::Path, str::FromStr, time::Duration};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -97,6 +97,7 @@ pub async fn connect_with_url(database_url: &str) -> AppResult<SqlitePool> {
         .map_err(|err| AppError::Config(err.to_string()))?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
         .foreign_keys(true);
 
     Ok(SqlitePoolOptions::new()
@@ -1344,6 +1345,34 @@ pub async fn recover_running_build_jobs(pool: &SqlitePool, reason: &str) -> AppR
     .await?
     .rows_affected();
     Ok(affected as usize)
+}
+
+pub async fn fail_running_build_job_after_worker_error(
+    pool: &SqlitePool,
+    id: i64,
+    reason: &str,
+) -> AppResult<bool> {
+    let now = now_rfc3339();
+    let error = bounded_error_text(reason);
+    let affected = sqlx::query(
+        "UPDATE forge_build_jobs
+         SET status = 'failed',
+             progress_percent = 100,
+             progress_stage = 'failed',
+             progress_message = 'Build stopped safely after an internal worker error',
+             error = ?,
+             completed_at = ?,
+             updated_at = ?
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(error)
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
 }
 
 pub async fn claim_next_build_job(pool: &SqlitePool) -> AppResult<Option<BuildJob>> {
@@ -2599,6 +2628,51 @@ mod tests {
         pool
     }
 
+    #[tokio::test]
+    async fn sqlite_busy_timeout_waits_for_a_transient_writer() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cybex-forge-sqlite-busy-test-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let url = format!("sqlite://{}", path.display());
+        let writer_pool = connect_with_url(&url).await.unwrap();
+        let waiting_pool = connect_with_url(&url).await.unwrap();
+        sqlx::query("CREATE TABLE lock_probe (value INTEGER NOT NULL)")
+            .execute(&writer_pool)
+            .await
+            .unwrap();
+
+        let mut transaction = writer_pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO lock_probe (value) VALUES (1)")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let waiter = tokio::spawn(async move {
+            sqlx::query("INSERT INTO lock_probe (value) VALUES (2)")
+                .execute(&waiting_pool)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+
+        transaction.commit().await.unwrap();
+        waiter.await.unwrap().unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lock_probe")
+            .fetch_one(&writer_pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        writer_pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_dir_permissions_are_owner_only() {
@@ -3430,6 +3504,55 @@ mod tests {
         assert_eq!(updated.output_size_bytes, 42);
         assert_eq!(updated.exit_code, Some(0));
         assert!(updated.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_error_recovery_marks_a_running_job_failed() {
+        let pool = test_pool().await;
+        let job = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: None,
+                target: Some("desktop_experience".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "worker-recovery".to_string(),
+                input_config_hash: "a".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        claim_next_build_job(&pool).await.unwrap().unwrap();
+        update_build_job_logs(&pool, job.id, "partial build output")
+            .await
+            .unwrap();
+
+        let recovered = fail_running_build_job_after_worker_error(
+            &pool,
+            job.id,
+            "Forge stopped the build safely after an internal worker error; retry the build.",
+        )
+        .await
+        .unwrap();
+        assert!(recovered);
+
+        let updated = get_build_job(&pool, job.id).await.unwrap();
+        assert_eq!(updated.status, "failed");
+        assert_eq!(updated.progress_percent, Some(100));
+        assert_eq!(updated.progress_stage.as_deref(), Some("failed"));
+        assert_eq!(
+            updated.progress_message.as_deref(),
+            Some("Build stopped safely after an internal worker error")
+        );
+        assert_eq!(updated.logs, "partial build output");
+        assert!(updated.error.contains("retry the build"));
+        assert!(updated.completed_at.is_some());
+        assert!(
+            !fail_running_build_job_after_worker_error(&pool, job.id, "ignored")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

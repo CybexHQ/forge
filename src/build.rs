@@ -178,6 +178,7 @@ async fn worker_loop(state: AppState, worker_index: usize) {
                 info!(job_id, worker_index, "claimed Forge build job");
                 if let Err(err) = execute_claimed_job(&state, job).await {
                     warn!(error = %safe_error(&err), worker_index, "Forge build job execution failed");
+                    recover_failed_job_execution(&state, job_id, worker_index).await;
                 }
                 cleanup_job_dirs(&state.config, job_id).await;
             }
@@ -189,6 +190,36 @@ async fn worker_loop(state: AppState, worker_index: usize) {
                 claim_failures = claim_failures.saturating_add(1);
                 let delay = (5u64 << claim_failures.saturating_sub(1).min(5)).min(120);
                 warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim Forge build job");
+                sleep(Duration::from_secs(delay)).await;
+            }
+        }
+    }
+}
+
+async fn recover_failed_job_execution(state: &AppState, job_id: i64, worker_index: usize) {
+    const RECOVERY_REASON: &str =
+        "Forge stopped the build safely after an internal worker error; retry the build.";
+    let mut failures: u32 = 0;
+    loop {
+        match db::fail_running_build_job_after_worker_error(&state.db, job_id, RECOVERY_REASON)
+            .await
+        {
+            Ok(true) => {
+                warn!(job_id, worker_index, "recovered failed Forge build worker");
+                return;
+            }
+            Ok(false) => return,
+            Err(err) => {
+                let err = anyhow::Error::new(err);
+                failures = failures.saturating_add(1);
+                let delay = (2u64 << failures.saturating_sub(1).min(5)).min(60);
+                warn!(
+                    error = %safe_error(&err),
+                    job_id,
+                    worker_index,
+                    retry_in_seconds = delay,
+                    "failed to persist Forge build worker recovery"
+                );
                 sleep(Duration::from_secs(delay)).await;
             }
         }
@@ -1380,6 +1411,7 @@ async fn run_nix_build(
         .current_dir(&config.build.work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn {}", command.program))?;
     let stdout = child
@@ -1397,15 +1429,25 @@ async fn run_nix_build(
     let started = Instant::now();
     let mut last_log_update = Instant::now();
     let outcome = loop {
-        if db::build_job_cancel_requested(pool, job.id).await? {
-            terminate_child(&mut child);
-            let _ = timeout(
-                Duration::from_secs(config.build.cancel_grace_seconds),
-                child.wait(),
-            )
-            .await;
-            let _ = child.kill().await;
-            break ProcessOutcome::Cancelled;
+        match db::build_job_cancel_requested(pool, job.id).await {
+            Ok(true) => {
+                terminate_child(&mut child);
+                let _ = timeout(
+                    Duration::from_secs(config.build.cancel_grace_seconds),
+                    child.wait(),
+                )
+                .await;
+                let _ = child.kill().await;
+                break ProcessOutcome::Cancelled;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    error = %safe_error(&err.into()),
+                    job_id = job.id,
+                    "could not check Forge build cancellation; build supervision will retry"
+                );
+            }
         }
         if started.elapsed() >= Duration::from_secs(config.build.timeout_seconds) {
             terminate_child(&mut child);
@@ -1426,7 +1468,13 @@ async fn run_nix_build(
             };
         }
         if last_log_update.elapsed() >= Duration::from_secs(5) {
-            db::update_build_job_logs(pool, job.id, &log.snapshot().await).await?;
+            if let Err(err) = db::update_build_job_logs(pool, job.id, &log.snapshot().await).await {
+                warn!(
+                    error = %safe_error(&err.into()),
+                    job_id = job.id,
+                    "could not persist Forge build logs; build supervision will retry"
+                );
+            }
             last_log_update = Instant::now();
         }
         sleep(Duration::from_millis(500)).await;
