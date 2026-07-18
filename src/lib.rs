@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod disk;
 pub mod error;
+pub mod host;
 pub mod manage;
 pub mod models;
 pub(crate) mod redact;

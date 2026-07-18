@@ -48,6 +48,7 @@ use crate::{
 
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
+const CAPABILITY_BLUEPRINT_BUILDER_V2: &str = "blueprint_builder_v2";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_UPDATER_V1: &str = "updater_v1";
 const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 3;
@@ -377,6 +378,7 @@ struct ForgeAgentReportRequest {
     cache_inventory_generation: i64,
     cache_artifacts_complete: bool,
     disk: Option<crate::disk::DiskStats>,
+    host: Option<crate::host::HostStats>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1013,8 +1015,9 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
         cache_inventory_generation: cache_inventory.generation,
         cache_artifacts_complete,
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
+        host: crate::host::sample().await,
     };
-    let body_bytes = serialize_forge_report_body(&body)?;
+    let (_body, body_bytes) = fit_forge_report_body(body, MAX_REPORT_BODY_BYTES)?;
     let device_id = managed_device_id(managed)?;
     let path = format!("/v1/agent/devices/{device_id}/forge/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)
@@ -1027,12 +1030,67 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
     Ok(())
 }
 
-fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
-    let body = serde_json::to_vec(body).context("serialize managed forge report")?;
-    if body.len() > MAX_REPORT_BODY_BYTES {
-        bail!("managed forge report exceeded {MAX_REPORT_BODY_BYTES} bytes");
+fn fit_forge_report_body(
+    mut body: ForgeAgentReportRequest,
+    max_bytes: usize,
+) -> Result<(ForgeAgentReportRequest, Vec<u8>)> {
+    let original_jobs = body.build_jobs.len();
+    let original_artifacts = body.cache_artifacts.len();
+    let mut body_bytes = serialize_forge_report_body(&body)?;
+    if body_bytes.len() <= max_bytes {
+        return Ok((body, body_bytes));
     }
-    Ok(body)
+
+    // Logs are diagnostic convenience; the managed job identity, state and
+    // cache metadata are the durable evidence that Manage needs. Drop logs
+    // first so the newest active and terminal job reports remain intact.
+    for job in &mut body.build_jobs {
+        job.logs.clear();
+    }
+    body_bytes = serialize_forge_report_body(&body)?;
+    while body_bytes.len() > max_bytes {
+        let Some(index) = body
+            .build_jobs
+            .iter()
+            .rposition(|job| matches!(job.status.as_str(), "succeeded" | "failed" | "cancelled"))
+        else {
+            break;
+        };
+        // list_build_jobs returns newest first, so rposition removes the
+        // oldest terminal evidence while preserving current work and the
+        // latest completed Blueprint inventory.
+        body.build_jobs.remove(index);
+        body_bytes = serialize_forge_report_body(&body)?;
+    }
+
+    if body_bytes.len() > max_bytes && !body.cache_artifacts.is_empty() {
+        let fitting = max_fitting_prefix_len(body.cache_artifacts.len(), |count| {
+            let mut candidate = body.clone();
+            candidate.cache_artifacts.truncate(count);
+            candidate.cache_artifacts_complete = false;
+            serialize_forge_report_body(&candidate).is_ok_and(|bytes| bytes.len() <= max_bytes)
+        });
+        body.cache_artifacts.truncate(fitting);
+        body.cache_artifacts_complete = false;
+        body_bytes = serialize_forge_report_body(&body)?;
+    }
+
+    if body_bytes.len() > max_bytes {
+        bail!("managed forge report base body exceeded {max_bytes} bytes");
+    }
+    warn!(
+        jobs_sent = body.build_jobs.len(),
+        jobs_total = original_jobs,
+        cache_artifacts_sent = body.cache_artifacts.len(),
+        cache_artifacts_total = original_artifacts,
+        max_bytes,
+        "managed forge report trimmed to fit request budget"
+    );
+    Ok((body, body_bytes))
+}
+
+fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
+    serde_json::to_vec(body).context("serialize managed forge report")
 }
 
 fn fit_boot_report_body(
@@ -3798,6 +3856,7 @@ fn forge_capabilities(config: &AppConfig) -> Vec<&'static str> {
     let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
+        CAPABILITY_BLUEPRINT_BUILDER_V2,
         CAPABILITY_CACHE_V1,
     ];
     if crate::updater::capabilities_enabled(config) {
@@ -7725,7 +7784,13 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(
             forge_capabilities(&config),
-            vec!["boot_v1", "builder_v1", "cache_v1", "updater_v1"]
+            vec![
+                "boot_v1",
+                "builder_v1",
+                "blueprint_builder_v2",
+                "cache_v1",
+                "updater_v1"
+            ]
         );
     }
 

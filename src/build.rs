@@ -51,6 +51,12 @@ pub struct BuildSpec {
     #[serde(alias = "desktop_experience_revision_config_hash")]
     pub blueprint_revision_config_hash: Option<String>,
     #[serde(default)]
+    pub nixpkgs_commit: Option<String>,
+    #[serde(default)]
+    pub source_lock_sha256: Option<String>,
+    #[serde(default)]
+    pub software_package_refs: Vec<String>,
+    #[serde(default)]
     pub build_input: Option<BlueprintBuildInput>,
 }
 
@@ -81,6 +87,9 @@ struct ValidatedBuildSpec {
     blueprint_id: Option<String>,
     blueprint_revision_id: Option<String>,
     blueprint_revision_config_hash: Option<String>,
+    nixpkgs_commit: Option<String>,
+    source_lock_sha256: Option<String>,
+    software_package_refs: Vec<String>,
     build_input: Option<ValidatedBlueprintBuildInput>,
 }
 
@@ -499,6 +508,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 .await?;
                 return Ok(());
             }
+            let software_inventory = evaluate_software_inventory(&state.config, &spec).await;
             db::update_build_job_progress(
                 &state.db,
                 job.id,
@@ -541,7 +551,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             };
             merge_build_metadata(
                 &mut cached.metadata,
-                &build_result_metadata(&state.config, &job, Some(&target), None),
+                &success_result_metadata(&state.config, &job, &target, &spec, &software_inventory),
             );
             db::update_build_job_progress(
                 &state.db,
@@ -569,7 +579,13 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 &output_info.output_sha256,
                 output_info.output_size_bytes,
                 Some(exit_code.into()),
-                Some(success_result_metadata(&state.config, &job, &target, &spec)),
+                Some(success_result_metadata(
+                    &state.config,
+                    &job,
+                    &target,
+                    &spec,
+                    &software_inventory,
+                )),
             )
             .await?;
         }
@@ -690,6 +706,25 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
     if build_input.is_some() && artifact_type != "nixos_closure" {
         bail!("blueprint build_input requires artifact_type nixos_closure");
     }
+    let nixpkgs_commit = spec
+        .nixpkgs_commit
+        .map(|value| normalize_nixpkgs_commit(&value))
+        .transpose()?;
+    let source_lock_sha256 = spec
+        .source_lock_sha256
+        .map(|value| normalize_sha256(&value))
+        .transpose()?;
+    if build_input.is_some() && (nixpkgs_commit.is_none() || source_lock_sha256.is_none()) {
+        bail!("Blueprint builds require nixpkgs_commit and source_lock_sha256");
+    }
+    if spec.software_package_refs.len() > 128 {
+        bail!("software_package_refs exceeds 128 items");
+    }
+    let software_package_refs = spec
+        .software_package_refs
+        .iter()
+        .map(|value| normalize_package_ref(value))
+        .collect::<Result<Vec<_>>>()?;
     Ok(ValidatedBuildSpec {
         artifact_type,
         target,
@@ -699,6 +734,9 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         blueprint_id,
         blueprint_revision_id,
         blueprint_revision_config_hash,
+        nixpkgs_commit,
+        source_lock_sha256,
+        software_package_refs,
         build_input,
     })
 }
@@ -974,6 +1012,7 @@ fn success_result_metadata(
     job: &BuildJob,
     target: &BuildTargetConfig,
     spec: &ValidatedBuildSpec,
+    software_inventory: &Value,
 ) -> Value {
     let mut metadata = build_result_metadata(config, job, Some(target), None);
     let Some(object) = metadata.as_object_mut() else {
@@ -1004,7 +1043,67 @@ fn success_result_metadata(
         ),
     );
     object.insert("cache".to_string(), json!("exported"));
+    if let Some(commit) = spec.nixpkgs_commit.as_deref() {
+        object.insert("nixpkgs_revision".to_string(), json!(commit));
+        object.insert(
+            "nixpkgs_flake".to_string(),
+            json!(format!("github:NixOS/nixpkgs/{commit}")),
+        );
+    }
+    object.insert(
+        "source_lock_sha256".to_string(),
+        json!(spec.source_lock_sha256),
+    );
+    object.insert("software_inventory".to_string(), software_inventory.clone());
     metadata
+}
+
+async fn evaluate_software_inventory(config: &AppConfig, spec: &ValidatedBuildSpec) -> Value {
+    let Some(commit) = spec.nixpkgs_commit.as_deref() else {
+        return json!([]);
+    };
+    let mut refs = vec![(
+        "linux-kernel".to_string(),
+        "linuxPackages.kernel".to_string(),
+    )];
+    for package_ref in &spec.software_package_refs {
+        if !refs.iter().any(|(_, existing)| existing == package_ref) {
+            refs.push((package_ref.clone(), package_ref.clone()));
+        }
+    }
+    let mut inventory = Vec::new();
+    for (name, package_ref) in refs {
+        let installable = format!(
+            "github:NixOS/nixpkgs/{commit}#legacyPackages.{}.{}.version",
+            spec.system, package_ref
+        );
+        let output = timeout(
+            Duration::from_secs(30),
+            Command::new(&config.build.nix_binary)
+                .args(["eval", "--raw", "--no-write-lock-file", &installable])
+                .output(),
+        )
+        .await;
+        let Ok(Ok(output)) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let version = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if version.is_empty() || version.len() > 160 {
+            continue;
+        }
+        inventory.push(json!({
+            "name": name,
+            "package_ref": package_ref,
+            "version": version,
+        }));
+    }
+    Value::Array(inventory)
 }
 
 fn merge_build_metadata(destination: &mut Value, source: &Value) {
@@ -1078,7 +1177,16 @@ fn blueprint_nix_build_command(
     )?;
     write_job_input_file(
         input_dir.join("flake.nix"),
-        &forge_nixos_flake(&target.flake, &spec.system, build_input),
+        &forge_nixos_flake(
+            &format!(
+                "github:NixOS/nixpkgs/{}",
+                spec.nixpkgs_commit
+                    .as_deref()
+                    .expect("validated Blueprint source pin")
+            ),
+            &spec.system,
+            build_input,
+        ),
     )?;
 
     let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
@@ -1567,6 +1675,34 @@ fn normalize_sha256(value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn normalize_nixpkgs_commit(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("nixpkgs_commit must be a lowercase 40-character commit");
+    }
+    Ok(value)
+}
+
+fn normalize_package_ref(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 192
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.split('.').any(|part| part.is_empty())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'.'))
+    {
+        bail!("invalid software package reference");
+    }
+    Ok(value.to_string())
+}
+
 fn normalize_optional_uuidish(field: &str, value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty()
@@ -1785,6 +1921,9 @@ mod tests {
             blueprint_id: None,
             blueprint_revision_id: None,
             blueprint_revision_config_hash: None,
+            nixpkgs_commit: None,
+            source_lock_sha256: None,
+            software_package_refs: Vec::new(),
             build_input: None,
         };
 
@@ -1863,6 +2002,9 @@ mod tests {
             blueprint_id: None,
             blueprint_revision_id: None,
             blueprint_revision_config_hash: None,
+            nixpkgs_commit: Some("c".repeat(40)),
+            source_lock_sha256: Some("d".repeat(64)),
+            software_package_refs: vec!["firefox".to_string()],
             build_input: Some(ValidatedBlueprintBuildInput {
                 generated_nix: "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }"
                     .to_string(),
@@ -1914,8 +2056,11 @@ mod tests {
         assert!(compatibility.contains("options.cybex.blueprint.applications"));
         assert!(compatibility.contains("lib.mkAliasOptionModule"));
         let flake = std::fs::read_to_string(root.join("work/job-42-input/flake.nix")).unwrap();
-        assert!(flake.contains(r#"inputs.nixpkgs.url = "/srv/cybex-forge/build-inputs/cybex";"#));
-        assert!(!flake.contains("nixos-26.05"));
+        assert!(flake.contains(&format!(
+            r#"inputs.nixpkgs.url = "github:NixOS/nixpkgs/{}";"#,
+            "c".repeat(40)
+        )));
+        assert!(!flake.contains("/srv/cybex-forge/build-inputs/cybex"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
