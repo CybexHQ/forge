@@ -2378,6 +2378,10 @@ fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> St
             Some("insufficient_swap") => "Forge swap is below the required minimum".to_string(),
             Some("insufficient_disk_space") => "Forge disk space is insufficient".to_string(),
             Some("package_build_failed") => "A package failed to build".to_string(),
+            Some("source_build_blocked") => {
+                "Blocked: requires building from source (not allowed for this Blueprint)"
+                    .to_string()
+            }
             Some("nix_daemon_unavailable") => "Nix daemon is unavailable".to_string(),
             Some("build_timeout") => "Build timed out".to_string(),
             _ => "Build failed".to_string(),

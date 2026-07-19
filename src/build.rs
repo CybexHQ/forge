@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     sync::Mutex,
     time::{sleep, timeout},
@@ -22,6 +22,7 @@ use crate::{
     config::{AppConfig, BuildTargetConfig, pinned_nixpkgs_revision},
     db,
     models::BuildJob,
+    nix_log::{InternalJsonParser, derivation_display_name},
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
 };
 
@@ -30,6 +31,10 @@ const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nix
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
 const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
+/// Progress range reserved for the nix build itself; the phases before
+/// (preparing, 12) and after (inspecting, 80) bound it.
+const BUILDING_PROGRESS_START: i32 = 25;
+const BUILDING_PROGRESS_END: i32 = 79;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +63,12 @@ pub struct BuildSpec {
     pub software_package_refs: Vec<String>,
     #[serde(default)]
     pub build_input: Option<BlueprintBuildInput>,
+    /// When false (the default, including when the field is absent), the build
+    /// must come entirely from binary substitution: a pre-flight cache-coverage
+    /// check fails the job when the closure would compile real packages from
+    /// source (trivial per-system glue derivations are exempt).
+    #[serde(default)]
+    pub allow_source_builds: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +102,7 @@ struct ValidatedBuildSpec {
     source_lock_sha256: Option<String>,
     software_package_refs: Vec<String>,
     build_input: Option<ValidatedBlueprintBuildInput>,
+    allow_source_builds: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +119,7 @@ struct NixBuildCommand {
     program: String,
     args: Vec<String>,
     out_link: PathBuf,
+    installable: String,
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +484,49 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     }
 
     let command = nix_build_command(&state.config, &target, &spec, job.id)?;
+    if !spec.allow_source_builds {
+        db::update_build_job_progress(
+            &state.db,
+            job.id,
+            Some(18),
+            "checking_cache",
+            "Checking binary cache coverage",
+        )
+        .await?;
+        match preflight_source_build_check(&state.config, &command).await {
+            Ok(offenders) if !offenders.is_empty() => {
+                let mut metadata = build_result_metadata(
+                    &state.config,
+                    &job,
+                    Some(&target),
+                    Some("source_build_blocked"),
+                );
+                if let Some(map) = metadata.as_object_mut() {
+                    map.insert("source_build_candidates".to_string(), json!(offenders));
+                }
+                db::finish_build_job(
+                    &state.db,
+                    job.id,
+                    "failed",
+                    "",
+                    &source_build_blocked_message(&offenders),
+                    "",
+                    "",
+                    0,
+                    None,
+                    Some(metadata),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(
+                error = %safe_error(&err),
+                job_id = job.id,
+                "cache-coverage pre-flight failed; continuing without substitution-only enforcement"
+            ),
+        }
+    }
     let log = SharedLog::new(state.config.build.max_log_bytes);
     db::update_build_job_progress(
         &state.db,
@@ -769,6 +825,7 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         source_lock_sha256,
         software_package_refs,
         build_input,
+        allow_source_builds: spec.allow_source_builds,
     })
 }
 
@@ -967,6 +1024,17 @@ fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, St
             "Forge ran out of disk space while building the Nix closure".to_string(),
         );
     }
+    if lower.contains("unable to start any build") {
+        let candidates: Vec<String> =
+            extract_would_build_derivations(logs, SOURCE_BUILD_CANDIDATE_CAP)
+                .iter()
+                .map(|path| derivation_display_name(path))
+                .collect();
+        return (
+            "source_build_blocked",
+            source_build_blocked_message(&candidates),
+        );
+    }
     if lower.contains("builder for '")
         || lower.contains("failed to build")
         || lower.contains("dependencies of derivation")
@@ -981,6 +1049,184 @@ fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, St
         "nix_build_failed",
         "Nix failed to build the requested closure; inspect the bounded build log".to_string(),
     )
+}
+
+const SOURCE_BUILD_CANDIDATE_CAP: usize = 50;
+const PREFLIGHT_DRY_RUN_TIMEOUT_SECS: u64 = 600;
+const PREFLIGHT_DERIVATION_SHOW_CHUNK: usize = 100;
+const PREFLIGHT_WOULD_BUILD_CAP: usize = 4096;
+
+/// Parse nix's "these N derivations will be built:" block (from `--dry-run`
+/// output or a captured build log) into `.drv` store paths, capped.
+fn extract_would_build_derivations(text: &str, cap: usize) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with("derivations will be built:")
+            || trimmed.ends_with("derivation will be built:")
+        {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if trimmed.starts_with("/nix/store/") && trimmed.ends_with(".drv") {
+                if paths.len() < cap {
+                    paths.push(trimmed.to_string());
+                }
+                continue;
+            }
+            in_block = false;
+        }
+    }
+    paths
+}
+
+fn source_build_blocked_message(candidates: &[String]) -> String {
+    let advice = "Enable \"Allow building from source\" on this Blueprint and retry, \
+                  or pin a nixpkgs revision with cached binaries.";
+    if candidates.is_empty() {
+        return format!(
+            "Blocked: this build requires compiling packages from source, \
+             which is not allowed for this Blueprint. {advice}"
+        );
+    }
+    let shown = candidates
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if candidates.len() > 5 {
+        format!(" (+{} more)", candidates.len() - 5)
+    } else {
+        String::new()
+    };
+    format!(
+        "Blocked: {} package(s) are not available from the binary cache and would be \
+         compiled from source: {shown}{suffix}. {advice}",
+        candidates.len()
+    )
+}
+
+/// Dry-run the build and return display names of derivations that would be
+/// compiled from source. preferLocalBuild glue (generated configs, activation
+/// scripts) and fixed-output derivations (downloads) are exempt — an empty
+/// result means the closure is fully substitutable.
+async fn preflight_source_build_check(
+    config: &AppConfig,
+    command: &NixBuildCommand,
+) -> Result<Vec<String>> {
+    tokio::fs::create_dir_all(&config.build.work_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "create build work directory {}",
+                config.build.work_dir.display()
+            )
+        })?;
+    let mut args = vec![
+        "build".to_string(),
+        command.installable.clone(),
+        "--dry-run".to_string(),
+        "--no-write-lock-file".to_string(),
+    ];
+    if let Some(position) = command.args.iter().position(|arg| arg == "--system") {
+        if let Some(system) = command.args.get(position + 1) {
+            args.extend(["--system".to_string(), system.clone()]);
+        }
+    }
+    let output = timeout(
+        Duration::from_secs(PREFLIGHT_DRY_RUN_TIMEOUT_SECS),
+        Command::new(&command.program)
+            .args(&args)
+            .current_dir(&config.build.work_dir)
+            .output(),
+    )
+    .await
+    .context("nix build --dry-run timed out")?
+    .context("run nix build --dry-run")?;
+    if !output.status.success() {
+        bail!(
+            "nix build --dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let would_build = extract_would_build_derivations(&stderr, PREFLIGHT_WOULD_BUILD_CAP);
+    if would_build.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut offenders = Vec::new();
+    for chunk in would_build.chunks(PREFLIGHT_DERIVATION_SHOW_CHUNK) {
+        let output = Command::new(&command.program)
+            .arg("derivation")
+            .arg("show")
+            .args(chunk)
+            .output()
+            .await
+            .context("run nix derivation show")?;
+        if !output.status.success() {
+            bail!(
+                "nix derivation show failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            );
+        }
+        let value: Value =
+            serde_json::from_slice(&output.stdout).context("parse nix derivation show JSON")?;
+        for path in chunk {
+            if !derivation_is_exempt_from_source_policy(lookup_derivation(&value, path)) {
+                offenders.push(derivation_display_name(path));
+            }
+        }
+    }
+    offenders.truncate(SOURCE_BUILD_CANDIDATE_CAP);
+    Ok(offenders)
+}
+
+/// Find a derivation entry in `nix derivation show` JSON. Older nix keys the
+/// top-level object by full store path; nix 2.30+ nests entries under
+/// `derivations` keyed by drv basename.
+fn lookup_derivation<'value>(value: &'value Value, drv_path: &str) -> Option<&'value Value> {
+    let map = value
+        .get("derivations")
+        .and_then(Value::as_object)
+        .or_else(|| value.as_object())?;
+    if let Some(entry) = map.get(drv_path) {
+        return Some(entry);
+    }
+    map.get(drv_path.rsplit('/').next().unwrap_or(drv_path))
+}
+
+/// Derivations that are legitimately built locally even under a
+/// substitution-only policy: preferLocalBuild glue, fixed-output fetches, and
+/// trivial-builder outputs. NixOS per-system glue (udev-rules, etc-*, unit
+/// files, the system toplevel) is generated with runCommand/writeText, whose
+/// derivations carry `buildCommand`/`text` — real nixpkgs packages use staged
+/// builders and carry neither. Attributes live in `env` (strings, "1" = true)
+/// or, for `__structuredAttrs` derivations, in `structuredAttrs` (real JSON
+/// types).
+fn derivation_is_exempt_from_source_policy(drv: Option<&Value>) -> bool {
+    let Some(drv) = drv else {
+        return false;
+    };
+    ["env", "structuredAttrs"].iter().any(|section| {
+        let Some(attrs) = drv.get(*section).and_then(Value::as_object) else {
+            return false;
+        };
+        attrs
+            .get("preferLocalBuild")
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("1"))
+            || attrs.contains_key("outputHash")
+            || attrs.contains_key("buildCommand")
+            || attrs.contains_key("text")
+    })
 }
 
 async fn ensure_nix_daemon_available(config: &AppConfig) -> Result<()> {
@@ -1161,21 +1407,25 @@ fn nix_build_command(
     let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
     let out_link = job_dir.join("result");
     let installable = format!("{}#{}", target.flake, target.attr);
+    let args = vec![
+        "build".to_string(),
+        installable.clone(),
+        "--cores".to_string(),
+        config.build.max_build_cores.to_string(),
+        "--system".to_string(),
+        spec.system.clone(),
+        "--out-link".to_string(),
+        out_link.display().to_string(),
+        "--print-build-logs".to_string(),
+        "--log-format".to_string(),
+        "internal-json".to_string(),
+        "--no-write-lock-file".to_string(),
+    ];
     Ok(NixBuildCommand {
         program: config.build.nix_binary.clone(),
-        args: vec![
-            "build".to_string(),
-            installable,
-            "--cores".to_string(),
-            config.build.max_build_cores.to_string(),
-            "--system".to_string(),
-            spec.system.clone(),
-            "--out-link".to_string(),
-            out_link.display().to_string(),
-            "--print-build-logs".to_string(),
-            "--no-write-lock-file".to_string(),
-        ],
+        args,
         out_link,
+        installable,
     })
 }
 
@@ -1223,19 +1473,23 @@ fn blueprint_nix_build_command(
     let job_dir = config.build.output_dir.join(format!("job-{job_id}"));
     let out_link = job_dir.join("result");
     let installable = format!("{}#{}", input_dir.display(), target.attr);
+    let args = vec![
+        "build".to_string(),
+        installable.clone(),
+        "--cores".to_string(),
+        config.build.max_build_cores.to_string(),
+        "--out-link".to_string(),
+        out_link.display().to_string(),
+        "--print-build-logs".to_string(),
+        "--log-format".to_string(),
+        "internal-json".to_string(),
+        "--no-write-lock-file".to_string(),
+    ];
     Ok(NixBuildCommand {
         program: config.build.nix_binary.clone(),
-        args: vec![
-            "build".to_string(),
-            installable,
-            "--cores".to_string(),
-            config.build.max_build_cores.to_string(),
-            "--out-link".to_string(),
-            out_link.display().to_string(),
-            "--print-build-logs".to_string(),
-            "--no-write-lock-file".to_string(),
-        ],
+        args,
         out_link,
+        installable,
     })
 }
 
@@ -1424,10 +1678,15 @@ async fn run_nix_build(
         .ok_or_else(|| anyhow!("nix build stderr was not captured"))?;
     let stdout_log = log.clone();
     let stderr_log = log.clone();
+    let progress = Arc::new(Mutex::new(InternalJsonParser::new()));
+    let stderr_progress = progress.clone();
     let stdout_task = tokio::spawn(async move { read_log_stream(stdout, stdout_log).await });
-    let stderr_task = tokio::spawn(async move { read_log_stream(stderr, stderr_log).await });
+    let stderr_task = tokio::spawn(async move {
+        read_internal_json_log_stream(stderr, stderr_log, stderr_progress).await
+    });
     let started = Instant::now();
     let mut last_log_update = Instant::now();
+    let mut last_progress_sent: Option<(i32, String)> = None;
     let outcome = loop {
         match db::build_job_cancel_requested(pool, job.id).await {
             Ok(true) => {
@@ -1474,6 +1733,36 @@ async fn run_nix_build(
                     job_id = job.id,
                     "could not persist Forge build logs; build supervision will retry"
                 );
+            }
+            let update = progress
+                .lock()
+                .await
+                .snapshot()
+                .progress_update(BUILDING_PROGRESS_START, BUILDING_PROGRESS_END);
+            if let Some((mut percent, message)) = update {
+                // Keep the reported percentage monotonic even if nix raises
+                // its expected-derivation count mid-build.
+                if let Some((last_percent, _)) = last_progress_sent.as_ref() {
+                    percent = percent.max(*last_percent);
+                }
+                if last_progress_sent.as_ref() != Some(&(percent, message.clone())) {
+                    match db::update_build_job_progress(
+                        pool,
+                        job.id,
+                        Some(percent),
+                        "building",
+                        &message,
+                    )
+                    .await
+                    {
+                        Ok(()) => last_progress_sent = Some((percent, message)),
+                        Err(err) => warn!(
+                            error = %safe_error(&err.into()),
+                            job_id = job.id,
+                            "could not persist Forge build progress; build supervision will retry"
+                        ),
+                    }
+                }
             }
             last_log_update = Instant::now();
         }
@@ -1585,6 +1874,24 @@ fn nix_path_info_sizes(first: &Value) -> (i64, i64) {
     (closure_size.max(nar_size).max(0), closure_size.max(0))
 }
 
+async fn read_internal_json_log_stream<R>(
+    reader: R,
+    log: SharedLog,
+    progress: Arc<Mutex<InternalJsonParser>>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let rendered = progress.lock().await.feed_line(&line);
+        if let Some(text) = rendered {
+            log.append(&format!("{text}\n")).await;
+        }
+    }
+    Ok(())
+}
+
 async fn read_log_stream<R>(mut reader: R, log: SharedLog) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1627,7 +1934,20 @@ impl SharedLog {
 }
 
 fn redact_log_text(text: &str, redact_following: &mut usize) -> String {
-    text.split_whitespace()
+    let mut redacted = String::with_capacity(text.len());
+    let mut first = true;
+    for line in text.split('\n') {
+        if !first {
+            redacted.push('\n');
+        }
+        first = false;
+        redacted.push_str(&redact_log_line(line, redact_following));
+    }
+    redacted
+}
+
+fn redact_log_line(line: &str, redact_following: &mut usize) -> String {
+    line.split_whitespace()
         .map(|token| {
             if *redact_following > 0 {
                 *redact_following -= 1;
@@ -1942,6 +2262,9 @@ mod tests {
             parsed.build_input.unwrap().blueprint_name.as_deref(),
             Some("Legacy Workstation")
         );
+        // Specs from older Manage versions omit allow_source_builds entirely;
+        // enforcement must default on.
+        assert!(!parsed.allow_source_builds);
         assert!(build_target_names_compatible(
             "desktop_experience",
             "blueprint"
@@ -1973,6 +2296,7 @@ mod tests {
             source_lock_sha256: None,
             software_package_refs: Vec::new(),
             build_input: None,
+            allow_source_builds: false,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
@@ -1987,6 +2311,49 @@ mod tests {
         );
         assert!(command.args.contains(&"--out-link".to_string()));
         assert!(command.args.windows(2).any(|args| args == ["--cores", "4"]));
+    }
+
+    #[test]
+    fn lookup_derivation_handles_both_show_output_shapes() {
+        let full_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-users-groups.json.drv";
+        // nix >= 2.30: nested under "derivations", keyed by basename.
+        let nested = json!({"derivations": {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-users-groups.json.drv": {"env": {"preferLocalBuild": "1"}}
+        }});
+        assert!(derivation_is_exempt_from_source_policy(lookup_derivation(
+            &nested, full_path
+        )));
+        // older nix: top-level keyed by full store path.
+        let flat = json!({
+            full_path: {"env": {"preferLocalBuild": "1"}}
+        });
+        assert!(derivation_is_exempt_from_source_policy(lookup_derivation(
+            &flat, full_path
+        )));
+        assert!(lookup_derivation(&nested, "/nix/store/bb-unknown.drv").is_none());
+    }
+
+    #[test]
+    fn source_policy_exemptions_cover_glue_but_not_packages() {
+        let prefer_local = json!({"env": {"preferLocalBuild": "1"}});
+        let fixed_output = json!({"env": {"outputHash": "sha256-..."}});
+        let run_command = json!({"env": {"buildCommand": "mkdir -p $out"}});
+        let write_text = json!({"env": {"text": "contents"}});
+        let package = json!({"env": {"src": "/nix/store/x-src", "stdenv": "/nix/store/y"}});
+        // __structuredAttrs derivations (e.g. buildEnv/system-path, the NixOS
+        // toplevel) keep attributes under structuredAttrs with real booleans.
+        let structured = json!({"env": {"__structuredAttrs": "1"}, "structuredAttrs": {"preferLocalBuild": true, "buildCommand": "..."}});
+        let structured_package = json!({"env": {"__structuredAttrs": "1"}, "structuredAttrs": {"src": "/nix/store/x-src"}});
+        assert!(derivation_is_exempt_from_source_policy(Some(&prefer_local)));
+        assert!(derivation_is_exempt_from_source_policy(Some(&fixed_output)));
+        assert!(derivation_is_exempt_from_source_policy(Some(&run_command)));
+        assert!(derivation_is_exempt_from_source_policy(Some(&write_text)));
+        assert!(derivation_is_exempt_from_source_policy(Some(&structured)));
+        assert!(!derivation_is_exempt_from_source_policy(Some(&package)));
+        assert!(!derivation_is_exempt_from_source_policy(Some(
+            &structured_package
+        )));
+        assert!(!derivation_is_exempt_from_source_policy(None));
     }
 
     #[test]
@@ -2020,6 +2387,31 @@ mod tests {
         assert_eq!(
             classify_nix_build_failure("cannot connect to socket at daemon-socket", false).0,
             "nix_daemon_unavailable"
+        );
+        let blocked_log = "these 2 derivations will be built:\n  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-140.0.drv\n  /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-vlc-3.0.21.drv\nerror: unable to start any build; either increase '--max-jobs' or enable remote builds";
+        let (kind, message) = classify_nix_build_failure(blocked_log, false);
+        assert_eq!(kind, "source_build_blocked");
+        assert!(message.contains("firefox-140.0"));
+        assert!(message.contains("Allow building from source"));
+    }
+
+    #[test]
+    fn would_build_extraction_and_blocked_message() {
+        let dry_run = "evaluating\nthis derivation will be built:\n  /nix/store/cccccccccccccccccccccccccccccccc-pkg-1.0.drv\nthese 3 paths will be fetched (12 MiB download):\n  /nix/store/x\n";
+        assert_eq!(
+            extract_would_build_derivations(dry_run, 10),
+            vec!["/nix/store/cccccccccccccccccccccccccccccccc-pkg-1.0.drv".to_string()]
+        );
+        assert!(extract_would_build_derivations("nothing to do", 10).is_empty());
+
+        let names: Vec<String> = (0..7).map(|index| format!("pkg-{index}")).collect();
+        let message = source_build_blocked_message(&names);
+        assert!(message.starts_with("Blocked: 7 package(s)"));
+        assert!(message.contains("pkg-4"));
+        assert!(!message.contains("pkg-5"));
+        assert!(message.contains("(+2 more)"));
+        assert!(
+            source_build_blocked_message(&[]).contains("requires compiling packages from source")
         );
     }
 
@@ -2067,6 +2459,7 @@ mod tests {
                 blueprint_name: Some("Standard Workstation".to_string()),
                 blueprint_revision: Some(8),
             }),
+            allow_source_builds: false,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();

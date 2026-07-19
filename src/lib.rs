@@ -9,6 +9,7 @@ pub mod error;
 pub mod host;
 pub mod manage;
 pub mod models;
+pub mod nix_log;
 pub(crate) mod redact;
 pub mod routes;
 pub mod updater;
