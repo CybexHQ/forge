@@ -5729,6 +5729,11 @@ fn managed_profile_has_boot_action(profile: &ManagedBootProfile) -> bool {
                     .as_deref()
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false)
+                // A managed-ISO profile whose desired ISO is still syncing
+                // becomes runnable once the artifact lands; manage assigns
+                // clients to such profiles (network reinstall), so accept
+                // the config instead of failing the whole sync.
+                || managed_profile_needs_iso_sync(profile)
         }
         "custom_ipxe" => false,
         _ => false,
@@ -7047,6 +7052,26 @@ mod tests {
         let err = validate_boot_config(&config).unwrap_err();
 
         assert!(err.to_string().contains("runnable boot action"));
+    }
+
+    #[test]
+    fn managed_config_accepts_pending_iso_sync_client_assignments() {
+        // A network-reinstall profile: linux_installer with no boot assets
+        // yet, but a desired ISO queued for sync.
+        let mut config = sample_boot_config();
+        config.profiles[0].profile_type = "linux_installer".to_string();
+        config.profiles[0].kernel_path = None;
+        config.profiles[0].iso_path = None;
+        config.profiles[0].raw_script = None;
+        config.profiles[0].desired_iso_artifact_id = "installer:abc:1".to_string();
+        config.profiles[0].desired_iso_filename = "cybex-nixos-installer.iso".to_string();
+        config.profiles[0].desired_iso_size_bytes = 1024;
+        config.profiles[0].desired_iso_sha256 = "a".repeat(64);
+        config.profiles[0].desired_iso_download_url =
+            "/v1/agent/devices/dev_boot/boot/profiles/profile-1/iso/download".to_string();
+
+        validate_boot_config(&config)
+            .expect("client assignment to a pending managed-ISO profile should be accepted");
     }
 
     #[test]

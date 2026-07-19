@@ -133,6 +133,9 @@ fn menu_profiles(profiles: &[BootProfile]) -> Vec<&BootProfile> {
         .iter()
         .filter(|profile| {
             profile.enabled
+                // One-time profiles are reachable only through a per-MAC
+                // binding (network reinstall); keep them out of the menu.
+                && !profile.one_time
                 && profile.profile_type != BootProfileType::LocalDisk
                 && profile_has_boot_action(profile)
         })
@@ -415,6 +418,31 @@ mod tests {
         let selection = choose_profile(None, &profiles);
         assert_eq!(selection.source, SelectionSource::Menu);
         assert!(selection.profile.is_none());
+    }
+
+    #[test]
+    fn one_time_profiles_stay_out_of_the_menu_but_boot_via_binding() {
+        let mut reinstall = profile(2, BootProfileType::LinuxInstaller);
+        reinstall.name = "Reinstall workstation-01".to_string();
+        reinstall.one_time = true;
+        reinstall.kernel_path = Some("cybex/bzImage".to_string());
+        let mut enrollment = profile(3, BootProfileType::LinuxInstaller);
+        enrollment.name = "Default Enrollment".to_string();
+        enrollment.kernel_path = Some("cybex/bzImage".to_string());
+        let profiles = vec![
+            profile(1, BootProfileType::LocalDisk),
+            reinstall,
+            enrollment,
+        ];
+
+        let menu = render_menu("http://forge.local", &profiles, None, None, 10_000);
+        assert!(!menu.contains("Reinstall workstation-01"));
+        assert!(menu.contains("Default Enrollment"));
+
+        let device = device(None, Some(2));
+        let selection = choose_profile(Some(&device), &profiles);
+        assert_eq!(selection.source, SelectionSource::OneTime);
+        assert_eq!(selection.profile.unwrap().id, 2);
     }
 
     #[test]
