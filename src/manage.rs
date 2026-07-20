@@ -43,6 +43,7 @@ use crate::{
     },
     db,
     models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
+    redact::redact_sensitive_key_values,
     updater::{ForgeUpdateStatusReport, ManagedUpdateRequest},
 };
 
@@ -4010,10 +4011,36 @@ async fn parse_success_json<T: DeserializeOwned>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
+        let detail = match read_bounded_response_body(&mut response, context).await {
+            Ok(body) => managed_api_error_detail(&body),
+            Err(_) => None,
+        };
+        if let Some(detail) = detail {
+            bail!("{context} failed with HTTP {status}: {detail}");
+        }
         bail!("{context} failed with HTTP {status}");
     }
     let body = read_bounded_response_body(&mut response, context).await?;
     serde_json::from_slice::<T>(&body).with_context(|| format!("parse {context} response failed"))
+}
+
+fn managed_api_error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let object = value.as_object()?;
+    let error_code = object
+        .get("error_code")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_path_segment(value));
+    let error = object
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|value| bounded_error_message(redact_sensitive_key_values(value)));
+    match (error_code, error.filter(|value| !value.is_empty())) {
+        (Some(code), Some(error)) => Some(format!("{code}: {error}")),
+        (Some(code), None) => Some(code.to_string()),
+        (None, Some(error)) => Some(error),
+        (None, None) => None,
+    }
 }
 
 async fn read_bounded_response_body(
@@ -6035,19 +6062,19 @@ mod tests {
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
         clean_optional, current_profile_sync_reports, failed_sync_interval_seconds,
         fit_boot_report_body, forge_capabilities, generated_iso_raw_script_can_be_preserved,
-        has_unreported_known_profile_events, managed_iso_error_is_retryable,
-        managed_iso_retry_delay_seconds, managed_profile_map, managed_profile_needs_iso_sync,
-        managed_profile_raw_script, managed_sync_interval_seconds, nixos_netboot_fstab,
-        normalize_legacy_boot_config, normalize_managed_settings, optional_report_uuid,
-        parse_nixos_netboot_ipxe_cmdline, parse_nixos_netboot_split_squashfs_capability,
-        patch_nixos_netboot_squashfs_fstab, patch_nixos_netboot_squashfs_graphical_kiosk,
-        patch_nixos_netboot_squashfs_injected_config, read_newc_entry_start,
-        read_valid_netboot_manifest, render_check_service, render_managed_config,
-        render_nixos_netboot_script, rewrite_newc_archive_with_netboot_files,
-        runtime_managed_files, serialize_boot_report_body, skip_padding, sync_clients,
-        sync_deleted_clients, sync_deleted_profiles, sync_profiles, validate_boot_config,
-        validate_component_compatibility, validate_profile, write_newc_file_from_bytes,
-        write_newc_trailer, write_secure_json,
+        has_unreported_known_profile_events, managed_api_error_detail,
+        managed_iso_error_is_retryable, managed_iso_retry_delay_seconds, managed_profile_map,
+        managed_profile_needs_iso_sync, managed_profile_raw_script, managed_sync_interval_seconds,
+        nixos_netboot_fstab, normalize_legacy_boot_config, normalize_managed_settings,
+        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
+        parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
+        patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
+        read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
+        render_managed_config, render_nixos_netboot_script,
+        rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
+        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_profiles,
+        validate_boot_config, validate_component_compatibility, validate_profile,
+        write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -6194,6 +6221,28 @@ mod tests {
         assert_eq!(bounded.chars().count(), 243);
         assert!(bounded.ends_with("..."));
         assert!(!bounded.contains('\n'));
+    }
+
+    #[test]
+    fn managed_api_error_detail_is_bounded_and_redacts_secrets() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error_code": "invalid_request",
+            "error": format!("invalid report token=top-secret\n{}", "x".repeat(300)),
+        }))
+        .unwrap();
+
+        let detail = managed_api_error_detail(&body).unwrap();
+
+        assert!(detail.starts_with("invalid_request: invalid report token=[REDACTED]"));
+        assert!(detail.ends_with("..."));
+        assert!(!detail.contains("top-secret"));
+        assert!(!detail.contains('\n'));
+    }
+
+    #[test]
+    fn managed_api_error_detail_ignores_unstructured_bodies() {
+        assert_eq!(managed_api_error_detail(b"not json"), None);
+        assert_eq!(managed_api_error_detail(br#"{"error":42}"#), None);
     }
 
     #[test]
