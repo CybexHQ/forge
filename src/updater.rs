@@ -237,6 +237,7 @@ async fn apply_requested_update_with_runtime(
         return Ok(());
     }
     ensure_update_dirs(config)?;
+    repair_service_status_ownership(config)?;
     let Some(_lock) = try_acquire_lock(config)? else {
         return Ok(());
     };
@@ -950,7 +951,119 @@ fn validate_apply_state(config: &AppConfig, state: &ApplyState) -> Result<()> {
 }
 
 fn write_status(config: &AppConfig, status: ForgeUpdateStatusReport) -> Result<()> {
-    write_json_atomic(&status_path(config), &status)
+    write_service_state_json_atomic(&status_path(config), &status)
+}
+
+fn write_service_state_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).with_context(|| format!("inspect {}", parent.display()))?;
+    if !parent_metadata.file_type().is_dir() {
+        bail!("Forge update service-state parent must be a directory");
+    }
+    let tmp = parent.join(format!(
+        ".cybex-forge-service-state-{}-{}.tmp",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let body = serde_json::to_vec_pretty(value).context("serialize update service state")?;
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        #[cfg(unix)]
+        align_service_state_owner(&file, &parent_metadata)?;
+        file.write_all(&body)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        drop(file);
+        fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+        sync_parent_directory(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn service_state_requires_chown(effective_uid: u32, parent_uid: u32) -> Result<bool> {
+    if effective_uid == 0 {
+        return Ok(true);
+    }
+    if effective_uid != parent_uid {
+        bail!("Forge update service state must be written by root or the service account");
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn align_service_state_owner(file: &fs::File, parent_metadata: &fs::Metadata) -> Result<()> {
+    let effective_uid = unsafe { libc::geteuid() };
+    if service_state_requires_chown(effective_uid, parent_metadata.uid())? {
+        let result = unsafe {
+            libc::fchown(
+                file.as_raw_fd(),
+                parent_metadata.uid(),
+                parent_metadata.gid(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error()).context("assign Forge service-state owner");
+        }
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .context("secure Forge service state")?;
+    let metadata = file.metadata().context("inspect Forge service state")?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != parent_metadata.uid()
+        || metadata.gid() != parent_metadata.gid()
+        || metadata.mode() & 0o777 != 0o600
+    {
+        bail!("Forge update service-state ownership is invalid");
+    }
+    Ok(())
+}
+
+fn repair_service_status_ownership(config: &AppConfig) -> Result<()> {
+    let path = status_path(config);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("Forge update service status must be a regular file");
+    }
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+        let parent_metadata = fs::symlink_metadata(parent)
+            .with_context(|| format!("inspect {}", parent.display()))?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        align_service_state_owner(&file, &parent_metadata)?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
+        sync_parent_directory(&path)?;
+    }
+    Ok(())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1650,6 +1763,37 @@ mod tests {
         assert_eq!(status.status, "rolled_back");
         assert!(status.error.contains("interrupted_apply_recovered"));
         assert!(!apply_state_path(&config).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_status_remains_private_and_readable_by_the_work_dir_owner() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&config.update.work_dir).unwrap();
+        let status = ForgeUpdateStatusReport {
+            status: "rolled_back".to_string(),
+            stage: "rolled_back".to_string(),
+            progress_percent: Some(100),
+            error: "synthetic rollback".to_string(),
+            target_version: "0.1.2".to_string(),
+            current_version: "0.1.1".to_string(),
+            attempt_id: "1".repeat(32),
+            started_at: Some("2026-07-23T00:00:00Z".to_string()),
+            completed_at: Some("2026-07-23T00:00:01Z".to_string()),
+        };
+
+        write_status(&config, status).unwrap();
+
+        let parent = fs::metadata(&config.update.work_dir).unwrap();
+        let written = fs::metadata(status_path(&config)).unwrap();
+        assert_eq!(written.uid(), parent.uid());
+        assert_eq!(written.gid(), parent.gid());
+        assert_eq!(written.mode() & 0o777, 0o600);
+        assert_eq!(read_status(&config).unwrap().unwrap().status, "rolled_back");
+        assert!(service_state_requires_chown(0, 4242).unwrap());
+        assert!(!service_state_requires_chown(4242, 4242).unwrap());
+        assert!(service_state_requires_chown(4343, 4242).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

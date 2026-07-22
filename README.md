@@ -261,8 +261,11 @@ Forge reports `rolled_back` only after both restoration and that restart
 succeed. A restoration or restored-binary restart failure is reported as a
 terminal failure whose reason starts with `rollback_failed:`; durable apply
 state and its backup remain for explicit recovery and must not be interpreted as
-a successful rollback. Backups and staged binaries from earlier completed
-attempts are pruned after each apply.
+a successful rollback. The privileged apply worker atomically returns
+`status.json` ownership to the unprivileged Forge service account while keeping
+it mode `0600`; this cross-UID handoff is required before terminal state can be
+reported to Manage. Backups and staged binaries from earlier completed attempts
+are pruned after each apply.
 
 When signing is enabled, sign this exact message:
 
