@@ -223,6 +223,10 @@ fn contains_unsafe_credential_assignment(text: &str) -> bool {
         if canonical == "hashedpassword" && assignment_value == "\"!\"" {
             continue;
         }
+        if canonical == "passwd" && safe_nixos_nss_passwd_assignment(text, equals, assignment_value)
+        {
+            continue;
+        }
         if is_credential_reference_key(&canonical)
             && safe_runtime_secret_reference(assignment_value)
         {
@@ -231,6 +235,30 @@ fn contains_unsafe_credential_assignment(text: &str) -> bool {
         return true;
     }
     false
+}
+
+fn safe_nixos_nss_passwd_assignment(text: &str, equals: usize, value: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut end = equals;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || matches!(bytes[start - 1], b'_' | b'-' | b'.'))
+    {
+        start -= 1;
+    }
+    if &text[start..end] != "system.nssDatabases.passwd" {
+        return false;
+    }
+
+    let compact = value.split_whitespace().collect::<String>();
+    matches!(
+        compact.as_str(),
+        r#"lib.mkOrder490["authd"]"# | r#"lib.mkOrder490[\"authd\"]"#
+    )
 }
 
 fn assignment_key(text: &str, equals: usize) -> Option<&str> {
@@ -658,6 +686,35 @@ mod tests {
         );
 
         validate_build_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn allows_only_the_exact_nixos_authd_passwd_database_declaration() {
+        for desktop_module_nix in [
+            r#"{ ... }: {
+              system.nssDatabases.passwd = lib.mkOrder 490 [ "authd" ];
+            }"#,
+            r#"{ ... }: {
+              embedded = "system.nssDatabases.passwd = lib.mkOrder 490 [ \"authd\" ];";
+            }"#,
+        ] {
+            validate_desktop_module_nix(desktop_module_nix).unwrap();
+        }
+
+        for rejected in [
+            r#"services.example.passwd = lib.mkOrder 490 [ "authd" ];"#,
+            r#"system.nssDatabases.passwd = lib.mkOrder 491 [ "authd" ];"#,
+            r#"system.nssDatabases.passwd = lib.mkOrder 490 [ "files" ];"#,
+            r#"system.nssDatabases.passwd = lib.mkOrder 490 [ "authd" "files" ];"#,
+            r#"system.nssDatabases.passwd = "literal-secret";"#,
+            r#"passwd = lib.mkOrder 490 [ "authd" ];"#,
+        ] {
+            let error = validate_desktop_module_nix(rejected)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("literal credential assignment"));
+            assert!(!error.contains("literal-secret"));
+        }
     }
 
     #[test]
