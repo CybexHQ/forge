@@ -18,6 +18,7 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(name = "cybex-forge")]
 #[command(about = "UEFI-only PXE/iPXE boot control service")]
+#[command(version)]
 pub struct Cli {
     #[arg(
         short,
@@ -854,6 +855,14 @@ mod tests {
 
         assert_eq!(config.redacted_for_display().auth.admin_token, "");
         assert_eq!(config.redacted_for_display().manage.forge_install_code, "");
+    }
+
+    #[test]
+    fn cli_reports_the_exact_package_version() {
+        let result = Cli::try_parse_from(["cybex-forge", "--version"]).unwrap_err();
+
+        assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(result.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
