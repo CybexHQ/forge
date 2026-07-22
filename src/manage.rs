@@ -8509,7 +8509,17 @@ mod tests {
 
     #[test]
     fn forge_capabilities_report_build_and_cache() {
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        assert_eq!(
+            forge_capabilities(&config),
+            vec!["boot_v1", "builder_v1", "blueprint_builder_v2", "cache_v1"]
+        );
+
+        config.update.trusted_public_key = STANDARD.encode(
+            SigningKey::from_bytes(&[13_u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         assert_eq!(
             forge_capabilities(&config),
             vec![

@@ -5,7 +5,12 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use clap::{Parser, Subcommand};
+use ed25519_dalek::VerifyingKey;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -463,14 +468,22 @@ fn normalize_optional_public_key_text(field: &str, value: &str) -> anyhow::Resul
     if value.is_empty() {
         return Ok(String::new());
     }
-    if value.len() > 2048
+    if value.len() > 128
         || value
             .chars()
             .any(|ch| ch.is_control() || ch.is_whitespace())
     {
         bail!("{field} is invalid");
     }
-    Ok(value.to_string())
+    let bytes = STANDARD
+        .decode(value)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(value))
+        .with_context(|| format!("{field} must be Base64-encoded"))?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{field} must decode to exactly 32 bytes"))?;
+    VerifyingKey::from_bytes(&key).with_context(|| format!("{field} must be an Ed25519 key"))?;
+    Ok(STANDARD.encode(key))
 }
 
 pub(crate) fn normalize_bootloader_filename(value: &str) -> anyhow::Result<String> {
@@ -815,6 +828,7 @@ impl Default for ManageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn print_config_view_redacts_admin_token() {
@@ -840,6 +854,31 @@ mod tests {
 
         assert_eq!(config.redacted_for_display().auth.admin_token, "");
         assert_eq!(config.redacted_for_display().manage.forge_install_code, "");
+    }
+
+    #[test]
+    fn update_trust_key_is_validated_and_canonicalized() {
+        let public_key = SigningKey::from_bytes(&[7_u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let url_safe = URL_SAFE_NO_PAD.encode(public_key);
+
+        assert_eq!(
+            normalize_optional_public_key_text("update.trusted_public_key", &url_safe).unwrap(),
+            STANDARD.encode(public_key)
+        );
+        assert!(
+            normalize_optional_public_key_text(
+                "update.trusted_public_key",
+                &STANDARD.encode([0_u8; 31])
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 32 bytes")
+        );
+        assert!(
+            normalize_optional_public_key_text("update.trusted_public_key", "not-base64").is_err()
+        );
     }
 
     #[test]

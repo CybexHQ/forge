@@ -1,8 +1,14 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+};
 use std::{
-    fs, io,
+    fs,
+    future::Future,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Command, Output},
     time::Duration,
 };
@@ -24,7 +30,10 @@ use crate::{config::AppConfig, db};
 const REQUEST_FILE: &str = "request.json";
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "apply.lock";
+const APPLY_STATE_FILE: &str = "apply-state.json";
 const RELEASE_SCHEMA: &str = "cybex.forge.update-request.v1";
+const APPLY_LOCK_SCHEMA: &str = "cybex.forge.update-lock.v1";
+const APPLY_STATE_SCHEMA: &str = "cybex.forge.apply-state.v1";
 
 fn command_output_with_transient_exec_retry(command: &mut Command) -> io::Result<Output> {
     const MAX_ATTEMPTS: usize = 8;
@@ -79,18 +88,68 @@ pub struct ForgeUpdateStatusReport {
     pub completed_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct UpdateLockOwner {
+    schema: String,
+    pid: u32,
+    process_start_ticks: u64,
+    boot_id: String,
+    state: String,
+    acquired_at: String,
+    released_at: Option<String>,
+}
+
 struct UpdateLock {
-    path: PathBuf,
+    file: fs::File,
+    owner: UpdateLockOwner,
 }
 
 impl Drop for UpdateLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.owner.state = "released".to_string();
+        self.owner.released_at = Some(now_rfc3339());
+        let _ = write_lock_owner(&mut self.file, &self.owner);
+        #[cfg(unix)]
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ApplyState {
+    schema: String,
+    attempt_id: String,
+    target_version: String,
+    backup_filename: String,
+    phase: String,
+    started_at: String,
+}
+
+trait UpdateRuntime {
+    fn restart_service(&self, config: &AppConfig) -> Result<()>;
+
+    fn wait_for_health<'a>(
+        &'a self,
+        config: &'a AppConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+struct SystemUpdateRuntime;
+
+impl UpdateRuntime for SystemUpdateRuntime {
+    fn restart_service(&self, config: &AppConfig) -> Result<()> {
+        restart_service(config)
+    }
+
+    fn wait_for_health<'a>(
+        &'a self,
+        config: &'a AppConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(wait_for_health(config))
     }
 }
 
 pub fn capabilities_enabled(config: &AppConfig) -> bool {
-    config.update.enabled
+    config.update.enabled && parse_trusted_public_key(&config.update.trusted_public_key).is_ok()
 }
 
 pub async fn store_update_request(
@@ -104,7 +163,7 @@ pub async fn store_update_request(
         return Ok(());
     };
     validate_request(&request)?;
-    ensure_update_dirs(config)?;
+    ensure_update_work_dir(config)?;
 
     let existing = read_status(config).ok().flatten();
     let same_target = existing
@@ -167,10 +226,25 @@ pub async fn status_report(config: &AppConfig) -> Result<Option<ForgeUpdateStatu
 }
 
 pub async fn apply_requested_update(config: &AppConfig) -> Result<()> {
+    apply_requested_update_with_runtime(config, &SystemUpdateRuntime).await
+}
+
+async fn apply_requested_update_with_runtime(
+    config: &AppConfig,
+    runtime: &dyn UpdateRuntime,
+) -> Result<()> {
     if !config.update.enabled {
         return Ok(());
     }
     ensure_update_dirs(config)?;
+    let Some(_lock) = try_acquire_lock(config)? else {
+        return Ok(());
+    };
+
+    if recover_interrupted_apply(config, runtime)? {
+        return Ok(());
+    }
+
     let Some(stored) = read_request(config)? else {
         return Ok(());
     };
@@ -189,30 +263,28 @@ pub async fn apply_requested_update(config: &AppConfig) -> Result<()> {
         }
     }
 
-    let Some(_lock) = try_acquire_lock(config)? else {
-        return Ok(());
-    };
-
     let started_at = now_rfc3339();
     let attempt_id = request_attempt_id(&request);
     let apply_result =
-        apply_requested_update_inner(config, &request, &attempt_id, &started_at).await;
+        apply_requested_update_inner(config, &request, &attempt_id, &started_at, runtime).await;
     prune_stale_update_files(config, &attempt_id, &request.version);
     if let Err(err) = apply_result {
+        let message = err.to_string();
         write_status(
             config,
             ForgeUpdateStatusReport {
                 status: "failed".to_string(),
                 stage: "failed".to_string(),
                 progress_percent: Some(100),
-                error: err.to_string(),
-                target_version: request.version,
+                error: message.clone(),
+                target_version: request.version.clone(),
                 current_version: env!("CARGO_PKG_VERSION").to_string(),
-                attempt_id,
-                started_at: Some(started_at),
+                attempt_id: attempt_id.clone(),
+                started_at: Some(started_at.clone()),
                 completed_at: Some(now_rfc3339()),
             },
         )?;
+        return Err(anyhow!(message));
     }
     Ok(())
 }
@@ -222,6 +294,7 @@ async fn apply_requested_update_inner(
     request: &ManagedUpdateRequest,
     attempt_id: &str,
     started_at: &str,
+    runtime: &dyn UpdateRuntime,
 ) -> Result<()> {
     write_progress(config, request, attempt_id, started_at, "preflight", 5, "")?;
     let pool = db::connect(config).await.context("open Forge database")?;
@@ -262,51 +335,102 @@ async fn apply_requested_update_inner(
     write_progress(config, request, attempt_id, started_at, "staged", 70, "")?;
     smoke_test_binary(config, &staged)?;
 
+    install_and_activate_candidate(config, request, attempt_id, started_at, &staged, runtime).await
+}
+
+async fn install_and_activate_candidate(
+    config: &AppConfig,
+    request: &ManagedUpdateRequest,
+    attempt_id: &str,
+    started_at: &str,
+    staged: &Path,
+    runtime: &dyn UpdateRuntime,
+) -> Result<()> {
     let backup = backup_current_binary(config, attempt_id)?;
+    let backup_filename = backup
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("update backup filename is invalid"))?
+        .to_string();
+    let mut state = ApplyState {
+        schema: APPLY_STATE_SCHEMA.to_string(),
+        attempt_id: attempt_id.to_string(),
+        target_version: request.version.clone(),
+        backup_filename,
+        phase: "backup_ready".to_string(),
+        started_at: started_at.to_string(),
+    };
+    write_apply_state(config, &state)?;
+
+    state.phase = "candidate_installing".to_string();
+    write_apply_state(config, &state)?;
     write_progress(config, request, attempt_id, started_at, "applying", 82, "")?;
-    install_binary(config, &staged)?;
-
-    write_progress(
-        config,
-        request,
-        attempt_id,
-        started_at,
-        "restarting",
-        88,
-        "",
-    )?;
-    restart_service(config)?;
-
-    write_progress(
-        config,
-        request,
-        attempt_id,
-        started_at,
-        "health_checking",
-        94,
-        "",
-    )?;
-    if let Err(err) = wait_for_health(config).await {
-        restore_binary(config, &backup)?;
-        let _ = restart_service(config);
-        write_status(
+    if let Err(err) = install_binary(config, staged) {
+        return rollback_after_activation_failure(
             config,
-            ForgeUpdateStatusReport {
-                status: "rolled_back".to_string(),
-                stage: "rolled_back".to_string(),
-                progress_percent: Some(100),
-                error: format!("health check failed after update; rolled back: {err}"),
-                target_version: request.version.clone(),
-                current_version: env!("CARGO_PKG_VERSION").to_string(),
-                attempt_id: attempt_id.to_string(),
-                started_at: Some(started_at.to_string()),
-                completed_at: Some(now_rfc3339()),
-            },
-        )?;
-        return Ok(());
+            request,
+            attempt_id,
+            started_at,
+            &backup,
+            &format!("candidate_install_failed: {err}"),
+            runtime,
+        );
     }
 
-    write_status(
+    state.phase = "candidate_installed".to_string();
+    if let Err(err) = write_apply_state(config, &state) {
+        return rollback_after_activation_failure(
+            config,
+            request,
+            attempt_id,
+            started_at,
+            &backup,
+            &format!("activation_state_persist_failed: {err}"),
+            runtime,
+        );
+    }
+    let activation_result = async {
+        write_progress(
+            config,
+            request,
+            attempt_id,
+            started_at,
+            "restarting",
+            88,
+            "",
+        )?;
+        runtime
+            .restart_service(config)
+            .context("candidate_restart_failed")?;
+        write_progress(
+            config,
+            request,
+            attempt_id,
+            started_at,
+            "health_checking",
+            94,
+            "",
+        )?;
+        runtime
+            .wait_for_health(config)
+            .await
+            .context("candidate_health_check_failed")?;
+        Result::<()>::Ok(())
+    }
+    .await;
+    if let Err(err) = activation_result {
+        return rollback_after_activation_failure(
+            config,
+            request,
+            attempt_id,
+            started_at,
+            &backup,
+            &err.to_string(),
+            runtime,
+        );
+    }
+
+    if let Err(err) = write_status(
         config,
         ForgeUpdateStatusReport {
             status: "succeeded".to_string(),
@@ -319,8 +443,140 @@ async fn apply_requested_update_inner(
             started_at: Some(started_at.to_string()),
             completed_at: Some(now_rfc3339()),
         },
-    )?;
+    ) {
+        return rollback_after_activation_failure(
+            config,
+            request,
+            attempt_id,
+            started_at,
+            &backup,
+            &format!("success_status_persist_failed: {err}"),
+            runtime,
+        );
+    }
+    if let Err(err) = remove_apply_state(config) {
+        tracing::warn!(error = %err, "failed to remove committed Forge update state");
+    }
     Ok(())
+}
+
+fn rollback_after_activation_failure(
+    config: &AppConfig,
+    request: &ManagedUpdateRequest,
+    attempt_id: &str,
+    started_at: &str,
+    backup: &Path,
+    trigger: &str,
+    runtime: &dyn UpdateRuntime,
+) -> Result<()> {
+    if let Err(err) = restore_binary(config, backup) {
+        bail!("rollback_failed: trigger={trigger}; restore_binary={err}");
+    }
+    if let Err(err) = runtime.restart_service(config) {
+        bail!("rollback_failed: trigger={trigger}; restored_binary_restart={err}");
+    }
+    write_status(
+        config,
+        ForgeUpdateStatusReport {
+            status: "rolled_back".to_string(),
+            stage: "rolled_back".to_string(),
+            progress_percent: Some(100),
+            error: format!("activation_failed: {trigger}; restored previous binary"),
+            target_version: request.version.clone(),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            attempt_id: attempt_id.to_string(),
+            started_at: Some(started_at.to_string()),
+            completed_at: Some(now_rfc3339()),
+        },
+    )?;
+    if let Err(err) = remove_apply_state(config) {
+        tracing::warn!(error = %err, "failed to remove rolled-back Forge update state");
+    }
+    Ok(())
+}
+
+fn recover_interrupted_apply(config: &AppConfig, runtime: &dyn UpdateRuntime) -> Result<bool> {
+    let Some(state) = read_apply_state(config)? else {
+        return Ok(false);
+    };
+    validate_apply_state(config, &state)?;
+
+    if read_status(config)?.is_some_and(|status| {
+        status.attempt_id == state.attempt_id
+            && status.target_version == state.target_version
+            && matches!(status.status.as_str(), "succeeded" | "rolled_back")
+    }) {
+        remove_apply_state(config)?;
+        return Ok(false);
+    }
+
+    if state.phase == "backup_ready" {
+        remove_apply_state(config)?;
+        return Ok(false);
+    }
+
+    let backup = config.update.releases_dir.join(&state.backup_filename);
+    if let Err(err) = restore_binary(config, &backup) {
+        return Err(record_interrupted_recovery_failure(
+            config,
+            &state,
+            format!("restore_binary={err}"),
+        ));
+    }
+    if let Err(err) = runtime.restart_service(config) {
+        return Err(record_interrupted_recovery_failure(
+            config,
+            &state,
+            format!("restored_binary_restart={err}"),
+        ));
+    }
+    write_status(
+        config,
+        ForgeUpdateStatusReport {
+            status: "rolled_back".to_string(),
+            stage: "rolled_back".to_string(),
+            progress_percent: Some(100),
+            error: format!(
+                "interrupted_apply_recovered: restored previous binary from {} phase",
+                state.phase
+            ),
+            target_version: state.target_version,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            attempt_id: state.attempt_id,
+            started_at: Some(state.started_at),
+            completed_at: Some(now_rfc3339()),
+        },
+    )?;
+    if let Err(err) = remove_apply_state(config) {
+        tracing::warn!(error = %err, "failed to remove recovered Forge update state");
+    }
+    Ok(true)
+}
+
+fn record_interrupted_recovery_failure(
+    config: &AppConfig,
+    state: &ApplyState,
+    detail: String,
+) -> anyhow::Error {
+    let message = format!("rollback_failed: trigger=interrupted_apply; {detail}");
+    let status_result = write_status(
+        config,
+        ForgeUpdateStatusReport {
+            status: "failed".to_string(),
+            stage: "failed".to_string(),
+            progress_percent: Some(100),
+            error: message.clone(),
+            target_version: state.target_version.clone(),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            attempt_id: state.attempt_id.clone(),
+            started_at: Some(state.started_at.clone()),
+            completed_at: Some(now_rfc3339()),
+        },
+    );
+    match status_result {
+        Ok(()) => anyhow!(message),
+        Err(err) => anyhow!("{message}; failure_status_persist_failed={err}"),
+    }
 }
 
 async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -> Result<PathBuf> {
@@ -352,12 +608,16 @@ async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -
     }
 
     crate::disk::ensure_headroom(
-        &config.update.work_dir,
+        &config.update.releases_dir,
         config.update.max_artifact_size_bytes,
         "Forge update download",
     )?;
-    let tmp_path = config.update.work_dir.join("artifact.download");
-    let mut file = tokio_fs::File::create(&tmp_path)
+    let tmp_path = config.update.releases_dir.join(".artifact.download");
+    remove_owned_regular_file_if_exists(&tmp_path)?;
+    let mut file = tokio_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
         .await
         .with_context(|| format!("create {}", tmp_path.display()))?;
     let mut hasher = Sha256::new();
@@ -375,36 +635,42 @@ async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -
             .context("write update artifact")?;
     }
     file.flush().await.context("flush update artifact")?;
+    file.sync_all().await.context("sync update artifact")?;
     drop(file);
 
     let actual = format!("{:x}", hasher.finalize());
     if actual != request.sha256.to_ascii_lowercase() {
+        let _ = fs::remove_file(&tmp_path);
         bail!("update artifact sha256 mismatch");
     }
     Ok(tmp_path)
 }
 
 fn verify_signature(config: &AppConfig, request: &ManagedUpdateRequest) -> Result<()> {
-    if config.update.trusted_public_key.trim().is_empty() {
-        bail!(
-            "update.trusted_public_key is not configured; refusing to apply an unverified Forge update (configure the trusted release key or set update.enabled = false)"
-        );
-    }
+    let key = parse_trusted_public_key(&config.update.trusted_public_key)?;
     if request.signature.trim().is_empty() {
         bail!("update signature is required");
     }
-    let key_bytes = decode_b64(config.update.trusted_public_key.trim())
-        .context("decode trusted update public key")?;
-    let key_array: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("trusted update public key must be Ed25519"))?;
-    let key = VerifyingKey::from_bytes(&key_array).context("parse trusted update public key")?;
     let sig_bytes = decode_b64(request.signature.trim()).context("decode update signature")?;
     let signature = Signature::from_slice(&sig_bytes).context("parse update signature")?;
     let message = update_signature_message(request);
     key.verify(message.as_bytes(), &signature)
         .context("verify update signature")
+}
+
+fn parse_trusted_public_key(value: &str) -> Result<VerifyingKey> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!(
+            "update.trusted_public_key is not configured; refusing to apply an unverified Forge update (configure the trusted release key or set update.enabled = false)"
+        );
+    }
+    let key_bytes = decode_b64(value).context("decode trusted update public key")?;
+    let key_array: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("trusted update public key must be a 32-byte Ed25519 key"))?;
+    VerifyingKey::from_bytes(&key_array).context("parse trusted update public key")
 }
 
 fn stage_artifact(
@@ -414,10 +680,14 @@ fn stage_artifact(
 ) -> Result<PathBuf> {
     let filename = format!("cybex-forge-{}", safe_version_filename(&request.version));
     let staged = config.update.releases_dir.join(filename);
-    let staged_tmp = config.update.work_dir.join("artifact.staged");
+    let staged_tmp = config.update.releases_dir.join(".artifact.staged");
+    remove_owned_regular_file_if_exists(&staged_tmp)?;
     fs::copy(artifact, &staged_tmp).with_context(|| format!("stage {}", staged_tmp.display()))?;
     set_executable(&staged_tmp)?;
+    sync_regular_file(&staged_tmp)?;
     fs::rename(&staged_tmp, &staged).with_context(|| format!("publish {}", staged.display()))?;
+    sync_parent_directory(&staged)?;
+    remove_owned_regular_file_if_exists(artifact)?;
     Ok(staged)
 }
 
@@ -441,11 +711,13 @@ fn smoke_test_binary(config: &AppConfig, binary: &Path) -> Result<()> {
 fn backup_current_binary(config: &AppConfig, attempt_id: &str) -> Result<PathBuf> {
     let backup = config
         .update
-        .work_dir
+        .releases_dir
         .join(format!("cybex-forge-backup-{attempt_id}"));
     fs::copy(&config.update.binary_path, &backup)
         .with_context(|| format!("backup {}", config.update.binary_path.display()))?;
     set_executable(&backup)?;
+    sync_regular_file(&backup)?;
+    sync_parent_directory(&backup)?;
     Ok(backup)
 }
 
@@ -458,8 +730,10 @@ fn install_binary(config: &AppConfig, staged: &Path) -> Result<()> {
     let tmp = parent.join(".cybex-forge.update");
     fs::copy(staged, &tmp).with_context(|| format!("install {}", tmp.display()))?;
     set_executable(&tmp)?;
+    sync_regular_file(&tmp)?;
     fs::rename(&tmp, &config.update.binary_path)
         .with_context(|| format!("replace {}", config.update.binary_path.display()))?;
+    sync_parent_directory(&config.update.binary_path)?;
     Ok(())
 }
 
@@ -471,7 +745,11 @@ fn prune_stale_update_files(config: &AppConfig, keep_attempt_id: &str, keep_vers
     let keep_backup = format!("cybex-forge-backup-{keep_attempt_id}");
     let keep_release = format!("cybex-forge-{}", safe_version_filename(keep_version));
     for (dir, prefix, keep) in [
-        (&config.update.work_dir, "cybex-forge-backup-", &keep_backup),
+        (
+            &config.update.releases_dir,
+            "cybex-forge-backup-",
+            &keep_backup,
+        ),
         (&config.update.releases_dir, "cybex-forge-", &keep_release),
     ] {
         let entries = match fs::read_dir(dir) {
@@ -509,8 +787,10 @@ fn restore_binary(config: &AppConfig, backup: &Path) -> Result<()> {
     let tmp = parent.join(".cybex-forge.rollback");
     fs::copy(backup, &tmp).with_context(|| format!("restore {}", tmp.display()))?;
     set_executable(&tmp)?;
+    sync_regular_file(&tmp)?;
     fs::rename(&tmp, &config.update.binary_path)
         .with_context(|| format!("rollback {}", config.update.binary_path.display()))?;
+    sync_parent_directory(&config.update.binary_path)?;
     Ok(())
 }
 
@@ -595,6 +875,80 @@ fn read_status(config: &AppConfig) -> Result<Option<ForgeUpdateStatusReport>> {
         .map(Some)
 }
 
+fn read_apply_state(config: &AppConfig) -> Result<Option<ApplyState>> {
+    let path = apply_state_path(config);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
+fn write_apply_state(config: &AppConfig, state: &ApplyState) -> Result<()> {
+    validate_apply_state(config, state)?;
+    write_json_atomic(&apply_state_path(config), state)
+}
+
+fn remove_apply_state(config: &AppConfig) -> Result<()> {
+    let path = apply_state_path(config);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_parent_directory(&path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn validate_apply_state(config: &AppConfig, state: &ApplyState) -> Result<()> {
+    if state.schema != APPLY_STATE_SCHEMA {
+        bail!("unsupported Forge apply-state schema");
+    }
+    if state.attempt_id.len() != 32
+        || !state
+            .attempt_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("Forge apply-state attempt ID is invalid");
+    }
+    if !matches!(
+        state.phase.as_str(),
+        "backup_ready" | "candidate_installing" | "candidate_installed"
+    ) {
+        bail!("Forge apply-state phase is invalid");
+    }
+    let expected_backup = format!("cybex-forge-backup-{}", state.attempt_id);
+    if state.backup_filename != expected_backup
+        || Path::new(&state.backup_filename)
+            .file_name()
+            .and_then(|v| v.to_str())
+            != Some(state.backup_filename.as_str())
+    {
+        bail!("Forge apply-state backup filename is invalid");
+    }
+    validate_request(&ManagedUpdateRequest {
+        version: state.target_version.clone(),
+        artifact_url: "https://invalid.example/cybex-forge".to_string(),
+        sha256: "0".repeat(64),
+        signature: String::new(),
+        release_url: String::new(),
+        notes_url: String::new(),
+        requested_at: None,
+    })?;
+    let backup = config.update.releases_dir.join(&state.backup_filename);
+    let metadata = fs::symlink_metadata(&backup)
+        .with_context(|| format!("inspect Forge apply-state backup {}", backup.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("Forge apply-state backup is missing");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+        bail!("Forge apply-state backup ownership is invalid");
+    }
+    Ok(())
+}
+
 fn write_status(config: &AppConfig, status: ForgeUpdateStatusReport) -> Result<()> {
     write_json_atomic(&status_path(config), &status)
 }
@@ -610,30 +964,241 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
     let body = serde_json::to_vec_pretty(value).context("serialize update state")?;
-    fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(&body)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(())
+    sync_parent_directory(path)
 }
 
 fn try_acquire_lock(config: &AppConfig) -> Result<Option<UpdateLock>> {
     let path = lock_path(config);
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
         .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+
+    #[cfg(unix)]
     {
-        Ok(_) => Ok(Some(UpdateLock { path })),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("create {}", path.display())),
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspect {}", path.display()))?;
+        if !metadata.file_type().is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            bail!("Forge update lock must be a singly-linked file owned by the updater");
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure {}", path.display()))?;
     }
+
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| format!("lock {}", path.display()));
+        }
+    }
+
+    if let Some(existing) = read_lock_owner(&mut file)? {
+        validate_lock_owner_shape(&existing)?;
+        if existing.state == "held" && lock_owner_is_live(&existing)? {
+            #[cfg(unix)]
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return Ok(None);
+        }
+    }
+
+    let owner = current_lock_owner()?;
+    write_lock_owner(&mut file, &owner)?;
+    sync_parent_directory(&path)?;
+    Ok(Some(UpdateLock { file, owner }))
+}
+
+fn read_lock_owner(file: &mut fs::File) -> Result<Option<UpdateLockOwner>> {
+    file.seek(SeekFrom::Start(0)).context("seek update lock")?;
+    let mut body = String::new();
+    file.take(16 * 1024)
+        .read_to_string(&mut body)
+        .context("read update lock")?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&body)
+        .context("parse update lock owner")
+        .map(Some)
+}
+
+fn write_lock_owner(file: &mut fs::File, owner: &UpdateLockOwner) -> Result<()> {
+    let body = serde_json::to_vec_pretty(owner).context("serialize update lock owner")?;
+    file.seek(SeekFrom::Start(0)).context("seek update lock")?;
+    file.set_len(0).context("truncate update lock")?;
+    file.write_all(&body).context("write update lock owner")?;
+    file.sync_all().context("sync update lock owner")
+}
+
+fn validate_lock_owner_shape(owner: &UpdateLockOwner) -> Result<()> {
+    if owner.schema != APPLY_LOCK_SCHEMA {
+        bail!("unsupported Forge update-lock schema");
+    }
+    if owner.pid == 0 || owner.process_start_ticks == 0 {
+        bail!("Forge update-lock process identity is invalid");
+    }
+    if !matches!(owner.state.as_str(), "held" | "released") {
+        bail!("Forge update-lock state is invalid");
+    }
+    if owner.boot_id.len() != 36
+        || !owner
+            .boot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        bail!("Forge update-lock boot identity is invalid");
+    }
+    Ok(())
+}
+
+fn current_lock_owner() -> Result<UpdateLockOwner> {
+    let pid = std::process::id();
+    let process_start_ticks = process_start_ticks(pid)?
+        .ok_or_else(|| anyhow!("current process identity is unavailable"))?;
+    Ok(UpdateLockOwner {
+        schema: APPLY_LOCK_SCHEMA.to_string(),
+        pid,
+        process_start_ticks,
+        boot_id: current_boot_id()?,
+        state: "held".to_string(),
+        acquired_at: now_rfc3339(),
+        released_at: None,
+    })
+}
+
+fn lock_owner_is_live(owner: &UpdateLockOwner) -> Result<bool> {
+    if owner.state != "held" || owner.boot_id != current_boot_id()? {
+        return Ok(false);
+    }
+    Ok(process_start_ticks(owner.pid)? == Some(owner.process_start_ticks))
+}
+
+fn current_boot_id() -> Result<String> {
+    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read Linux boot identity")?;
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 36
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        bail!("Linux boot identity is invalid");
+    }
+    Ok(value)
+}
+
+fn process_start_ticks(pid: u32) -> Result<Option<u64>> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| anyhow!("{} has an invalid process identity", path.display()))?;
+    let start_ticks = stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow!("{} has no process start time", path.display()))?
+        .parse::<u64>()
+        .with_context(|| format!("parse {} process start time", path.display()))?;
+    if start_ticks == 0 {
+        bail!("{} process start time is invalid", path.display());
+    }
+    Ok(Some(start_ticks))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("open {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", parent.display()))
+}
+
+fn sync_regular_file(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", path.display()))
 }
 
 fn ensure_update_dirs(config: &AppConfig) -> Result<()> {
-    fs::create_dir_all(&config.update.work_dir)
-        .with_context(|| format!("create {}", config.update.work_dir.display()))?;
+    ensure_update_work_dir(config)?;
     fs::create_dir_all(&config.update.releases_dir)
         .with_context(|| format!("create {}", config.update.releases_dir.display()))?;
+    ensure_protected_releases_dir(&config.update.releases_dir)?;
     Ok(())
+}
+
+fn ensure_update_work_dir(config: &AppConfig) -> Result<()> {
+    fs::create_dir_all(&config.update.work_dir)
+        .with_context(|| format!("create {}", config.update.work_dir.display()))?;
+    Ok(())
+}
+
+fn ensure_protected_releases_dir(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect protected release directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("protected Forge release path must be a directory");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        bail!(
+            "protected Forge release directory must be updater-owned and not group/other writable"
+        );
+    }
+    Ok(())
+}
+
+fn remove_owned_regular_file_if_exists(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to replace non-regular Forge update path {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+        bail!(
+            "refusing to replace unowned Forge update path {}",
+            path.display()
+        );
+    }
+    fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
 }
 
 fn validate_request(request: &ManagedUpdateRequest) -> Result<()> {
@@ -733,7 +1298,11 @@ fn status_path(config: &AppConfig) -> PathBuf {
 }
 
 fn lock_path(config: &AppConfig) -> PathBuf {
-    config.update.work_dir.join(LOCK_FILE)
+    config.update.releases_dir.join(LOCK_FILE)
+}
+
+fn apply_state_path(config: &AppConfig) -> PathBuf {
+    config.update.releases_dir.join(APPLY_STATE_FILE)
 }
 
 #[cfg(unix)]
@@ -752,6 +1321,70 @@ fn set_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Default)]
+    struct ScriptedRuntime {
+        restart_errors: Mutex<VecDeque<Option<String>>>,
+        health_errors: Mutex<VecDeque<Option<String>>>,
+        restart_count: AtomicUsize,
+        health_count: AtomicUsize,
+    }
+
+    impl ScriptedRuntime {
+        fn with_results(
+            restart_errors: impl IntoIterator<Item = Option<&'static str>>,
+            health_errors: impl IntoIterator<Item = Option<&'static str>>,
+        ) -> Self {
+            Self {
+                restart_errors: Mutex::new(
+                    restart_errors
+                        .into_iter()
+                        .map(|value| value.map(str::to_string))
+                        .collect(),
+                ),
+                health_errors: Mutex::new(
+                    health_errors
+                        .into_iter()
+                        .map(|value| value.map(str::to_string))
+                        .collect(),
+                ),
+                restart_count: AtomicUsize::new(0),
+                health_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl UpdateRuntime for ScriptedRuntime {
+        fn restart_service(&self, _config: &AppConfig) -> Result<()> {
+            self.restart_count.fetch_add(1, Ordering::SeqCst);
+            match self.restart_errors.lock().unwrap().pop_front().flatten() {
+                Some(error) => Err(anyhow!(error)),
+                None => Ok(()),
+            }
+        }
+
+        fn wait_for_health<'a>(
+            &'a self,
+            _config: &'a AppConfig,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            self.health_count.fetch_add(1, Ordering::SeqCst);
+            let error = self.health_errors.lock().unwrap().pop_front().flatten();
+            Box::pin(async move {
+                match error {
+                    Some(error) => Err(anyhow!(error)),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
 
     fn test_request(requested_at: &str) -> ManagedUpdateRequest {
         ManagedUpdateRequest {
@@ -775,6 +1408,24 @@ mod tests {
         config.update.work_dir = root.join("updates");
         config.update.releases_dir = root.join("releases");
         (config, root)
+    }
+
+    fn activation_fixture() -> (AppConfig, PathBuf, PathBuf, ManagedUpdateRequest, String) {
+        let (mut config, root) = test_config();
+        config.update.binary_path = root.join("bin/cybex-forge");
+        config.update.config_path = root.join("config.toml");
+        fs::create_dir_all(config.update.binary_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&config.update.work_dir).unwrap();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        fs::write(&config.update.binary_path, b"baseline").unwrap();
+        set_executable(&config.update.binary_path).unwrap();
+        fs::write(&config.update.config_path, b"").unwrap();
+        let staged = config.update.releases_dir.join("cybex-forge-0.1.1");
+        fs::write(&staged, b"candidate").unwrap();
+        set_executable(&staged).unwrap();
+        let request = test_request("2026-07-06T00:00:00Z");
+        let attempt_id = request_attempt_id(&request);
+        (config, root, staged, request, attempt_id)
     }
 
     #[cfg(unix)]
@@ -814,12 +1465,264 @@ mod tests {
     }
 
     #[test]
+    fn verify_signature_accepts_the_exact_signed_release_message() {
+        let (mut config, root) = test_config();
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        config.update.trusted_public_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+        let mut request = test_request("2026-07-06T00:00:00Z");
+        request.signature = STANDARD.encode(
+            signing_key
+                .sign(update_signature_message(&request).as_bytes())
+                .to_bytes(),
+        );
+
+        verify_signature(&config, &request).unwrap();
+        assert!(capabilities_enabled(&config));
+
+        request.artifact_url.push_str("?changed=1");
+        assert!(verify_signature(&config, &request).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updater_capability_requires_a_valid_trust_anchor() {
+        let (mut config, root) = test_config();
+        config.update.enabled = true;
+        config.update.trusted_public_key = STANDARD.encode([0_u8; 31]);
+        assert!(!capabilities_enabled(&config));
+        config.update.trusted_public_key = String::new();
+        assert!(!capabilities_enabled(&config));
+        config.update.enabled = false;
+        config.update.trusted_public_key = STANDARD.encode(
+            SigningKey::from_bytes(&[4_u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(!capabilities_enabled(&config));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn successful_activation_commits_candidate_and_clears_recovery_state() {
+        let (config, root, staged, request, attempt_id) = activation_fixture();
+        let runtime = ScriptedRuntime::with_results([None], [None]);
+
+        install_and_activate_candidate(
+            &config,
+            &request,
+            &attempt_id,
+            "2026-07-06T00:00:00Z",
+            &staged,
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"candidate");
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "succeeded");
+        assert_eq!(status.current_version, request.version);
+        assert!(!apply_state_path(&config).exists());
+        assert_eq!(runtime.restart_count.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.health_count.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn restart_failure_restores_binary_before_reporting_rolled_back() {
+        let (config, root, staged, request, attempt_id) = activation_fixture();
+        let runtime = ScriptedRuntime::with_results(
+            [Some("candidate restart refused"), None],
+            std::iter::empty(),
+        );
+
+        install_and_activate_candidate(
+            &config,
+            &request,
+            &attempt_id,
+            "2026-07-06T00:00:00Z",
+            &staged,
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "rolled_back");
+        assert!(status.error.contains("candidate_restart_failed"));
+        assert_eq!(runtime.restart_count.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.health_count.load(Ordering::SeqCst), 0);
+        assert!(!apply_state_path(&config).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn health_failure_restores_binary_and_requires_restart_success() {
+        let (config, root, staged, request, attempt_id) = activation_fixture();
+        let runtime = ScriptedRuntime::with_results([None, None], [Some("health timeout")]);
+
+        install_and_activate_candidate(
+            &config,
+            &request,
+            &attempt_id,
+            "2026-07-06T00:00:00Z",
+            &staged,
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "rolled_back");
+        assert!(status.error.contains("candidate_health_check_failed"));
+        assert_eq!(runtime.restart_count.load(Ordering::SeqCst), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_restart_remains_categorical_and_retryable() {
+        let (config, root, staged, request, attempt_id) = activation_fixture();
+        let runtime = ScriptedRuntime::with_results(
+            [
+                Some("candidate restart failed"),
+                Some("baseline restart failed"),
+            ],
+            std::iter::empty(),
+        );
+
+        let err = install_and_activate_candidate(
+            &config,
+            &request,
+            &attempt_id,
+            "2026-07-06T00:00:00Z",
+            &staged,
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("rollback_failed:"));
+        assert!(err.to_string().contains("restored_binary_restart"));
+        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        assert!(apply_state_path(&config).is_file());
+
+        let recovery_runtime = ScriptedRuntime::with_results([None], std::iter::empty());
+        let recovery_error = recover_interrupted_apply(
+            &config,
+            &ScriptedRuntime::with_results([Some("still unavailable")], std::iter::empty()),
+        )
+        .unwrap_err();
+        assert!(recovery_error.to_string().contains("rollback_failed:"));
+        let failed_status = read_status(&config).unwrap().unwrap();
+        assert_eq!(failed_status.status, "failed");
+        assert!(failed_status.error.contains("restored_binary_restart"));
+        assert!(recover_interrupted_apply(&config, &recovery_runtime).unwrap());
+        assert_eq!(read_status(&config).unwrap().unwrap().status, "rolled_back");
+        assert!(!apply_state_path(&config).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_candidate_is_restored_from_durable_apply_state() {
+        let (config, root, _staged, request, attempt_id) = activation_fixture();
+        let backup = backup_current_binary(&config, &attempt_id).unwrap();
+        fs::write(&config.update.binary_path, b"interrupted-candidate").unwrap();
+        set_executable(&config.update.binary_path).unwrap();
+        write_apply_state(
+            &config,
+            &ApplyState {
+                schema: APPLY_STATE_SCHEMA.to_string(),
+                attempt_id: attempt_id.clone(),
+                target_version: request.version.clone(),
+                backup_filename: backup.file_name().unwrap().to_str().unwrap().to_string(),
+                phase: "candidate_installed".to_string(),
+                started_at: "2026-07-06T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let runtime = ScriptedRuntime::with_results([None], std::iter::empty());
+
+        assert!(recover_interrupted_apply(&config, &runtime).unwrap());
+
+        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "rolled_back");
+        assert!(status.error.contains("interrupted_apply_recovered"));
+        assert!(!apply_state_path(&config).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_lock_excludes_a_live_holder_and_reacquires_after_release() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+
+        let first = try_acquire_lock(&config).unwrap().unwrap();
+        assert!(try_acquire_lock(&config).unwrap().is_none());
+        drop(first);
+        assert!(try_acquire_lock(&config).unwrap().is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_lock_never_steals_exact_live_process_ownership() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        let owner = current_lock_owner().unwrap();
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path(&config))
+            .unwrap();
+        write_lock_owner(&mut file, &owner).unwrap();
+        drop(file);
+
+        assert!(try_acquire_lock(&config).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_lock_recovers_proven_stale_process_identity() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        let mut stale = current_lock_owner().unwrap();
+        stale.process_start_ticks = stale.process_start_ticks.saturating_add(1);
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path(&config))
+            .unwrap();
+        write_lock_owner(&mut file, &stale).unwrap();
+        drop(file);
+
+        let recovered = try_acquire_lock(&config).unwrap().unwrap();
+        assert_eq!(recovered.owner.pid, std::process::id());
+        assert_ne!(
+            recovered.owner.process_start_ticks,
+            stale.process_start_ticks
+        );
+        drop(recovered);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prune_stale_update_files_keeps_current_attempt_and_version() {
         let (config, root) = test_config();
         fs::create_dir_all(&config.update.work_dir).unwrap();
         fs::create_dir_all(&config.update.releases_dir).unwrap();
-        let keep_backup = config.update.work_dir.join("cybex-forge-backup-current");
-        let stale_backup = config.update.work_dir.join("cybex-forge-backup-old");
+        let keep_backup = config
+            .update
+            .releases_dir
+            .join("cybex-forge-backup-current");
+        let stale_backup = config.update.releases_dir.join("cybex-forge-backup-old");
         let unrelated = config.update.work_dir.join("request.json");
         let keep_release = config.update.releases_dir.join("cybex-forge-v0.1.2");
         let stale_release = config.update.releases_dir.join("cybex-forge-v0.1.1");
