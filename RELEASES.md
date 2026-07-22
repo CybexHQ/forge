@@ -7,7 +7,7 @@ Use one section per production tag.
 Status: release qualification pending; production tag pending.
 
 This is the governed update qualification target. The testbench builds the
-exact `d396131f9c170f9b3cd27f5c3db8764cedccb00d` source as Bookworm-compatible
+exact `3479528d8e05036d70780d93207c3e835f3006be` source as Bookworm-compatible
 `0.1.1` bootstrap release A, builds this revision as `0.1.2` release B in the
 same pinned environment, verifies both binary identities, signs both immutable
 artifacts, and exercises rollback plus successful promotion on an owned Forge
