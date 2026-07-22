@@ -2,6 +2,31 @@
 
 Use one section per production tag.
 
+## v0.1.2
+
+Status: release qualification pending; production tag pending.
+
+This is the governed update qualification target. The testbench builds the
+exact `d396131f9c170f9b3cd27f5c3db8764cedccb00d` source as Bookworm-compatible
+`0.1.1` bootstrap release A, builds this revision as `0.1.2` release B in the
+same pinned environment, verifies both binary identities, signs both immutable
+artifacts, and exercises rollback plus successful promotion on an owned Forge
+node. Neither candidate is a production release until that evidence and the
+remaining checklist below are complete.
+
+Release checklist:
+
+- Cargo metadata, the lockfile, and `cybex-forge --version` all report exact
+  canonical version `0.1.2`.
+- The governed Forge update qualification proves signature rejection,
+  restart/health failure rollback, durable interrupted-apply recovery, stale
+  lock recovery, and successful `0.1.1` to `0.1.2` activation.
+- Artifacts are built in the pinned Debian Bookworm environment used by Forge;
+  a host binary linked against a newer glibc is never deployed to the node.
+- The `v0.1.1` checklist below remains the release signing, installer,
+  enrollment, and production-readiness checklist for `v0.1.2` as well, with
+  versions and URLs advanced consistently.
+
 ## v0.1.1
 
 Status: release qualification pending; production tag pending.
