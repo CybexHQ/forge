@@ -27,5 +27,5 @@ pub async fn cache_file(
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    assets::serve_file_from_root(&state.config.cache.root_dir, &path, &headers).await
+    assets::serve_binary_cache_member_from_root(&state.config.cache.root_dir, &path, &headers).await
 }

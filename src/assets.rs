@@ -27,6 +27,8 @@ use crate::{
 };
 
 const ISO_CHECKSUM_REVERIFY_SECONDS: i64 = 6 * 60 * 60;
+const NIX_BASE32_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+const NAR_COMPRESSION_SUFFIXES: &[&str] = &[".xz", ".bz2", ".zst", ".gz", ".lzip", ".lz4", ".br"];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IsoScanSummary {
@@ -157,6 +159,59 @@ pub async fn serve_file_from_root(
         }
         Err(()) => range_not_satisfiable_response(file_len),
     }
+}
+
+/// Serve only the file layout emitted by a Nix static binary cache. This
+/// endpoint is intentionally unauthenticated, so unrelated files must remain
+/// unreachable even if an operator accidentally places them below the cache
+/// document root.
+pub async fn serve_binary_cache_member_from_root(
+    root: &Path,
+    requested_path: &str,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
+    if !is_binary_cache_member_path(requested_path) {
+        return Err(AppError::NotFound);
+    }
+    serve_file_from_root(root, requested_path, headers).await
+}
+
+pub(crate) fn is_binary_cache_member_path(requested_path: &str) -> bool {
+    if requested_path.trim() != requested_path
+        || requested_path.contains("//")
+        || sanitize_relative_path(requested_path).is_err()
+    {
+        return false;
+    };
+    let components = requested_path.split('/').collect::<Vec<_>>();
+    match components.as_slice() {
+        ["nix-cache-info"] => true,
+        [filename] => filename
+            .strip_suffix(".narinfo")
+            .is_some_and(|hash| valid_nix_base32(hash, 32)),
+        ["nar", filename] => valid_nar_member_filename(filename),
+        _ => false,
+    }
+}
+
+fn valid_nar_member_filename(filename: &str) -> bool {
+    let Some(without_nar) = filename.strip_suffix(".nar").or_else(|| {
+        NAR_COMPRESSION_SUFFIXES.iter().find_map(|compression| {
+            filename
+                .strip_suffix(compression)
+                .and_then(|value| value.strip_suffix(".nar"))
+        })
+    }) else {
+        return false;
+    };
+    valid_nix_base32(without_nar, 52)
+}
+
+fn valid_nix_base32(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| NIX_BASE32_ALPHABET.contains(&byte))
 }
 
 async fn reject_symlink_components(root: &Path, full_path: &Path) -> AppResult<()> {
@@ -470,7 +525,10 @@ type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_url, parse_byte_range, sanitize_relative_path, serve_file_from_root};
+    use super::{
+        asset_url, is_binary_cache_member_path, parse_byte_range, sanitize_relative_path,
+        serve_binary_cache_member_from_root, serve_file_from_root,
+    };
     use crate::{config::AppConfig, db};
     use axum::http::{HeaderMap, StatusCode};
     use std::{
@@ -490,6 +548,74 @@ mod tests {
     fn rejects_empty_paths() {
         assert!(sanitize_relative_path("").is_err());
         assert!(sanitize_relative_path("/").is_err());
+    }
+
+    #[test]
+    fn binary_cache_member_allowlist_matches_nix_static_cache_layout() {
+        let store_hash = "0".repeat(32);
+        let file_hash = "1".repeat(52);
+        assert!(is_binary_cache_member_path("nix-cache-info"));
+        assert!(is_binary_cache_member_path(&format!(
+            "{store_hash}.narinfo"
+        )));
+        for suffix in ["", ".xz", ".bz2", ".zst", ".gz", ".lzip", ".lz4", ".br"] {
+            assert!(
+                is_binary_cache_member_path(&format!("nar/{file_hash}.nar{suffix}")),
+                "expected NAR compression suffix {suffix:?} to be allowed"
+            );
+        }
+
+        for path in [
+            "cache-priv-key.pem",
+            "cache-pub-key.pem",
+            "manifest.json",
+            ".nix-cache-info.tmp",
+            "narinfo/00000000000000000000000000000000",
+            "nar/secret.txt",
+            " nix-cache-info ",
+            "nar//1111111111111111111111111111111111111111111111111111.nar.xz",
+            "nar/nested/1111111111111111111111111111111111111111111111111111.nar.xz",
+            "0000000000000000000000000000000.narinfo",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.narinfo",
+            "nar/111111111111111111111111111111111111111111111111111.nar.xz",
+            "nar/1111111111111111111111111111111111111111111111111111.nar.zip",
+        ] {
+            assert!(
+                !is_binary_cache_member_path(path),
+                "unexpected public cache member: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_cache_server_refuses_existing_non_cache_files() {
+        let root = temp_asset_root();
+        let nar_dir = root.join("nar");
+        fs::create_dir(&nar_dir).unwrap();
+        let store_hash = "0".repeat(32);
+        let file_hash = "1".repeat(52);
+        fs::write(root.join("nix-cache-info"), b"cache").unwrap();
+        fs::write(root.join(format!("{store_hash}.narinfo")), b"narinfo").unwrap();
+        fs::write(nar_dir.join(format!("{file_hash}.nar.zst")), b"nar").unwrap();
+        fs::write(root.join("cache-priv-key.pem"), b"private").unwrap();
+
+        for path in [
+            "nix-cache-info".to_string(),
+            format!("{store_hash}.narinfo"),
+            format!("nar/{file_hash}.nar.zst"),
+        ] {
+            let response = serve_binary_cache_member_from_root(&root, &path, &HeaderMap::new())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let error =
+            serve_binary_cache_member_from_root(&root, "cache-priv-key.pem", &HeaderMap::new())
+                .await
+                .unwrap_err();
+        assert_eq!(error.code(), "not_found");
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

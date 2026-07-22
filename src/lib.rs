@@ -10,6 +10,7 @@ pub mod host;
 pub mod manage;
 pub mod models;
 pub mod nix_log;
+pub(crate) mod protected_material;
 pub(crate) mod redact;
 pub mod routes;
 pub mod updater;

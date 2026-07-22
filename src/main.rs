@@ -46,25 +46,20 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&config)
         .await
         .context("failed to open database")?;
+    db::migrate(&pool)
+        .await
+        .context("database migration failed")?;
+    cybex_forge::cache::remediate_protected_build_jobs(&pool, &config)
+        .await
+        .context("protected build cache remediation failed")?;
 
     match command {
-        Command::Serve => {
-            db::migrate(&pool)
-                .await
-                .context("database migration failed")?;
-            run_server(config, pool).await
-        }
+        Command::Serve => run_server(config, pool).await,
         Command::Migrate => {
-            db::migrate(&pool)
-                .await
-                .context("database migration failed")?;
             info!("database migrations completed");
             Ok(())
         }
         Command::ScanIsos => {
-            db::migrate(&pool)
-                .await
-                .context("database migration failed")?;
             let summary = assets::scan_iso_dir(&config, &pool)
                 .await
                 .context("ISO scan failed")?;
@@ -77,16 +72,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Enroll => {
-            db::migrate(&pool)
-                .await
-                .context("database migration failed")?;
             let state = AppState::new(config, pool);
             cybex_forge::manage::enroll_once(&state).await
         }
         Command::SyncOnce => {
-            db::migrate(&pool)
-                .await
-                .context("database migration failed")?;
             let state = AppState::new(config, pool);
             cybex_forge::manage::sync_once(&state).await
         }

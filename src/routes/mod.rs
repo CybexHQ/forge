@@ -197,6 +197,63 @@ mod tests {
         assert_eq!(&file_body[..], b"probe\n");
     }
 
+    #[tokio::test]
+    async fn cache_route_serves_only_static_binary_cache_members() {
+        let state = test_state().await;
+        let cache_root = state.config.cache.root_dir.clone();
+        let store_hash = "0".repeat(32);
+        let file_hash = "1".repeat(52);
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+        fs::write(cache_root.join("nix-cache-info"), b"cache-info").unwrap();
+        fs::write(cache_root.join(format!("{store_hash}.narinfo")), b"narinfo").unwrap();
+        fs::write(
+            cache_root.join(format!("nar/{file_hash}.nar.xz")),
+            b"compressed-nar",
+        )
+        .unwrap();
+        fs::write(cache_root.join("cache-priv-key.pem"), b"private-key").unwrap();
+        let app = router(state);
+
+        for (path, expected) in [
+            (
+                "/cache/nix-cache-info".to_string(),
+                b"cache-info".as_slice(),
+            ),
+            (
+                format!("/cache/{store_hash}.narinfo"),
+                b"narinfo".as_slice(),
+            ),
+            (
+                format!("/cache/nar/{file_hash}.nar.xz"),
+                b"compressed-nar".as_slice(),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                &to_bytes(response.into_body(), 1024).await.unwrap()[..],
+                expected
+            );
+        }
+
+        for path in [
+            "/cache/cache-priv-key.pem",
+            "/cache/manifest.json",
+            "/cache/nar/not-a-cache-member.txt",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
     async fn test_state() -> AppState {
         let root = temp_test_dir("cybex-forge-router");
         let config_path = root.join("config.toml");

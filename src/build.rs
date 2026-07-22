@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    fs, io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -26,6 +27,7 @@ use crate::{
     db,
     models::BuildJob,
     nix_log::{InternalJsonParser, derivation_display_name},
+    protected_material,
     redact::{contains_sensitive_key_value, redact_sensitive_key_values},
 };
 
@@ -33,6 +35,7 @@ const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_LOG_LINE_BYTES: usize = 64 * 1024;
 const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 /// Progress range reserved for the nix build itself; the phases before
 /// (preparing, 12) and after (inspecting, 80) bound it.
@@ -169,6 +172,7 @@ struct NixOutputInfo {
     output_sha256: String,
     output_size_bytes: i64,
     closure_size_bytes: i64,
+    evaluated_derivation: Option<String>,
 }
 
 #[derive(Clone)]
@@ -180,6 +184,7 @@ struct SharedLog {
 #[derive(Debug, Default)]
 struct SharedLogState {
     text: String,
+    pending: String,
     redact_following: usize,
 }
 
@@ -666,11 +671,13 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             )
             .await?;
             let mut cached = match cache::export_output(
+                &state.db,
                 &state.config,
                 &job,
                 &output_info.output_path,
                 &output_info.output_sha256,
                 output_info.closure_size_bytes,
+                output_info.evaluated_derivation.as_deref(),
             )
             .await
             {
@@ -808,6 +815,7 @@ fn capacity_meets_minimum(actual: u64, minimum: u64) -> bool {
 }
 
 fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBuildSpec> {
+    protected_material::validate_build_spec(&job.build_spec)?;
     let spec: BuildSpec = serde_json::from_value(job.build_spec.clone())
         .context("build_spec does not match schema")?;
     if spec.schema_version != 1 {
@@ -893,6 +901,13 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
 fn validate_blueprint_build_input(
     input: BlueprintBuildInput,
 ) -> Result<ValidatedBlueprintBuildInput> {
+    protected_material::validate_generated_nix(&input.generated_nix)?;
+    if let Some(desktop_module_nix) = input.desktop_module_nix.as_deref() {
+        protected_material::validate_desktop_module_nix(desktop_module_nix)?;
+    }
+    if let Some(expected_state) = input.expected_state.as_ref() {
+        protected_material::validate_expected_state(expected_state)?;
+    }
     let kind = input.kind.trim();
     if !matches!(
         kind,
@@ -1138,14 +1153,23 @@ const SOFTWARE_INVENTORY_STDOUT_MAX_BYTES: usize = 16 * 1024;
 const SOFTWARE_INVENTORY_STDERR_MAX_BYTES: usize = 64 * 1024;
 const DISABLE_IFD_NIX_OPTION: [&str; 3] = ["--option", "allow-import-from-derivation", "false"];
 const REJECT_FLAKE_CONFIG_NIX_OPTION: [&str; 3] = ["--option", "accept-flake-config", "false"];
+const REQUIRE_BUILD_SANDBOX_NIX_OPTION: [&str; 3] = ["--option", "sandbox", "true"];
 
 fn append_source_policy_nix_options(args: &mut Vec<String>, allow_source_builds: bool) {
+    // Forge is a trusted Nix client because it exports and signs closures.
+    // Pin the daemon-side sandbox and refuse flake-supplied client settings on
+    // every path so a Blueprint cannot use that trust to relax isolation.
+    args.extend(
+        REJECT_FLAKE_CONFIG_NIX_OPTION
+            .iter()
+            .map(|value| value.to_string()),
+    );
+    args.extend(
+        REQUIRE_BUILD_SANDBOX_NIX_OPTION
+            .iter()
+            .map(|value| value.to_string()),
+    );
     if !allow_source_builds {
-        args.extend(
-            REJECT_FLAKE_CONFIG_NIX_OPTION
-                .iter()
-                .map(|value| value.to_string()),
-        );
         args.extend(DISABLE_IFD_NIX_OPTION.iter().map(|value| value.to_string()));
     }
 }
@@ -1333,10 +1357,17 @@ async fn run_bounded_command(
             }
         }
         if status.is_some() && captured_stdout.is_some() && captured_stderr.is_some() {
+            let (Some(status), Some(stdout), Some(stderr)) = (
+                status.take(),
+                captured_stdout.take(),
+                captured_stderr.take(),
+            ) else {
+                unreachable!("bounded command completion state was checked")
+            };
             return Ok(BoundedCommandOutput {
-                status: status.expect("status checked"),
-                stdout: captured_stdout.take().expect("stdout checked"),
-                stderr: captured_stderr.take().expect("stderr checked"),
+                status,
+                stdout,
+                stderr,
             });
         }
     }
@@ -1908,13 +1939,6 @@ fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
     let mut merged = serde_json::Map::new();
     let mut conflict = false;
     let mut invalid = false;
-    let mut merge = |key: String, value: Value| {
-        if merged.get(&key).is_some_and(|existing| existing != &value) {
-            conflict = true;
-        } else {
-            merged.insert(key, value);
-        }
-    };
     if let Some(env_value) = drv.get("env") {
         if let Some(env) = env_value.as_object() {
             if let Some(encoded_value) = env.get("__json") {
@@ -1924,14 +1948,14 @@ fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
                 {
                     Some(Value::Object(structured)) => {
                         for (key, value) in structured {
-                            merge(key, value);
+                            merge_derivation_attribute(&mut merged, &mut conflict, key, value);
                         }
                     }
                     _ => invalid = true,
                 }
             }
             for (key, value) in env.iter().filter(|(key, _)| key.as_str() != "__json") {
-                merge(key.clone(), value.clone());
+                merge_derivation_attribute(&mut merged, &mut conflict, key.clone(), value.clone());
             }
         } else {
             invalid = true;
@@ -1940,13 +1964,12 @@ fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
     if let Some(structured_value) = drv.get("structuredAttrs") {
         if let Some(structured) = structured_value.as_object() {
             for (key, value) in structured {
-                merge(key.clone(), value.clone());
+                merge_derivation_attribute(&mut merged, &mut conflict, key.clone(), value.clone());
             }
         } else {
             invalid = true;
         }
     }
-    drop(merge);
     if conflict {
         merged.insert(
             "__cybex_conflicting_derivation_attributes".to_string(),
@@ -1960,6 +1983,19 @@ fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
         );
     }
     merged
+}
+
+fn merge_derivation_attribute(
+    merged: &mut serde_json::Map<String, Value>,
+    conflict: &mut bool,
+    key: String,
+    value: Value,
+) {
+    if merged.get(&key).is_some_and(|existing| existing != &value) {
+        *conflict = true;
+    } else {
+        merged.insert(key, value);
+    }
 }
 
 fn derivation_attr_truthy(attrs: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -3916,7 +3952,12 @@ fn merge_build_metadata(destination: &mut Value, source: &Value) {
         return;
     };
     for (key, value) in source {
-        destination.insert(key.clone(), value.clone());
+        // Cache export metadata includes cryptographically verified fields
+        // such as the closure manifest and its digest. Managed/request
+        // metadata may add context, but must never replace an export result.
+        destination
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
     }
 }
 
@@ -3962,9 +4003,27 @@ fn blueprint_nix_build_command(
     build_input: &ValidatedBlueprintBuildInput,
     job_id: i64,
 ) -> Result<NixBuildCommand> {
+    // ValidatedBuildSpec is private, but keep the write boundary independently
+    // guarded so future internal call sites cannot materialize protected data.
+    protected_material::validate_generated_nix(&build_input.generated_nix)?;
+    if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
+        protected_material::validate_desktop_module_nix(desktop_module_nix)?;
+    }
+    if let Some(expected_state) = build_input.expected_state.as_ref() {
+        protected_material::validate_expected_state(expected_state)?;
+    }
+
+    fs::create_dir_all(&config.build.work_dir).with_context(|| {
+        format!(
+            "create build work directory {}",
+            config.build.work_dir.display()
+        )
+    })?;
+    set_private_job_input_dir_permissions(&config.build.work_dir)?;
     let input_dir = config.build.work_dir.join(format!("job-{job_id}-input"));
-    fs::create_dir_all(&input_dir)
+    fs::create_dir(&input_dir)
         .with_context(|| format!("create build input directory {}", input_dir.display()))?;
+    set_private_job_input_dir_permissions(&input_dir)?;
     write_job_input_file(input_dir.join("blueprint.nix"), &build_input.generated_nix)?;
     if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
         write_job_input_file(input_dir.join("cybex-blueprints.nix"), desktop_module_nix)?;
@@ -4021,7 +4080,46 @@ fn blueprint_nix_build_command(
 }
 
 fn write_job_input_file(path: PathBuf, contents: &str) -> Result<()> {
-    fs::write(&path, contents).with_context(|| format!("write build input {}", path.display()))
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("create build input {}", path.display()))?;
+    set_private_job_input_file_permissions(&path)?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("write build input {}", path.display()))
+}
+
+#[cfg(unix)]
+fn set_private_job_input_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict build input directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_job_input_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_job_input_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict build input file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_job_input_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn forge_nixos_flake(
@@ -4316,12 +4414,14 @@ async fn inspect_build_output(
         bail!("build output path was not in /nix/store");
     }
     let output_sha256 = run_nix_hash(config, &output_path).await?;
-    let (output_size_bytes, closure_size_bytes) = run_nix_path_info(config, &output_path).await?;
+    let (output_size_bytes, closure_size_bytes, evaluated_derivation) =
+        run_nix_path_info(config, &output_path).await?;
     Ok(NixOutputInfo {
         output_path,
         output_sha256,
         output_size_bytes,
         closure_size_bytes,
+        evaluated_derivation,
     })
 }
 
@@ -4349,7 +4449,7 @@ async fn run_nix_hash(config: &AppConfig, path: &str) -> Result<String> {
     Ok(hash.to_ascii_lowercase())
 }
 
-async fn run_nix_path_info(config: &AppConfig, path: &str) -> Result<(i64, i64)> {
+async fn run_nix_path_info(config: &AppConfig, path: &str) -> Result<(i64, i64, Option<String>)> {
     let output = Command::new(&config.build.nix_binary)
         .arg("path-info")
         .arg("--json")
@@ -4369,20 +4469,28 @@ async fn run_nix_path_info(config: &AppConfig, path: &str) -> Result<(i64, i64)>
         serde_json::from_slice(&output.stdout).context("parse nix path-info JSON")?;
     let first = nix_path_info_row(&value, path)?;
     let (output_size_bytes, closure_size_bytes) = nix_path_info_sizes(first);
-    Ok((output_size_bytes, closure_size_bytes))
+    let evaluated_derivation = nix_path_info_deriver(first);
+    Ok((output_size_bytes, closure_size_bytes, evaluated_derivation))
 }
 
 fn nix_path_info_row<'a>(value: &'a Value, path: &str) -> Result<&'a Value> {
-    if let Some(first) = value.as_array().and_then(|array| array.first()) {
+    if let Some(array) = value.as_array() {
+        if array.len() != 1 {
+            bail!("nix path-info returned an unexpected number of rows");
+        }
+        let first = &array[0];
+        if let Some(returned_path) = first.get("path").and_then(Value::as_str) {
+            if returned_path != path {
+                bail!("nix path-info returned a row for an unexpected store path");
+            }
+        }
         return Ok(first);
     }
     if let Some(object) = value.as_object() {
         if let Some(row) = object.get(path) {
             return Ok(row);
         }
-        if let Some(row) = object.values().next() {
-            return Ok(row);
-        }
+        bail!("nix path-info omitted the requested store path");
     }
     Err(anyhow!("nix path-info returned no rows"))
 }
@@ -4399,6 +4507,13 @@ fn nix_path_info_sizes(first: &Value) -> (i64, i64) {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     (closure_size.max(nar_size).max(0), closure_size.max(0))
+}
+
+fn nix_path_info_deriver(first: &Value) -> Option<String> {
+    first
+        .get("deriver")
+        .and_then(Value::as_str)
+        .and_then(normalize_derivation_store_path)
 }
 
 async fn read_internal_json_log_stream<R>(
@@ -4444,20 +4559,45 @@ impl SharedLog {
 
     async fn append(&self, text: &str) {
         let mut inner = self.inner.lock().await;
-        let redacted = redact_log_text(text, &mut inner.redact_following);
-        inner.text.push_str(&redacted);
-        if inner.text.len() > self.max_bytes {
-            let marker = "[... earlier build log truncated ...]\n";
-            let keep = self.max_bytes.saturating_sub(marker.len());
-            let start = utf8_tail_start(&inner.text, keep);
-            let tail = inner.text[start..].to_string();
-            inner.text = format!("{marker}{tail}");
+        inner.pending.push_str(text);
+        if let Some(last_newline) = inner.pending.rfind('\n') {
+            let complete = inner.pending[..=last_newline].to_string();
+            inner.pending.drain(..=last_newline);
+            let mut redact_following = inner.redact_following;
+            let redacted = redact_log_text(&complete, &mut redact_following);
+            inner.redact_following = redact_following;
+            inner.text.push_str(&redacted);
+            bound_captured_log(&mut inner.text, self.max_bytes);
+        }
+        if inner.pending.len() > MAX_PENDING_LOG_LINE_BYTES {
+            inner
+                .text
+                .push_str("[... oversized unbroken build log line redacted ...]\n");
+            inner.pending.clear();
+            inner.redact_following = 0;
+            bound_captured_log(&mut inner.text, self.max_bytes);
         }
     }
 
     async fn snapshot(&self) -> String {
-        self.inner.lock().await.text.clone()
+        let inner = self.inner.lock().await;
+        let mut snapshot = inner.text.clone();
+        let mut redact_following = inner.redact_following;
+        snapshot.push_str(&redact_log_text(&inner.pending, &mut redact_following));
+        bound_captured_log(&mut snapshot, self.max_bytes);
+        snapshot
     }
+}
+
+fn bound_captured_log(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let marker = "[... earlier build log truncated ...]\n";
+    let keep = max_bytes.saturating_sub(marker.len());
+    let start = utf8_tail_start(text, keep);
+    let tail = text[start..].to_string();
+    *text = format!("{marker}{tail}");
 }
 
 fn redact_log_text(text: &str, redact_following: &mut usize) -> String {
@@ -4474,6 +4614,7 @@ fn redact_log_text(text: &str, redact_following: &mut usize) -> String {
 }
 
 fn redact_log_line(line: &str, redact_following: &mut usize) -> String {
+    let line = redact_sensitive_key_values(line);
     line.split_whitespace()
         .map(|token| {
             if *redact_following > 0 {
@@ -4655,6 +4796,16 @@ mod tests {
             })
     }
 
+    fn build_sandbox_is_required(args: &[String]) -> bool {
+        args.windows(REQUIRE_BUILD_SANDBOX_NIX_OPTION.len())
+            .any(|window| {
+                window
+                    .iter()
+                    .map(String::as_str)
+                    .eq(REQUIRE_BUILD_SANDBOX_NIX_OPTION)
+            })
+    }
+
     fn software_inventory_test_spec(
         allow_source_builds: bool,
         software_package_refs: Vec<String>,
@@ -4683,6 +4834,7 @@ mod tests {
         let source_disabled = software_inventory_eval_args(installable, false);
         assert!(import_from_derivation_is_disabled(&source_disabled));
         assert!(flake_config_is_rejected(&source_disabled));
+        assert!(build_sandbox_is_required(&source_disabled));
         assert_eq!(
             source_disabled.last().map(String::as_str),
             Some(installable)
@@ -4690,7 +4842,8 @@ mod tests {
 
         let source_enabled = software_inventory_eval_args(installable, true);
         assert!(!import_from_derivation_is_disabled(&source_enabled));
-        assert!(!flake_config_is_rejected(&source_enabled));
+        assert!(flake_config_is_rejected(&source_enabled));
+        assert!(build_sandbox_is_required(&source_enabled));
     }
 
     #[cfg(unix)]
@@ -5009,11 +5162,13 @@ sleep 5
         assert!(command.args.windows(2).any(|args| args == ["--cores", "4"]));
         assert!(import_from_derivation_is_disabled(&command.args));
         assert!(flake_config_is_rejected(&command.args));
+        assert!(build_sandbox_is_required(&command.args));
 
         spec.allow_source_builds = true;
         let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
         assert!(!import_from_derivation_is_disabled(&source_enabled.args));
-        assert!(!flake_config_is_rejected(&source_enabled.args));
+        assert!(flake_config_is_rejected(&source_enabled.args));
+        assert!(build_sandbox_is_required(&source_enabled.args));
     }
 
     #[test]
@@ -6629,6 +6784,7 @@ esac
         );
         assert!(import_from_derivation_is_disabled(&command.args));
         assert!(flake_config_is_rejected(&command.args));
+        assert!(build_sandbox_is_required(&command.args));
         assert!(root.join("work/job-42-input/flake.nix").is_file());
         assert!(root.join("work/job-42-input/blueprint.nix").is_file());
         assert!(
@@ -6636,6 +6792,22 @@ esac
                 .is_file()
         );
         assert!(root.join("work/job-42-input/expected-state.json").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let input_dir = root.join("work/job-42-input");
+            assert_eq!(
+                std::fs::metadata(&input_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for entry in std::fs::read_dir(&input_dir).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            }
+        }
         let configuration =
             std::fs::read_to_string(root.join("work/job-42-input/configuration.nix")).unwrap();
         assert!(configuration.contains("./cybex-blueprints.nix"));
@@ -6663,7 +6835,59 @@ esac
         spec.allow_source_builds = true;
         let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
         assert!(!import_from_derivation_is_disabled(&source_enabled.args));
-        assert!(!flake_config_is_rejected(&source_enabled.args));
+        assert!(flake_config_is_rejected(&source_enabled.args));
+        assert!(build_sandbox_is_required(&source_enabled.args));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nix_build_command_rejects_protected_material_before_writing_inputs() {
+        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-protected-build-input-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = AppConfig::default();
+        config.build.work_dir = root.join("work");
+        config.build.output_dir = root.join("out");
+        let target = BuildTargetConfig {
+            artifact_type: "nixos_closure".to_string(),
+            target: "blueprint".to_string(),
+            system: "x86_64-linux".to_string(),
+            flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
+            attr: "packages.x86_64-linux.desktop-experience".to_string(),
+        };
+        let spec = ValidatedBuildSpec {
+            artifact_type: "nixos_closure".to_string(),
+            target: "blueprint".to_string(),
+            system: "x86_64-linux".to_string(),
+            input_revision: "rev".to_string(),
+            input_config_hash: "a".repeat(64),
+            blueprint_id: None,
+            blueprint_revision_id: None,
+            blueprint_revision_config_hash: None,
+            nixpkgs_commit: Some("c".repeat(40)),
+            source_lock_sha256: Some("d".repeat(64)),
+            software_package_refs: Vec::new(),
+            build_input: Some(ValidatedBlueprintBuildInput {
+                generated_nix: format!(
+                    "{{ ... }}: {{ users.users.alice.hashedPassword = \"{sentinel}\"; }}"
+                ),
+                desktop_module_nix: None,
+                expected_state: None,
+                blueprint_name: None,
+                blueprint_revision: None,
+            }),
+            allow_source_builds: false,
+        };
+
+        let error = nix_build_command(&config, &target, &spec, 99)
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains(sentinel));
+        assert!(!root.join("work/job-99-input").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6705,6 +6929,37 @@ esac
         assert!(!snapshot.contains("split-secret"));
     }
 
+    #[tokio::test]
+    async fn log_capture_redacts_spaced_nix_assignments_and_modular_hashes() {
+        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let password_hash = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
+        let log = SharedLog::new(4096);
+        log.append(&format!(
+            "users.users.alice.hashedPassword = \"{sentinel}\"; bare {password_hash}\n"
+        ))
+        .await;
+        let snapshot = log.snapshot().await;
+
+        assert!(snapshot.contains("[REDACTED]"));
+        assert!(!snapshot.contains(sentinel));
+        assert!(!snapshot.contains(password_hash));
+    }
+
+    #[tokio::test]
+    async fn log_capture_redacts_assignments_split_across_stream_chunks() {
+        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let log = SharedLog::new(4096);
+        log.append("users.users.alice.hashedPassword = \"CYBEX_FORGE_")
+            .await;
+        assert!(!log.snapshot().await.contains("CYBEX_FORGE_"));
+
+        log.append("PROTECTED_SENTINEL_7f922a\"; done\n").await;
+        let snapshot = log.snapshot().await;
+
+        assert!(snapshot.contains("done"));
+        assert!(!snapshot.contains(sentinel));
+    }
+
     #[test]
     fn safe_error_redacts_entire_secret_key_value() {
         let err =
@@ -6720,11 +6975,16 @@ esac
         let object = json!({
             "/nix/store/example": {
                 "closureSize": 128,
-                "narSize": 64
+                "narSize": 64,
+                "deriver": format!("/nix/store/{}-example.drv", "a".repeat(32))
             }
         });
         let row = nix_path_info_row(&object, "/nix/store/example").unwrap();
         assert_eq!(nix_path_info_sizes(row), (128, 128));
+        assert_eq!(
+            nix_path_info_deriver(row).as_deref(),
+            Some(format!("/nix/store/{}-example.drv", "a".repeat(32)).as_str())
+        );
 
         let array = json!([
             {
@@ -6734,5 +6994,51 @@ esac
         ]);
         let row = nix_path_info_row(&array, "/nix/store/other").unwrap();
         assert_eq!(nix_path_info_sizes(row), (300, 200));
+        assert_eq!(nix_path_info_deriver(row), None);
+
+        let unrelated_object = json!({
+            "/nix/store/unrelated": {
+                "deriver": format!("/nix/store/{}-unrelated.drv", "b".repeat(32))
+            }
+        });
+        assert!(
+            nix_path_info_row(&unrelated_object, "/nix/store/requested")
+                .unwrap_err()
+                .to_string()
+                .contains("omitted the requested store path")
+        );
+
+        let unrelated_array = json!([{
+            "path": "/nix/store/unrelated",
+            "deriver": format!("/nix/store/{}-unrelated.drv", "b".repeat(32))
+        }]);
+        assert!(
+            nix_path_info_row(&unrelated_array, "/nix/store/requested")
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected store path")
+        );
+    }
+
+    #[test]
+    fn managed_metadata_cannot_replace_verified_cache_export_fields() {
+        let mut destination = json!({
+            "cache_schema": "cybex.forge.cache.v1",
+            "closure_manifest": {"verified": true},
+            "closure_manifest_sha256": "a".repeat(64)
+        });
+        let source = json!({
+            "cache_schema": "untrusted",
+            "closure_manifest": {"forged": true},
+            "closure_manifest_sha256": "b".repeat(64),
+            "target": "blueprint"
+        });
+
+        merge_build_metadata(&mut destination, &source);
+
+        assert_eq!(destination["cache_schema"], "cybex.forge.cache.v1");
+        assert_eq!(destination["closure_manifest"], json!({"verified": true}));
+        assert_eq!(destination["closure_manifest_sha256"], "a".repeat(64));
+        assert_eq!(destination["target"], "blueprint");
     }
 }

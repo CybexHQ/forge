@@ -71,7 +71,12 @@ const MAX_REPORT_EVENTS: i64 = 500;
 const MAX_REPORT_BUILD_JOBS: usize = 500;
 const MAX_REPORT_CACHE_ARTIFACTS: usize = 2_000;
 const MAX_MANAGED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
+const MAX_BOOT_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
+// Closure-bearing cache metadata is bounded to 24 MiB. Leave
+// room for the remainder of the authenticated node report so a verified
+// manifest is never silently dropped solely because the transport cap is
+// smaller than the persistence contract.
+const MAX_FORGE_REPORT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEVICE_HOSTNAME_CHARS: usize = 253;
 const MAX_DEVICE_SERIAL_CHARS: usize = 128;
 const MAX_DEVICE_NOTES_CHARS: usize = 2_000;
@@ -1009,7 +1014,7 @@ async fn report_boot_state(
             })
             .collect(),
     };
-    let (body, body_bytes) = fit_boot_report_body(body, MAX_REPORT_BODY_BYTES)?;
+    let (body, body_bytes) = fit_boot_report_body(body, MAX_BOOT_REPORT_BODY_BYTES)?;
     let max_event_id = body.events.iter().map(|event| event.source_event_id).max();
     let device_id = managed_device_id(managed)?;
     let path = format!("/v1/agent/devices/{device_id}/boot/report");
@@ -1124,7 +1129,7 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
         host: crate::host::sample().await,
     };
-    let (_body, body_bytes) = fit_forge_report_body(body, MAX_REPORT_BODY_BYTES)?;
+    let (_body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
     let device_id = managed_device_id(managed)?;
     let path = format!("/v1/agent/devices/{device_id}/forge/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)

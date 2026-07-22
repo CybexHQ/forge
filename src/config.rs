@@ -158,12 +158,14 @@ impl AppConfig {
         if !path.exists() {
             let mut config = Self::default();
             config.normalize()?;
+            config.validate_public_cache_boundary(path)?;
             return Ok(config);
         }
 
         let raw = fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&raw)?;
         config.normalize()?;
+        config.validate_public_cache_boundary(path)?;
         Ok(config)
     }
 
@@ -278,6 +280,86 @@ impl AppConfig {
             bail!("manage.organization_id is required when managed mode is enabled");
         }
         Ok(())
+    }
+
+    /// The cache document root is deliberately unauthenticated so Nix clients
+    /// can fetch signed artifacts. Keep it entirely separate from every path
+    /// that can hold credentials, mutable state, build inputs, or update
+    /// payloads. The HTTP handler also allowlists binary-cache member names,
+    /// but a path-layout error must still fail closed at startup.
+    fn validate_public_cache_boundary(&self, loaded_config_path: &Path) -> anyhow::Result<()> {
+        let cache_root = path_identity_for_overlap(&self.cache.root_dir)
+            .context("resolve cache.root_dir for public-cache boundary validation")?;
+        let private_paths = [
+            ("loaded configuration file", loaded_config_path),
+            ("paths.data_dir", self.paths.data_dir.as_path()),
+            ("paths.database_path", self.paths.database_path.as_path()),
+            ("build.work_dir", self.build.work_dir.as_path()),
+            ("build.output_dir", self.build.output_dir.as_path()),
+            (
+                "cache.private_key_path",
+                self.cache.private_key_path.as_path(),
+            ),
+            (
+                "cache.public_key_path",
+                self.cache.public_key_path.as_path(),
+            ),
+            ("update.work_dir", self.update.work_dir.as_path()),
+            ("update.releases_dir", self.update.releases_dir.as_path()),
+            ("update.binary_path", self.update.binary_path.as_path()),
+            ("update.config_path", self.update.config_path.as_path()),
+            ("manage.state_path", self.manage.state_path.as_path()),
+        ];
+        for (field, private_path) in private_paths {
+            let private_path = path_identity_for_overlap(private_path)
+                .with_context(|| format!("resolve {field} for public-cache boundary validation"))?;
+            if paths_overlap(&cache_root, &private_path) {
+                bail!("cache.root_dir must be path-disjoint from {field}");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Resolve every existing path component so symlink aliases cannot bypass an
+/// overlap check. If the leaf does not exist yet, retain its normalized suffix
+/// beneath the deepest canonicalizable ancestor.
+fn path_identity_for_overlap(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute;
+    let mut cursor = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()
+            .context("resolve current directory for public-cache boundary validation")?
+            .join(path);
+        absolute.as_path()
+    };
+    let mut missing_suffix = Vec::new();
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut canonical) => {
+                for component in missing_suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let filename = cursor.file_name().ok_or_else(|| {
+                    anyhow::anyhow!("could not resolve absolute path {}", path.display())
+                })?;
+                missing_suffix.push(filename.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    anyhow::anyhow!("could not resolve absolute path {}", path.display())
+                })?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("resolve path {}", path.display()));
+            }
+        }
     }
 }
 
@@ -1064,6 +1146,104 @@ state_path = "/var/lib/cybex-forge/../manage-state.json"
     }
 
     #[test]
+    fn config_rejects_private_paths_inside_public_cache_root() {
+        let root = temp_config_dir("cache-boundary-lexical");
+        let cache_root = root.join("public-cache");
+        let private_key = cache_root.join("keys/cache-private.pem");
+        let public_key = root.join("keys/cache-public.pem");
+        let path = write_temp_config(&format!(
+            r#"
+[server]
+public_base_url = "http://boot.example"
+
+[cache]
+root_dir = "{}"
+private_key_path = "{}"
+public_key_path = "{}"
+"#,
+            cache_root.display(),
+            private_key.display(),
+            public_key.display(),
+        ));
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            err.to_string()
+                .contains("cache.root_dir must be path-disjoint from cache.private_key_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_public_cache_nested_in_private_state_root() {
+        let root = temp_config_dir("cache-boundary-private-parent");
+        let data_dir = root.join("private-state");
+        let cache_root = data_dir.join("public-cache");
+        let path = write_temp_config(&format!(
+            r#"
+[server]
+public_base_url = "http://boot.example"
+
+[paths]
+data_dir = "{}"
+
+[cache]
+root_dir = "{}"
+"#,
+            data_dir.display(),
+            cache_root.display(),
+        ));
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            err.to_string()
+                .contains("cache.root_dir must be path-disjoint from paths.data_dir"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_public_cache_symlink_alias_of_private_key_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_config_dir("cache-boundary-symlink");
+        let real_cache = root.join("real-cache");
+        let cache_alias = root.join("cache-alias");
+        fs::create_dir_all(&real_cache).unwrap();
+        symlink(&real_cache, &cache_alias).unwrap();
+        let private_key = real_cache.join("cache-private.pem");
+        fs::write(&private_key, "private").unwrap();
+        let path = write_temp_config(&format!(
+            r#"
+[server]
+public_base_url = "http://boot.example"
+
+[cache]
+root_dir = "{}"
+private_key_path = "{}"
+"#,
+            cache_alias.display(),
+            private_key.display(),
+        ));
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            err.to_string()
+                .contains("cache.root_dir must be path-disjoint from cache.private_key_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn config_load_rejects_invalid_menu_timeout() {
         let path = write_temp_config(
             r#"
@@ -1091,6 +1271,19 @@ menu_timeout_ms = 42
             std::process::id()
         ));
         fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn temp_config_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cybex-forge-config-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
         path
     }
 }

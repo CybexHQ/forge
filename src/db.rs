@@ -2,6 +2,7 @@ use std::{collections::HashSet, fs, path::Path, str::FromStr, time::Duration};
 
 use chrono::Utc;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
     FromRow, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -17,6 +18,8 @@ use crate::{
         NewBootEvent, UpdateBootProfileRequest, UpdateDeviceRequest, clean_optional_string,
         clean_tags, normalize_mac,
     },
+    protected_material,
+    redact::redact_sensitive_key_values,
 };
 
 const MAX_BOOT_EVENTS_RETAINED: i64 = 10_000;
@@ -33,7 +36,29 @@ const MAX_BUILD_ERROR_CHARS: usize = 2_000;
 const MAX_BUILD_PROGRESS_STAGE_CHARS: usize = 48;
 const MAX_BUILD_PROGRESS_MESSAGE_CHARS: usize = 160;
 const MAX_CACHE_METADATA_BYTES: usize = 1024 * 1024;
+// A verified closure manifest records every reachable store path. Keep the
+// tighter bound for inbound job metadata, while allowing a bounded multi-MiB
+// inventory on the cache artifact that owns the manifest.
+const MAX_CACHE_ARTIFACT_METADATA_BYTES: usize = 24 * 1024 * 1024;
 const ALLOWED_BUILD_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "cancelled"];
+
+#[derive(Debug, FromRow)]
+struct LegacyProtectedBuildJobRow {
+    id: i64,
+    managed_job_id: Option<String>,
+    status: String,
+    build_spec: String,
+    cache_metadata: String,
+    logs: String,
+    error: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
+pub(crate) struct ProtectedBuildJobRemediation {
+    pub job_id: i64,
+    pub managed_job_id: Option<String>,
+    pub output_path: String,
+}
 
 pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
     fs::create_dir_all(&config.paths.data_dir)?;
@@ -111,6 +136,214 @@ pub async fn migrate(pool: &SqlitePool) -> AppResult<()> {
         .run(pool)
         .await
         .map_err(|err| AppError::Config(err.to_string()))?;
+    quarantine_protected_build_jobs(pool).await?;
+    Ok(())
+}
+
+/// Scrub protected legacy inputs before any worker or Manage report can read
+/// them. The durable ledger stores only a categorical boundary rule, the
+/// original BuildSpec SHA-256, and job identity/status. This is deliberately
+/// implemented in Rust so it uses the same versioned boundary as new writes
+/// rather than a narrower SQL substring.
+pub async fn quarantine_protected_build_jobs(pool: &SqlitePool) -> AppResult<usize> {
+    let rows = sqlx::query_as::<_, LegacyProtectedBuildJobRow>(
+        "SELECT id, managed_job_id, status, build_spec, cache_metadata, logs, error
+         FROM forge_build_jobs ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut quarantined = 0usize;
+    for row in rows {
+        let spec: Value = serde_json::from_str(&row.build_spec)
+            .map_err(|err| AppError::Config(format!("build job build_spec: {err}")))?;
+        let metadata: Value = serde_json::from_str(&row.cache_metadata)
+            .map_err(|err| AppError::Config(format!("build job cache_metadata: {err}")))?;
+        let protected_spec = protected_material::validate_build_spec(&spec).is_err();
+        let protected_metadata = protected_material::validate_cache_metadata(&metadata).is_err();
+        let redacted_logs = redact_sensitive_key_values(&row.logs);
+        let redacted_error = redact_sensitive_key_values(&row.error);
+        if protected_spec || protected_metadata {
+            let rule = match (protected_spec, protected_metadata) {
+                (true, true) => "protected_build_spec_and_cache_metadata",
+                (true, false) => "protected_build_spec",
+                (false, true) => "protected_cache_metadata",
+                (false, false) => unreachable!("protected branch requires a failed boundary"),
+            };
+            let build_spec_sha256 = hex::encode(Sha256::digest(row.build_spec.as_bytes()));
+            let safe_spec = serde_json::to_string(&json!({
+                "schema_version": 1,
+                "security_quarantine": "protected reusable input removed during Forge upgrade"
+            }))
+            .map_err(|err| AppError::Config(err.to_string()))?;
+            let safe_metadata = serde_json::to_string(&json!({
+                "security_quarantine": {
+                    "status": "pending_purge",
+                    "reason": "protected reusable input removed during Forge upgrade",
+                    "scope": "static_binary_cache",
+                    "store_gc": "operator_managed"
+                }
+            }))
+            .map_err(|err| AppError::Config(err.to_string()))?;
+            let now = now_rfc3339();
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO protected_build_job_remediations
+                 (job_id, managed_job_id, original_status, rule, build_spec_sha256,
+                  cache_purge_status, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 'pending_purge', ?, ?)
+                 ON CONFLICT(job_id) DO NOTHING",
+            )
+            .bind(row.id)
+            .bind(&row.managed_job_id)
+            .bind(&row.status)
+            .bind(rule)
+            .bind(build_spec_sha256)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE forge_build_jobs
+                 SET build_spec = ?, cache_metadata = ?, status = 'failed',
+                     progress_percent = 100, progress_stage = 'failed',
+                     progress_message = 'Build quarantined during Forge security upgrade',
+                     logs = '', error = 'Build quarantined because reusable input failed the protected-material boundary',
+                     completed_at = COALESCE(completed_at, ?), updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(safe_spec)
+            .bind(safe_metadata)
+            .bind(&now)
+            .bind(&now)
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            quarantined += 1;
+        } else if redacted_logs != row.logs || redacted_error != row.error {
+            sqlx::query(
+                "UPDATE forge_build_jobs SET logs = ?, error = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(redacted_logs)
+            .bind(redacted_error)
+            .bind(now_rfc3339())
+            .bind(row.id)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(quarantined)
+}
+
+pub(crate) async fn pending_protected_build_job_remediations(
+    pool: &SqlitePool,
+) -> AppResult<Vec<ProtectedBuildJobRemediation>> {
+    sqlx::query_as::<_, ProtectedBuildJobRemediation>(
+        "SELECT remediation.job_id, remediation.managed_job_id, job.output_path
+         FROM protected_build_job_remediations remediation
+         JOIN forge_build_jobs job ON job.id = remediation.job_id
+         WHERE remediation.cache_purge_status = 'pending_purge'
+         ORDER BY remediation.job_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)
+}
+
+pub(crate) async fn protected_build_job_remediation_exists(
+    pool: &SqlitePool,
+    job_id: i64,
+) -> AppResult<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM protected_build_job_remediations WHERE job_id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count != 0)
+}
+
+/// Complete the SQLite half of a protected-artifact purge after the cache
+/// mutation lock holder has unpublished and swept the filesystem. A `purged`
+/// status covers withdrawal of the exported root plus sweeping members not
+/// shared by retained roots; Forge deliberately leaves `/nix/store` garbage
+/// collection to its separately governed policy.
+pub(crate) async fn complete_protected_build_job_cache_purge(
+    pool: &SqlitePool,
+    remediation: &ProtectedBuildJobRemediation,
+    artifact_ids: &[i64],
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    for artifact_id in artifact_ids {
+        sqlx::query("DELETE FROM forge_cache_artifacts WHERE id = ?")
+            .bind(artifact_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    for artifact_id in artifact_ids {
+        let remaining_by_id: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forge_cache_artifacts WHERE id = ?")
+                .bind(artifact_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if remaining_by_id != 0 {
+            return Err(AppError::Config(
+                "protected build cache purge left selected artifact rows".to_string(),
+            ));
+        }
+    }
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM forge_cache_artifacts
+         WHERE (? IS NOT NULL AND source_build_job_id = ?)
+            OR (? <> '' AND store_path = ?)",
+    )
+    .bind(&remediation.managed_job_id)
+    .bind(&remediation.managed_job_id)
+    .bind(&remediation.output_path)
+    .bind(&remediation.output_path)
+    .fetch_one(&mut *tx)
+    .await?;
+    if remaining != 0 {
+        return Err(AppError::Config(
+            "protected build cache purge left associated artifact rows".to_string(),
+        ));
+    }
+
+    let now = now_rfc3339();
+    let safe_metadata = serde_json::to_string(&json!({
+        "security_quarantine": {
+            "status": "purged",
+            "reason": "protected reusable input removed during Forge upgrade",
+            "scope": "static_binary_cache",
+            "store_gc": "operator_managed"
+        }
+    }))
+    .map_err(|err| AppError::Config(err.to_string()))?;
+    sqlx::query("UPDATE forge_build_jobs SET cache_metadata = ?, updated_at = ? WHERE id = ?")
+        .bind(safe_metadata)
+        .bind(&now)
+        .bind(remediation.job_id)
+        .execute(&mut *tx)
+        .await?;
+    let updated = sqlx::query(
+        "UPDATE protected_build_job_remediations
+         SET cache_purge_status = 'purged', purged_at = ?, updated_at = ?
+         WHERE job_id = ? AND cache_purge_status = 'pending_purge'",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(remediation.job_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(AppError::Config(
+            "protected build cache purge ledger was not pending".to_string(),
+        ));
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1531,7 +1764,11 @@ pub async fn finish_build_job(
              END,
              completed_at = ?,
              updated_at = ?
-         WHERE id = ?",
+         WHERE id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM protected_build_job_remediations remediation
+               WHERE remediation.job_id = forge_build_jobs.id
+           )",
     )
     .bind(cancel_override)
     .bind(status)
@@ -1607,7 +1844,11 @@ pub async fn update_build_job_report(
              completed_at = ?,
              cache_metadata = ?,
              updated_at = ?
-         WHERE managed_job_id = ?",
+         WHERE managed_job_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM protected_build_job_remediations remediation
+               WHERE remediation.job_id = forge_build_jobs.id
+           )",
     )
     .bind(status)
     .bind(progress_percent)
@@ -1701,6 +1942,10 @@ pub async fn cache_artifacts_due_for_verification(
 ) -> AppResult<Vec<CacheArtifact>> {
     let rows = sqlx::query_as::<_, CacheArtifactRow>(
         "SELECT * FROM forge_cache_artifacts
+         WHERE last_verified_at IS NULL
+            OR julianday(last_verified_at) IS NULL
+            OR julianday(last_verified_at) <= julianday('now', '-1 day')
+            OR julianday(last_verified_at) > julianday('now', '+5 minutes')
          ORDER BY COALESCE(last_verified_at, '') ASC, created_at ASC, id ASC
          LIMIT ?",
     )
@@ -1802,7 +2047,11 @@ pub async fn upsert_cache_artifact(
     let source_build_job_id = source_build_job_id
         .map(|value| normalize_managed_id(value, "source_build_job_id"))
         .transpose()?;
-    let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
+    let cache_metadata = metadata_to_string_with_limit(
+        cache_metadata,
+        "cache_metadata",
+        MAX_CACHE_ARTIFACT_METADATA_BYTES,
+    )?;
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO forge_cache_artifacts
@@ -2227,6 +2476,8 @@ fn build_spec_to_string(
     object.insert("system".to_string(), json!(system));
     object.insert("input_revision".to_string(), json!(input_revision));
     object.insert("input_config_hash".to_string(), json!(input_config_hash));
+    protected_material::validate_build_spec(&value)
+        .map_err(|err| AppError::Validation(err.to_string()))?;
     let encoded =
         serde_json::to_string(&value).map_err(|err| AppError::Validation(err.to_string()))?;
     if encoded.len() > MAX_CACHE_METADATA_BYTES {
@@ -2289,11 +2540,14 @@ fn validate_terminal_build_status(status: &str) -> AppResult<()> {
 }
 
 fn bounded_log_text(value: &str) -> String {
-    bounded_bytes(value, MAX_BUILD_LOG_BYTES)
+    bounded_bytes(&redact_sensitive_key_values(value), MAX_BUILD_LOG_BYTES)
 }
 
 fn bounded_error_text(value: &str) -> String {
-    value.chars().take(MAX_BUILD_ERROR_CHARS).collect()
+    redact_sensitive_key_values(value)
+        .chars()
+        .take(MAX_BUILD_ERROR_CHARS)
+        .collect()
 }
 
 fn normalize_build_progress_percent(value: Option<i32>, status: &str) -> Option<i32> {
@@ -2405,17 +2659,27 @@ fn bounded_bytes(value: &str, max_bytes: usize) -> String {
 }
 
 fn metadata_to_string(value: Option<Value>, field: &str) -> AppResult<String> {
+    metadata_to_string_with_limit(value, field, MAX_CACHE_METADATA_BYTES)
+}
+
+fn metadata_to_string_with_limit(
+    value: Option<Value>,
+    field: &str,
+    max_bytes: usize,
+) -> AppResult<String> {
     let value = value.unwrap_or_else(|| json!({}));
     if !value.is_object() {
         return Err(AppError::Validation(format!(
             "{field} must be a JSON object"
         )));
     }
+    protected_material::validate_cache_metadata(&value)
+        .map_err(|err| AppError::Validation(format!("{field}: {err}")))?;
     let encoded =
         serde_json::to_string(&value).map_err(|err| AppError::Validation(err.to_string()))?;
-    if encoded.len() > MAX_CACHE_METADATA_BYTES {
+    if encoded.len() > max_bytes {
         return Err(AppError::Validation(format!(
-            "{field} must be {MAX_CACHE_METADATA_BYTES} bytes or fewer"
+            "{field} must be {max_bytes} bytes or fewer"
         )));
     }
     Ok(encoded)
@@ -3797,6 +4061,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_build_material_is_rejected_before_database_persistence() {
+        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let password_hash = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
+        let pool = test_pool().await;
+        let error = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: Some(json!({
+                    "schema_version": 1,
+                    "nixpkgs_commit": "c".repeat(40),
+                    "source_lock_sha256": "d".repeat(64),
+                    "build_input": {
+                        "kind": "blueprint_nixos_module",
+                        "generated_nix": format!(
+                            "{{ ... }}: {{ environment.etc.probe.text = \"{password_hash}\"; }}"
+                        )
+                    }
+                })),
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "protected-revision".to_string(),
+                input_config_hash: "a".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(!error.contains(password_hash));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let error = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: Some(json!({
+                    "schema_version": 1,
+                    "api_token": sentinel,
+                })),
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "protected-unknown-field".to_string(),
+                input_config_hash: "e".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains(sentinel));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let error = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: None,
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "protected-metadata".to_string(),
+                input_config_hash: "b".repeat(64),
+                cache_metadata: Some(json!({"builder": {"access_token": sentinel}})),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(!error.contains(sentinel));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let job = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: None,
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "redacted-log".to_string(),
+                input_config_hash: "c".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        let claimed = claim_next_build_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job.id);
+        update_build_job_logs(
+            &pool,
+            job.id,
+            &format!("users.users.alice.hashedPassword = \"{sentinel}\"; bare {password_hash}"),
+        )
+        .await
+        .unwrap();
+        let stored = get_build_job(&pool, job.id).await.unwrap().logs;
+        assert!(stored.contains("[REDACTED]"));
+        assert!(!stored.contains(sentinel));
+        assert!(!stored.contains(password_hash));
+    }
+
+    #[tokio::test]
+    async fn upgrade_quarantine_scrubs_legacy_build_inputs_before_reporting() {
+        let sentinel = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
+        let pool = test_pool().await;
+        let job = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: None,
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "legacy-protected".to_string(),
+                input_config_hash: "f".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        let unsafe_spec = json!({
+            "schema_version": 1,
+            "build_input": {
+                "kind": "blueprint_nixos_module",
+                "generated_nix": format!(
+                    "{{ ... }}: {{ users.users.alice.hashedPassword = \"{sentinel}\"; }}"
+                )
+            }
+        });
+        let encoded_unsafe_spec = serde_json::to_string(&unsafe_spec).unwrap();
+        sqlx::query(
+            "UPDATE forge_build_jobs
+             SET build_spec = ?, status = 'succeeded', logs = ?, error = ? WHERE id = ?",
+        )
+        .bind(&encoded_unsafe_spec)
+        .bind(format!("legacy log {sentinel}"))
+        .bind(format!("legacy error {sentinel}"))
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let running = create_build_job(
+            &pool,
+            CreateBuildJobRequest {
+                requested_artifact_type: "nixos_closure".to_string(),
+                build_spec: None,
+                target: Some("blueprint".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                input_revision: "legacy-protected-running".to_string(),
+                input_config_hash: "e".repeat(64),
+                cache_metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE forge_build_jobs
+             SET status = 'running', cache_metadata = ?, logs = ?, error = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&json!({"api_token": sentinel})).unwrap())
+        .bind(format!("running log {sentinel}"))
+        .bind(format!("running error {sentinel}"))
+        .bind(running.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(quarantine_protected_build_jobs(&pool).await.unwrap(), 2);
+        let stored: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT build_spec, cache_metadata, status, logs, error
+             FROM forge_build_jobs WHERE id = ?",
+        )
+        .bind(job.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!stored.0.contains(sentinel));
+        assert!(!stored.1.contains(sentinel));
+        assert_eq!(stored.2, "failed");
+        assert!(stored.3.is_empty());
+        assert!(!stored.4.contains(sentinel));
+        let running_stored: (String, String, String, String) = sqlx::query_as(
+            "SELECT cache_metadata, status, logs, error FROM forge_build_jobs WHERE id = ?",
+        )
+        .bind(running.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!format!("{running_stored:?}").contains(sentinel));
+        assert_eq!(running_stored.1, "failed");
+        assert!(running_stored.2.is_empty());
+
+        let late_worker = finish_build_job(
+            &pool,
+            job.id,
+            "succeeded",
+            "late worker output",
+            "",
+            "",
+            "",
+            0,
+            Some(0),
+            Some(json!({"late_worker": true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(late_worker.status, "failed");
+        assert!(late_worker.logs.is_empty());
+        assert_eq!(
+            late_worker
+                .cache_metadata
+                .pointer("/security_quarantine/status")
+                .and_then(Value::as_str),
+            Some("pending_purge")
+        );
+
+        let ledgers: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+            "SELECT job_id, original_status, rule, build_spec_sha256, cache_purge_status
+             FROM protected_build_job_remediations ORDER BY job_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ledgers.len(), 2);
+        assert_eq!(ledgers[0].1, "succeeded");
+        assert_eq!(ledgers[0].2, "protected_build_spec");
+        assert_eq!(
+            ledgers[0].3,
+            hex::encode(Sha256::digest(encoded_unsafe_spec.as_bytes()))
+        );
+        assert_eq!(ledgers[1].1, "running");
+        assert_eq!(ledgers[1].2, "protected_cache_metadata");
+        assert!(ledgers.iter().all(|row| row.4 == "pending_purge"));
+        assert!(!format!("{ledgers:?}").contains(sentinel));
+        assert_eq!(quarantine_protected_build_jobs(&pool).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn closure_artifact_metadata_has_a_separate_bounded_manifest_budget() {
+        let metadata = json!({
+            "closure_manifest": {
+                "padding": "x".repeat(MAX_CACHE_METADATA_BYTES + 1)
+            }
+        });
+
+        assert!(metadata_to_string(Some(metadata.clone()), "cache_metadata").is_err());
+        assert!(
+            metadata_to_string_with_limit(
+                Some(metadata),
+                "cache_metadata",
+                MAX_CACHE_ARTIFACT_METADATA_BYTES,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn cache_artifact_validation_rejects_bad_hashes_and_paths() {
         let pool = test_pool().await;
         let err = create_cache_artifact(
@@ -4092,6 +4632,36 @@ mod tests {
         let inserted = cache_inventory_state(&pool).await.unwrap();
         assert_eq!(inserted.instance_id, initial.instance_id);
         assert!(inserted.generation > initial.generation);
+        assert_eq!(
+            cache_artifacts_due_for_verification(&pool, 8)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        mark_cache_artifact_verified(&pool, artifact.id)
+            .await
+            .unwrap();
+        assert!(
+            cache_artifacts_due_for_verification(&pool, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query(
+            "UPDATE forge_cache_artifacts SET last_verified_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(artifact.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cache_artifacts_due_for_verification(&pool, 8)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         replace_managed_cache_protections(&pool, &[("nixos_closure".into(), "a".repeat(64))], true)
             .await
