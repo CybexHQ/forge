@@ -15,6 +15,7 @@ tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
 http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
+update_trusted_public_key="${CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY:-}"
 
 vmid="${CYBEX_FORGE_PROXMOX_VMID:-}"
 hostname="${CYBEX_FORGE_PROXMOX_HOSTNAME:-cybex-forge}"
@@ -62,6 +63,8 @@ Boot runtime options:
   --http-root PATH               HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME              UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS           Boot menu timeout; 0 disables it (default: 0)
+  --update-trusted-public-key KEY
+                                Standard-Base64 raw 32-byte Ed25519 update public key
 
 Advanced Proxmox options:
   --vmid ID                      Container VMID (default: next cluster id)
@@ -131,6 +134,7 @@ while [ "$#" -gt 0 ]; do
     --http-root) http_root="${2:-}"; shift 2 ;;
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
+    --update-trusted-public-key) update_trusted_public_key="${2:-}"; shift 2 ;;
     --vmid) vmid="${2:-}"; shift 2 ;;
     --hostname) hostname="${2:-}"; shift 2 ;;
     --storage) storage="${2:-}"; shift 2 ;;
@@ -310,6 +314,26 @@ validate_bootloader_filename() {
     die "--bootloader must use only letters, numbers, dot, underscore, or hyphen"
 }
 
+validate_update_trusted_public_key() {
+  local value="$update_trusted_public_key"
+  local decoded_size canonical
+  [ -n "$value" ] || return 0
+  require_command base64
+  if ! printf '%s' "$value" | LC_ALL=C grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+    die "--update-trusted-public-key must be canonical standard Base64 for exactly 32 bytes"
+  fi
+  if ! decoded_size="$(printf '%s' "$value" | base64 --decode 2>/dev/null | wc -c | tr -d '[:space:]')"; then
+    die "--update-trusted-public-key is not valid standard Base64"
+  fi
+  [ "$decoded_size" = "32" ] ||
+    die "--update-trusted-public-key must decode to exactly 32 bytes"
+  if ! canonical="$(printf '%s' "$value" | base64 --decode 2>/dev/null | base64 | tr -d '\n')"; then
+    die "--update-trusted-public-key is not valid standard Base64"
+  fi
+  [ "$canonical" = "$value" ] ||
+    die "--update-trusted-public-key must use canonical standard Base64"
+}
+
 validate_forge_ref() {
   validate_plain_value "--forge-ref" "$forge_ref"
   [ -n "$forge_ref" ] || die "--forge-ref is required"
@@ -464,6 +488,11 @@ print_summary() {
   info "Forge source: $forge_git_url"
   info "Forge ref: $forge_ref"
   info "Forge checkout: $forge_source_dir"
+  if [ -n "$update_trusted_public_key" ]; then
+    info "Forge update trust: configured"
+  else
+    info "Forge update trust: not configured (managed updates will be refused)"
+  fi
 }
 
 create_container() {
@@ -571,7 +600,8 @@ run_lxc_installer() {
     --tftp-root "$tftp_root" \
     --http-root "$http_root" \
     --bootloader "$bootloader_filename" \
-    --menu-timeout-ms "$menu_timeout_ms"
+    --menu-timeout-ms "$menu_timeout_ms" \
+    --update-trusted-public-key "$update_trusted_public_key"
 }
 
 print_final() {
@@ -602,6 +632,7 @@ validate_auth_code
 validate_runtime_roots
 validate_absolute_path "--forge-source-dir" "$forge_source_dir"
 validate_bootloader_filename
+validate_update_trusted_public_key
 if [ "$menu_timeout_ms" != "0" ]; then
   validate_int_range "--menu-timeout-ms" "$menu_timeout_ms" 1000 600000
 fi

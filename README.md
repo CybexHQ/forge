@@ -71,6 +71,15 @@ The installer uses Debian's Nix package to bootstrap `/nix/var/nix/profiles/defa
 to a current Nix release, and Forge Build uses that profile binary for managed
 flake builds.
 
+The generated Proxmox helper and the in-LXC installer accept
+`--update-trusted-public-key` (or
+`CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY`) for the canonical standard-Base64
+encoding of a raw 32-byte Ed25519 public key. This value is public material and
+is written to `update.trusted_public_key`; the corresponding private release key
+must never be copied to Manage, a Forge node, an installer command, or test
+evidence. Omitting the public key is supported, but the updater then fails
+closed and Forge refuses every managed update.
+
 Proxmox LXC is supported for Forge Boot and Build/Cache. Build/Cache requires at
 least **16 GiB of memory**, 4 CPU cores, and 8 GiB of emergency swap; use 32 GiB
 for heavy developer Blueprints. The default installer enforces those capacity
@@ -180,9 +189,10 @@ binary update; reliability is not limited to newly provisioned appliances.
 
 ## Managed Updates
 
-Managed installs enable `[update]` by default. Cybex Manage discovers the latest
-release manifest, shows an `Update available` badge for adopted Forge nodes that
-advertise `updater_v1`, and sends the selected update through the signed managed
+Managed installs enable `[update]` by default. A node advertises `updater_v1`
+only when it also has a valid trusted Ed25519 public key. Cybex Manage discovers
+the latest release manifest, shows an `Update available` badge for eligible
+adopted Forge nodes, and sends the selected update through the signed managed
 config endpoint. Forge stores the request, reports progress back to Manage, and
 the root `cybex-forge-runtime-apply.timer` performs the privileged apply.
 
@@ -191,17 +201,49 @@ The release manifest asset is JSON:
 ```json
 {
   "schema": "cybex.forge.release.v1",
-  "version": "v0.1.0",
-  "release_url": "https://github.com/CybexHQ/forge/releases/tag/v0.1.0",
-  "notes_url": "https://github.com/CybexHQ/forge/releases/tag/v0.1.0",
-  "published_at": "2026-07-06T00:00:00Z",
+  "version": "0.1.1",
+  "release_url": "https://github.com/CybexHQ/forge/releases/tag/v0.1.1",
+  "notes_url": "https://github.com/CybexHQ/forge/releases/tag/v0.1.1",
+  "published_at": "2026-07-23T12:00:00Z",
   "artifact": {
-    "url": "https://github.com/CybexHQ/forge/releases/download/v0.1.0/cybex-forge-x86_64-linux",
+    "url": "https://github.com/CybexHQ/forge/releases/download/v0.1.1/cybex-forge-x86_64-linux",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
-  "signature": ""
+  "signature": "replace-with-standard-base64-ed25519-signature"
 }
 ```
+
+Manifest `version` is the exact canonical Cargo SemVer reported by the binary,
+without the Git tag's leading `v`. Build manifests with the checked-in tool; it
+hashes the already-built artifact, signs the exact update message, self-verifies
+the Ed25519 signature, and atomically writes deterministic JSON. It refuses
+symlinked input, a non-Ed25519 key, or a private key that grants group/other
+access. `--published-at` is deliberately explicit so identical inputs produce
+identical output.
+
+```bash
+install -d -m 0700 /secure/operator-owned/forge-release
+umask 077
+openssl genpkey -algorithm ED25519 \
+  -out /secure/operator-owned/forge-release/release-key.pem
+
+tools/forge-release.py public-key \
+  --private-key /secure/operator-owned/forge-release/release-key.pem
+
+tools/forge-release.py manifest \
+  --artifact dist/cybex-forge-x86_64-linux \
+  --artifact-url https://github.com/CybexHQ/forge/releases/download/v0.1.1/cybex-forge-x86_64-linux \
+  --version 0.1.1 \
+  --private-key /secure/operator-owned/forge-release/release-key.pem \
+  --output dist/cybex-forge-release.json \
+  --release-url https://github.com/CybexHQ/forge/releases/tag/v0.1.1 \
+  --notes-url https://github.com/CybexHQ/forge/releases/tag/v0.1.1 \
+  --published-at 2026-07-23T12:00:00Z
+```
+
+The example key directory is illustrative. Use the approved release-key store
+in each environment, retain it outside the repository and release artifacts,
+and provision only the `public-key` command's output into installers.
 
 Forge first verifies the request's Ed25519 signature against
 `update.trusted_public_key` (the signature covers version, sha256, and artifact
@@ -213,9 +255,14 @@ URL, so nothing is downloaded for an unsigned request; an empty
 atomically replaces `binary_path`, restarts `service_name`, and waits for
 `health_url`. Leave `health_url` empty in config to derive it from
 `server.listen_addr`; managed config rendering keeps it aligned with
-Manage-owned listener changes. On restart or health failure, Forge restores the
-previous binary and reports `rolled_back`. Backups and staged binaries from
-earlier attempts are pruned after each apply.
+Manage-owned listener changes. Any failure after candidate activation begins
+causes Forge to restore the previous binary and restart the restored service.
+Forge reports `rolled_back` only after both restoration and that restart
+succeed. A restoration or restored-binary restart failure is reported as a
+terminal failure whose reason starts with `rollback_failed:`; durable apply
+state and its backup remain for explicit recovery and must not be interpreted as
+a successful rollback. Backups and staged binaries from earlier completed
+attempts are pruned after each apply.
 
 When signing is enabled, sign this exact message:
 

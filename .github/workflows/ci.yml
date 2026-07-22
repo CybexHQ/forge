@@ -48,6 +48,9 @@ jobs:
       - name: Shellcheck
         run: shellcheck install/proxmox-host-lxc.sh install/cybex-forge-lxc-install.sh
 
+      - name: Release tooling tests
+        run: python3 -B -m unittest discover -s tools/tests -v
+
   security:
     name: Dependency Audit
     runs-on: ubuntu-latest

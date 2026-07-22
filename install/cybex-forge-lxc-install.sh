@@ -29,6 +29,8 @@ Options:
   --http-root PATH          HTTP asset root below /srv/cybex-forge (default: /srv/cybex-forge/www)
   --bootloader NAME         UEFI iPXE loader filename (default: snponly.efi)
   --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage; 0 disables it (default: 0)
+  --update-trusted-public-key KEY
+                            Standard-Base64 raw 32-byte Ed25519 update public key
   --dry-run, --validate-only
                             Validate inputs/environment without installing or enrolling
   -h, --help                Show this help
@@ -38,7 +40,7 @@ Environment alternatives:
   CYBEX_FORGE_PUBLIC_BASE_URL, CYBEX_FORGE_SOURCE_DIR, CYBEX_FORGE_GIT_URL,
   CYBEX_FORGE_REF, CYBEX_FORGE_LISTEN_ADDR, CYBEX_FORGE_TFTP_ROOT,
   CYBEX_FORGE_HTTP_ROOT, CYBEX_FORGE_BOOTLOADER_FILENAME,
-  CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS
+  CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS, CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY
 EOF
 }
 
@@ -54,6 +56,7 @@ tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
 http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
+update_trusted_public_key="${CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY:-}"
 dry_run=0
 
 while [ "$#" -gt 0 ]; do
@@ -70,6 +73,7 @@ while [ "$#" -gt 0 ]; do
     --http-root) http_root="${2:-}"; shift 2 ;;
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
+    --update-trusted-public-key) update_trusted_public_key="${2:-}"; shift 2 ;;
     --dry-run|--validate-only) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -272,6 +276,33 @@ validate_bootloader_filename() {
   validate_plain_value "--bootloader" "$bootloader_filename"
   if ! printf '%s' "$bootloader_filename" | LC_ALL=C grep -Eq '^[A-Za-z0-9._-]+$'; then
     echo "--bootloader must use only letters, numbers, dot, underscore, or hyphen" >&2
+    exit 2
+  fi
+}
+
+validate_update_trusted_public_key() {
+  local value="$update_trusted_public_key"
+  local decoded_size canonical
+  [ -n "$value" ] || return 0
+  require_command base64
+  if ! printf '%s' "$value" | LC_ALL=C grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+    echo "--update-trusted-public-key must be canonical standard Base64 for exactly 32 bytes" >&2
+    exit 2
+  fi
+  if ! decoded_size="$(printf '%s' "$value" | base64 --decode 2>/dev/null | wc -c | tr -d '[:space:]')"; then
+    echo "--update-trusted-public-key is not valid standard Base64" >&2
+    exit 2
+  fi
+  if [ "$decoded_size" != "32" ]; then
+    echo "--update-trusted-public-key must decode to exactly 32 bytes" >&2
+    exit 2
+  fi
+  if ! canonical="$(printf '%s' "$value" | base64 --decode 2>/dev/null | base64 | tr -d '\n')"; then
+    echo "--update-trusted-public-key is not valid standard Base64" >&2
+    exit 2
+  fi
+  if [ "$canonical" != "$value" ]; then
+    echo "--update-trusted-public-key must use canonical standard Base64" >&2
     exit 2
   fi
 }
@@ -690,7 +721,7 @@ config_path = "/etc/cybex-forge/config.toml"
 service_name = "cybex-forge.service"
 health_url = ""
 max_artifact_size_bytes = 134217728
-trusted_public_key = ""
+trusted_public_key = "$update_trusted_public_key"
 
 [manage]
 enabled = true
@@ -1364,6 +1395,7 @@ validate_listen_addr
 validate_absolute_path "--source-dir" "$source_dir"
 validate_runtime_roots
 validate_bootloader_filename
+validate_update_trusted_public_key
 validate_menu_timeout
 validate_forge_ref
 if [ "$dry_run" -eq 1 ]; then
