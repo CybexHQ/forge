@@ -1,9 +1,13 @@
 use std::{
     collections::HashSet,
-    fs,
-    os::unix::fs::PermissionsExt,
+    fs, io,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,6 +19,89 @@ use sqlx::SqlitePool;
 use tokio::task;
 
 use crate::{config::AppConfig, db, models::BuildJob, redact::redact_sensitive_key_values};
+
+const CACHE_MUTATION_LOCK_FILENAME: &str = ".cybex-cache-mutation.lock";
+
+/// Cross-process lease for the cache filesystem and its artifact inventory.
+///
+/// A process-local mutex would still let an overlapping Forge process (for
+/// example during a service restart) sweep files that `nix copy` is publishing.
+/// Keep this descriptor open for the complete filesystem + SQLite mutation so
+/// all Forge processes agree on the same serialization boundary.
+#[derive(Debug)]
+struct CacheMutationLock(fs::File);
+
+impl Drop for CacheMutationLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+async fn acquire_cache_mutation_lock(config: &AppConfig) -> Result<CacheMutationLock> {
+    let cache_root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || acquire_cache_mutation_lock_blocking(&cache_root))
+        .await
+        .context("join cache mutation lock task")?
+}
+
+fn acquire_cache_mutation_lock_blocking(cache_root: &Path) -> Result<CacheMutationLock> {
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("create cache directory {}", cache_root.display()))?;
+    let path = cache_root.join(CACHE_MUTATION_LOCK_FILENAME);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("open cache mutation lock {}", path.display()))?;
+    let metadata = lock
+        .metadata()
+        .with_context(|| format!("inspect cache mutation lock {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("cache mutation lock is not a regular file");
+    }
+    if metadata.nlink() != 1 {
+        bail!("cache mutation lock must not have hard links");
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("cache mutation lock is owned by an unexpected user");
+    }
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure cache mutation lock {}", path.display()))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(CacheMutationLock(lock));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("lock cache mutation file {}", path.display()));
+        }
+    }
+}
+
+fn command_output_with_transient_exec_retry(command: &mut Command) -> io::Result<Output> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match command.output() {
+            Ok(output) => return Ok(output),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                // A concurrent fork can briefly inherit an executable's
+                // just-closed writer until exec honors CLOEXEC. Retry only
+                // that transient kernel error; every other launch failure is
+                // returned immediately.
+                std::thread::sleep(Duration::from_millis(1_u64 << attempt.min(6)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("command output retry loop returns on its final attempt")
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CacheStatusReport {
@@ -28,7 +115,7 @@ pub struct CacheStatusReport {
     pub error: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CachedNixArtifact {
     pub artifact_hash: String,
     pub size_bytes: i64,
@@ -44,6 +131,10 @@ pub struct CachedNixArtifact {
     pub compression: String,
     pub references: Vec<String>,
     pub metadata: Value,
+    // Exported files are not reachable from the SQLite inventory until
+    // `record_cached_artifact` finishes. Carry the lease in the returned value
+    // so no deletion/sweep can enter during that publication gap.
+    _mutation_lock: CacheMutationLock,
 }
 
 #[derive(Debug)]
@@ -122,6 +213,7 @@ pub async fn initialize(config: &AppConfig) -> Result<()> {
     if !config.cache.enabled {
         return Ok(());
     }
+    let _mutation_lock = acquire_cache_mutation_lock(config).await?;
     let cache_dir = config.cache.root_dir.clone();
     task::spawn_blocking(move || initialize_cache_root_blocking(&cache_dir))
         .await
@@ -159,6 +251,7 @@ pub async fn export_output(
     if !config.cache.enabled {
         bail!("Forge Cache is disabled");
     }
+    let mutation_lock = acquire_cache_mutation_lock(config).await?;
     crate::disk::ensure_headroom(
         &config.cache.root_dir,
         closure_size_bytes.max(0) as u64,
@@ -179,12 +272,13 @@ pub async fn export_output(
             cache_dir.display(),
             private_key_path.display()
         );
-        let output = Command::new(&nix_binary)
+        let mut command = Command::new(&nix_binary);
+        command
             .arg("copy")
             .arg("--to")
             .arg(&destination)
-            .arg(&store_path)
-            .output()
+            .arg(&store_path);
+        let output = command_output_with_transient_exec_retry(&mut command)
             .with_context(|| format!("run {nix_binary} copy to local binary cache"))?;
         if !output.status.success() {
             bail!(
@@ -236,6 +330,7 @@ pub async fn export_output(
             compression: narinfo.compression,
             references: narinfo.references,
             metadata,
+            _mutation_lock: mutation_lock,
         })
     })
     .await
@@ -270,15 +365,18 @@ pub async fn record_cached_artifact(
         artifact.closure_size_bytes,
         artifact.closure_file_size_bytes,
         &artifact.compression,
-        Some(json!(artifact.references)),
+        Some(json!(&artifact.references)),
         &serving_url,
         job.managed_job_id.as_deref(),
-        Some(artifact.metadata),
+        Some(artifact.metadata.clone()),
     )
     .await
     .map_err(anyhow::Error::from)?;
-    enforce_retention(pool, config).await?;
-    Ok(())
+    let result = enforce_retention_locked(pool, config).await;
+    // Make the export-to-inventory lock lifetime explicit. In particular, do
+    // not let a future refactor release it before retention sees the new row.
+    drop(artifact);
+    result
 }
 
 /// Remove specific artifacts (identified by artifact_type + hash) on request
@@ -292,6 +390,7 @@ pub async fn remove_artifacts_by_key(
     if keys.is_empty() {
         return Ok(());
     }
+    let _mutation_lock = acquire_cache_mutation_lock(config).await?;
     let artifacts = db::list_cache_artifacts(pool).await?;
     let doomed = artifacts
         .iter()
@@ -313,11 +412,19 @@ pub async fn remove_artifacts_by_key(
         .filter(|artifact| !doomed.contains(&artifact.id))
         .map(RetainedArtifactFiles::from)
         .collect::<Vec<_>>();
-    sweep_unreachable(config, retained).await?;
+    sweep_unreachable_locked(config, retained).await?;
     Ok(())
 }
 
 pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
+    if config.cache.max_bytes == 0 {
+        return enforce_retention_locked(pool, config).await;
+    }
+    let _mutation_lock = acquire_cache_mutation_lock(config).await?;
+    enforce_retention_locked(pool, config).await
+}
+
+async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
         tracing::warn!(
             "cache.max_bytes is 0: Forge Cache retention is disabled and the cache root can grow without bound"
@@ -330,20 +437,72 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     if total <= config.cache.max_bytes {
         return Ok(());
     }
+    let mut candidates = db::list_cache_artifacts(pool).await?;
+    candidates.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    // First reclaim files left behind by an interrupted export. The cache
+    // mutation lock guarantees that every in-flight successful export is
+    // already represented by a row before this sweep can enter.
+    let retained = candidates
+        .iter()
+        .map(RetainedArtifactFiles::from)
+        .collect::<Vec<_>>();
+    sweep_unreachable_locked(config, retained).await?;
+    total = cache_disk_usage(config).await;
+    if total <= config.cache.max_bytes {
+        return Ok(());
+    }
+
     let build_jobs = db::list_build_jobs(pool).await?;
     let managed_protections = db::list_managed_cache_protections(pool).await?;
-    let mut protected_sources = HashSet::new();
-    for job in build_jobs
+    let candidate_sources = candidates
+        .iter()
+        .filter_map(|artifact| artifact.source_build_job_id.as_deref())
+        .collect::<HashSet<_>>();
+    let active_sources = build_jobs
         .iter()
         .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
-        .chain(build_jobs.iter().take(config.cache.retain_recent_builds))
-    {
-        if let Some(managed_job_id) = job.managed_job_id.as_deref() {
-            protected_sources.insert(managed_job_id.to_string());
-        }
+        .filter_map(|job| job.managed_job_id.clone())
+        .collect::<HashSet<_>>();
+    let recent_terminal_sources = build_jobs
+        .iter()
+        .filter(|job| !matches!(job.status.as_str(), "queued" | "running"))
+        .filter_map(|job| job.managed_job_id.as_deref())
+        .filter(|managed_job_id| candidate_sources.contains(managed_job_id))
+        .take(config.cache.retain_recent_builds)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    // Manage-desired artifacts and outputs of active jobs are hard fences.
+    // Recent terminal outputs are a preference: consider every other artifact
+    // first, then use the oldest recent outputs if the cache is still too big.
+    let hard_protected = |artifact: &crate::models::CacheArtifact| {
+        managed_protections.contains(&(artifact.artifact_type.clone(), artifact.hash.clone()))
+            || artifact
+                .source_build_job_id
+                .as_deref()
+                .is_some_and(|id| active_sources.contains(id))
+    };
+    let mut eviction_order = Vec::with_capacity(candidates.len());
+    for evict_recent_terminal in [false, true] {
+        eviction_order.extend(
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, artifact)| !hard_protected(artifact))
+                .filter(|(_, artifact)| {
+                    let recent_terminal = artifact
+                        .source_build_job_id
+                        .as_deref()
+                        .is_some_and(|id| recent_terminal_sources.contains(id));
+                    recent_terminal == evict_recent_terminal
+                })
+                .map(|(index, _)| index),
+        );
     }
-    let mut candidates = db::list_cache_artifacts(pool).await?;
-    candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     let mut evicted_ids: HashSet<i64> = HashSet::new();
     // Evict oldest-first in rounds: pick a batch whose estimated compressed
     // footprint covers the excess, then mark-and-sweep ONCE for the whole
@@ -352,25 +511,13 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     // the expensive full-cache walks proportional to rounds (usually one),
     // not to the number of evicted artifacts.
     let mut next_index = 0;
-    while total > config.cache.max_bytes && next_index < candidates.len() {
+    while total > config.cache.max_bytes && next_index < eviction_order.len() {
         let excess = total - config.cache.max_bytes;
         let mut estimated_freed: u64 = 0;
         let mut evicted_this_round = false;
-        while next_index < candidates.len() && estimated_freed <= excess {
-            let artifact = &candidates[next_index];
+        while next_index < eviction_order.len() && estimated_freed < excess {
+            let artifact = &candidates[eviction_order[next_index]];
             next_index += 1;
-            if managed_protections
-                .contains(&(artifact.artifact_type.clone(), artifact.hash.clone()))
-            {
-                continue;
-            }
-            if artifact
-                .source_build_job_id
-                .as_deref()
-                .is_some_and(|id| protected_sources.contains(id))
-            {
-                continue;
-            }
             db::delete_cache_artifact(pool, artifact.id).await?;
             evicted_ids.insert(artifact.id);
             evicted_this_round = true;
@@ -388,8 +535,15 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
             .filter(|candidate| !evicted_ids.contains(&candidate.id))
             .map(RetainedArtifactFiles::from)
             .collect::<Vec<_>>();
-        sweep_unreachable(config, retained).await?;
+        sweep_unreachable_locked(config, retained).await?;
         total = cache_disk_usage(config).await;
+    }
+    if total > config.cache.max_bytes {
+        tracing::warn!(
+            total_size_bytes = total,
+            max_size_bytes = config.cache.max_bytes,
+            "Forge Cache remains above max_bytes after evicting every eligible artifact"
+        );
     }
     Ok(())
 }
@@ -402,6 +556,7 @@ pub async fn scrub_cache_artifacts(
     config: &AppConfig,
     limit: i64,
 ) -> Result<u64> {
+    let _mutation_lock = acquire_cache_mutation_lock(config).await?;
     let candidates = db::cache_artifacts_due_for_verification(pool, limit).await?;
     if candidates.is_empty() {
         return Ok(0);
@@ -428,7 +583,7 @@ pub async fn scrub_cache_artifacts(
             .iter()
             .map(RetainedArtifactFiles::from)
             .collect::<Vec<_>>();
-        sweep_unreachable(config, retained).await?;
+        sweep_unreachable_locked(config, retained).await?;
     }
     Ok(invalid_ids.len() as u64)
 }
@@ -475,7 +630,7 @@ impl From<&crate::models::CacheArtifact> for RetainedArtifactFiles {
     }
 }
 
-async fn sweep_unreachable(
+async fn sweep_unreachable_locked(
     config: &AppConfig,
     retained: Vec<RetainedArtifactFiles>,
 ) -> Result<u64> {
@@ -694,12 +849,13 @@ fn ensure_signing_key_blocking_with_command(
         .with_context(|| format!("create cache key directory {}", parent.display()))?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("harden cache key directory {}", parent.display()))?;
-    let output = Command::new(nix_store)
+    let mut command = Command::new(nix_store);
+    command
         .arg("--generate-binary-cache-key")
         .arg(key_name)
         .arg(private_key)
-        .arg(public_key)
-        .output()
+        .arg(public_key);
+    let output = command_output_with_transient_exec_retry(&mut command)
         .with_context(|| format!("run {} --generate-binary-cache-key", nix_store.display()))?;
     if !output.status.success() {
         bail!(
@@ -911,7 +1067,11 @@ fn bounded_command_error(stderr: &[u8], private_key: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn test_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -924,6 +1084,55 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn pending_cache_artifact_holds_cross_process_mutation_lock_until_dropped() {
+        let root = test_temp_dir("mutation-lock");
+        let cache_root = root.join("cache");
+        let pending = CachedNixArtifact {
+            artifact_hash: "a".repeat(64),
+            size_bytes: 1,
+            nar_path: cache_root.join("nar/output.nar.xz"),
+            narinfo_path: cache_root.join(format!("{}.narinfo", "a".repeat(32))),
+            nar_url: "nar/output.nar.xz".to_string(),
+            store_path: format!("/nix/store/{}-output", "a".repeat(32)),
+            file_hash: "sha256:file".to_string(),
+            nar_hash: "sha256:nar".to_string(),
+            nar_size_bytes: 1,
+            closure_size_bytes: 1,
+            closure_file_size_bytes: 1,
+            compression: "xz".to_string(),
+            references: Vec::new(),
+            metadata: json!({}),
+            _mutation_lock: acquire_cache_mutation_lock_blocking(&cache_root).unwrap(),
+        };
+        let lock_metadata = fs::metadata(cache_root.join(CACHE_MUTATION_LOCK_FILENAME)).unwrap();
+        assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_root = cache_root.clone();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            acquired_tx
+                .send(acquire_cache_mutation_lock_blocking(&contender_root))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(pending);
+        let acquired = acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        drop(acquired);
+        contender.join().unwrap();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1080,6 +1289,14 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake_nix_store, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable_writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&fake_nix_store)
+            .unwrap();
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(executable_writer);
+        });
         let private_key = root.join("keys/cache-priv-key.pem");
         let public_key = root.join("keys/cache-pub-key.pem");
 
@@ -1090,6 +1307,7 @@ mod tests {
             &fake_nix_store,
         )
         .unwrap();
+        release_writer.join().unwrap();
 
         assert!(public.starts_with("cybex-forge-cache:"));
         let fingerprint = public_key_fingerprint(&public);
@@ -1397,6 +1615,137 @@ mod tests {
             artifacts[0].source_build_job_id.as_deref(),
             Some("active-job")
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn retention_prefers_recent_terminal_artifact_but_evicts_it_to_reach_cap() {
+        let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let root = test_temp_dir("retention-recent-soft-limit");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(cache_root.join("nar")).unwrap();
+
+        let old_hash = "b".repeat(32);
+        let recent_hash = "c".repeat(32);
+        let old_nar = cache_root.join("nar/old.nar.xz");
+        let old_narinfo = cache_root.join(format!("{old_hash}.narinfo"));
+        let recent_nar = cache_root.join("nar/recent.nar.xz");
+        let recent_narinfo = cache_root.join(format!("{recent_hash}.narinfo"));
+        fs::write(&old_nar, vec![1u8; 40]).unwrap();
+        fs::write(
+            &old_narinfo,
+            format!("StorePath: /nix/store/{old_hash}-old\nURL: nar/old.nar.xz\n"),
+        )
+        .unwrap();
+        fs::write(&recent_nar, vec![2u8; 40]).unwrap();
+        fs::write(
+            &recent_narinfo,
+            format!("StorePath: /nix/store/{recent_hash}-recent\nURL: nar/recent.nar.xz\n"),
+        )
+        .unwrap();
+        let old_footprint =
+            fs::metadata(&old_nar).unwrap().len() + fs::metadata(&old_narinfo).unwrap().len();
+        let recent_footprint =
+            fs::metadata(&recent_nar).unwrap().len() + fs::metadata(&recent_narinfo).unwrap().len();
+
+        let recent_job = db::upsert_managed_build_job(
+            &pool,
+            "recent-terminal-job",
+            "nixos_closure",
+            None,
+            Some("desktop_experience"),
+            Some("x86_64-linux"),
+            "revision-2",
+            &"d".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+        db::finish_build_job(
+            &pool,
+            recent_job.id,
+            "succeeded",
+            "",
+            "",
+            &format!("/nix/store/{recent_hash}-recent"),
+            &"e".repeat(64),
+            40,
+            Some(0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (hash, name, nar, narinfo, source, footprint) in [
+            (
+                &old_hash,
+                "old",
+                &old_nar,
+                &old_narinfo,
+                None,
+                old_footprint,
+            ),
+            (
+                &recent_hash,
+                "recent",
+                &recent_nar,
+                &recent_narinfo,
+                Some("recent-terminal-job".to_string()),
+                recent_footprint,
+            ),
+        ] {
+            db::create_cache_artifact(
+                &pool,
+                crate::models::CreateCacheArtifactRequest {
+                    artifact_type: "nixos_closure".to_string(),
+                    hash: hash.repeat(2),
+                    size_bytes: 40,
+                    path: nar.display().to_string(),
+                    store_path: Some(format!("/nix/store/{hash}-{name}")),
+                    narinfo_path: Some(narinfo.display().to_string()),
+                    nar_url: Some(format!("nar/{name}.nar.xz")),
+                    file_hash: Some(format!("sha256:{name}")),
+                    nar_hash: Some(format!("sha256:{name}nar")),
+                    nar_size_bytes: Some(40),
+                    closure_size_bytes: Some(40),
+                    closure_file_size_bytes: Some(footprint as i64),
+                    compression: Some("xz".to_string()),
+                    references: Some(json!([])),
+                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    source_build_job_id: source,
+                    cache_metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut config = AppConfig::default();
+        config.cache.root_dir = cache_root.clone();
+        config.cache.max_bytes = recent_footprint;
+        config.cache.retain_recent_builds = 10;
+
+        enforce_retention(&pool, &config).await.unwrap();
+
+        let artifacts = db::list_cache_artifacts(&pool).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].source_build_job_id.as_deref(),
+            Some("recent-terminal-job")
+        );
+        assert!(!old_nar.exists());
+        assert!(!old_narinfo.exists());
+        assert!(recent_nar.exists());
+        assert!(recent_narinfo.exists());
+
+        config.cache.max_bytes = 1;
+        enforce_retention(&pool, &config).await.unwrap();
+
+        assert!(db::list_cache_artifacts(&pool).await.unwrap().is_empty());
+        assert!(!recent_nar.exists());
+        assert!(!recent_narinfo.exists());
+        assert!(directory_size_bytes(&cache_root) <= config.cache.max_bytes);
         fs::remove_dir_all(root).ok();
     }
 

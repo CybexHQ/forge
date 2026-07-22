@@ -1,9 +1,9 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     time::Duration,
 };
 
@@ -25,6 +25,26 @@ const REQUEST_FILE: &str = "request.json";
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "apply.lock";
 const RELEASE_SCHEMA: &str = "cybex.forge.update-request.v1";
+
+fn command_output_with_transient_exec_retry(command: &mut Command) -> io::Result<Output> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match command.output() {
+            Ok(output) => return Ok(output),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                // The update worker can copy a new executable while another
+                // service thread forks. CLOEXEC closes that inherited writer
+                // only at exec, so retry the resulting short ETXTBSY window.
+                std::thread::sleep(Duration::from_millis(1_u64 << attempt.min(6)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("command output retry loop returns on its final attempt")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ManagedUpdateRequest {
@@ -402,11 +422,12 @@ fn stage_artifact(
 }
 
 fn smoke_test_binary(config: &AppConfig, binary: &Path) -> Result<()> {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--config")
         .arg(&config.update.config_path)
-        .arg("print-config")
-        .output()
+        .arg("print-config");
+    let output = command_output_with_transient_exec_retry(&mut command)
         .with_context(|| format!("run smoke test for {}", binary.display()))?;
     if !output.status.success() {
         bail!(
@@ -494,11 +515,10 @@ fn restore_binary(config: &AppConfig, backup: &Path) -> Result<()> {
 }
 
 fn restart_service(config: &AppConfig) -> Result<()> {
-    let output = Command::new("systemctl")
-        .arg("restart")
-        .arg(&config.update.service_name)
-        .output()
-        .context("restart Forge service")?;
+    let mut command = Command::new("systemctl");
+    command.arg("restart").arg(&config.update.service_name);
+    let output =
+        command_output_with_transient_exec_retry(&mut command).context("restart Forge service")?;
     if !output.status.success() {
         bail!(
             "restart {} failed: {}",
@@ -755,6 +775,32 @@ mod tests {
         config.update.work_dir = root.join("updates");
         config.update.releases_dir = root.join("releases");
         (config, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_retries_a_transient_busy_update_binary() {
+        let (_config, root) = test_config();
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("busy-update-binary");
+        fs::write(&executable, "#!/bin/sh\nprintf ready\n").unwrap();
+        set_executable(&executable).unwrap();
+        let executable_writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(executable_writer);
+        });
+
+        let output =
+            command_output_with_transient_exec_retry(&mut Command::new(&executable)).unwrap();
+        release_writer.join().unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

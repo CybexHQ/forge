@@ -30,6 +30,28 @@ profile, normally `Default Enrollment`, is listed next. Explicit per-client
 one-time or default profile assignments still bypass the menu and boot the
 assigned profile directly.
 
+After each atomic managed-config transaction, Boot reports the Manage client
+UUID and the exact managed default/one-time profile UUIDs resolved from its
+committed SQLite rows. These optional protocol-v3 fields let Manage prove that
+a destructive network-reinstall assignment was locally applied before it
+queues a reboot. The fields are additive: older Manage releases ignore them,
+while newer Manage releases safely leave destructive requests armed when an
+older Forge omits them.
+
+Forge also signs the exact JSON bytes of its initial enrollment request with
+its generated Ed25519 key. The request uses the same timestamp, request ID,
+body hash, and signature contract as managed agent calls, but omits a device ID
+because Manage has not assigned one yet. This proof lets Manage retry a lost
+enrollment response without allowing an anonymous public-key replay to replace
+the pending polling secret or reported identity. Pending status polls prove the
+same key with a signed, empty-body `GET` over the exact enrollment status path;
+they omit the not-yet-assigned device ID and retain the polling token only for
+compatibility with older Manage releases. Forge creates and exclusively locks
+`<state_path>.lock` before loading enrollment state, so the service and one-shot
+commands cannot race key creation, credential rotation, or adoption persistence.
+On Unix the lock is opened without following symlinks, verified as a regular
+file, and secured through the opened file descriptor before it is locked.
+
 ## Installation
 
 Installation is currently supported only through the Proxmox installer generated
@@ -54,14 +76,40 @@ least **16 GiB of memory**, 4 CPU cores, and 8 GiB of emergency swap; use 32 GiB
 for heavy developer Blueprints. The default installer enforces those capacity
 minimums, limits individual Nix derivations to four cores, and creates a narrow
 generated Blueprint closure target in `[[build.targets]]`. Blueprint targets
-must use an immutable 40-character nixpkgs commit. The installer validates the
-pin and representative heavy browser outputs against `cache.nixos.org` before
+must use an immutable 40-character nixpkgs commit, and Forge rejects a managed
+build request whose `nixpkgs_commit` differs from that configured target. The
+installer validates the pin and representative heavy browser outputs against `cache.nixos.org` before
 starting Forge. Jobs and cache artifacts record the exact pin used, and capacity,
 OOM, disk, timeout, and package failures are reported as distinct operator-facing
 states. Capacity detection supports finite cgroup limits, `/proc/meminfo`, and
 the LXC-virtualized `sysinfo(2)` fallback used when hardened systemd services
 hide non-process procfs files. Add further targets deliberately instead of using a broad build
 allowlist. Manual standalone installation is not currently supported.
+
+When a Blueprint disables source builds, Forge evaluates its closure in a
+fresh isolated local Nix store before the real build. Every advertised local
+derivation must either be a plain fixed-output fetch or match reviewed native
+NixOS materialization bytes executed by the pinned stdenv/default builder;
+the exact Bash provider and each allowed generator tool/output are pinned.
+Forge carries the complete dry-run derivation set into this decision, so a
+locally built shell, compiler, hook, or same-named replacement tool cannot hide
+inside otherwise reviewed glue. Configuration-only derivations are admitted in
+a bounded dependency fixed point, so reviewed glue may consume already proven
+glue while dependency cycles and source-building leaves remain rejected.
+Source-disabled preflight and real builds also reject flake-provided Nix config
+and disable import from derivation at command-line precedence, so evaluation
+cannot re-enable or realize hidden work before the advertised derivation set is
+classified.
+Unknown output, malformed structured attrs,
+truncated listings, extra tools/hooks, traversal paths, and executable
+environment injection fail closed. Subprocess output is captured concurrently
+with byte and time limits enforced while it is read. This prevents an output
+already present in Forge's normal store from hiding a source requirement.
+Prefer a cache-backed native nixpkgs package or a native NixOS option first;
+enable source builds only as an explicit Blueprint fallback when no source-free
+replacement exists. A nixpkgs pin refresh must include review and deliberate
+refresh of materializer, executable-path, and tool-provider fingerprints—names
+such as `runCommand` or `preferLocalBuild` are not provenance.
 
 ## Availability and self-healing
 
@@ -105,7 +153,13 @@ Forge reports a persistent cache-inventory instance and mutation generation,
 and marks a snapshot complete only when every artifact fits in the signed
 report. Manage returns protected current-Blueprint keys, so local retention
 cannot evict rollout-critical artifacts. Bounded cache scrubs remove invalid
-NAR/NARInfo rows for automatic rebuild. Managed Organization ISOs retry
+NAR/NARInfo rows for automatic rebuild. Cache export, inventory publication,
+deletion, retention, and scrubbing share one cross-process mutation lock, so a
+sync sweep cannot remove an export before its SQLite row is committed.
+Retention evicts unprotected artifacts oldest-first, preferring recent completed
+builds until capacity requires them; active builds and Manage-desired artifacts
+remain hard-protected and produce an explicit warning if they alone exceed the
+configured capacity. Managed Organization ISOs retry
 transient failures with capped backoff, periodically reverify ready bytes, and
 garbage-collect only unreferenced content-addressed files after a grace period.
 Boot asset inventory scans persist each ISO's device, inode, size, modification

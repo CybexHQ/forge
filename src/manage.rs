@@ -1,5 +1,8 @@
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -316,10 +319,13 @@ struct BootAgentSettingsReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct BootAgentClientReport {
+    managed_client_id: Option<String>,
     mac: String,
     hostname: Option<String>,
     serial_number: Option<String>,
     last_seen_at: Option<String>,
+    default_profile_id: Option<String>,
+    one_time_profile_id: Option<String>,
     notes: String,
     tags: Vec<String>,
 }
@@ -598,8 +604,16 @@ pub fn spawn(state: AppState) {
 
 pub async fn enroll_once(state: &AppState) -> Result<()> {
     ensure_manage_enabled(state)?;
+    // Enrollment identity, rotated polling credentials, and adoption tokens
+    // share one state document. Serialize every read/modify/write cycle across
+    // the service and one-shot CLI commands before loading that document.
+    let _state_lock = acquire_managed_state_lock(&state.config)?;
     let mut managed = load_managed_state(state)?;
     ensure_key_material(&mut managed)?;
+    // The enrollment public key is an idempotency identity. Make it durable
+    // before the first HTTP request so response loss cannot create a second
+    // pending identity on the next retry.
+    save_managed_state(state, &managed)?;
     let enrolled = ensure_enrolled(state, &mut managed).await?;
     save_managed_state(state, &managed)?;
     if enrolled {
@@ -637,7 +651,23 @@ pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn acquire_runtime_apply_lock() -> Result<fs::File> {
+struct AdvisoryFileLock(fs::File);
+
+#[cfg(unix)]
+impl Drop for AdvisoryFileLock {
+    fn drop(&mut self) {
+        // O_CLOEXEC closes an inherited descriptor only once a concurrently
+        // forked child reaches exec. Unlock the shared open-file description
+        // explicitly so dropping the parent guard releases the lock at once.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+type AdvisoryFileLock = fs::File;
+
+#[cfg(unix)]
+fn acquire_runtime_apply_lock() -> Result<AdvisoryFileLock> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -648,11 +678,11 @@ fn acquire_runtime_apply_lock() -> Result<fs::File> {
     if result != 0 {
         bail!("another managed runtime apply is already running");
     }
-    Ok(lock)
+    Ok(AdvisoryFileLock(lock))
 }
 
 #[cfg(not(unix))]
-fn acquire_runtime_apply_lock() -> Result<fs::File> {
+fn acquire_runtime_apply_lock() -> Result<AdvisoryFileLock> {
     fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -663,8 +693,11 @@ fn acquire_runtime_apply_lock() -> Result<fs::File> {
 
 async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     ensure_manage_enabled(state)?;
+    let _state_lock = acquire_managed_state_lock(&state.config)?;
     let mut managed = load_managed_state(state)?;
     ensure_key_material(&mut managed)?;
+    // Keep the signing identity stable across failed submits and restarts.
+    save_managed_state(state, &managed)?;
     if !ensure_enrolled(state, &mut managed).await? {
         save_managed_state(state, &managed)?;
         return Ok(SyncOutcome::PendingEnrollment);
@@ -683,6 +716,57 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     Ok(SyncOutcome::Synced)
 }
 
+#[derive(Debug, FromRow)]
+struct ManagedBootClientReportRow {
+    managed_client_id: Option<String>,
+    mac: String,
+    hostname: Option<String>,
+    serial_number: Option<String>,
+    last_seen_at: Option<String>,
+    default_profile_id: Option<String>,
+    one_time_profile_id: Option<String>,
+    notes: String,
+    tags: String,
+}
+
+/// Read the acknowledgement payload from the same committed local rows that
+/// serve PXE. The managed IDs prove which Manage client/profile assignments
+/// survived validation and the atomic SQLite config transaction.
+async fn current_boot_client_reports(pool: &SqlitePool) -> Result<Vec<BootAgentClientReport>> {
+    let rows = sqlx::query_as::<_, ManagedBootClientReportRow>(
+        r#"SELECT client.managed_client_id,
+                  client.mac, client.hostname, client.serial_number,
+                  client.last_seen_at,
+                  default_profile.managed_profile_id AS default_profile_id,
+                  one_time_profile.managed_profile_id AS one_time_profile_id,
+                  client.notes, client.tags
+           FROM devices client
+           LEFT JOIN boot_profiles default_profile
+             ON default_profile.id = client.default_profile_id
+           LEFT JOIN boot_profiles one_time_profile
+             ON one_time_profile.id = client.one_time_profile_id
+           ORDER BY CASE WHEN one_time_profile.managed_profile_id IS NOT NULL THEN 0 ELSE 1 END,
+                    COALESCE(client.last_seen_at, client.created_at) DESC,
+                    client.mac ASC"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| BootAgentClientReport {
+            managed_client_id: optional_report_uuid(row.managed_client_id),
+            mac: row.mac,
+            hostname: row.hostname,
+            serial_number: row.serial_number,
+            last_seen_at: row.last_seen_at,
+            default_profile_id: optional_report_uuid(row.default_profile_id),
+            one_time_profile_id: optional_report_uuid(row.one_time_profile_id),
+            notes: row.notes,
+            tags: clean_tags(serde_json::from_str(&row.tags).unwrap_or_default()),
+        })
+        .collect())
+}
+
 async fn ensure_enrolled(state: &AppState, managed: &mut ManagedState) -> Result<bool> {
     if managed
         .device_id
@@ -694,7 +778,10 @@ async fn ensure_enrolled(state: &AppState, managed: &mut ManagedState) -> Result
 
     if managed.enrollment_id.is_none() || managed.enrollment_secret.is_none() {
         submit_enrollment(state, managed).await?;
-        return Ok(false);
+        // The submit response can contain a rotated polling credential for an
+        // already-adopted idempotent retry. Persist it before polling so a
+        // crash cannot lose the only recovery credential.
+        save_managed_state(state, managed)?;
     }
 
     let status = poll_enrollment(state, managed).await?;
@@ -724,19 +811,43 @@ async fn ensure_enrolled(state: &AppState, managed: &mut ManagedState) -> Result
 
 async fn submit_enrollment(state: &AppState, managed: &mut ManagedState) -> Result<()> {
     let body = enrollment_body(state, managed)?;
+    let body = serde_json::to_vec(&body).context("serialize managed enrollment request")?;
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let request_id = random_request_id();
     let endpoint = api_url(state, "/v1/agent/enrollments")?;
+    let signed_path = request_path_and_query(&endpoint)?;
+    let signature =
+        enrollment_request_signature(managed, &signed_path, &timestamp, &request_id, &body)?;
     let response = http_client(state)?
         .post(endpoint)
         .header("x-cybex-organization", organization_header(&state.config)?)
+        .header("x-cybex-request-id", request_id)
+        .header("x-cybex-timestamp", timestamp)
+        .header("x-cybex-signature", signature)
         .header(CONTENT_TYPE, "application/json")
-        .json(&body)
+        .body(body)
         .send()
         .await
         .context("submit managed enrollment request failed")?;
     let response: EnrollmentResponse =
         parse_success_json(response, "submit managed enrollment").await?;
-    if response.status != "pending" {
-        bail!("managed enrollment returned non-pending status");
+    apply_enrollment_response(managed, response)?;
+    info!("managed enrollment submitted or recovered; checking approval state");
+    Ok(())
+}
+
+fn apply_enrollment_response(
+    managed: &mut ManagedState,
+    response: EnrollmentResponse,
+) -> Result<()> {
+    if !matches!(response.status.as_str(), "pending" | "adopted") {
+        bail!("managed enrollment returned unsupported status");
+    }
+    if !is_safe_path_segment(&response.enrollment_id) {
+        bail!("managed enrollment response contained an unsafe enrollment id");
+    }
+    if !is_safe_path_segment(&response.pairing_code) {
+        bail!("managed enrollment response contained an unsafe pairing code");
     }
     let secret = response
         .enrollment_secret
@@ -745,7 +856,6 @@ async fn submit_enrollment(state: &AppState, managed: &mut ManagedState) -> Resu
     managed.enrollment_id = Some(response.enrollment_id);
     managed.enrollment_secret = Some(secret);
     managed.pairing_code = Some(response.pairing_code);
-    info!("managed enrollment submitted; waiting for administrator approval");
     Ok(())
 }
 
@@ -763,13 +873,20 @@ async fn poll_enrollment(
         .as_deref()
         .filter(|value| is_valid_header_value(value))
         .ok_or_else(|| anyhow!("missing enrollment polling secret"))?;
-    let endpoint = api_url(
-        state,
-        &format!("/v1/agent/enrollments/{enrollment_id}/status"),
-    )?;
+    let path = format!("/v1/agent/enrollments/{enrollment_id}/status");
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let request_id = random_request_id();
+    let endpoint = api_url(state, &path)?;
+    let signed_path = request_path_and_query(&endpoint)?;
+    let signature = enrollment_status_signature(managed, &signed_path, &timestamp, &request_id)?;
     let response = http_client(state)?
         .get(endpoint)
         .header("x-cybex-organization", organization_header(&state.config)?)
+        .header("x-cybex-request-id", request_id)
+        .header("x-cybex-timestamp", timestamp)
+        .header("x-cybex-signature", signature)
+        // Kept during the compatibility window. Manage prioritizes the
+        // signed pending-key proof and older releases still accept this token.
         .header("x-cybex-enrollment-token", secret)
         .send()
         .await
@@ -815,7 +932,7 @@ async fn report_boot_state(
     if let Some(error) = &asset_scan.error {
         warn!(error = %error, "managed ISO asset scan failed");
     }
-    let devices = db::list_devices(&state.db).await?;
+    let clients = current_boot_client_reports(&state.db).await?;
     let assets = db::list_iso_assets(&state.db).await?;
     let profile_count = db::list_profiles(&state.db).await?.len();
     let events = list_events_after(
@@ -838,7 +955,7 @@ async fn report_boot_state(
     };
     let reported_state = boot_report_state(
         profile_count,
-        devices.len(),
+        clients.len(),
         assets.len(),
         &asset_scan,
         reliability_state,
@@ -857,18 +974,7 @@ async fn report_boot_state(
             state: reported_state,
         },
         profile_sync,
-        clients: devices
-            .into_iter()
-            .take(MAX_REPORT_CLIENTS)
-            .map(|device| BootAgentClientReport {
-                mac: device.mac,
-                hostname: device.hostname,
-                serial_number: device.serial_number,
-                last_seen_at: device.last_seen_at,
-                notes: device.notes,
-                tags: device.tags,
-            })
-            .collect(),
+        clients: clients.into_iter().take(MAX_REPORT_CLIENTS).collect(),
         assets: assets
             .into_iter()
             .take(MAX_REPORT_ASSETS)
@@ -3768,10 +3874,16 @@ async fn signed_request_for_config(
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_id = random_request_id();
     let body_sha256 = sha256_hex(&body);
-    let canonical =
-        canonical_agent_payload(method.as_str(), path, &timestamp, &request_id, &body_sha256);
-    let signature = URL_SAFE_NO_PAD.encode(signing.sign(canonical.as_bytes()).to_bytes());
     let endpoint = api_url_for_config(config, path)?;
+    let signed_path = request_path_and_query(&endpoint)?;
+    let canonical = canonical_agent_payload(
+        method.as_str(),
+        &signed_path,
+        &timestamp,
+        &request_id,
+        &body_sha256,
+    );
+    let signature = URL_SAFE_NO_PAD.encode(signing.sign(canonical.as_bytes()).to_bytes());
     let request = http_client_for_config(config)?
         .request(method, endpoint)
         .header("x-cybex-organization", organization_header(config)?)
@@ -3796,9 +3908,11 @@ async fn signed_download_request(
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_id = random_request_id();
     let body_sha256 = sha256_hex([]);
-    let canonical = canonical_agent_payload("GET", path, &timestamp, &request_id, &body_sha256);
-    let signature = URL_SAFE_NO_PAD.encode(signing.sign(canonical.as_bytes()).to_bytes());
     let endpoint = api_url(state, path)?;
+    let signed_path = request_path_and_query(&endpoint)?;
+    let canonical =
+        canonical_agent_payload("GET", &signed_path, &timestamp, &request_id, &body_sha256);
+    let signature = URL_SAFE_NO_PAD.encode(signing.sign(canonical.as_bytes()).to_bytes());
     Ok(http_download_client(state)?
         .get(endpoint)
         .header("x-cybex-organization", organization_header(&state.config)?)
@@ -3920,6 +4034,67 @@ fn load_managed_state_from_config(config: &AppConfig) -> Result<ManagedState> {
     }
     let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn managed_state_lock_path(config: &AppConfig) -> Result<PathBuf> {
+    let file_name = config
+        .manage
+        .state_path
+        .file_name()
+        .ok_or_else(|| anyhow!("managed state path must include a file name"))?;
+    let mut lock_name = OsString::from(file_name);
+    lock_name.push(".lock");
+    Ok(config.manage.state_path.with_file_name(lock_name))
+}
+
+#[cfg(unix)]
+fn acquire_managed_state_lock(config: &AppConfig) -> Result<AdvisoryFileLock> {
+    let path = managed_state_lock_path(config)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create managed state directory {}", parent.display()))?;
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| format!("open managed state lock {}", path.display()))?;
+    let metadata = lock
+        .metadata()
+        .with_context(|| format!("inspect managed state lock {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("managed state lock is not a regular file");
+    }
+    if metadata.nlink() != 1 {
+        bail!("managed state lock must not have hard links");
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("managed state lock is owned by an unexpected user");
+    }
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure managed state lock {}", path.display()))?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        bail!("another managed enrollment or sync process is already running");
+    }
+    Ok(AdvisoryFileLock(lock))
+}
+
+#[cfg(not(unix))]
+fn acquire_managed_state_lock(config: &AppConfig) -> Result<AdvisoryFileLock> {
+    let path = managed_state_lock_path(config)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .context("open managed state lock")
 }
 
 fn save_managed_state(state: &AppState, managed: &ManagedState) -> Result<()> {
@@ -4162,6 +4337,19 @@ fn api_url_for_config(config: &AppConfig, path: &str) -> Result<String> {
     Ok(format!("{base}{path}"))
 }
 
+fn request_path_and_query(endpoint: &str) -> Result<String> {
+    let endpoint = reqwest::Url::parse(endpoint).context("parse managed request URL")?;
+    if endpoint.fragment().is_some() {
+        bail!("manage.api_url must not contain a URL fragment");
+    }
+    let mut path = endpoint.path().to_string();
+    if let Some(query) = endpoint.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok(path)
+}
+
 fn organization_header(config: &AppConfig) -> Result<String> {
     if !config.manage.organization_id.trim().is_empty() {
         return Ok(config.manage.organization_id.trim().to_string());
@@ -4223,6 +4411,27 @@ fn canonical_agent_payload(
         request_id,
         body_sha256
     )
+}
+
+fn enrollment_request_signature(
+    managed: &ManagedState,
+    path: &str,
+    timestamp: &str,
+    request_id: &str,
+    body: &[u8],
+) -> Result<String> {
+    let canonical = canonical_agent_payload("POST", path, timestamp, request_id, &sha256_hex(body));
+    Ok(URL_SAFE_NO_PAD.encode(signing_key(managed)?.sign(canonical.as_bytes()).to_bytes()))
+}
+
+fn enrollment_status_signature(
+    managed: &ManagedState,
+    path: &str,
+    timestamp: &str,
+    request_id: &str,
+) -> Result<String> {
+    let canonical = canonical_agent_payload("GET", path, timestamp, request_id, &sha256_hex([]));
+    Ok(URL_SAFE_NO_PAD.encode(signing_key(managed)?.sign(canonical.as_bytes()).to_bytes()))
 }
 
 fn random_request_id() -> String {
@@ -6052,29 +6261,33 @@ mod tests {
     use super::{
         AgentBootConfigResponse, BootAgentAssetReport, BootAgentClientReport, BootAgentEventReport,
         BootAgentReportRequest, BootAgentSettingsReport, CYBEX_COMPONENT_PROTOCOL_VERSION,
-        CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract,
+        CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract, EnrollmentResponse,
         MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS,
         MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS,
-        MAX_PROFILE_RAW_SCRIPT_BYTES, ManagedBootClient, ManagedBootProfile, ManagedBootSettings,
-        ManagedState, NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
-        NixosNetbootManifest, NormalizedManagedSettings, SyncOutcome,
-        active_managed_sync_interval_seconds, append_bounded_response_chunk_with_limit,
+        MAX_PROFILE_RAW_SCRIPT_BYTES, MAX_REPORT_CLIENTS, ManagedBootClient, ManagedBootProfile,
+        ManagedBootSettings, ManagedState, NIXOS_NETBOOT_INITRD_FORMAT,
+        NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings,
+        SyncOutcome, acquire_managed_state_lock, active_managed_sync_interval_seconds,
+        api_url_for_config, append_bounded_response_chunk_with_limit, apply_enrollment_response,
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
-        clean_optional, current_profile_sync_reports, failed_sync_interval_seconds,
-        fit_boot_report_body, forge_capabilities, generated_iso_raw_script_can_be_preserved,
+        canonical_agent_payload, clean_optional, current_boot_client_reports,
+        current_profile_sync_reports, enrollment_request_signature, enrollment_status_signature,
+        ensure_key_material, failed_sync_interval_seconds, fit_boot_report_body,
+        forge_capabilities, generated_iso_raw_script_can_be_preserved,
         has_unreported_known_profile_events, managed_api_error_detail,
         managed_iso_error_is_retryable, managed_iso_retry_delay_seconds, managed_profile_map,
-        managed_profile_needs_iso_sync, managed_profile_raw_script, managed_sync_interval_seconds,
-        nixos_netboot_fstab, normalize_legacy_boot_config, normalize_managed_settings,
-        optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
+        managed_profile_needs_iso_sync, managed_profile_raw_script, managed_state_lock_path,
+        managed_sync_interval_seconds, nixos_netboot_fstab, normalize_legacy_boot_config,
+        normalize_managed_settings, optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
         parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
         patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
         read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
-        render_managed_config, render_nixos_netboot_script,
+        render_managed_config, render_nixos_netboot_script, request_path_and_query,
         rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
-        skip_padding, sync_clients, sync_deleted_clients, sync_deleted_profiles, sync_profiles,
-        validate_boot_config, validate_component_compatibility, validate_profile,
-        write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
+        sha256_hex, signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
+        sync_deleted_profiles, sync_profiles, validate_boot_config,
+        validate_component_compatibility, validate_profile, write_newc_file_from_bytes,
+        write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -6083,7 +6296,13 @@ mod tests {
         db,
         models::{CreateDeviceRequest, NewBootEvent},
     };
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    use ed25519_dalek::{Signature, SigningKey, Verifier};
     use rand::{RngCore, rngs::OsRng};
+    use reqwest::Method;
     use std::{
         collections::HashMap,
         fs,
@@ -6091,6 +6310,287 @@ mod tests {
         path::{Path, PathBuf},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn enrollment_request_signature_proves_the_exact_body() {
+        let signing = SigningKey::from_bytes(&[7_u8; 32]);
+        let managed = ManagedState {
+            private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+            ..ManagedState::default()
+        };
+        let timestamp = "2026-07-22T00:00:00Z";
+        let request_id = "req_enrollment_proof";
+        let body = br#"{"device_kind":"cybex-forge"}"#;
+        let encoded = enrollment_request_signature(
+            &managed,
+            "/v1/agent/enrollments",
+            timestamp,
+            request_id,
+            body,
+        )
+        .expect("sign enrollment body");
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(encoded)
+                .expect("decode enrollment signature"),
+        )
+        .expect("parse enrollment signature");
+        let canonical = canonical_agent_payload(
+            "POST",
+            "/v1/agent/enrollments",
+            timestamp,
+            request_id,
+            &sha256_hex(body),
+        );
+
+        signing
+            .verifying_key()
+            .verify(canonical.as_bytes(), &signature)
+            .expect("signature verifies for exact body");
+        let changed = canonical_agent_payload(
+            "POST",
+            "/v1/agent/enrollments",
+            timestamp,
+            request_id,
+            &sha256_hex(br#"{"device_kind":"nixos"}"#),
+        );
+        assert!(
+            signing
+                .verifying_key()
+                .verify(changed.as_bytes(), &signature)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_enrollment_status_signature_proves_exact_empty_get() {
+        let signing = SigningKey::from_bytes(&[9_u8; 32]);
+        let managed = ManagedState {
+            private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+            ..ManagedState::default()
+        };
+        let path = "/v1/agent/enrollments/enrollment-123/status";
+        let timestamp = "2026-07-22T00:00:00Z";
+        let request_id = "req_pending_status";
+        let encoded = enrollment_status_signature(&managed, path, timestamp, request_id)
+            .expect("sign pending enrollment status poll");
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(encoded)
+                .expect("decode enrollment status signature"),
+        )
+        .expect("parse enrollment status signature");
+        let canonical =
+            canonical_agent_payload("GET", path, timestamp, request_id, &sha256_hex([]));
+        signing
+            .verifying_key()
+            .verify(canonical.as_bytes(), &signature)
+            .expect("signature verifies for exact empty GET");
+
+        let wrong_path = canonical_agent_payload(
+            "GET",
+            "/v1/agent/enrollments/other/status",
+            timestamp,
+            request_id,
+            &sha256_hex([]),
+        );
+        assert!(
+            signing
+                .verifying_key()
+                .verify(wrong_path.as_bytes(), &signature)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_requests_canonicalize_the_final_prefixed_path_and_query() {
+        let signing = SigningKey::from_bytes(&[11_u8; 32]);
+        let managed = ManagedState {
+            device_id: Some("forge-123".to_string()),
+            private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+            ..ManagedState::default()
+        };
+        let mut config = AppConfig::default();
+        config.manage.api_url = "https://manage.example.invalid/api".to_string();
+        config.manage.organization_id = "org-123".to_string();
+        let relative = "/v1/agent/devices/forge-123/config?cursor=a%2Fb";
+        let body = br#"{"status":"ready"}"#.to_vec();
+        let request =
+            signed_request_for_config(&config, &managed, Method::POST, relative, body.clone())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+        let signed_path = request_path_and_query(request.url().as_str()).unwrap();
+        assert_eq!(
+            signed_path,
+            "/api/v1/agent/devices/forge-123/config?cursor=a%2Fb"
+        );
+        let timestamp = request.headers()["x-cybex-timestamp"].to_str().unwrap();
+        let request_id = request.headers()["x-cybex-request-id"].to_str().unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(request.headers()["x-cybex-signature"].to_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let canonical = canonical_agent_payload(
+            "POST",
+            &signed_path,
+            timestamp,
+            request_id,
+            &sha256_hex(&body),
+        );
+        signing
+            .verifying_key()
+            .verify(canonical.as_bytes(), &signature)
+            .expect("signature covers the URL prefix and query sent on the wire");
+        let unprefixed =
+            canonical_agent_payload("POST", relative, timestamp, request_id, &sha256_hex(&body));
+        assert!(
+            signing
+                .verifying_key()
+                .verify(unprefixed.as_bytes(), &signature)
+                .is_err()
+        );
+
+        let enrollment_endpoint = api_url_for_config(&config, "/v1/agent/enrollments").unwrap();
+        let enrollment_path = request_path_and_query(&enrollment_endpoint).unwrap();
+        assert_eq!(enrollment_path, "/api/v1/agent/enrollments");
+        let enrollment_signature = enrollment_request_signature(
+            &managed,
+            &enrollment_path,
+            "2026-07-22T00:00:00Z",
+            "req_prefixed_enrollment",
+            &body,
+        )
+        .unwrap();
+        let enrollment_signature =
+            Signature::from_slice(&URL_SAFE_NO_PAD.decode(enrollment_signature).unwrap()).unwrap();
+        let enrollment_canonical = canonical_agent_payload(
+            "POST",
+            "/api/v1/agent/enrollments",
+            "2026-07-22T00:00:00Z",
+            "req_prefixed_enrollment",
+            &sha256_hex(&body),
+        );
+        signing
+            .verifying_key()
+            .verify(enrollment_canonical.as_bytes(), &enrollment_signature)
+            .expect("enrollment signature covers the configured API prefix");
+
+        let status_path = "/api/v1/agent/enrollments/enrollment-123/status";
+        let status_signature = enrollment_status_signature(
+            &managed,
+            status_path,
+            "2026-07-22T00:00:00Z",
+            "req_prefixed_status",
+        )
+        .unwrap();
+        let status_signature =
+            Signature::from_slice(&URL_SAFE_NO_PAD.decode(status_signature).unwrap()).unwrap();
+        let status_canonical = canonical_agent_payload(
+            "GET",
+            status_path,
+            "2026-07-22T00:00:00Z",
+            "req_prefixed_status",
+            &sha256_hex([]),
+        );
+        signing
+            .verifying_key()
+            .verify(status_canonical.as_bytes(), &status_signature)
+            .expect("pending status signature covers the configured API prefix");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_state_lock_is_adjacent_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_state_dir();
+        let mut config = AppConfig::default();
+        config.manage.state_path = root.join("manage-state.json");
+        assert_eq!(
+            managed_state_lock_path(&config).unwrap(),
+            root.join("manage-state.json.lock")
+        );
+
+        let lock_path = managed_state_lock_path(&config).unwrap();
+        fs::write(&lock_path, []).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+        let first = acquire_managed_state_lock(&config).expect("acquire first state lock");
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Model the descriptor copy that exists briefly between a concurrent
+        // fork and exec. Dropping the guard must explicitly unlock even while
+        // that inherited open-file description is still alive.
+        let inherited = first
+            .0
+            .try_clone()
+            .expect("duplicate state lock descriptor");
+        assert!(acquire_managed_state_lock(&config).is_err());
+        drop(first);
+        let second = acquire_managed_state_lock(&config)
+            .expect("state lock guard explicitly releases inherited descriptors");
+        drop(inherited);
+        assert!(acquire_managed_state_lock(&config).is_err());
+        drop(second);
+        acquire_managed_state_lock(&config).expect("state lock releases with file handle");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_state_lock_rejects_symlinks_and_nonregular_paths() {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt,
+                fs::{PermissionsExt, symlink},
+            },
+            time::{Duration, Instant},
+        };
+
+        let root = temp_state_dir();
+        let mut config = AppConfig::default();
+        config.manage.state_path = root.join("manage-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = managed_state_lock_path(&config).unwrap();
+        let target = root.join("unrelated-target");
+        fs::write(&target, []).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        assert!(acquire_managed_state_lock(&config).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a rejected symlink must never chmod its target"
+        );
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        assert!(acquire_managed_state_lock(&config).is_err());
+
+        fs::remove_dir(&lock_path).unwrap();
+        let fifo = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(acquire_managed_state_lock(&config).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "opening a hostile FIFO must not block before metadata validation"
+        );
+
+        fs::remove_file(&lock_path).unwrap();
+        let hard_link_target = root.join("hard-link-target");
+        fs::write(&hard_link_target, []).unwrap();
+        fs::hard_link(&hard_link_target, &lock_path).unwrap();
+        assert!(acquire_managed_state_lock(&config).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn sample_netboot_manifest(
         iso_sha256: &str,
@@ -6640,10 +7140,13 @@ mod tests {
         };
         let clients = (0..2)
             .map(|idx| BootAgentClientReport {
+                managed_client_id: None,
                 mac: format!("02:00:00:00:30:{idx:02x}"),
                 hostname: Some(format!("node-{idx}")),
                 serial_number: None,
                 last_seen_at: None,
+                default_profile_id: None,
+                one_time_profile_id: None,
                 notes: "n".repeat(1024),
                 tags: vec!["rack-a".to_string()],
             })
@@ -7314,6 +7817,152 @@ mod tests {
             !has_unreported_known_profile_events(&pool, Some(known.id))
                 .await
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn enrollment_submit_recovery_accepts_pending_or_adopted_with_safe_polling_state() {
+        for status in ["pending", "adopted"] {
+            let mut managed = ManagedState::default();
+            apply_enrollment_response(
+                &mut managed,
+                EnrollmentResponse {
+                    enrollment_id: "enrollment-123".to_string(),
+                    pairing_code: "123456".to_string(),
+                    status: status.to_string(),
+                    enrollment_secret: Some("rotated-secret".to_string()),
+                },
+            )
+            .unwrap();
+            assert_eq!(managed.enrollment_id.as_deref(), Some("enrollment-123"));
+            assert_eq!(managed.enrollment_secret.as_deref(), Some("rotated-secret"));
+        }
+
+        for response in [
+            EnrollmentResponse {
+                enrollment_id: "../unsafe".to_string(),
+                pairing_code: "123456".to_string(),
+                status: "adopted".to_string(),
+                enrollment_secret: Some("secret".to_string()),
+            },
+            EnrollmentResponse {
+                enrollment_id: "enrollment-123".to_string(),
+                pairing_code: "123456".to_string(),
+                status: "rejected".to_string(),
+                enrollment_secret: Some("secret".to_string()),
+            },
+            EnrollmentResponse {
+                enrollment_id: "enrollment-123".to_string(),
+                pairing_code: "123456".to_string(),
+                status: "pending".to_string(),
+                enrollment_secret: Some("bad\nsecret".to_string()),
+            },
+        ] {
+            assert!(apply_enrollment_response(&mut ManagedState::default(), response).is_err());
+        }
+    }
+
+    #[test]
+    fn enrollment_signing_identity_survives_persistence_before_submit() {
+        let root = temp_state_dir();
+        let path = root.join("managed-state.json");
+        let mut managed = ManagedState::default();
+        ensure_key_material(&mut managed).unwrap();
+        write_secure_json(&path, &managed).unwrap();
+
+        let restored: ManagedState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.private_key_b64, managed.private_key_b64);
+        assert_eq!(
+            restored.public_key_fingerprint,
+            managed.public_key_fingerprint
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn armed_one_time_assignments_are_reported_before_the_client_cap() {
+        let pool = managed_test_pool().await;
+        let default_id = "00000000-0000-4000-8000-000000000101";
+        let one_time_id = "00000000-0000-4000-8000-000000000102";
+        let mut one_time = sample_profile(one_time_id);
+        one_time.one_time = true;
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &[sample_profile(default_id), one_time], true)
+            .await
+            .unwrap();
+        let profile_map = managed_profile_map(&mut tx).await.unwrap();
+        let target_index = MAX_REPORT_CLIENTS;
+        let clients = (0..=target_index)
+            .map(|index| {
+                let id = format!("00000000-0000-4000-8000-{index:012x}");
+                let mac = format!(
+                    "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
+                    (index >> 24) & 0xff,
+                    (index >> 16) & 0xff,
+                    (index >> 8) & 0xff,
+                    index & 0xff,
+                );
+                let mut client = sample_client(&id, &mac, default_id);
+                client.last_seen_at = Some(if index == target_index {
+                    "2020-01-01T00:00:00Z".to_string()
+                } else {
+                    "2026-07-22T00:00:00Z".to_string()
+                });
+                if index == target_index {
+                    client.one_time_profile_id = Some(one_time_id.to_string());
+                }
+                client
+            })
+            .collect::<Vec<_>>();
+        sync_clients(&mut tx, &clients, &profile_map, true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let reports = current_boot_client_reports(&pool).await.unwrap();
+        let target_id = format!("00000000-0000-4000-8000-{target_index:012x}");
+        assert_eq!(reports.len(), MAX_REPORT_CLIENTS + 1);
+        assert_eq!(
+            reports[0].managed_client_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert!(reports.into_iter().take(MAX_REPORT_CLIENTS).any(|report| {
+            report.managed_client_id.as_deref() == Some(target_id.as_str())
+                && report.one_time_profile_id.as_deref() == Some(one_time_id)
+        }));
+    }
+
+    #[tokio::test]
+    async fn boot_client_report_echoes_committed_managed_assignment_ids() {
+        let pool = managed_test_pool().await;
+        let client_id = "00000000-0000-4000-8000-000000000101".to_string();
+        let default_profile_id = "00000000-0000-4000-8000-000000000102".to_string();
+        let one_time_profile_id = "00000000-0000-4000-8000-000000000103".to_string();
+        let mut client = sample_client(&client_id, "02:00:00:00:10:01", &default_profile_id);
+        client.one_time_profile_id = Some(one_time_profile_id.clone());
+        let profiles = vec![
+            sample_profile(&default_profile_id),
+            sample_profile(&one_time_profile_id),
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        sync_profiles(&mut tx, &profiles, true).await.unwrap();
+        let profile_map = managed_profile_map(&mut tx).await.unwrap();
+        sync_clients(&mut tx, &[client], &profile_map, true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let reports = current_boot_client_reports(&pool).await.unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].managed_client_id.as_deref(), Some(&*client_id));
+        assert_eq!(
+            reports[0].default_profile_id.as_deref(),
+            Some(&*default_profile_id)
+        );
+        assert_eq!(
+            reports[0].one_time_profile_id.as_deref(),
+            Some(&*one_time_profile_id)
         );
     }
 
