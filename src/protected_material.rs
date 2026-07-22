@@ -17,6 +17,7 @@ const MODULAR_PASSWORD_HASH_PREFIXES: &[&str] = &[
     "$argon2i$",
     "$argon2id$",
 ];
+const CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX: &str = "/var/lib/cybex-agent/secrets/local-accounts/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtectedMaterialKind {
@@ -471,6 +472,17 @@ fn safe_runtime_secret_reference(value: &str) -> bool {
     {
         return false;
     }
+    if value
+        .strip_prefix(CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX)
+        .is_some_and(|secret_ref| {
+            secret_ref.len() == 64
+                && secret_ref
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return true;
+    }
     if [
         "/run/cybex/secrets/",
         "/run/secrets/",
@@ -646,6 +658,36 @@ mod tests {
         );
 
         validate_build_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn allows_only_exact_manage_local_account_runtime_secret_references() {
+        let secret_ref = "a".repeat(64);
+        let managed_path = format!("{CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX}{secret_ref}");
+        let spec = build_spec(
+            &format!("{{ ... }}: {{ users.users.alice.hashedPasswordFile = \"{managed_path}\"; }}"),
+            "{ ... }: { users.users.disabled.hashedPassword = \"!\"; }",
+            json!({"schema": "cybex.blueprint.expected-state.v2"}),
+        );
+        validate_build_spec(&spec).unwrap();
+
+        for rejected_path in [
+            format!("{CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX}short"),
+            format!("{CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX}{}", "A".repeat(64)),
+            format!("{CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX}{secret_ref}/extra"),
+            format!("{CYBEX_LOCAL_ACCOUNT_SECRET_PREFIX}../{secret_ref}"),
+            format!("/var/lib/cybex-agent/secrets/other/{secret_ref}"),
+        ] {
+            let rejected = build_spec(
+                &format!(
+                    "{{ ... }}: {{ users.users.alice.hashedPasswordFile = \"{rejected_path}\"; }}"
+                ),
+                "{ ... }: {}",
+                json!({"schema": "cybex.blueprint.expected-state.v2"}),
+            );
+            let error = validate_build_spec(&rejected).unwrap_err().to_string();
+            assert!(!error.contains(&rejected_path));
+        }
     }
 
     #[test]
