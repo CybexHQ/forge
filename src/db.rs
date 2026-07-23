@@ -2897,6 +2897,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrations_forward_drop_retired_system_release_schema() {
+        let pool = test_pool().await;
+        let historical_migration_applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations
+             WHERE version = 20260716000001 AND success = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let obsolete_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'managed_system_release_closure_uploads'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(historical_migration_applied, 1);
+        assert_eq!(obsolete_tables, 0);
+    }
+
+    #[tokio::test]
     async fn sqlite_busy_timeout_waits_for_a_transient_writer() {
         use std::time::{SystemTime, UNIX_EPOCH};
 

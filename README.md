@@ -187,6 +187,15 @@ are embedded in the Forge binary's privileged runtime apply plan. Existing
 managed nodes therefore adopt the same availability baseline after a verified
 binary update; reliability is not limited to newly provisioned appliances.
 
+### Database migration compatibility
+
+Forge database migrations are append-only once released because SQLx records
+their checksums in each node's SQLite database. Historical migration
+`20260716000001_system_release_closure_uploads.sql` therefore remains unchanged,
+but its acknowledgement table has no supported runtime consumer.
+`20260723000000_drop_retired_system_release_closure_uploads.sql` removes that
+obsolete table on both existing and newly provisioned Forge nodes.
+
 ## Managed Updates
 
 Managed installs enable `[update]` by default. A node advertises `updater_v1`
