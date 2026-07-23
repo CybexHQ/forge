@@ -34,6 +34,8 @@ const APPLY_STATE_FILE: &str = "apply-state.json";
 const RELEASE_SCHEMA: &str = "cybex.forge.update-request.v1";
 const APPLY_LOCK_SCHEMA: &str = "cybex.forge.update-lock.v1";
 const APPLY_STATE_SCHEMA: &str = "cybex.forge.apply-state.v1";
+pub const UPDATE_ONLY_PROJECTION_SCHEMA: &str = "cybex.forge.update-projection.v1";
+const MAX_UPDATE_ONLY_PROJECTION_BYTES: u64 = 4 * 1024;
 
 fn command_output_with_transient_exec_retry(command: &mut Command) -> io::Result<Output> {
     const MAX_ATTEMPTS: usize = 8;
@@ -86,6 +88,15 @@ pub struct ForgeUpdateStatusReport {
     pub attempt_id: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateOnlyStatusProjection {
+    schema: String,
+    status: String,
+    attempt_id: String,
+    current_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -223,6 +234,116 @@ pub async fn status_report(config: &AppConfig) -> Result<Option<ForgeUpdateStatu
         started_at: None,
         completed_at: None,
     }))
+}
+
+/// Return only a durable updater status written by the updater itself.
+///
+/// Unlike [`status_report`], this never synthesizes an idle projection using
+/// the version of the currently executing control binary.
+pub fn stored_status_report(config: &AppConfig) -> Result<Option<ForgeUpdateStatusReport>> {
+    if !config.update.enabled {
+        return Ok(None);
+    }
+    read_status(config)
+}
+
+/// Read a narrow, non-secret updater projection for an update-only report.
+///
+/// This qualification input is deliberately distinct from updater-owned
+/// `status.json`: it is explicit, bounded, read-only, denies unknown fields,
+/// and cannot carry error text or timestamps into a signed report.
+pub fn read_update_only_projection(path: &Path) -> Result<ForgeUpdateStatusReport> {
+    if !path.is_absolute() {
+        bail!("Forge update-only projection path must be absolute");
+    }
+    let path_metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !path_metadata.file_type().is_file() {
+        bail!("Forge update-only projection must be a regular file");
+    }
+    if path_metadata.len() > MAX_UPDATE_ONLY_PROJECTION_BYTES {
+        bail!("Forge update-only projection exceeds its size limit");
+    }
+    #[cfg(unix)]
+    {
+        let owner = path_metadata.uid();
+        let effective_uid = unsafe { libc::geteuid() };
+        if path_metadata.nlink() != 1
+            || path_metadata.mode() & 0o022 != 0
+            || (owner != 0 && owner != effective_uid)
+        {
+            bail!("Forge update-only projection ownership or permissions are unsafe");
+        }
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("inspect open {}", path.display()))?;
+    if !opened_metadata.file_type().is_file() {
+        bail!("Forge update-only projection must remain a regular file");
+    }
+    if opened_metadata.len() > MAX_UPDATE_ONLY_PROJECTION_BYTES {
+        bail!("Forge update-only projection exceeds its size limit");
+    }
+    #[cfg(unix)]
+    if opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+        || opened_metadata.nlink() != 1
+    {
+        bail!("Forge update-only projection changed while opening");
+    }
+
+    let mut bytes = Vec::with_capacity(
+        (opened_metadata.len() + 1).min(MAX_UPDATE_ONLY_PROJECTION_BYTES + 1) as usize,
+    );
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_UPDATE_ONLY_PROJECTION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_UPDATE_ONLY_PROJECTION_BYTES {
+        bail!("Forge update-only projection exceeds its size limit");
+    }
+    let read_metadata = file
+        .metadata()
+        .with_context(|| format!("reinspect {}", path.display()))?;
+    #[cfg(unix)]
+    if read_metadata.dev() != path_metadata.dev()
+        || read_metadata.ino() != path_metadata.ino()
+        || read_metadata.uid() != path_metadata.uid()
+        || read_metadata.mode() != path_metadata.mode()
+        || read_metadata.nlink() != path_metadata.nlink()
+        || read_metadata.len() != path_metadata.len()
+        || read_metadata.mtime() != path_metadata.mtime()
+        || read_metadata.mtime_nsec() != path_metadata.mtime_nsec()
+    {
+        bail!("Forge update-only projection changed while reading");
+    }
+    #[cfg(not(unix))]
+    if read_metadata.len() != path_metadata.len() {
+        bail!("Forge update-only projection changed while reading");
+    }
+    let projection: UpdateOnlyStatusProjection =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    validate_update_only_projection(&projection)?;
+
+    Ok(ForgeUpdateStatusReport {
+        status: projection.status,
+        stage: "idle".to_string(),
+        progress_percent: None,
+        error: String::new(),
+        target_version: String::new(),
+        current_version: projection.current_version,
+        attempt_id: projection.attempt_id,
+        started_at: None,
+        completed_at: None,
+    })
 }
 
 pub async fn apply_requested_update(config: &AppConfig) -> Result<()> {
@@ -1314,6 +1435,35 @@ fn remove_owned_regular_file_if_exists(path: &Path) -> Result<()> {
     fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
 }
 
+fn validate_update_only_projection(projection: &UpdateOnlyStatusProjection) -> Result<()> {
+    if projection.schema != UPDATE_ONLY_PROJECTION_SCHEMA {
+        bail!("unsupported Forge update-only projection schema");
+    }
+    if projection.status != "idle" {
+        bail!("explicit Forge update-only projections are restricted to idle status");
+    }
+    if !projection.attempt_id.is_empty() {
+        bail!("idle Forge update-only projection must have an empty attempt");
+    }
+    validate_update_projection_version(&projection.current_version, "current")?;
+    Ok(())
+}
+
+fn validate_update_projection_version(version: &str, field: &str) -> Result<()> {
+    if version.is_empty()
+        || version.len() > 128
+        || version.starts_with('-')
+        || version.ends_with(['-', '.'])
+        || version.contains("..")
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+    {
+        bail!("Forge update-only projection {field} version is invalid");
+    }
+    Ok(())
+}
+
 fn validate_request(request: &ManagedUpdateRequest) -> Result<()> {
     if request.version.trim().is_empty()
         || request.version.len() > 128
@@ -1539,6 +1689,131 @@ mod tests {
         let request = test_request("2026-07-06T00:00:00Z");
         let attempt_id = request_attempt_id(&request);
         (config, root, staged, request, attempt_id)
+    }
+
+    fn write_update_only_projection(root: &Path, value: serde_json::Value) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join("update-projection.json");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    #[test]
+    fn explicit_idle_projection_preserves_historical_version_without_writes() {
+        let (mut config, root) = test_config();
+        config.update.enabled = true;
+        let projection = write_update_only_projection(
+            &root,
+            serde_json::json!({
+                "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "idle",
+                "attempt_id": "",
+                "current_version": "0.1.0"
+            }),
+        );
+        let before = fs::read(&projection).unwrap();
+
+        let status = read_update_only_projection(&projection).unwrap();
+
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.stage, "idle");
+        assert!(status.attempt_id.is_empty());
+        assert_eq!(status.current_version, "0.1.0");
+        assert!(status.target_version.is_empty());
+        assert!(status.error.is_empty());
+        assert_eq!(status.progress_percent, None);
+        assert_eq!(fs::read(&projection).unwrap(), before);
+        assert!(stored_status_report(&config).unwrap().is_none());
+        assert!(!config.update.work_dir.exists());
+        assert!(!config.update.releases_dir.exists());
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![projection.file_name().unwrap().to_os_string()]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_projection_rejects_unknown_or_unsafe_domains() {
+        let (_config, root) = test_config();
+        let invalid = [
+            serde_json::json!({
+                "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "idle",
+                "attempt_id": "",
+                "current_version": "0.1.0",
+                "error": "must not be accepted"
+            }),
+            serde_json::json!({
+                "schema": "cybex.forge.update-projection.v0",
+                "status": "idle",
+                "attempt_id": "",
+                "current_version": "0.1.0"
+            }),
+            serde_json::json!({
+                "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "failed",
+                "attempt_id": "a".repeat(32),
+                "current_version": "0.1.0"
+            }),
+            serde_json::json!({
+                "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "idle",
+                "attempt_id": "a".repeat(32),
+                "current_version": "0.1.0"
+            }),
+        ];
+        for value in invalid {
+            let path = write_update_only_projection(&root, value);
+            assert!(read_update_only_projection(&path).is_err());
+        }
+        for version in ["-0.1.0", "0.1.0-", "0.1.0.", "0..1", "0.1 0"] {
+            let path = write_update_only_projection(
+                &root,
+                serde_json::json!({
+                    "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                    "status": "idle",
+                    "attempt_id": "",
+                    "current_version": version
+                }),
+            );
+            assert!(read_update_only_projection(&path).is_err());
+        }
+        assert!(
+            read_update_only_projection(Path::new("relative-projection.json"))
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_projection_rejects_mutable_or_indirect_files() {
+        let (_config, root) = test_config();
+        let projection = write_update_only_projection(
+            &root,
+            serde_json::json!({
+                "schema": UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "idle",
+                "attempt_id": "",
+                "current_version": "0.1.0"
+            }),
+        );
+        fs::set_permissions(&projection, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(read_update_only_projection(&projection).is_err());
+
+        fs::set_permissions(&projection, fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink = root.join("projection-link.json");
+        std::os::unix::fs::symlink(&projection, &symlink).unwrap();
+        assert!(read_update_only_projection(&symlink).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

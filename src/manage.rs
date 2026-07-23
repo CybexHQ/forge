@@ -584,6 +584,7 @@ struct AssetScanReport {
 pub struct ExpectedUpdateReport {
     pub status: String,
     pub attempt_id: String,
+    pub current_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -760,9 +761,10 @@ pub async fn sync_once(state: &AppState) -> Result<SyncOnceReport> {
 /// This path exists for qualification while a historical Forge binary is the
 /// active service. It deliberately requires an already-adopted signing state,
 /// an update-only scope acknowledgement from Manage, and—when supplied—an
-/// exact local status/attempt fence.
+/// exact local status/attempt/current-version fence.
 pub async fn sync_update_report_once(
     config: &AppConfig,
+    projection_file: Option<&Path>,
     expected_update: Option<&ExpectedUpdateReport>,
 ) -> Result<SyncOnceReport> {
     ensure_manage_enabled_config(config)?;
@@ -772,11 +774,14 @@ pub async fn sync_update_report_once(
     let _state_lock = acquire_managed_state_lock(config)?;
     let managed = load_managed_state_from_config(config)?;
     let device_id = managed_device_id(&managed)?;
-    let update = crate::updater::status_report(config)
-        .await?
-        .ok_or_else(|| {
-            anyhow!("update-only Forge sync did not include a local updater status report")
-        })?;
+    let update = match projection_file {
+        Some(path) => crate::updater::read_update_only_projection(path)?,
+        None => crate::updater::stored_status_report(config)?.ok_or_else(|| {
+            anyhow!(
+                "update-only Forge sync found no durable updater status; use an explicit update projection file"
+            )
+        })?,
+    };
     validate_expected_update_report(Some(&update), expected_update)?;
 
     let updater = SyncOnceUpdaterReport::from(&update);
@@ -1374,6 +1379,13 @@ fn validate_expected_update_report(
             "fenced Forge sync updater attempt mismatch: expected {}, got {}",
             expected.attempt_id,
             actual.attempt_id
+        );
+    }
+    if actual.current_version != expected.current_version {
+        bail!(
+            "fenced Forge sync updater current version mismatch: expected {}, got {}",
+            expected.current_version,
+            actual.current_version
         );
     }
     Ok(())
@@ -6605,6 +6617,8 @@ mod tests {
     use ed25519_dalek::{Signature, SigningKey, Verifier};
     use rand::{RngCore, rngs::OsRng};
     use reqwest::Method;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         collections::HashMap,
         fs,
@@ -8919,11 +8933,12 @@ mod tests {
     }
 
     #[test]
-    fn fenced_update_report_requires_the_exact_status_and_attempt() {
+    fn fenced_update_report_requires_exact_status_attempt_and_current_version() {
         let attempt_id = "a".repeat(32);
         let expected = ExpectedUpdateReport {
             status: "failed".to_string(),
             attempt_id: attempt_id.clone(),
+            current_version: "0.1.1".to_string(),
         };
         let mut actual = crate::updater::ForgeUpdateStatusReport {
             status: "failed".to_string(),
@@ -8959,6 +8974,14 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("attempt mismatch")
+        );
+        actual.attempt_id = expected.attempt_id.clone();
+        actual.current_version = "0.1.0".to_string();
+        assert!(
+            validate_expected_update_report(Some(&actual), Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("current version mismatch")
         );
     }
 
@@ -9039,7 +9062,7 @@ mod tests {
         let managed_state_before = fs::read(&config.manage.state_path).unwrap();
         let updater_status_before = fs::read(update_dir.join("status.json")).unwrap();
 
-        let report = sync_update_report_once(&config, None).await.unwrap();
+        let report = sync_update_report_once(&config, None, None).await.unwrap();
         let (headers, raw_body, body) = capture_rx.await.unwrap();
         server.abort();
 
@@ -9116,11 +9139,131 @@ mod tests {
             .expect("update-only request signature covers the exact scoped body");
     }
 
+    #[tokio::test]
+    async fn update_only_sync_uses_fenced_historical_idle_projection_without_writes() {
+        let root = temp_state_dir();
+        let shared_data = root.join("shared-data-must-not-exist");
+        let shared_boot = root.join("shared-boot-must-not-exist");
+        let shared_cache = root.join("shared-cache-must-not-exist");
+        let shared_build = root.join("shared-build-must-not-exist");
+        let shared_releases = root.join("shared-releases-must-not-exist");
+        let update_dir = root.join("updater-status-must-not-exist");
+        let state_dir = root.join("signing-state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let signing = SigningKey::from_bytes(&[29_u8; 32]);
+        let managed = ManagedState {
+            private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+            public_key_b64: Some(STANDARD.encode(signing.verifying_key().to_bytes())),
+            public_key_fingerprint: Some(sha256_hex(signing.verifying_key().to_bytes())),
+            device_id: Some("forge-update-only-test".to_string()),
+            ..ManagedState::default()
+        };
+        let projection_path = root.join("idle-projection.json");
+        fs::write(
+            &projection_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": crate::updater::UPDATE_ONLY_PROJECTION_SCHEMA,
+                "status": "idle",
+                "attempt_id": "",
+                "current_version": "0.1.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&projection_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let projection_before = fs::read(&projection_path).unwrap();
+
+        let (capture_tx, capture_rx) = oneshot::channel();
+        let capture: UpdateOnlyCapture = Arc::new(Mutex::new(Some(capture_tx)));
+        let app = Router::new()
+            .route(
+                "/v1/agent/devices/forge-update-only-test/forge/update-report",
+                post(capture_update_only_report),
+            )
+            .with_state(capture);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.manage.enabled = true;
+        config.manage.api_url = format!("http://{address}");
+        config.manage.organization_id = "organization-update-only-test".to_string();
+        config.manage.state_path = state_dir.join("manage-state.json");
+        config.paths.data_dir = shared_data.clone();
+        config.paths.database_path = shared_data.join("forge.sqlite");
+        config.paths.boot_assets_dir = shared_boot.clone();
+        config.paths.iso_dir = shared_boot.join("isos");
+        config.paths.static_dir = shared_boot.join("assets");
+        config.paths.tftp_dir = shared_boot.join("tftp");
+        config.cache.root_dir = shared_cache.clone();
+        config.cache.private_key_path = shared_cache.join("private-key");
+        config.cache.public_key_path = shared_cache.join("public-key");
+        config.build.work_dir = shared_build.join("work");
+        config.build.output_dir = shared_build.join("output");
+        config.update.enabled = true;
+        config.update.work_dir = update_dir.clone();
+        config.update.releases_dir = shared_releases.clone();
+        config.update.trusted_public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        write_secure_json(&config.manage.state_path, &managed).unwrap();
+        let managed_state_before = fs::read(&config.manage.state_path).unwrap();
+        let expected = ExpectedUpdateReport {
+            status: "idle".to_string(),
+            attempt_id: String::new(),
+            current_version: "0.1.0".to_string(),
+        };
+
+        let missing = sync_update_report_once(&config, None, None)
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("no durable updater status"));
+        assert!(!update_dir.exists());
+
+        let report = sync_update_report_once(&config, Some(&projection_path), Some(&expected))
+            .await
+            .unwrap();
+        let (_headers, _raw_body, body) = capture_rx.await.unwrap();
+        server.abort();
+
+        assert_eq!(body["update"]["status"], "idle");
+        assert_eq!(body["update"]["stage"], "idle");
+        assert_eq!(body["update"]["attempt_id"], "");
+        assert_eq!(body["update"]["current_version"], "0.1.0");
+        assert_eq!(body["update"]["target_version"], "");
+        assert_eq!(body["update"]["error"], "");
+        assert_eq!(report.report_scope, Some(FORGE_REPORT_SCOPE_UPDATE_ONLY));
+        assert_eq!(report.updater.as_ref().unwrap().current_version, "0.1.0");
+        assert_eq!(
+            report.persisted_update,
+            Some(super::SyncOncePersistedUpdate {
+                status: "idle".to_string(),
+                attempt_id: String::new(),
+                reported_at: "2026-07-23T10:00:00Z".to_string(),
+            })
+        );
+        assert_eq!(fs::read(&projection_path).unwrap(), projection_before);
+        assert_eq!(
+            fs::read(&config.manage.state_path).unwrap(),
+            managed_state_before
+        );
+        assert!(!update_dir.exists());
+        assert!(!shared_data.exists());
+        assert!(!shared_boot.exists());
+        assert!(!shared_cache.exists());
+        assert!(!shared_build.exists());
+        assert!(!shared_releases.exists());
+    }
+
     #[test]
     fn update_only_report_requires_scope_update_and_persistence_acknowledgement() {
         let expected = ExpectedUpdateReport {
             status: "failed".to_string(),
             attempt_id: "a".repeat(32),
+            current_version: "0.1.1".to_string(),
         };
         let mut receipt = ForgeReportReceipt {
             update_acknowledged: false,
@@ -9268,6 +9411,7 @@ mod tests {
         let expected = ExpectedUpdateReport {
             status: "failed".to_string(),
             attempt_id: "a".repeat(32),
+            current_version: "0.1.1".to_string(),
         };
 
         assert!(

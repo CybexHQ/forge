@@ -153,24 +153,61 @@ terminal updater record:
 cybex-forge-sync-once \
   --update-only \
   --expect-update-status failed \
-  --expect-update-attempt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  --expect-update-attempt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --expect-update-current-version 0.1.1
 ```
 
-`--update-only` is independently usable for cleanup and baseline receipts. It
-branches before Forge directory setup, SQLite connection/migration, protected
-build remediation, and every Boot, Build, and Cache read or mutation. It reads
-only the explicitly loaded config, adopted managed signing state, and updater
-status, then posts a signed `report_scope: "update_only"` body whose sole
-capability is `updater_v1` to the dedicated
+`--update-only` branches before Forge directory setup, SQLite
+connection/migration, protected build remediation, and every Boot, Build, and
+Cache read or mutation. Without a projection file it reads only an existing,
+updater-owned `status.json`; absence is an error. In particular, this path
+never invents an idle status or current version from the qualification control
+binary.
+
+Baseline and restore reporting uses an explicit idle projection. The file is a
+bounded, owner-controlled regular JSON file at an absolute path, is not
+group/world writable, and has no unknown fields:
+
+```json
+{
+  "schema": "cybex.forge.update-projection.v1",
+  "status": "idle",
+  "attempt_id": "",
+  "current_version": "0.1.1"
+}
+```
+
+The projection is restricted to canonical idle state; active and terminal
+updates must come from updater-owned durable status. A typical remote
+qualification unit makes the projection root-owned and service-group-readable
+(`root:cybex-forge`, mode `0640`), then runs:
+
+```bash
+cybex-forge-sync-once \
+  --update-only \
+  --update-projection-file /run/cybex-forge/idle-projection.json \
+  --expect-update-status idle \
+  --expect-update-attempt '' \
+  --expect-update-current-version 0.1.1
+```
+
+The projection option requires the complete status, attempt, and current
+version fence. Idle requires an empty attempt; every non-idle durable status
+requires a 32-character lowercase hexadecimal attempt. Versions use Manage's
+canonical release-version domain.
+
+After selecting and fencing the status, Forge posts a signed
+`report_scope: "update_only"` body whose sole capability is `updater_v1` to the
+dedicated
 `/v1/agent/devices/{device_id}/forge/update-report` route. An older Manage
 therefore returns `404` before any full-report mutation. A compatible Manage
 must echo that scope, return `update: true`, and confirm the exact persisted
 status/attempt with a valid report timestamp.
 
-The two expectation flags are an optional required pair that strengthens
-`--update-only`. When present, the command validates the local status and
-32-character lowercase hexadecimal attempt ID before sending. A successful
-receipt uses schema `cybex.forge.sync-once.v1` and records `outcome`,
+The three expectation flags are an optional required set for durable status
+and mandatory for an explicit projection. When present, Forge validates the
+local status, attempt, and current version before sending. A successful receipt
+uses schema `cybex.forge.sync-once.v1` and records `outcome`,
 `report_posted`, `update_included`, `update_acknowledged`, plus the non-secret
 updater status, attempt, stage, versions, and progress. Updater error text is
 deliberately excluded because transport failures can contain

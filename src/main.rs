@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, bail};
 use axum::serve as axum_serve;
@@ -40,9 +40,17 @@ async fn main() -> anyhow::Result<()> {
         return cybex_forge::manage::apply_runtime_config_once(&config).await;
     }
 
-    if let CommandStartup::UpdateOnly(expected_update) = command_startup(&command)? {
-        let outcome =
-            cybex_forge::manage::sync_update_report_once(&config, expected_update.as_ref()).await?;
+    if let CommandStartup::UpdateOnly {
+        projection_file,
+        expected_update,
+    } = command_startup(&command)?
+    {
+        let outcome = cybex_forge::manage::sync_update_report_once(
+            &config,
+            projection_file.as_deref(),
+            expected_update.as_ref(),
+        )
+        .await?;
         println!("{}", serde_json::to_string(&outcome)?);
         return Ok(());
     }
@@ -86,11 +94,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::SyncOnce {
             update_only,
+            update_projection_file,
             expect_update_status,
             expect_update_attempt,
+            expect_update_current_version,
         } => {
             debug_assert!(
-                !update_only && expect_update_status.is_none() && expect_update_attempt.is_none()
+                !update_only
+                    && update_projection_file.is_none()
+                    && expect_update_status.is_none()
+                    && expect_update_attempt.is_none()
+                    && expect_update_current_version.is_none()
             );
             let state = AppState::new(config, pool);
             let outcome = cybex_forge::manage::sync_once(&state).await?;
@@ -107,29 +121,61 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CommandStartup {
     DatabaseBacked,
-    UpdateOnly(Option<ExpectedUpdateReport>),
+    UpdateOnly {
+        projection_file: Option<PathBuf>,
+        expected_update: Option<ExpectedUpdateReport>,
+    },
 }
 
 fn command_startup(command: &Command) -> anyhow::Result<CommandStartup> {
     let Command::SyncOnce {
         update_only,
+        update_projection_file,
         expect_update_status,
         expect_update_attempt,
+        expect_update_current_version,
     } = command
     else {
         return Ok(CommandStartup::DatabaseBacked);
     };
-    match (*update_only, expect_update_status, expect_update_attempt) {
-        (true, Some(status), Some(attempt_id)) => {
-            Ok(CommandStartup::UpdateOnly(Some(ExpectedUpdateReport {
-                status: status.clone(),
-                attempt_id: attempt_id.clone(),
-            })))
+    match (
+        *update_only,
+        expect_update_status,
+        expect_update_attempt,
+        expect_update_current_version,
+    ) {
+        (true, Some(status), Some(attempt_id), Some(current_version)) => {
+            if update_projection_file.is_some() && status != "idle" {
+                bail!("explicit update-only Forge projections are restricted to idle status");
+            }
+            if status == "idle" && !attempt_id.is_empty() {
+                bail!("idle update-only Forge sync requires an empty expected attempt ID");
+            }
+            if status != "idle" && attempt_id.is_empty() {
+                bail!(
+                    "non-idle update-only Forge sync requires a 32-character expected attempt ID"
+                );
+            }
+            Ok(CommandStartup::UpdateOnly {
+                projection_file: update_projection_file.clone(),
+                expected_update: Some(ExpectedUpdateReport {
+                    status: status.clone(),
+                    attempt_id: attempt_id.clone(),
+                    current_version: current_version.clone(),
+                }),
+            })
         }
-        (true, None, None) => Ok(CommandStartup::UpdateOnly(None)),
-        (false, None, None) => Ok(CommandStartup::DatabaseBacked),
+        (true, None, None, None) if update_projection_file.is_none() => {
+            Ok(CommandStartup::UpdateOnly {
+                projection_file: None,
+                expected_update: None,
+            })
+        }
+        (false, None, None, None) if update_projection_file.is_none() => {
+            Ok(CommandStartup::DatabaseBacked)
+        }
         _ => bail!(
-            "update-only Forge sync requires both update expectation arguments when either is set"
+            "update-only Forge sync requires all three update expectation arguments when any is set"
         ),
     }
 }
@@ -258,6 +304,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use cybex_forge::config::AppConfig;
 
     use super::{Command, CommandStartup, command_startup, managed_command_requires_service_user};
@@ -274,8 +322,10 @@ mod tests {
             Command::Enroll,
             Command::SyncOnce {
                 update_only: false,
+                update_projection_file: None,
                 expect_update_status: None,
                 expect_update_attempt: None,
+                expect_update_current_version: None,
             },
         ] {
             assert!(managed_command_requires_service_user(&config, &command));
@@ -294,8 +344,10 @@ mod tests {
             &config,
             &Command::SyncOnce {
                 update_only: false,
+                update_projection_file: None,
                 expect_update_status: None,
                 expect_update_attempt: None,
+                expect_update_current_version: None,
             }
         ));
     }
@@ -304,19 +356,29 @@ mod tests {
     fn update_only_sync_uses_the_database_free_startup_path() {
         let command = Command::SyncOnce {
             update_only: true,
-            expect_update_status: Some("failed".to_string()),
-            expect_update_attempt: Some("a".repeat(32)),
+            update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
+            expect_update_status: Some("idle".to_string()),
+            expect_update_attempt: Some(String::new()),
+            expect_update_current_version: Some("0.1.1".to_string()),
         };
 
         let startup = command_startup(&command).unwrap();
 
-        assert!(matches!(&startup, CommandStartup::UpdateOnly(Some(_))));
+        assert!(matches!(
+            &startup,
+            CommandStartup::UpdateOnly {
+                projection_file: Some(_),
+                expected_update: Some(_),
+            }
+        ));
         assert_ne!(startup, CommandStartup::DatabaseBacked);
         assert_eq!(
             command_startup(&Command::SyncOnce {
                 update_only: false,
+                update_projection_file: None,
                 expect_update_status: None,
                 expect_update_attempt: None,
+                expect_update_current_version: None,
             })
             .unwrap(),
             CommandStartup::DatabaseBacked
@@ -324,11 +386,49 @@ mod tests {
         assert_eq!(
             command_startup(&Command::SyncOnce {
                 update_only: true,
+                update_projection_file: None,
                 expect_update_status: None,
                 expect_update_attempt: None,
+                expect_update_current_version: None,
             })
             .unwrap(),
-            CommandStartup::UpdateOnly(None)
+            CommandStartup::UpdateOnly {
+                projection_file: None,
+                expected_update: None,
+            }
         );
+
+        for invalid in [
+            Command::SyncOnce {
+                update_only: true,
+                update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
+                expect_update_status: None,
+                expect_update_attempt: None,
+                expect_update_current_version: None,
+            },
+            Command::SyncOnce {
+                update_only: true,
+                update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
+                expect_update_status: Some("failed".to_string()),
+                expect_update_attempt: Some("a".repeat(32)),
+                expect_update_current_version: Some("0.1.1".to_string()),
+            },
+            Command::SyncOnce {
+                update_only: true,
+                update_projection_file: None,
+                expect_update_status: Some("idle".to_string()),
+                expect_update_attempt: Some("a".repeat(32)),
+                expect_update_current_version: Some("0.1.1".to_string()),
+            },
+            Command::SyncOnce {
+                update_only: true,
+                update_projection_file: None,
+                expect_update_status: Some("failed".to_string()),
+                expect_update_attempt: Some(String::new()),
+                expect_update_current_version: Some("0.1.1".to_string()),
+            },
+        ] {
+            assert!(command_startup(&invalid).is_err());
+        }
     }
 }

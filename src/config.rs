@@ -43,21 +43,55 @@ pub enum Command {
         #[arg(long)]
         update_only: bool,
 
+        /// Read an explicit, sanitized updater projection instead of status.json.
+        #[arg(
+            long,
+            requires_all = [
+                "update_only",
+                "expect_update_status",
+                "expect_update_attempt",
+                "expect_update_current_version"
+            ],
+            value_name = "ABSOLUTE_JSON_PATH"
+        )]
+        update_projection_file: Option<PathBuf>,
+
         /// Fail unless the Forge report contains this exact updater status.
         #[arg(
             long,
-            requires_all = ["update_only", "expect_update_attempt"],
+            requires_all = [
+                "update_only",
+                "expect_update_attempt",
+                "expect_update_current_version"
+            ],
             value_parser = parse_expected_update_status
         )]
         expect_update_status: Option<String>,
 
-        /// Fail unless the Forge report contains this exact updater attempt ID.
+        /// Fail unless the report contains this attempt ID (empty only for idle).
         #[arg(
             long,
-            requires_all = ["update_only", "expect_update_status"],
+            requires_all = [
+                "update_only",
+                "expect_update_status",
+                "expect_update_current_version"
+            ],
             value_parser = parse_expected_update_attempt
         )]
         expect_update_attempt: Option<String>,
+
+        /// Fail unless the report contains this exact current Forge version.
+        #[arg(
+            long,
+            requires_all = [
+                "update_only",
+                "expect_update_status",
+                "expect_update_attempt"
+            ],
+            allow_hyphen_values = true,
+            value_parser = parse_expected_update_version
+        )]
+        expect_update_current_version: Option<String>,
     },
     ApplyRuntimeConfig,
     PrintConfig,
@@ -88,17 +122,34 @@ fn parse_expected_update_status(value: &str) -> Result<String, String> {
 }
 
 fn parse_expected_update_attempt(value: &str) -> Result<String, String> {
-    if value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    if value.is_empty()
+        || (value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
     {
         Ok(value.to_string())
     } else {
         Err(
-            "expected updater attempt must be exactly 32 lowercase hexadecimal characters"
+            "expected updater attempt must be empty for idle or exactly 32 lowercase hexadecimal characters"
                 .to_string(),
         )
+    }
+}
+
+fn parse_expected_update_version(value: &str) -> Result<String, String> {
+    if !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('-')
+        && !value.ends_with(['-', '.'])
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err("expected updater current version is not canonical".to_string())
     }
 }
 
@@ -937,21 +988,27 @@ mod tests {
             "failed",
             "--expect-update-attempt",
             &attempt_id,
+            "--expect-update-current-version",
+            "0.1.1",
         ])
         .unwrap();
 
         assert_eq!(cli.config, PathBuf::from("/tmp/qualification.toml"));
         let Some(Command::SyncOnce {
             update_only,
+            update_projection_file,
             expect_update_status,
             expect_update_attempt,
+            expect_update_current_version,
         }) = cli.command
         else {
             panic!("expected sync-once command");
         };
         assert!(update_only);
+        assert!(update_projection_file.is_none());
         assert_eq!(expect_update_status.as_deref(), Some("failed"));
         assert_eq!(expect_update_attempt.as_deref(), Some(attempt_id.as_str()));
+        assert_eq!(expect_update_current_version.as_deref(), Some("0.1.1"));
     }
 
     #[test]
@@ -970,6 +1027,8 @@ mod tests {
                 "failed",
                 "--expect-update-attempt",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-update-current-version",
+                "0.1.1",
             ],
         ] {
             let error = Cli::try_parse_from(args).unwrap_err();
@@ -988,10 +1047,61 @@ mod tests {
             cli.command,
             Some(Command::SyncOnce {
                 update_only: true,
+                update_projection_file: None,
                 expect_update_status: None,
                 expect_update_attempt: None,
+                expect_update_current_version: None,
             })
         ));
+    }
+
+    #[test]
+    fn sync_once_cli_accepts_a_fenced_idle_projection() {
+        let cli = Cli::try_parse_from([
+            "cybex-forge",
+            "sync-once",
+            "--update-only",
+            "--update-projection-file",
+            "/run/cybex-forge/idle-projection.json",
+            "--expect-update-status",
+            "idle",
+            "--expect-update-attempt",
+            "",
+            "--expect-update-current-version",
+            "0.1.1",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::SyncOnce {
+                update_only: true,
+                update_projection_file: Some(path),
+                expect_update_status: Some(status),
+                expect_update_attempt: Some(attempt),
+                expect_update_current_version: Some(current_version),
+            }) if path == PathBuf::from("/run/cybex-forge/idle-projection.json")
+                && status == "idle"
+                && attempt.is_empty()
+                && current_version == "0.1.1"
+        ));
+    }
+
+    #[test]
+    fn sync_once_cli_requires_a_full_fence_for_a_projection() {
+        let error = Cli::try_parse_from([
+            "cybex-forge",
+            "sync-once",
+            "--update-only",
+            "--update-projection-file",
+            "/run/cybex-forge/idle-projection.json",
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
@@ -1005,6 +1115,8 @@ mod tests {
                 "unexpected",
                 "--expect-update-attempt",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-update-current-version",
+                "0.1.1",
             ],
             vec![
                 "cybex-forge",
@@ -1014,6 +1126,41 @@ mod tests {
                 "failed",
                 "--expect-update-attempt",
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--expect-update-current-version",
+                "0.1.1",
+            ],
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--update-only",
+                "--expect-update-status",
+                "failed",
+                "--expect-update-attempt",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-update-current-version",
+                "0..1",
+            ],
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--update-only",
+                "--expect-update-status",
+                "failed",
+                "--expect-update-attempt",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-update-current-version",
+                "-0.1.1",
+            ],
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--update-only",
+                "--expect-update-status",
+                "failed",
+                "--expect-update-attempt",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-update-current-version",
+                "0.1.1.",
             ],
         ] {
             let error = Cli::try_parse_from(args).unwrap_err();
