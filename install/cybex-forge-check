@@ -1405,8 +1405,8 @@ check_file_contains "TFTP listens on IPv4 wildcard" /etc/default/tftpd-hpa 'TFTP
 check_file_contains "TFTP uses secure IPv4 options" /etc/default/tftpd-hpa 'TFTP_OPTIONS="--ipv4 --secure"'
 check_path_stat "Boot binary permissions" /usr/local/bin/cybex-forge "root:root 755"
 check_path_stat "sync helper permissions" /usr/local/sbin/cybex-forge-sync-once "root:root 755"
-check_file_contains "sync helper drops root to service user" /usr/local/sbin/cybex-forge-sync-once 'exec runuser -u cybex-forge -- /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once'
-check_file_contains "sync helper uses service config" /usr/local/sbin/cybex-forge-sync-once 'exec /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once'
+check_file_contains "sync helper drops root to service user and forwards arguments" /usr/local/sbin/cybex-forge-sync-once 'exec runuser -u cybex-forge -- /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"'
+check_file_contains "sync helper uses service config and forwards arguments" /usr/local/sbin/cybex-forge-sync-once 'exec /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"'
 check_path_stat "checker permissions" /usr/local/bin/cybex-forge-check "root:root 755"
 check_file_contains "Nix enables flake build commands" /etc/nix/nix.conf "experimental-features = nix-command flakes"
 check_file_contains "Nix trusts Forge build user" /etc/nix/nix.conf "trusted-users = root cybex-forge"

@@ -75,9 +75,23 @@ async fn main() -> anyhow::Result<()> {
             let state = AppState::new(config, pool);
             cybex_forge::manage::enroll_once(&state).await
         }
-        Command::SyncOnce => {
+        Command::SyncOnce {
+            expect_update_status,
+            expect_update_attempt,
+        } => {
             let state = AppState::new(config, pool);
-            cybex_forge::manage::sync_once(&state).await
+            let expected_update =
+                expect_update_status
+                    .zip(expect_update_attempt)
+                    .map(
+                        |(status, attempt_id)| cybex_forge::manage::ExpectedUpdateReport {
+                            status,
+                            attempt_id,
+                        },
+                    );
+            let outcome = cybex_forge::manage::sync_once(&state, expected_update.as_ref()).await?;
+            println!("{}", serde_json::to_string(&outcome)?);
+            Ok(())
         }
         Command::ApplyRuntimeConfig => {
             unreachable!("apply-runtime-config exits before database setup")
@@ -202,7 +216,9 @@ fn init_tracing() {
         .unwrap_or_else(|_| EnvFilter::new("cybex_forge=info,tower_http=info"));
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        // Operational logs belong on stderr so one-shot commands can reserve
+        // stdout for stable machine-readable results.
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 }
 
@@ -222,7 +238,10 @@ mod tests {
             Command::Migrate,
             Command::ScanIsos,
             Command::Enroll,
-            Command::SyncOnce,
+            Command::SyncOnce {
+                expect_update_status: None,
+                expect_update_attempt: None,
+            },
         ] {
             assert!(managed_command_requires_service_user(&config, &command));
         }
@@ -238,7 +257,10 @@ mod tests {
         config.manage.enabled = false;
         assert!(!managed_command_requires_service_user(
             &config,
-            &Command::SyncOnce
+            &Command::SyncOnce {
+                expect_update_status: None,
+                expect_update_attempt: None,
+            }
         ));
     }
 }

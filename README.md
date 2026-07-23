@@ -143,6 +143,31 @@ all managed configuration files, installs changes atomically, validates nginx,
 restarts and verifies all local boot services, probes cached PXE, and restores
 the previous files and services if any stage fails.
 
+`sync-once` writes a versioned JSON receipt to stdout after a successful
+one-shot managed sync; operational logs remain on stderr. The installed
+`cybex-forge-sync-once` wrapper forwards command arguments while dropping root
+to the service account. Update qualification can fence a report to one exact
+terminal updater record:
+
+```bash
+cybex-forge-sync-once \
+  --expect-update-status failed \
+  --expect-update-attempt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+The two expectation flags are a required pair. Fenced mode uses the explicitly
+loaded service config and only posts the signed Forge report after adoption; it
+does not apply unrelated desired Boot, Build, or Cache state. It fails if the
+local report omits the updater, its status or 32-character lowercase
+hexadecimal attempt ID differs, the Forge report is not accepted, or Manage
+does not acknowledge it with `update: true`. A successful receipt uses schema
+`cybex.forge.sync-once.v1` and records `outcome`, `report_posted`,
+`update_included`, `update_acknowledged`, plus the non-secret updater status,
+attempt, stage, versions, and progress. Updater error text is deliberately
+excluded because transport failures can contain credential-bearing URLs.
+Plain `sync-once` retains the full production synchronization behavior and
+does not require a new Manage acknowledgement field.
+
 Managed ISO synchronization runs in a durable worker separate from the control
 and report loop. Each desired profile carries a generation and operation UUID;
 local state transitions and reports use both values, so a late completion can

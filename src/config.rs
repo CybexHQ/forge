@@ -38,9 +38,64 @@ pub enum Command {
     Migrate,
     ScanIsos,
     Enroll,
-    SyncOnce,
+    SyncOnce {
+        /// Fail unless the Forge report contains this exact updater status.
+        #[arg(
+            long,
+            requires = "expect_update_attempt",
+            value_parser = parse_expected_update_status
+        )]
+        expect_update_status: Option<String>,
+
+        /// Fail unless the Forge report contains this exact updater attempt ID.
+        #[arg(
+            long,
+            requires = "expect_update_status",
+            value_parser = parse_expected_update_attempt
+        )]
+        expect_update_attempt: Option<String>,
+    },
     ApplyRuntimeConfig,
     PrintConfig,
+}
+
+fn parse_expected_update_status(value: &str) -> Result<String, String> {
+    if matches!(
+        value,
+        "idle"
+            | "requested"
+            | "waiting"
+            | "preflight"
+            | "downloading"
+            | "verifying"
+            | "staged"
+            | "applying"
+            | "restarting"
+            | "health_checking"
+            | "succeeded"
+            | "failed"
+            | "rolled_back"
+            | "unsupported"
+    ) {
+        Ok(value.to_string())
+    } else {
+        Err("expected updater status is not supported".to_string())
+    }
+}
+
+fn parse_expected_update_attempt(value: &str) -> Result<String, String> {
+    if value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(
+            "expected updater attempt must be exactly 32 lowercase hexadecimal characters"
+                .to_string(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -863,6 +918,74 @@ mod tests {
 
         assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(result.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn sync_once_cli_accepts_an_exact_update_fence() {
+        let attempt_id = "a".repeat(32);
+        let cli = Cli::try_parse_from([
+            "cybex-forge",
+            "--config",
+            "/tmp/qualification.toml",
+            "sync-once",
+            "--expect-update-status",
+            "failed",
+            "--expect-update-attempt",
+            &attempt_id,
+        ])
+        .unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/qualification.toml"));
+        let Some(Command::SyncOnce {
+            expect_update_status,
+            expect_update_attempt,
+        }) = cli.command
+        else {
+            panic!("expected sync-once command");
+        };
+        assert_eq!(expect_update_status.as_deref(), Some("failed"));
+        assert_eq!(expect_update_attempt.as_deref(), Some(attempt_id.as_str()));
+    }
+
+    #[test]
+    fn sync_once_cli_requires_the_complete_update_fence() {
+        let error = Cli::try_parse_from([
+            "cybex-forge",
+            "sync-once",
+            "--expect-update-status",
+            "failed",
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn sync_once_cli_rejects_noncanonical_update_fences() {
+        for args in [
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--expect-update-status",
+                "unexpected",
+                "--expect-update-attempt",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--expect-update-status",
+                "failed",
+                "--expect-update-attempt",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
     }
 
     #[test]

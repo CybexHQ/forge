@@ -206,6 +206,12 @@ struct AgentForgeConfigResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ForgeReportResponse {
+    #[serde(default)]
+    update: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct ManagedDeletedCacheArtifact {
     artifact_type: String,
     hash: String,
@@ -550,10 +556,82 @@ struct AssetScanReport {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SyncOutcome {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedUpdateReport {
+    pub status: String,
+    pub attempt_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncOnceUpdaterReport {
+    pub status: String,
+    pub attempt_id: String,
+    pub stage: String,
+    pub target_version: String,
+    pub current_version: String,
+    pub progress_percent: Option<i32>,
+}
+
+impl From<&ForgeUpdateStatusReport> for SyncOnceUpdaterReport {
+    fn from(status: &ForgeUpdateStatusReport) -> Self {
+        Self {
+            status: status.status.clone(),
+            attempt_id: status.attempt_id.clone(),
+            stage: status.stage.clone(),
+            target_version: status.target_version.clone(),
+            current_version: status.current_version.clone(),
+            progress_percent: status.progress_percent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncOnceDisposition {
     Synced,
     PendingEnrollment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncOnceReport {
+    pub schema: &'static str,
+    pub outcome: SyncOnceDisposition,
+    /// True only after Manage accepted and returned JSON for the signed Forge
+    /// report. Boot reports are intentionally not counted here.
+    pub report_posted: bool,
+    pub update_included: bool,
+    pub update_acknowledged: bool,
+    pub updater: Option<SyncOnceUpdaterReport>,
+}
+
+impl SyncOnceReport {
+    fn pending_enrollment() -> Self {
+        Self {
+            schema: "cybex.forge.sync-once.v1",
+            outcome: SyncOnceDisposition::PendingEnrollment,
+            report_posted: false,
+            update_included: false,
+            update_acknowledged: false,
+            updater: None,
+        }
+    }
+
+    fn synced(receipt: ForgeReportReceipt) -> Self {
+        Self {
+            schema: "cybex.forge.sync-once.v1",
+            outcome: SyncOnceDisposition::Synced,
+            report_posted: true,
+            update_included: receipt.updater.is_some(),
+            update_acknowledged: receipt.update_acknowledged,
+            updater: receipt.updater,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ForgeReportReceipt {
+    update_acknowledged: bool,
+    updater: Option<SyncOnceUpdaterReport>,
 }
 
 #[derive(Debug)]
@@ -574,11 +652,11 @@ pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         let mut consecutive_failures: u32 = 0;
         loop {
-            let interval = match sync_once_with_outcome(&state).await {
-                Ok(outcome) => {
+            let interval = match sync_once_with_outcome(&state, None).await {
+                Ok(report) => {
                     consecutive_failures = 0;
                     let normal_interval =
-                        managed_sync_interval_seconds(&state.config.manage, outcome);
+                        managed_sync_interval_seconds(&state.config.manage, report.outcome);
                     match db::active_build_job_count(&state.db).await {
                         Ok(active_builds) => {
                             active_managed_sync_interval_seconds(normal_interval, active_builds > 0)
@@ -629,8 +707,13 @@ pub async fn enroll_once(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync_once(state: &AppState) -> Result<()> {
-    sync_once_with_outcome(state).await.map(|_| ())
+pub async fn sync_once(
+    state: &AppState,
+    expected_update: Option<&ExpectedUpdateReport>,
+) -> Result<SyncOnceReport> {
+    let report = sync_once_with_outcome(state, expected_update).await?;
+    validate_sync_once_report(&report, expected_update)?;
+    Ok(report)
 }
 
 pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
@@ -696,7 +779,10 @@ fn acquire_runtime_apply_lock() -> Result<AdvisoryFileLock> {
         .context("open managed runtime apply lock")
 }
 
-async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
+async fn sync_once_with_outcome(
+    state: &AppState,
+    expected_update: Option<&ExpectedUpdateReport>,
+) -> Result<SyncOnceReport> {
     ensure_manage_enabled(state)?;
     let _state_lock = acquire_managed_state_lock(&state.config)?;
     let mut managed = load_managed_state(state)?;
@@ -705,7 +791,17 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     save_managed_state(state, &managed)?;
     if !ensure_enrolled(state, &mut managed).await? {
         save_managed_state(state, &managed)?;
-        return Ok(SyncOutcome::PendingEnrollment);
+        return Ok(SyncOnceReport::pending_enrollment());
+    }
+
+    // A fenced one-shot is an evidence operation for an already-adopted
+    // updater. Report the exact local updater record without also applying
+    // unrelated desired Boot/Build/Cache state or transiently claiming the
+    // control binary's package version as the running Boot service version.
+    if expected_update.is_some() {
+        let forge_report = report_forge_state(state, &managed, expected_update).await?;
+        save_managed_state(state, &managed)?;
+        return Ok(SyncOnceReport::synced(forge_report));
     }
 
     if has_unreported_known_profile_events(&state.db, managed.last_reported_event_id).await? {
@@ -716,9 +812,9 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOutcome> {
     apply_boot_config(state, &config).await?;
     let profile_sync = current_profile_sync_reports(&state.db).await?;
     report_boot_state(state, &mut managed, profile_sync).await?;
-    sync_forge_foundation(state, &managed).await?;
+    let forge_report = sync_forge_foundation(state, &managed, expected_update).await?;
     save_managed_state(state, &managed)?;
-    Ok(SyncOutcome::Synced)
+    Ok(SyncOnceReport::synced(forge_report))
 }
 
 #[derive(Debug, FromRow)]
@@ -1031,7 +1127,11 @@ async fn report_boot_state(
     Ok(())
 }
 
-async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Result<()> {
+async fn sync_forge_foundation(
+    state: &AppState,
+    managed: &ManagedState,
+    expected_update: Option<&ExpectedUpdateReport>,
+) -> Result<ForgeReportReceipt> {
     let desired = fetch_forge_config(state, managed).await?;
     if desired.build_jobs.len() > MAX_MANAGED_BUILD_JOBS {
         bail!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs");
@@ -1078,7 +1178,7 @@ async fn sync_forge_foundation(state: &AppState, managed: &ManagedState) -> Resu
     crate::cache::enforce_retention(&state.db, &state.config).await?;
     crate::updater::store_update_request(&state.config, desired.update).await?;
 
-    report_forge_state(state, managed).await
+    report_forge_state(state, managed, expected_update).await
 }
 
 async fn fetch_forge_config(
@@ -1098,10 +1198,17 @@ async fn fetch_forge_config(
     Ok(config)
 }
 
-async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<()> {
+async fn report_forge_state(
+    state: &AppState,
+    managed: &ManagedState,
+    expected_update: Option<&ExpectedUpdateReport>,
+) -> Result<ForgeReportReceipt> {
+    let fenced = expected_update.is_some();
     let build_jobs = db::list_build_jobs(&state.db).await?;
-    if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
-        warn!(error = %err, "Forge cache integrity scrub failed");
+    if !fenced {
+        if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
+            warn!(error = %err, "Forge cache integrity scrub failed");
+        }
     }
     let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
     let cache_inventory = db::cache_inventory_state(&state.db).await?;
@@ -1129,7 +1236,9 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
         host: crate::host::sample().await,
     };
-    let (_body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
+    let (body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
+    validate_expected_update_report(body.update.as_ref(), expected_update)?;
+    let updater = body.update.as_ref().map(SyncOnceUpdaterReport::from);
     let device_id = managed_device_id(managed)?;
     let path = format!("/v1/agent/devices/{device_id}/forge/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)
@@ -1138,7 +1247,72 @@ async fn report_forge_state(state: &AppState, managed: &ManagedState) -> Result<
         .send()
         .await
         .context("report managed forge state request failed")?;
-    parse_success_json::<Value>(response, "report managed forge state").await?;
+    let response =
+        parse_success_json::<ForgeReportResponse>(response, "report managed forge state").await?;
+    let receipt = ForgeReportReceipt {
+        update_acknowledged: response.update,
+        updater,
+    };
+    validate_forge_report_receipt(&receipt, expected_update)?;
+    Ok(receipt)
+}
+
+fn validate_expected_update_report(
+    actual: Option<&ForgeUpdateStatusReport>,
+    expected: Option<&ExpectedUpdateReport>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = actual.ok_or_else(|| {
+        anyhow!("fenced Forge sync did not include a local updater status report")
+    })?;
+    if actual.status != expected.status {
+        bail!(
+            "fenced Forge sync updater status mismatch: expected {}, got {}",
+            expected.status,
+            actual.status
+        );
+    }
+    if actual.attempt_id != expected.attempt_id {
+        bail!(
+            "fenced Forge sync updater attempt mismatch: expected {}, got {}",
+            expected.attempt_id,
+            actual.attempt_id
+        );
+    }
+    Ok(())
+}
+
+fn validate_forge_report_receipt(
+    receipt: &ForgeReportReceipt,
+    expected: Option<&ExpectedUpdateReport>,
+) -> Result<()> {
+    if expected.is_some() && !receipt.update_acknowledged {
+        bail!("Manage did not acknowledge the fenced Forge update report");
+    }
+    Ok(())
+}
+
+fn validate_sync_once_report(
+    report: &SyncOnceReport,
+    expected: Option<&ExpectedUpdateReport>,
+) -> Result<()> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    if report.outcome != SyncOnceDisposition::Synced {
+        bail!("fenced Forge sync requires an adopted node");
+    }
+    if !report.report_posted {
+        bail!("fenced Forge sync did not post a Forge report");
+    }
+    if !report.update_included {
+        bail!("fenced Forge sync did not include an updater report");
+    }
+    if !report.update_acknowledged {
+        bail!("Manage did not acknowledge the fenced Forge update report");
+    }
     Ok(())
 }
 
@@ -4305,10 +4479,10 @@ fn bounded_http_timeout_seconds(value: u64) -> u64 {
     value.clamp(1, 300)
 }
 
-fn managed_sync_interval_seconds(config: &ManageConfig, outcome: SyncOutcome) -> u64 {
+fn managed_sync_interval_seconds(config: &ManageConfig, outcome: SyncOnceDisposition) -> u64 {
     match outcome {
-        SyncOutcome::Synced => config.sync_interval_seconds.clamp(5, 3600),
-        SyncOutcome::PendingEnrollment => config.enrollment_poll_seconds.clamp(1, 300),
+        SyncOnceDisposition::Synced => config.sync_interval_seconds.clamp(5, 3600),
+        SyncOnceDisposition::PendingEnrollment => config.enrollment_poll_seconds.clamp(1, 300),
     }
 }
 
@@ -6267,12 +6441,13 @@ mod tests {
         AgentBootConfigResponse, BootAgentAssetReport, BootAgentClientReport, BootAgentEventReport,
         BootAgentReportRequest, BootAgentSettingsReport, CYBEX_COMPONENT_PROTOCOL_VERSION,
         CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract, EnrollmentResponse,
-        MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS,
-        MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS,
-        MAX_PROFILE_RAW_SCRIPT_BYTES, MAX_REPORT_CLIENTS, ManagedBootClient, ManagedBootProfile,
-        ManagedBootSettings, ManagedState, NIXOS_NETBOOT_INITRD_FORMAT,
-        NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings,
-        SyncOutcome, acquire_managed_state_lock, active_managed_sync_interval_seconds,
+        ExpectedUpdateReport, ForgeReportReceipt, MAX_DEVICE_HOSTNAME_CHARS,
+        MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
+        MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
+        MAX_REPORT_CLIENTS, ManagedBootClient, ManagedBootProfile, ManagedBootSettings,
+        ManagedState, NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
+        NixosNetbootManifest, NormalizedManagedSettings, SyncOnceDisposition, SyncOnceReport,
+        SyncOnceUpdaterReport, acquire_managed_state_lock, active_managed_sync_interval_seconds,
         api_url_for_config, append_bounded_response_chunk_with_limit, apply_enrollment_response,
         asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
         canonical_agent_payload, clean_optional, current_boot_client_reports,
@@ -6291,8 +6466,9 @@ mod tests {
         rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
         sha256_hex, signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
         sync_deleted_profiles, sync_profiles, validate_boot_config,
-        validate_component_compatibility, validate_profile, write_newc_file_from_bytes,
-        write_newc_trailer, write_secure_json,
+        validate_component_compatibility, validate_expected_update_report,
+        validate_forge_report_receipt, validate_profile, validate_sync_once_report,
+        write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
     use crate::{
@@ -8567,11 +8743,11 @@ mod tests {
         };
 
         assert_eq!(
-            managed_sync_interval_seconds(&config, SyncOutcome::PendingEnrollment),
+            managed_sync_interval_seconds(&config, SyncOnceDisposition::PendingEnrollment),
             2
         );
         assert_eq!(
-            managed_sync_interval_seconds(&config, SyncOutcome::Synced),
+            managed_sync_interval_seconds(&config, SyncOnceDisposition::Synced),
             60
         );
 
@@ -8581,12 +8757,162 @@ mod tests {
             ..ManageConfig::default()
         };
         assert_eq!(
-            managed_sync_interval_seconds(&clamped, SyncOutcome::PendingEnrollment),
+            managed_sync_interval_seconds(&clamped, SyncOnceDisposition::PendingEnrollment),
             1
         );
         assert_eq!(
-            managed_sync_interval_seconds(&clamped, SyncOutcome::Synced),
+            managed_sync_interval_seconds(&clamped, SyncOnceDisposition::Synced),
             5
+        );
+    }
+
+    #[test]
+    fn fenced_update_report_requires_the_exact_status_and_attempt() {
+        let attempt_id = "a".repeat(32);
+        let expected = ExpectedUpdateReport {
+            status: "failed".to_string(),
+            attempt_id: attempt_id.clone(),
+        };
+        let mut actual = crate::updater::ForgeUpdateStatusReport {
+            status: "failed".to_string(),
+            stage: "failed".to_string(),
+            progress_percent: Some(100),
+            error: "sensitive diagnostic omitted from sync receipt".to_string(),
+            target_version: "0.1.2".to_string(),
+            current_version: "0.1.1".to_string(),
+            attempt_id,
+            started_at: None,
+            completed_at: Some("2026-07-23T10:00:00Z".to_string()),
+        };
+
+        validate_expected_update_report(Some(&actual), Some(&expected)).unwrap();
+        assert!(
+            validate_expected_update_report(None, Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("did not include")
+        );
+
+        actual.status = "idle".to_string();
+        assert!(
+            validate_expected_update_report(Some(&actual), Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("status mismatch")
+        );
+        actual.status = "failed".to_string();
+        actual.attempt_id = "b".repeat(32);
+        assert!(
+            validate_expected_update_report(Some(&actual), Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("attempt mismatch")
+        );
+    }
+
+    #[test]
+    fn fenced_update_report_requires_manage_acknowledgement() {
+        let expected = ExpectedUpdateReport {
+            status: "failed".to_string(),
+            attempt_id: "a".repeat(32),
+        };
+        let receipt = ForgeReportReceipt {
+            update_acknowledged: false,
+            updater: Some(SyncOnceUpdaterReport {
+                status: expected.status.clone(),
+                attempt_id: expected.attempt_id.clone(),
+                stage: "failed".to_string(),
+                target_version: "0.1.2".to_string(),
+                current_version: "0.1.1".to_string(),
+                progress_percent: Some(100),
+            }),
+        };
+
+        validate_forge_report_receipt(&receipt, None).unwrap();
+        assert!(
+            validate_forge_report_receipt(&receipt, Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("did not acknowledge")
+        );
+    }
+
+    #[test]
+    fn forge_report_response_requires_an_explicit_true_update_ack() {
+        let acknowledged: super::ForgeReportResponse =
+            serde_json::from_str(r#"{"status":"ok","update":true}"#).unwrap();
+        let legacy: super::ForgeReportResponse =
+            serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
+
+        assert!(acknowledged.update);
+        assert!(!legacy.update);
+        assert!(
+            serde_json::from_str::<super::ForgeReportResponse>(
+                r#"{"status":"ok","update":"true"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sync_once_receipt_is_structured_and_excludes_updater_error_text() {
+        let receipt = SyncOnceReport::synced(ForgeReportReceipt {
+            update_acknowledged: true,
+            updater: Some(SyncOnceUpdaterReport {
+                status: "failed".to_string(),
+                attempt_id: "a".repeat(32),
+                stage: "failed".to_string(),
+                target_version: "0.1.2".to_string(),
+                current_version: "0.1.1".to_string(),
+                progress_percent: Some(100),
+            }),
+        });
+        let value = serde_json::to_value(&receipt).unwrap();
+
+        assert_eq!(value["schema"], "cybex.forge.sync-once.v1");
+        assert_eq!(value["outcome"], "synced");
+        assert_eq!(value["report_posted"], true);
+        assert_eq!(value["update_included"], true);
+        assert_eq!(value["update_acknowledged"], true);
+        assert_eq!(value["updater"]["status"], "failed");
+        assert_eq!(value["updater"]["attempt_id"], "a".repeat(32));
+        assert!(value["updater"].get("error").is_none());
+    }
+
+    #[test]
+    fn fenced_sync_rejects_a_pending_or_unreported_outcome() {
+        let expected = ExpectedUpdateReport {
+            status: "failed".to_string(),
+            attempt_id: "a".repeat(32),
+        };
+
+        assert!(
+            validate_sync_once_report(&SyncOnceReport::pending_enrollment(), Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("adopted")
+        );
+
+        let unreported = SyncOnceReport {
+            schema: "cybex.forge.sync-once.v1",
+            outcome: SyncOnceDisposition::Synced,
+            report_posted: false,
+            update_included: true,
+            update_acknowledged: true,
+            updater: Some(SyncOnceUpdaterReport {
+                status: expected.status.clone(),
+                attempt_id: expected.attempt_id.clone(),
+                stage: "failed".to_string(),
+                target_version: "0.1.2".to_string(),
+                current_version: "0.1.1".to_string(),
+                progress_percent: Some(100),
+            }),
+        };
+        assert!(
+            validate_sync_once_report(&unreported, Some(&expected))
+                .unwrap_err()
+                .to_string()
+                .contains("did not post")
         );
     }
 

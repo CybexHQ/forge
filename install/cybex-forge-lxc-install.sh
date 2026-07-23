@@ -916,10 +916,10 @@ install_maintenance_tools() {
 set -euo pipefail
 
 if [ "$(id -u)" -eq 0 ]; then
-  exec runuser -u cybex-forge -- /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once
+  exec runuser -u cybex-forge -- /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"
 fi
 
-exec /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once
+exec /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"
 EOF
   chown root:root /usr/local/sbin/cybex-forge-sync-once
   chmod 0755 /usr/local/sbin/cybex-forge-sync-once
