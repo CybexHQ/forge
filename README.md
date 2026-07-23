@@ -174,8 +174,11 @@ receipt uses schema `cybex.forge.sync-once.v1` and records `outcome`,
 `report_posted`, `update_included`, `update_acknowledged`, plus the non-secret
 updater status, attempt, stage, versions, and progress. Updater error text is
 deliberately excluded because transport failures can contain
-credential-bearing URLs. Plain `sync-once` retains the full production
-synchronization behavior and does not require scoped acknowledgement fields.
+credential-bearing URLs. An update-only receipt also includes the validated
+literal `report_scope: "update_only"` and Manage's sanitized
+`persisted_update` acknowledgement (`status`, `attempt_id`, and
+`reported_at`). Plain `sync-once` retains the full production synchronization
+behavior and omits these scoped acknowledgement fields.
 
 Managed ISO synchronization runs in a durable worker separate from the control
 and report loop. Each desired profile carries a generation and operation UUID;

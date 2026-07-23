@@ -609,6 +609,13 @@ impl From<&ForgeUpdateStatusReport> for SyncOnceUpdaterReport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncOncePersistedUpdate {
+    pub status: String,
+    pub attempt_id: String,
+    pub reported_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncOnceDisposition {
@@ -625,6 +632,10 @@ pub struct SyncOnceReport {
     pub report_posted: bool,
     pub update_included: bool,
     pub update_acknowledged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_update: Option<SyncOncePersistedUpdate>,
     pub updater: Option<SyncOnceUpdaterReport>,
 }
 
@@ -636,6 +647,8 @@ impl SyncOnceReport {
             report_posted: false,
             update_included: false,
             update_acknowledged: false,
+            report_scope: None,
+            persisted_update: None,
             updater: None,
         }
     }
@@ -647,6 +660,8 @@ impl SyncOnceReport {
             report_posted: true,
             update_included: receipt.updater.is_some(),
             update_acknowledged: receipt.update_acknowledged,
+            report_scope: receipt.report_scope,
+            persisted_update: receipt.persisted_update,
             updater: receipt.updater,
         }
     }
@@ -657,6 +672,8 @@ struct ForgeReportReceipt {
     update_acknowledged: bool,
     scope_acknowledged: bool,
     persisted_update_acknowledged: bool,
+    report_scope: Option<&'static str>,
+    persisted_update: Option<SyncOncePersistedUpdate>,
     updater: Option<SyncOnceUpdaterReport>,
 }
 
@@ -795,6 +812,13 @@ pub async fn sync_update_report_once(
         update_acknowledged: response.update,
         scope_acknowledged: response.report_scope == FORGE_REPORT_SCOPE_UPDATE_ONLY,
         persisted_update_acknowledged,
+        report_scope: (response.report_scope == FORGE_REPORT_SCOPE_UPDATE_ONLY)
+            .then_some(FORGE_REPORT_SCOPE_UPDATE_ONLY),
+        persisted_update: persisted_update_acknowledged.then_some(SyncOncePersistedUpdate {
+            status: response.persisted_update.status,
+            attempt_id: response.persisted_update.attempt_id,
+            reported_at: response.persisted_update.reported_at,
+        }),
         updater: Some(updater),
     };
     validate_forge_report_receipt(&receipt, true)?;
@@ -1321,6 +1345,8 @@ async fn report_forge_state(
         update_acknowledged: response.update,
         scope_acknowledged: false,
         persisted_update_acknowledged: false,
+        report_scope: None,
+        persisted_update: None,
         updater,
     };
     Ok(receipt)
@@ -1390,6 +1416,21 @@ fn validate_update_only_sync_report(report: &SyncOnceReport) -> Result<()> {
     }
     if !report.update_acknowledged {
         bail!("Manage did not acknowledge the update-only Forge report");
+    }
+    if report.report_scope != Some(FORGE_REPORT_SCOPE_UPDATE_ONLY) {
+        bail!("update-only Forge sync receipt is missing its validated report scope");
+    }
+    let updater = report.updater.as_ref().ok_or_else(|| {
+        anyhow!("update-only Forge sync receipt is missing its updater projection")
+    })?;
+    let persisted = report.persisted_update.as_ref().ok_or_else(|| {
+        anyhow!("update-only Forge sync receipt is missing its persistence acknowledgement")
+    })?;
+    if persisted.status != updater.status
+        || persisted.attempt_id != updater.attempt_id
+        || chrono::DateTime::parse_from_rfc3339(&persisted.reported_at).is_err()
+    {
+        bail!("update-only Forge sync persistence acknowledgement changed");
     }
     Ok(())
 }
@@ -9026,6 +9067,15 @@ mod tests {
         assert!(report.report_posted);
         assert!(report.update_included);
         assert!(report.update_acknowledged);
+        assert_eq!(report.report_scope, Some(FORGE_REPORT_SCOPE_UPDATE_ONLY));
+        assert_eq!(
+            report.persisted_update,
+            Some(super::SyncOncePersistedUpdate {
+                status: "failed".to_string(),
+                attempt_id: "a".repeat(32),
+                reported_at: "2026-07-23T10:00:00Z".to_string(),
+            })
+        );
         assert_eq!(report.updater.as_ref().unwrap().status, "failed");
         assert!(!shared_data.exists());
         assert!(!shared_boot.exists());
@@ -9076,6 +9126,8 @@ mod tests {
             update_acknowledged: false,
             scope_acknowledged: false,
             persisted_update_acknowledged: false,
+            report_scope: None,
+            persisted_update: None,
             updater: Some(SyncOnceUpdaterReport {
                 status: expected.status.clone(),
                 attempt_id: expected.attempt_id.clone(),
@@ -9164,6 +9216,12 @@ mod tests {
             update_acknowledged: true,
             scope_acknowledged: true,
             persisted_update_acknowledged: true,
+            report_scope: Some(FORGE_REPORT_SCOPE_UPDATE_ONLY),
+            persisted_update: Some(super::SyncOncePersistedUpdate {
+                status: "failed".to_string(),
+                attempt_id: "a".repeat(32),
+                reported_at: "2026-07-23T10:00:00Z".to_string(),
+            }),
             updater: Some(SyncOnceUpdaterReport {
                 status: "failed".to_string(),
                 attempt_id: "a".repeat(32),
@@ -9180,9 +9238,29 @@ mod tests {
         assert_eq!(value["report_posted"], true);
         assert_eq!(value["update_included"], true);
         assert_eq!(value["update_acknowledged"], true);
+        assert_eq!(value["report_scope"], "update_only");
+        assert_eq!(value["persisted_update"]["status"], "failed");
+        assert_eq!(value["persisted_update"]["attempt_id"], "a".repeat(32));
+        assert_eq!(
+            value["persisted_update"]["reported_at"],
+            "2026-07-23T10:00:00Z"
+        );
+        assert!(value["persisted_update"].get("error").is_none());
         assert_eq!(value["updater"]["status"], "failed");
         assert_eq!(value["updater"]["attempt_id"], "a".repeat(32));
         assert!(value["updater"].get("error").is_none());
+
+        let normal_receipt = serde_json::to_value(SyncOnceReport::synced(ForgeReportReceipt {
+            update_acknowledged: false,
+            scope_acknowledged: false,
+            persisted_update_acknowledged: false,
+            report_scope: None,
+            persisted_update: None,
+            updater: None,
+        }))
+        .unwrap();
+        assert!(normal_receipt.get("report_scope").is_none());
+        assert!(normal_receipt.get("persisted_update").is_none());
     }
 
     #[test]
@@ -9205,6 +9283,12 @@ mod tests {
             report_posted: false,
             update_included: true,
             update_acknowledged: true,
+            report_scope: Some(FORGE_REPORT_SCOPE_UPDATE_ONLY),
+            persisted_update: Some(super::SyncOncePersistedUpdate {
+                status: expected.status.clone(),
+                attempt_id: expected.attempt_id.clone(),
+                reported_at: "2026-07-23T10:00:00Z".to_string(),
+            }),
             updater: Some(SyncOnceUpdaterReport {
                 status: expected.status.clone(),
                 attempt_id: expected.attempt_id.clone(),
@@ -9219,6 +9303,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("did not post")
+        );
+
+        let mut malformed = unreported;
+        malformed.report_posted = true;
+        malformed.report_scope = None;
+        assert!(
+            validate_update_only_sync_report(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("validated report scope")
+        );
+
+        malformed.report_scope = Some(FORGE_REPORT_SCOPE_UPDATE_ONLY);
+        malformed.persisted_update = None;
+        assert!(
+            validate_update_only_sync_report(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("persistence acknowledgement")
+        );
+
+        malformed.persisted_update = Some(super::SyncOncePersistedUpdate {
+            status: "idle".to_string(),
+            attempt_id: expected.attempt_id,
+            reported_at: "2026-07-23T10:00:00Z".to_string(),
+        });
+        assert!(
+            validate_update_only_sync_report(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("acknowledgement changed")
         );
     }
 
