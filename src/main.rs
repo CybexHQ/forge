@@ -6,7 +6,9 @@ use clap::Parser;
 use cybex_forge::{
     AppState, assets,
     config::{Cli, Command},
-    db, router,
+    db,
+    manage::ExpectedUpdateReport,
+    router,
 };
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
@@ -36,6 +38,13 @@ async fn main() -> anyhow::Result<()> {
 
     if matches!(command, Command::ApplyRuntimeConfig) {
         return cybex_forge::manage::apply_runtime_config_once(&config).await;
+    }
+
+    if let CommandStartup::UpdateOnly(expected_update) = command_startup(&command)? {
+        let outcome =
+            cybex_forge::manage::sync_update_report_once(&config, expected_update.as_ref()).await?;
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
     }
 
     if !config.manage.enabled && config.auth.admin_token == "change-me" {
@@ -76,20 +85,15 @@ async fn main() -> anyhow::Result<()> {
             cybex_forge::manage::enroll_once(&state).await
         }
         Command::SyncOnce {
+            update_only,
             expect_update_status,
             expect_update_attempt,
         } => {
+            debug_assert!(
+                !update_only && expect_update_status.is_none() && expect_update_attempt.is_none()
+            );
             let state = AppState::new(config, pool);
-            let expected_update =
-                expect_update_status
-                    .zip(expect_update_attempt)
-                    .map(
-                        |(status, attempt_id)| cybex_forge::manage::ExpectedUpdateReport {
-                            status,
-                            attempt_id,
-                        },
-                    );
-            let outcome = cybex_forge::manage::sync_once(&state, expected_update.as_ref()).await?;
+            let outcome = cybex_forge::manage::sync_once(&state).await?;
             println!("{}", serde_json::to_string(&outcome)?);
             Ok(())
         }
@@ -97,6 +101,36 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("apply-runtime-config exits before database setup")
         }
         Command::PrintConfig => unreachable!("print-config exits before database setup"),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommandStartup {
+    DatabaseBacked,
+    UpdateOnly(Option<ExpectedUpdateReport>),
+}
+
+fn command_startup(command: &Command) -> anyhow::Result<CommandStartup> {
+    let Command::SyncOnce {
+        update_only,
+        expect_update_status,
+        expect_update_attempt,
+    } = command
+    else {
+        return Ok(CommandStartup::DatabaseBacked);
+    };
+    match (*update_only, expect_update_status, expect_update_attempt) {
+        (true, Some(status), Some(attempt_id)) => {
+            Ok(CommandStartup::UpdateOnly(Some(ExpectedUpdateReport {
+                status: status.clone(),
+                attempt_id: attempt_id.clone(),
+            })))
+        }
+        (true, None, None) => Ok(CommandStartup::UpdateOnly(None)),
+        (false, None, None) => Ok(CommandStartup::DatabaseBacked),
+        _ => bail!(
+            "update-only Forge sync requires both update expectation arguments when either is set"
+        ),
     }
 }
 
@@ -226,7 +260,7 @@ fn init_tracing() {
 mod tests {
     use cybex_forge::config::AppConfig;
 
-    use super::{Command, managed_command_requires_service_user};
+    use super::{Command, CommandStartup, command_startup, managed_command_requires_service_user};
 
     #[test]
     fn managed_stateful_commands_require_service_user() {
@@ -239,6 +273,7 @@ mod tests {
             Command::ScanIsos,
             Command::Enroll,
             Command::SyncOnce {
+                update_only: false,
                 expect_update_status: None,
                 expect_update_attempt: None,
             },
@@ -258,9 +293,42 @@ mod tests {
         assert!(!managed_command_requires_service_user(
             &config,
             &Command::SyncOnce {
+                update_only: false,
                 expect_update_status: None,
                 expect_update_attempt: None,
             }
         ));
+    }
+
+    #[test]
+    fn update_only_sync_uses_the_database_free_startup_path() {
+        let command = Command::SyncOnce {
+            update_only: true,
+            expect_update_status: Some("failed".to_string()),
+            expect_update_attempt: Some("a".repeat(32)),
+        };
+
+        let startup = command_startup(&command).unwrap();
+
+        assert!(matches!(&startup, CommandStartup::UpdateOnly(Some(_))));
+        assert_ne!(startup, CommandStartup::DatabaseBacked);
+        assert_eq!(
+            command_startup(&Command::SyncOnce {
+                update_only: false,
+                expect_update_status: None,
+                expect_update_attempt: None,
+            })
+            .unwrap(),
+            CommandStartup::DatabaseBacked
+        );
+        assert_eq!(
+            command_startup(&Command::SyncOnce {
+                update_only: true,
+                expect_update_status: None,
+                expect_update_attempt: None,
+            })
+            .unwrap(),
+            CommandStartup::UpdateOnly(None)
+        );
     }
 }

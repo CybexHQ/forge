@@ -55,6 +55,7 @@ const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_BLUEPRINT_BUILDER_V2: &str = "blueprint_builder_v2";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_UPDATER_V1: &str = "updater_v1";
+const FORGE_REPORT_SCOPE_UPDATE_ONLY: &str = "update_only";
 const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 3;
 const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 1;
 const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 3;
@@ -209,6 +210,21 @@ struct AgentForgeConfigResponse {
 struct ForgeReportResponse {
     #[serde(default)]
     update: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgeUpdateOnlyReportResponse {
+    status: String,
+    update: bool,
+    report_scope: String,
+    persisted_update: ForgePersistedUpdateAcknowledgement,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgePersistedUpdateAcknowledgement {
+    status: String,
+    attempt_id: String,
+    reported_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +413,14 @@ struct ForgeAgentReportRequest {
     cache_artifacts_complete: bool,
     disk: Option<crate::disk::DiskStats>,
     host: Option<crate::host::HostStats>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForgeUpdateOnlyReportRequest {
+    protocol_version: u32,
+    report_scope: &'static str,
+    capabilities: [&'static str; 1],
+    update: ForgeUpdateStatusReport,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -631,6 +655,8 @@ impl SyncOnceReport {
 #[derive(Debug)]
 struct ForgeReportReceipt {
     update_acknowledged: bool,
+    scope_acknowledged: bool,
+    persisted_update_acknowledged: bool,
     updater: Option<SyncOnceUpdaterReport>,
 }
 
@@ -652,7 +678,7 @@ pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         let mut consecutive_failures: u32 = 0;
         loop {
-            let interval = match sync_once_with_outcome(&state, None).await {
+            let interval = match sync_once_with_outcome(&state).await {
                 Ok(report) => {
                     consecutive_failures = 0;
                     let normal_interval =
@@ -707,12 +733,73 @@ pub async fn enroll_once(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync_once(
-    state: &AppState,
+pub async fn sync_once(state: &AppState) -> Result<SyncOnceReport> {
+    sync_once_with_outcome(state).await
+}
+
+/// Post one exact updater status without opening the Forge SQLite database or
+/// reading/mutating Boot, Build, or Cache state.
+///
+/// This path exists for qualification while a historical Forge binary is the
+/// active service. It deliberately requires an already-adopted signing state,
+/// an update-only scope acknowledgement from Manage, and—when supplied—an
+/// exact local status/attempt fence.
+pub async fn sync_update_report_once(
+    config: &AppConfig,
     expected_update: Option<&ExpectedUpdateReport>,
 ) -> Result<SyncOnceReport> {
-    let report = sync_once_with_outcome(state, expected_update).await?;
-    validate_sync_once_report(&report, expected_update)?;
+    ensure_manage_enabled_config(config)?;
+    if !crate::updater::capabilities_enabled(config) {
+        bail!("update-only Forge sync requires an enabled updater trust anchor");
+    }
+    let _state_lock = acquire_managed_state_lock(config)?;
+    let managed = load_managed_state_from_config(config)?;
+    let device_id = managed_device_id(&managed)?;
+    let update = crate::updater::status_report(config)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("update-only Forge sync did not include a local updater status report")
+        })?;
+    validate_expected_update_report(Some(&update), expected_update)?;
+
+    let updater = SyncOnceUpdaterReport::from(&update);
+    let body = ForgeUpdateOnlyReportRequest {
+        protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
+        report_scope: FORGE_REPORT_SCOPE_UPDATE_ONLY,
+        capabilities: [CAPABILITY_UPDATER_V1],
+        update,
+    };
+    let body_bytes =
+        serde_json::to_vec(&body).context("serialize update-only Forge report failed")?;
+    if body_bytes.len() > MAX_FORGE_REPORT_BODY_BYTES {
+        bail!("update-only Forge report exceeded {MAX_FORGE_REPORT_BODY_BYTES} bytes");
+    }
+    let path = format!("/v1/agent/devices/{device_id}/forge/update-report");
+    let response = signed_request_for_config(config, &managed, Method::POST, &path, body_bytes)
+        .await?
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .context("report update-only Forge state request failed")?;
+    let response = parse_success_json::<ForgeUpdateOnlyReportResponse>(
+        response,
+        "report update-only Forge state",
+    )
+    .await?;
+    if response.status != "ok" {
+        bail!("Manage returned an invalid update-only Forge report status");
+    }
+    let persisted_update_acknowledged =
+        persisted_update_ack_matches(&response.persisted_update, &updater);
+    let receipt = ForgeReportReceipt {
+        update_acknowledged: response.update,
+        scope_acknowledged: response.report_scope == FORGE_REPORT_SCOPE_UPDATE_ONLY,
+        persisted_update_acknowledged,
+        updater: Some(updater),
+    };
+    validate_forge_report_receipt(&receipt, true)?;
+    let report = SyncOnceReport::synced(receipt);
+    validate_update_only_sync_report(&report)?;
     Ok(report)
 }
 
@@ -779,10 +866,7 @@ fn acquire_runtime_apply_lock() -> Result<AdvisoryFileLock> {
         .context("open managed runtime apply lock")
 }
 
-async fn sync_once_with_outcome(
-    state: &AppState,
-    expected_update: Option<&ExpectedUpdateReport>,
-) -> Result<SyncOnceReport> {
+async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     ensure_manage_enabled(state)?;
     let _state_lock = acquire_managed_state_lock(&state.config)?;
     let mut managed = load_managed_state(state)?;
@@ -794,16 +878,6 @@ async fn sync_once_with_outcome(
         return Ok(SyncOnceReport::pending_enrollment());
     }
 
-    // A fenced one-shot is an evidence operation for an already-adopted
-    // updater. Report the exact local updater record without also applying
-    // unrelated desired Boot/Build/Cache state or transiently claiming the
-    // control binary's package version as the running Boot service version.
-    if expected_update.is_some() {
-        let forge_report = report_forge_state(state, &managed, expected_update).await?;
-        save_managed_state(state, &managed)?;
-        return Ok(SyncOnceReport::synced(forge_report));
-    }
-
     if has_unreported_known_profile_events(&state.db, managed.last_reported_event_id).await? {
         report_boot_state(state, &mut managed, Vec::new()).await?;
         save_managed_state(state, &managed)?;
@@ -812,7 +886,7 @@ async fn sync_once_with_outcome(
     apply_boot_config(state, &config).await?;
     let profile_sync = current_profile_sync_reports(&state.db).await?;
     report_boot_state(state, &mut managed, profile_sync).await?;
-    let forge_report = sync_forge_foundation(state, &managed, expected_update).await?;
+    let forge_report = sync_forge_foundation(state, &managed).await?;
     save_managed_state(state, &managed)?;
     Ok(SyncOnceReport::synced(forge_report))
 }
@@ -1130,7 +1204,6 @@ async fn report_boot_state(
 async fn sync_forge_foundation(
     state: &AppState,
     managed: &ManagedState,
-    expected_update: Option<&ExpectedUpdateReport>,
 ) -> Result<ForgeReportReceipt> {
     let desired = fetch_forge_config(state, managed).await?;
     if desired.build_jobs.len() > MAX_MANAGED_BUILD_JOBS {
@@ -1178,7 +1251,7 @@ async fn sync_forge_foundation(
     crate::cache::enforce_retention(&state.db, &state.config).await?;
     crate::updater::store_update_request(&state.config, desired.update).await?;
 
-    report_forge_state(state, managed, expected_update).await
+    report_forge_state(state, managed).await
 }
 
 async fn fetch_forge_config(
@@ -1201,14 +1274,10 @@ async fn fetch_forge_config(
 async fn report_forge_state(
     state: &AppState,
     managed: &ManagedState,
-    expected_update: Option<&ExpectedUpdateReport>,
 ) -> Result<ForgeReportReceipt> {
-    let fenced = expected_update.is_some();
     let build_jobs = db::list_build_jobs(&state.db).await?;
-    if !fenced {
-        if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
-            warn!(error = %err, "Forge cache integrity scrub failed");
-        }
+    if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
+        warn!(error = %err, "Forge cache integrity scrub failed");
     }
     let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
     let cache_inventory = db::cache_inventory_state(&state.db).await?;
@@ -1237,7 +1306,6 @@ async fn report_forge_state(
         host: crate::host::sample().await,
     };
     let (body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
-    validate_expected_update_report(body.update.as_ref(), expected_update)?;
     let updater = body.update.as_ref().map(SyncOnceUpdaterReport::from);
     let device_id = managed_device_id(managed)?;
     let path = format!("/v1/agent/devices/{device_id}/forge/report");
@@ -1251,9 +1319,10 @@ async fn report_forge_state(
         parse_success_json::<ForgeReportResponse>(response, "report managed forge state").await?;
     let receipt = ForgeReportReceipt {
         update_acknowledged: response.update,
+        scope_acknowledged: false,
+        persisted_update_acknowledged: false,
         updater,
     };
-    validate_forge_report_receipt(&receipt, expected_update)?;
     Ok(receipt)
 }
 
@@ -1286,32 +1355,41 @@ fn validate_expected_update_report(
 
 fn validate_forge_report_receipt(
     receipt: &ForgeReportReceipt,
-    expected: Option<&ExpectedUpdateReport>,
+    require_update_only: bool,
 ) -> Result<()> {
-    if expected.is_some() && !receipt.update_acknowledged {
-        bail!("Manage did not acknowledge the fenced Forge update report");
+    if require_update_only && !receipt.scope_acknowledged {
+        bail!("Manage did not acknowledge the update-only Forge report scope");
+    }
+    if require_update_only && !receipt.update_acknowledged {
+        bail!("Manage did not acknowledge the update-only Forge report");
+    }
+    if require_update_only && !receipt.persisted_update_acknowledged {
+        bail!("Manage did not confirm the persisted Forge update status and attempt");
     }
     Ok(())
 }
 
-fn validate_sync_once_report(
-    report: &SyncOnceReport,
-    expected: Option<&ExpectedUpdateReport>,
-) -> Result<()> {
-    if expected.is_none() {
-        return Ok(());
-    }
+fn persisted_update_ack_matches(
+    persisted: &ForgePersistedUpdateAcknowledgement,
+    updater: &SyncOnceUpdaterReport,
+) -> bool {
+    persisted.status == updater.status
+        && persisted.attempt_id == updater.attempt_id
+        && chrono::DateTime::parse_from_rfc3339(&persisted.reported_at).is_ok()
+}
+
+fn validate_update_only_sync_report(report: &SyncOnceReport) -> Result<()> {
     if report.outcome != SyncOnceDisposition::Synced {
-        bail!("fenced Forge sync requires an adopted node");
+        bail!("update-only Forge sync requires an adopted node");
     }
     if !report.report_posted {
-        bail!("fenced Forge sync did not post a Forge report");
+        bail!("update-only Forge sync did not post a Forge report");
     }
     if !report.update_included {
-        bail!("fenced Forge sync did not include an updater report");
+        bail!("update-only Forge sync did not include an updater report");
     }
     if !report.update_acknowledged {
-        bail!("Manage did not acknowledge the fenced Forge update report");
+        bail!("Manage did not acknowledge the update-only Forge report");
     }
     Ok(())
 }
@@ -6441,15 +6519,16 @@ mod tests {
         AgentBootConfigResponse, BootAgentAssetReport, BootAgentClientReport, BootAgentEventReport,
         BootAgentReportRequest, BootAgentSettingsReport, CYBEX_COMPONENT_PROTOCOL_VERSION,
         CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION, ComponentCompatibilityContract, EnrollmentResponse,
-        ExpectedUpdateReport, ForgeReportReceipt, MAX_DEVICE_HOSTNAME_CHARS,
-        MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS, MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS,
-        MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS, MAX_PROFILE_RAW_SCRIPT_BYTES,
-        MAX_REPORT_CLIENTS, ManagedBootClient, ManagedBootProfile, ManagedBootSettings,
-        ManagedState, NIXOS_NETBOOT_INITRD_FORMAT, NIXOS_NETBOOT_SPLIT_INITRD_FORMAT,
-        NixosNetbootManifest, NormalizedManagedSettings, SyncOnceDisposition, SyncOnceReport,
-        SyncOnceUpdaterReport, acquire_managed_state_lock, active_managed_sync_interval_seconds,
-        api_url_for_config, append_bounded_response_chunk_with_limit, apply_enrollment_response,
-        asset_scan_report, boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
+        ExpectedUpdateReport, FORGE_REPORT_SCOPE_UPDATE_ONLY, ForgeReportReceipt,
+        MAX_DEVICE_HOSTNAME_CHARS, MAX_DEVICE_NOTES_CHARS, MAX_DEVICE_SERIAL_CHARS,
+        MAX_DEVICE_TAGS, MAX_MANAGED_CLIENTS, MAX_MANAGED_PROFILES, MAX_PROFILE_DESCRIPTION_CHARS,
+        MAX_PROFILE_RAW_SCRIPT_BYTES, MAX_REPORT_CLIENTS, ManagedBootClient, ManagedBootProfile,
+        ManagedBootSettings, ManagedState, NIXOS_NETBOOT_INITRD_FORMAT,
+        NIXOS_NETBOOT_SPLIT_INITRD_FORMAT, NixosNetbootManifest, NormalizedManagedSettings,
+        SyncOnceDisposition, SyncOnceReport, SyncOnceUpdaterReport, acquire_managed_state_lock,
+        active_managed_sync_interval_seconds, api_url_for_config,
+        append_bounded_response_chunk_with_limit, apply_enrollment_response, asset_scan_report,
+        boot_report_state, bounded_error_message, bounded_http_timeout_seconds,
         canonical_agent_payload, clean_optional, current_boot_client_reports,
         current_profile_sync_reports, enrollment_request_signature, enrollment_status_signature,
         ensure_key_material, failed_sync_interval_seconds, fit_boot_report_body,
@@ -6465,9 +6544,9 @@ mod tests {
         render_managed_config, render_nixos_netboot_script, request_path_and_query,
         rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
         sha256_hex, signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
-        sync_deleted_profiles, sync_profiles, validate_boot_config,
+        sync_deleted_profiles, sync_profiles, sync_update_report_once, validate_boot_config,
         validate_component_compatibility, validate_expected_update_report,
-        validate_forge_report_receipt, validate_profile, validate_sync_once_report,
+        validate_forge_report_receipt, validate_profile, validate_update_only_sync_report,
         write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
     };
     use crate::error::AppError;
@@ -6477,6 +6556,7 @@ mod tests {
         db,
         models::{CreateDeviceRequest, NewBootEvent},
     };
+    use axum::{Json, Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
     use base64::{
         Engine as _,
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -6489,8 +6569,39 @@ mod tests {
         fs,
         io::{BufReader, Read},
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
     };
+    use tokio::{net::TcpListener, sync::oneshot};
     use uuid::Uuid;
+
+    type UpdateOnlyCapture =
+        Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Vec<u8>, serde_json::Value)>>>>;
+
+    async fn capture_update_only_report(
+        State(capture): State<UpdateOnlyCapture>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<serde_json::Value> {
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let status = value["update"]["status"].as_str().unwrap().to_string();
+        let attempt_id = value["update"]["attempt_id"].as_str().unwrap().to_string();
+        if let Some(sender) = capture.lock().unwrap().take() {
+            sender
+                .send((headers, body.to_vec(), value))
+                .map_err(|_| ())
+                .unwrap();
+        }
+        Json(serde_json::json!({
+            "status": "ok",
+            "report_scope": "update_only",
+            "update": true,
+            "persisted_update": {
+                "status": status,
+                "attempt_id": attempt_id,
+                "reported_at": "2026-07-23T10:00:00Z"
+            }
+        }))
+    }
 
     #[test]
     fn enrollment_request_signature_proves_the_exact_body() {
@@ -8810,14 +8921,161 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_only_sync_posts_exact_scoped_body_without_shared_state() {
+        let root = temp_state_dir();
+        let shared_data = root.join("shared-data-must-not-exist");
+        let shared_boot = root.join("shared-boot-must-not-exist");
+        let shared_cache = root.join("shared-cache-must-not-exist");
+        let shared_build = root.join("shared-build-must-not-exist");
+        let shared_releases = root.join("shared-releases-must-not-exist");
+        let state_dir = root.join("signing-state");
+        let update_dir = root.join("isolated-update");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&update_dir).unwrap();
+
+        let signing = SigningKey::from_bytes(&[23_u8; 32]);
+        let managed = ManagedState {
+            private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
+            public_key_b64: Some(STANDARD.encode(signing.verifying_key().to_bytes())),
+            public_key_fingerprint: Some(sha256_hex(signing.verifying_key().to_bytes())),
+            device_id: Some("forge-update-only-test".to_string()),
+            ..ManagedState::default()
+        };
+        let attempt_id = "a".repeat(32);
+        let updater = crate::updater::ForgeUpdateStatusReport {
+            status: "failed".to_string(),
+            stage: "failed".to_string(),
+            progress_percent: Some(100),
+            error: "synthetic signature rejection".to_string(),
+            target_version: "0.1.2".to_string(),
+            current_version: "0.1.1".to_string(),
+            attempt_id: attempt_id.clone(),
+            started_at: Some("2026-07-23T09:59:00Z".to_string()),
+            completed_at: Some("2026-07-23T10:00:00Z".to_string()),
+        };
+
+        let (capture_tx, capture_rx) = oneshot::channel();
+        let capture: UpdateOnlyCapture = Arc::new(Mutex::new(Some(capture_tx)));
+        let app = Router::new()
+            .route(
+                "/v1/agent/devices/forge-update-only-test/forge/update-report",
+                post(capture_update_only_report),
+            )
+            .with_state(capture);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.manage.enabled = true;
+        config.manage.api_url = format!("http://{address}");
+        config.manage.organization_id = "organization-update-only-test".to_string();
+        config.manage.state_path = state_dir.join("manage-state.json");
+        config.paths.data_dir = shared_data.clone();
+        config.paths.database_path = shared_data.join("forge.sqlite");
+        config.paths.boot_assets_dir = shared_boot.clone();
+        config.paths.iso_dir = shared_boot.join("isos");
+        config.paths.static_dir = shared_boot.join("assets");
+        config.paths.tftp_dir = shared_boot.join("tftp");
+        config.cache.root_dir = shared_cache.clone();
+        config.cache.private_key_path = shared_cache.join("private-key");
+        config.cache.public_key_path = shared_cache.join("public-key");
+        config.build.work_dir = shared_build.join("work");
+        config.build.output_dir = shared_build.join("output");
+        config.update.enabled = true;
+        config.update.work_dir = update_dir.clone();
+        config.update.releases_dir = shared_releases.clone();
+        config.update.trusted_public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        write_secure_json(&config.manage.state_path, &managed).unwrap();
+        fs::write(
+            update_dir.join("status.json"),
+            serde_json::to_vec(&updater).unwrap(),
+        )
+        .unwrap();
+        let managed_state_before = fs::read(&config.manage.state_path).unwrap();
+        let updater_status_before = fs::read(update_dir.join("status.json")).unwrap();
+
+        let report = sync_update_report_once(&config, None).await.unwrap();
+        let (headers, raw_body, body) = capture_rx.await.unwrap();
+        server.abort();
+
+        let keys = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "capabilities",
+                "protocol_version",
+                "report_scope",
+                "update",
+            ])
+        );
+        assert_eq!(body["protocol_version"], CYBEX_COMPONENT_PROTOCOL_VERSION);
+        assert_eq!(body["report_scope"], FORGE_REPORT_SCOPE_UPDATE_ONLY);
+        assert_eq!(body["capabilities"], serde_json::json!(["updater_v1"]));
+        assert_eq!(body["update"]["status"], "failed");
+        assert_eq!(body["update"]["attempt_id"], attempt_id);
+        assert_eq!(body["update"]["current_version"], "0.1.1");
+        assert!(report.report_posted);
+        assert!(report.update_included);
+        assert!(report.update_acknowledged);
+        assert_eq!(report.updater.as_ref().unwrap().status, "failed");
+        assert!(!shared_data.exists());
+        assert!(!shared_boot.exists());
+        assert!(!shared_cache.exists());
+        assert!(!shared_build.exists());
+        assert!(!shared_releases.exists());
+        assert_eq!(
+            fs::read(&config.manage.state_path).unwrap(),
+            managed_state_before
+        );
+        assert_eq!(
+            fs::read(update_dir.join("status.json")).unwrap(),
+            updater_status_before
+        );
+
+        assert_eq!(
+            headers["x-cybex-organization"].to_str().unwrap(),
+            "organization-update-only-test"
+        );
+        let timestamp = headers["x-cybex-timestamp"].to_str().unwrap();
+        let request_id = headers["x-cybex-request-id"].to_str().unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(headers["x-cybex-signature"].to_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let canonical = canonical_agent_payload(
+            "POST",
+            "/v1/agent/devices/forge-update-only-test/forge/update-report",
+            timestamp,
+            request_id,
+            &sha256_hex(&raw_body),
+        );
+        signing
+            .verifying_key()
+            .verify(canonical.as_bytes(), &signature)
+            .expect("update-only request signature covers the exact scoped body");
+    }
+
     #[test]
-    fn fenced_update_report_requires_manage_acknowledgement() {
+    fn update_only_report_requires_scope_update_and_persistence_acknowledgement() {
         let expected = ExpectedUpdateReport {
             status: "failed".to_string(),
             attempt_id: "a".repeat(32),
         };
-        let receipt = ForgeReportReceipt {
+        let mut receipt = ForgeReportReceipt {
             update_acknowledged: false,
+            scope_acknowledged: false,
+            persisted_update_acknowledged: false,
             updater: Some(SyncOnceUpdaterReport {
                 status: expected.status.clone(),
                 attempt_id: expected.attempt_id.clone(),
@@ -8828,26 +9086,48 @@ mod tests {
             }),
         };
 
-        validate_forge_report_receipt(&receipt, None).unwrap();
+        validate_forge_report_receipt(&receipt, false).unwrap();
         assert!(
-            validate_forge_report_receipt(&receipt, Some(&expected))
+            validate_forge_report_receipt(&receipt, true)
+                .unwrap_err()
+                .to_string()
+                .contains("report scope")
+        );
+        receipt.scope_acknowledged = true;
+        assert!(
+            validate_forge_report_receipt(&receipt, true)
                 .unwrap_err()
                 .to_string()
                 .contains("did not acknowledge")
         );
+        receipt.update_acknowledged = true;
+        assert!(
+            validate_forge_report_receipt(&receipt, true)
+                .unwrap_err()
+                .to_string()
+                .contains("did not confirm")
+        );
+        receipt.persisted_update_acknowledged = true;
+        validate_forge_report_receipt(&receipt, true).unwrap();
     }
 
     #[test]
     fn forge_report_response_requires_an_explicit_true_update_ack() {
-        let acknowledged: super::ForgeReportResponse =
-            serde_json::from_str(r#"{"status":"ok","update":true}"#).unwrap();
+        let acknowledged: super::ForgeUpdateOnlyReportResponse =
+            serde_json::from_str(
+                r#"{"status":"ok","report_scope":"update_only","update":true,"persisted_update":{"status":"failed","attempt_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reported_at":"2026-07-23T10:00:00Z"}}"#,
+            )
+            .unwrap();
         let legacy: super::ForgeReportResponse =
             serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
 
+        assert_eq!(acknowledged.status, "ok");
         assert!(acknowledged.update);
+        assert_eq!(acknowledged.report_scope, "update_only");
+        assert_eq!(acknowledged.persisted_update.status, "failed");
         assert!(!legacy.update);
         assert!(
-            serde_json::from_str::<super::ForgeReportResponse>(
+            serde_json::from_str::<super::ForgeUpdateOnlyReportResponse>(
                 r#"{"status":"ok","update":"true"}"#
             )
             .is_err()
@@ -8855,9 +9135,35 @@ mod tests {
     }
 
     #[test]
+    fn persisted_update_ack_requires_exact_projection_and_timestamp() {
+        let updater = SyncOnceUpdaterReport {
+            status: "failed".to_string(),
+            attempt_id: "a".repeat(32),
+            stage: "failed".to_string(),
+            target_version: "0.1.2".to_string(),
+            current_version: "0.1.1".to_string(),
+            progress_percent: Some(100),
+        };
+        let mut persisted = super::ForgePersistedUpdateAcknowledgement {
+            status: updater.status.clone(),
+            attempt_id: updater.attempt_id.clone(),
+            reported_at: "2026-07-23T10:00:00Z".to_string(),
+        };
+
+        assert!(super::persisted_update_ack_matches(&persisted, &updater));
+        persisted.attempt_id = "b".repeat(32);
+        assert!(!super::persisted_update_ack_matches(&persisted, &updater));
+        persisted.attempt_id = updater.attempt_id.clone();
+        persisted.reported_at = "not-a-timestamp".to_string();
+        assert!(!super::persisted_update_ack_matches(&persisted, &updater));
+    }
+
+    #[test]
     fn sync_once_receipt_is_structured_and_excludes_updater_error_text() {
         let receipt = SyncOnceReport::synced(ForgeReportReceipt {
             update_acknowledged: true,
+            scope_acknowledged: true,
+            persisted_update_acknowledged: true,
             updater: Some(SyncOnceUpdaterReport {
                 status: "failed".to_string(),
                 attempt_id: "a".repeat(32),
@@ -8880,14 +9186,14 @@ mod tests {
     }
 
     #[test]
-    fn fenced_sync_rejects_a_pending_or_unreported_outcome() {
+    fn update_only_sync_rejects_a_pending_or_unreported_outcome() {
         let expected = ExpectedUpdateReport {
             status: "failed".to_string(),
             attempt_id: "a".repeat(32),
         };
 
         assert!(
-            validate_sync_once_report(&SyncOnceReport::pending_enrollment(), Some(&expected))
+            validate_update_only_sync_report(&SyncOnceReport::pending_enrollment())
                 .unwrap_err()
                 .to_string()
                 .contains("adopted")
@@ -8909,7 +9215,7 @@ mod tests {
             }),
         };
         assert!(
-            validate_sync_once_report(&unreported, Some(&expected))
+            validate_update_only_sync_report(&unreported)
                 .unwrap_err()
                 .to_string()
                 .contains("did not post")

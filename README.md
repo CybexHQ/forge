@@ -151,22 +151,31 @@ terminal updater record:
 
 ```bash
 cybex-forge-sync-once \
+  --update-only \
   --expect-update-status failed \
   --expect-update-attempt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 
-The two expectation flags are a required pair. Fenced mode uses the explicitly
-loaded service config and only posts the signed Forge report after adoption; it
-does not apply unrelated desired Boot, Build, or Cache state. It fails if the
-local report omits the updater, its status or 32-character lowercase
-hexadecimal attempt ID differs, the Forge report is not accepted, or Manage
-does not acknowledge it with `update: true`. A successful receipt uses schema
-`cybex.forge.sync-once.v1` and records `outcome`, `report_posted`,
-`update_included`, `update_acknowledged`, plus the non-secret updater status,
-attempt, stage, versions, and progress. Updater error text is deliberately
-excluded because transport failures can contain credential-bearing URLs.
-Plain `sync-once` retains the full production synchronization behavior and
-does not require a new Manage acknowledgement field.
+`--update-only` is independently usable for cleanup and baseline receipts. It
+branches before Forge directory setup, SQLite connection/migration, protected
+build remediation, and every Boot, Build, and Cache read or mutation. It reads
+only the explicitly loaded config, adopted managed signing state, and updater
+status, then posts a signed `report_scope: "update_only"` body whose sole
+capability is `updater_v1` to the dedicated
+`/v1/agent/devices/{device_id}/forge/update-report` route. An older Manage
+therefore returns `404` before any full-report mutation. A compatible Manage
+must echo that scope, return `update: true`, and confirm the exact persisted
+status/attempt with a valid report timestamp.
+
+The two expectation flags are an optional required pair that strengthens
+`--update-only`. When present, the command validates the local status and
+32-character lowercase hexadecimal attempt ID before sending. A successful
+receipt uses schema `cybex.forge.sync-once.v1` and records `outcome`,
+`report_posted`, `update_included`, `update_acknowledged`, plus the non-secret
+updater status, attempt, stage, versions, and progress. Updater error text is
+deliberately excluded because transport failures can contain
+credential-bearing URLs. Plain `sync-once` retains the full production
+synchronization behavior and does not require scoped acknowledgement fields.
 
 Managed ISO synchronization runs in a durable worker separate from the control
 and report loop. Each desired profile carries a generation and operation UUID;

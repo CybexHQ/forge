@@ -39,10 +39,14 @@ pub enum Command {
     ScanIsos,
     Enroll,
     SyncOnce {
+        /// Post only the local updater status without opening Forge state.
+        #[arg(long)]
+        update_only: bool,
+
         /// Fail unless the Forge report contains this exact updater status.
         #[arg(
             long,
-            requires = "expect_update_attempt",
+            requires_all = ["update_only", "expect_update_attempt"],
             value_parser = parse_expected_update_status
         )]
         expect_update_status: Option<String>,
@@ -50,7 +54,7 @@ pub enum Command {
         /// Fail unless the Forge report contains this exact updater attempt ID.
         #[arg(
             long,
-            requires = "expect_update_status",
+            requires_all = ["update_only", "expect_update_status"],
             value_parser = parse_expected_update_attempt
         )]
         expect_update_attempt: Option<String>,
@@ -928,6 +932,7 @@ mod tests {
             "--config",
             "/tmp/qualification.toml",
             "sync-once",
+            "--update-only",
             "--expect-update-status",
             "failed",
             "--expect-update-attempt",
@@ -937,30 +942,56 @@ mod tests {
 
         assert_eq!(cli.config, PathBuf::from("/tmp/qualification.toml"));
         let Some(Command::SyncOnce {
+            update_only,
             expect_update_status,
             expect_update_attempt,
         }) = cli.command
         else {
             panic!("expected sync-once command");
         };
+        assert!(update_only);
         assert_eq!(expect_update_status.as_deref(), Some("failed"));
         assert_eq!(expect_update_attempt.as_deref(), Some(attempt_id.as_str()));
     }
 
     #[test]
     fn sync_once_cli_requires_the_complete_update_fence() {
-        let error = Cli::try_parse_from([
-            "cybex-forge",
-            "sync-once",
-            "--expect-update-status",
-            "failed",
-        ])
-        .unwrap_err();
+        for args in [
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--expect-update-status",
+                "failed",
+            ],
+            vec![
+                "cybex-forge",
+                "sync-once",
+                "--expect-update-status",
+                "failed",
+                "--expect-update-attempt",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
 
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+    #[test]
+    fn sync_once_cli_accepts_update_only_without_an_expectation() {
+        let cli = Cli::try_parse_from(["cybex-forge", "sync-once", "--update-only"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::SyncOnce {
+                update_only: true,
+                expect_update_status: None,
+                expect_update_attempt: None,
+            })
+        ));
     }
 
     #[test]
@@ -969,6 +1000,7 @@ mod tests {
             vec![
                 "cybex-forge",
                 "sync-once",
+                "--update-only",
                 "--expect-update-status",
                 "unexpected",
                 "--expect-update-attempt",
@@ -977,6 +1009,7 @@ mod tests {
             vec![
                 "cybex-forge",
                 "sync-once",
+                "--update-only",
                 "--expect-update-status",
                 "failed",
                 "--expect-update-attempt",
