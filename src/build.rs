@@ -2933,6 +2933,22 @@ const PINNED_DESKTOP_NIXOS_GENERATOR_FINGERPRINTS: &[(&str, &str)] = &[
         "c518c8ef32da2ce4eddc5812ee50a9ce43054202c903356fadbf3a2374958426",
         "4666d1bbec850bf0e780de6e75ca0562c6918c08a7733b67dc62de996997d3a0",
     ),
+    // Standard Workstation (Chromium, no Mail) system and user unit link
+    // farms plus /etc assembly. These reviewed scripts only copy or link
+    // independently trusted store inputs; the executable-pinned digest keeps
+    // every configuration-dependent provider identity in the contract.
+    (
+        "0f4a38129dbc5c3ae0a75b02a15549630eb19f48a18196c2229b5ab50c4eb1b1",
+        "936c01fcf78920bf6736d5c9a7461941d6df3d1f8f2dc29f040f59b8102d64e5",
+    ),
+    (
+        "fe12db07a2de4c5d9053a05b139a90ba110e6ad13b6365c2ab9a4efaaec5babe",
+        "f21eb14f20b91832619da2515fad5d437a809c9b1936173b0ee6b278cfaf4af5",
+    ),
+    (
+        "3ee4be64b7ae61e457c188845565f35d592ef1f43afd7828c7f9f6f222f44c4b",
+        "c1e3714ff277c969f8daf643cc5e8917c5afdee31b149041d651fe93a472f0e6",
+    ),
 ];
 
 const PINNED_NIXOS_TOPLEVEL_GENERATOR_FINGERPRINT: &str =
