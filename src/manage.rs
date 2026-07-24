@@ -107,17 +107,7 @@ CPUWeight=1000
 IOWeight=1000
 OOMScoreAdjust=-750
 "#;
-const NIX_DAEMON_RESOURCE_DROPIN: &str = r#"[Unit]
-StartLimitIntervalSec=0
-
-[Service]
-Restart=always
-RestartSec=3s
-Slice=cybex-forge-build.slice
-CPUWeight=25
-IOWeight=25
-OOMScoreAdjust=250
-"#;
+const NIX_DAEMON_RESOURCE_DROPIN: &str = include_str!("../systemd/nix-daemon-cybex-forge.conf");
 const NGINX_AVAILABILITY_DROPIN: &str = r#"[Unit]
 StartLimitIntervalSec=0
 
@@ -7777,6 +7767,11 @@ mod tests {
             by_path.contains_key(
                 "/etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf"
             )
+        );
+        assert!(
+            by_path["/etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf"]
+                .contents
+                .contains("/nix/var/nix/profiles/default/bin/nix-daemon --daemon")
         );
     }
 

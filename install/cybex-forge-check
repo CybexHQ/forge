@@ -1340,6 +1340,7 @@ check_systemd_contains cybex-forge After network-online.target
 check_systemd_contains cybex-forge After nix-daemon.socket
 check_systemd_value nix-daemon Restart always
 check_systemd_value nix-daemon RestartUSec 3s
+check_systemd_contains nix-daemon ExecStart "/nix/var/nix/profiles/default/bin/nix-daemon"
 check_systemd_value cybex-forge AmbientCapabilities ""
 check_systemd_value cybex-forge CapabilityBoundingSet ""
 check_systemd_value cybex-forge LockPersonality yes
@@ -1414,6 +1415,7 @@ check_file_contains "Forge Build uses current Nix profile" /etc/cybex-forge/conf
 check_command_success "Forge effective configuration parses" /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml print-config
 check_file_contains "Forge Build pins nixpkgs" /etc/cybex-forge/config.toml "flake = \"github:NixOS/nixpkgs/$NIXPKGS_REVISION\""
 check_command_success "current Nix profile command available" /nix/var/nix/profiles/default/bin/nix --version
+check_command_success "current Nix profile daemon available" /nix/var/nix/profiles/default/bin/nix-daemon --version
 check_path_stat "Boot service unit permissions" /etc/systemd/system/cybex-forge.service "root:root 644"
 check_path_stat "Boot logging drop-in permissions" /etc/systemd/system/cybex-forge.service.d/10-logging.conf "root:root 644"
 check_path_stat "Boot migrate drop-in permissions" /etc/systemd/system/cybex-forge.service.d/20-migrate.conf "root:root 644"

@@ -68,8 +68,9 @@ the service account Nix daemon access, auto-detects the LXC LAN address for the
 initial Boot URL, enrolls it with Cybex Manage, and keeps the local Forge node
 managed by Cybex.
 The installer uses Debian's Nix package to bootstrap `/nix/var/nix/profiles/default/bin/nix`
-to a current Nix release, and Forge Build uses that profile binary for managed
-flake builds.
+to a current Nix release. Forge Build uses that profile client for managed
+flake builds, and the systemd daemon is pinned to the matching profile
+`nix-daemon` so modern structured derivations are interpreted consistently.
 
 The generated Proxmox helper and the in-LXC installer accept
 `--update-trusted-public-key` (or

@@ -565,7 +565,9 @@ verify_source_compatibility() {
     systemd/cybex-forge-build.slice \
     systemd/cybex-forge-sentinel.service \
     systemd/cybex-forge-sentinel.timer \
+    systemd/nix-daemon-cybex-forge.conf \
     install/cybex-forge-check \
+    install/cybex-forge-sync-once \
     install/cybex-forge-sentinel; do
     if [ ! -f "$source_dir/$required" ]; then
       echo "source directory $source_dir is missing $required" >&2
@@ -805,18 +807,8 @@ Wants=nix-daemon.socket
 After=nix-daemon.socket
 EOF
   install -m 0755 -d /etc/systemd/system/nix-daemon.service.d
-  cat > /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf <<'EOF'
-[Unit]
-StartLimitIntervalSec=0
-
-[Service]
-Restart=always
-RestartSec=3s
-Slice=cybex-forge-build.slice
-CPUWeight=25
-IOWeight=25
-OOMScoreAdjust=250
-EOF
+  install -m 0644 "$source_dir/systemd/nix-daemon-cybex-forge.conf" \
+    /etc/systemd/system/nix-daemon.service.d/10-cybex-forge-restart.conf
   install -m 0755 -d /etc/systemd/system/systemd-resolved.service.d
   cat > /etc/systemd/system/systemd-resolved.service.d/10-cybex-forge-recovery.conf <<'EOF'
 [Unit]
@@ -910,19 +902,9 @@ EOF
 }
 
 install_maintenance_tools() {
-  rm -f /usr/local/sbin/cybex-forge-sync-once
-  cat > /usr/local/sbin/cybex-forge-sync-once <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "$(id -u)" -eq 0 ]; then
-  exec runuser -u cybex-forge -- /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"
-fi
-
-exec /usr/local/bin/cybex-forge --config /etc/cybex-forge/config.toml sync-once "$@"
-EOF
-  chown root:root /usr/local/sbin/cybex-forge-sync-once
-  chmod 0755 /usr/local/sbin/cybex-forge-sync-once
+  install -o root -g root -m 0755 \
+    "$source_dir/install/cybex-forge-sync-once" \
+    /usr/local/sbin/cybex-forge-sync-once
 
   rm -f /usr/local/sbin/cybex-forge-check
   install -o root -g root -m 0755 \
