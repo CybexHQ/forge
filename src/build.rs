@@ -2326,9 +2326,10 @@ fn input_drv_output_references(drv: &Value, path: &str) -> Option<Vec<InputOutpu
 
 /// Nix 2.34's derivation JSON v4 nests inputs and gives each input derivation
 /// explicit `outputs` and `dynamicOutputs` metadata. Versions 1-3 use sibling
-/// `inputDrvs`/`inputSrcs` fields and encode outputs as an array. Parse exactly
-/// one complete schema, reject unknown/dynamic v4 metadata, and normalize store
-/// basenames before making provenance decisions.
+/// `inputDrvs`/`inputSrcs` fields and encode outputs as an array. Nix 2.26 also
+/// emits an unversioned sibling form with the exact v4 metadata object. Parse
+/// exactly one complete, internally consistent schema, reject unknown/dynamic
+/// metadata, and normalize store basenames before making provenance decisions.
 struct NormalizedDerivationInputs {
     drvs: Vec<(String, Vec<String>)>,
     srcs: Vec<String>,
@@ -2339,7 +2340,7 @@ fn derivation_inputs(drv: &Value) -> Option<NormalizedDerivationInputs> {
         Some(version) => Some(version.as_u64()?),
         None => None,
     };
-    let (drv_entries, source_values, modern) = match (
+    let (drv_entries, source_values, structured_metadata) = match (
         drv.get("inputDrvs"),
         drv.get("inputSrcs"),
         drv.get("inputs"),
@@ -2347,7 +2348,15 @@ fn derivation_inputs(drv: &Value) -> Option<NormalizedDerivationInputs> {
         (Some(drvs), Some(srcs), None)
             if version.is_none_or(|version| (1..=3).contains(&version)) =>
         {
-            (drvs.as_object()?, srcs.as_array()?, false)
+            let drvs = drvs.as_object()?;
+            let structured_metadata = if drvs.is_empty() || drvs.values().all(Value::is_array) {
+                false
+            } else if version.is_none() && drvs.values().all(Value::is_object) {
+                true
+            } else {
+                return None;
+            };
+            (drvs, srcs.as_array()?, structured_metadata)
         }
         (None, None, Some(inputs)) if version == Some(4) => {
             let inputs = inputs.as_object()?;
@@ -2367,7 +2376,7 @@ fn derivation_inputs(drv: &Value) -> Option<NormalizedDerivationInputs> {
         .iter()
         .map(|(path, metadata)| {
             let path = normalize_derivation_store_path(path)?;
-            let values = if modern {
+            let values = if structured_metadata {
                 let metadata = metadata.as_object()?;
                 if metadata.len() != 2
                     || !metadata
@@ -5447,6 +5456,55 @@ sleep 5
             derivation_input_sources(&legacy).unwrap()
         );
         assert!(input_drv_output_reference(&modern, TRUSTED_STDENV_NO_CC).is_some());
+
+        let mut unversioned_structured = legacy.clone();
+        for metadata in unversioned_structured["inputDrvs"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            *metadata = json!({
+                "dynamicOutputs": {},
+                "outputs": metadata.clone(),
+            });
+        }
+        assert!(derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&unversioned_structured),
+            &synthetic_pinned_source,
+        ));
+        assert_eq!(
+            derivation_input_sources(&unversioned_structured).unwrap(),
+            derivation_input_sources(&legacy).unwrap()
+        );
+        assert!(
+            input_drv_output_reference(&unversioned_structured, TRUSTED_STDENV_NO_CC).is_some()
+        );
+
+        let mut mixed_unversioned = unversioned_structured.clone();
+        mixed_unversioned["inputDrvs"][TRUSTED_STDENV_NO_CC_DRV] = json!(["out"]);
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&mixed_unversioned),
+            &synthetic_pinned_source,
+        ));
+
+        let mut dynamic_unversioned = unversioned_structured.clone();
+        dynamic_unversioned["inputDrvs"][TRUSTED_STDENV_NO_CC_DRV]["dynamicOutputs"] =
+            json!({"dynamic": {}});
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&dynamic_unversioned),
+            &synthetic_pinned_source,
+        ));
+
+        let mut extra_unversioned = unversioned_structured;
+        extra_unversioned["inputDrvs"][TRUSTED_STDENV_NO_CC_DRV]["unexpected"] = json!(true);
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&extra_unversioned),
+            &synthetic_pinned_source,
+        ));
 
         let mut version_three = legacy.clone();
         version_three["version"] = json!(3);
