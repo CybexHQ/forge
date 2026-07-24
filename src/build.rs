@@ -1888,6 +1888,70 @@ fn executable_pinned_script_sha256(script: &str) -> String {
     script_sha256_with_store_path_policy(script, true)
 }
 
+fn script_store_item_paths(script: &str) -> Option<HashSet<String>> {
+    let bytes = script.as_bytes();
+    let mut paths = HashSet::new();
+    let mut index = 0;
+    const PREFIX: &[u8] = b"/nix/store/";
+    while index < bytes.len() {
+        if !bytes[index..].starts_with(PREFIX) {
+            index += 1;
+            continue;
+        }
+        let path_start = index;
+        index += PREFIX.len();
+        let hash_end = index.checked_add(32)?;
+        if hash_end >= bytes.len()
+            || bytes[hash_end] != b'-'
+            || !bytes[index..hash_end]
+                .iter()
+                .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(byte))
+        {
+            return None;
+        }
+        let name_start = hash_end + 1;
+        let mut path_end = name_start;
+        while path_end < bytes.len()
+            && (bytes[path_end].is_ascii_alphanumeric()
+                || matches!(bytes[path_end], b'.' | b'_' | b'+' | b'-'))
+        {
+            path_end += 1;
+        }
+        if path_end == name_start {
+            return None;
+        }
+        let path = std::str::from_utf8(&bytes[path_start..path_end])
+            .ok()?
+            .to_string();
+        if !safe_nix_store_path(&path) {
+            return None;
+        }
+        paths.insert(path);
+        index = path_end;
+    }
+    Some(paths)
+}
+
+fn script_store_item_paths_are_trusted(
+    drv: &Value,
+    script: &str,
+    would_build: &HashSet<String>,
+    trusted_local: &HashSet<String>,
+) -> bool {
+    script_store_item_paths(script).is_some_and(|paths| {
+        !paths.is_empty()
+            && paths.iter().all(|path| {
+                input_drv_output_reference(drv, path).is_some_and(|reference| {
+                    input_derivation_is_nonlocal_or_trusted(
+                        &reference.drv_path,
+                        would_build,
+                        trusted_local,
+                    )
+                })
+            })
+    })
+}
+
 fn script_sha256_with_store_path_policy(script: &str, preserve_executables: bool) -> String {
     let bytes = script.as_bytes();
     let mut normalized = Vec::with_capacity(bytes.len());
@@ -2871,6 +2935,9 @@ const PINNED_DESKTOP_NIXOS_GENERATOR_FINGERPRINTS: &[(&str, &str)] = &[
     ),
 ];
 
+const PINNED_NIXOS_TOPLEVEL_GENERATOR_FINGERPRINT: &str =
+    "c518c8ef32da2ce4eddc5812ee50a9ce43054202c903356fadbf3a2374958426";
+
 fn reviewed_generator_fingerprints_match(normalized: &str, executable_pinned: &str) -> bool {
     matches!(
         (normalized, executable_pinned),
@@ -3466,7 +3533,25 @@ where
                 would_build,
                 trusted_local,
             ));
-    reviewed_generator_fingerprints_match(&fingerprint, &executable_fingerprint)
+    let reviewed_fingerprint = if fingerprint == PINNED_NIXOS_TOPLEVEL_GENERATOR_FINGERPRINT {
+        // The final NixOS toplevel script has exact, reviewed command bytes,
+        // but its executable store hashes legitimately vary with Blueprint
+        // configuration. Require every literal store item to be supplied by a
+        // substitutable or independently reviewed input instead of enumerating
+        // every valid configuration-dependent executable fingerprint.
+        build_command.contains(NIXOS_SYSTEM_SETUP_HOOK.path)
+            && reviewed_store_output_is_trusted(
+                drv,
+                NIXOS_SYSTEM_SETUP_HOOK.path,
+                NIXOS_SYSTEM_SETUP_HOOK,
+                would_build,
+                trusted_local,
+            )
+            && script_store_item_paths_are_trusted(drv, build_command, would_build, trusted_local)
+    } else {
+        reviewed_generator_fingerprints_match(&fingerprint, &executable_fingerprint)
+    };
+    reviewed_fingerprint
         && reviewed_script_inputs
         && reviewed_tool_inputs_match(drv, attrs, expected_tools, would_build, trusted_local)
 }
@@ -5524,6 +5609,51 @@ sleep 5
                 executable,
             ));
         }
+    }
+
+    #[test]
+    fn source_policy_requires_all_toplevel_script_paths_to_have_trusted_providers() {
+        let trusted_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-switch-to-configuration";
+        let trusted_drv = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-switch-to-configuration.drv";
+        let script = format!("{trusted_path}/bin/switch-to-configuration");
+        let mut drv = synthetic_materializer(json!({}), vec![]);
+        drv["inputDrvs"][trusted_drv] = json!(["out"]);
+
+        assert!(script_store_item_paths_are_trusted(
+            &drv,
+            &script,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert!(!script_store_item_paths_are_trusted(
+            &drv,
+            &script,
+            &HashSet::from([trusted_drv.to_string()]),
+            &HashSet::new(),
+        ));
+        assert!(script_store_item_paths_are_trusted(
+            &drv,
+            &script,
+            &HashSet::from([trusted_drv.to_string()]),
+            &HashSet::from([trusted_drv.to_string()]),
+        ));
+
+        let unreferenced =
+            "/nix/store/cccccccccccccccccccccccccccccccc-unreviewed-payload/bin/payload";
+        assert!(!script_store_item_paths_are_trusted(
+            &drv,
+            unreferenced,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert_eq!(
+            script_store_item_paths(&format!("{script}; {script}"))
+                .unwrap()
+                .len(),
+            1,
+            "duplicate script references should resolve to one reviewed provider"
+        );
+        assert!(script_store_item_paths("/nix/store/not-a-store-hash/tool").is_none());
     }
 
     #[test]
