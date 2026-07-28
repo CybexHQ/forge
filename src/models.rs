@@ -119,6 +119,11 @@ pub struct BuildJob {
     pub progress_message: Option<String>,
     pub logs: String,
     pub error: String,
+    /// Enumerated reason this Forge refused the job, empty when it did not.
+    /// Manage renders operator text from this code; the prose in `error` is
+    /// for local logs and may be redacted in transit.
+    #[serde(default)]
+    pub rejection_code: String,
     pub output_path: String,
     pub output_sha256: String,
     pub output_size_bytes: i64,

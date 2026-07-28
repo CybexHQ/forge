@@ -35,7 +35,7 @@ use tokio::{
     fs as tokio_fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +45,7 @@ use crate::{
         normalize_http_url, normalize_listen_addr, validate_menu_timeout_ms,
     },
     db,
+    error::AppError,
     models::{BootProfileType, BuildJob, CacheArtifact, clean_tags, normalize_mac},
     redact::redact_sensitive_key_values,
     updater::{ForgeUpdateStatusReport, ManagedUpdateRequest},
@@ -429,6 +430,11 @@ struct ForgeBuildJobReport {
     progress_message: Option<String>,
     logs: String,
     error: String,
+    /// Enumerated rejection reason, omitted when the job was not refused.
+    /// Manage screens reported prose for credential-shaped words and blanks
+    /// the whole field, so the reason has to travel as a code to survive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejection_code: Option<String>,
     output_path: String,
     output_sha256: String,
     output_size_bytes: i64,
@@ -483,6 +489,7 @@ impl From<BuildJob> for ForgeBuildJobReport {
             progress_message: job.progress_message,
             logs: job.logs,
             error: job.error,
+            rejection_code: (!job.rejection_code.is_empty()).then_some(job.rejection_code),
             output_path: job.output_path,
             output_sha256: job.output_sha256,
             output_size_bytes: job.output_size_bytes,
@@ -1232,7 +1239,7 @@ async fn sync_forge_foundation(
     let mut retained_job_ids = Vec::with_capacity(desired.build_jobs.len());
     for job in desired.build_jobs {
         retained_job_ids.push(job.id.clone());
-        db::upsert_managed_build_job(
+        let sync = db::upsert_managed_build_job(
             &state.db,
             &job.id,
             &job.requested_artifact_type,
@@ -1243,8 +1250,46 @@ async fn sync_forge_foundation(
             &job.input_config_hash,
             job.cache_metadata,
         )
-        .await
-        .with_context(|| format!("sync managed build job {}", job.id))?;
+        .await;
+        // A job this Forge refuses must not take the sync cycle down with it.
+        // Everything below -- cancellations, cache deletions, retention, and
+        // the report itself -- used to be skipped whenever a single job failed
+        // to validate, so one bad Blueprint silently froze cache, disk, and
+        // host reporting for the whole node while its heartbeat stayed green.
+        match sync {
+            Ok(_) => {}
+            Err(AppError::Validation(reason)) => {
+                warn!(
+                    job_id = %job.id,
+                    %reason,
+                    "rejecting managed build job; reporting it to Manage as failed"
+                );
+                if let Err(error) = db::record_rejected_managed_build_job(
+                    &state.db,
+                    &job.id,
+                    &job.requested_artifact_type,
+                    job.target.as_deref(),
+                    job.system.as_deref(),
+                    &job.input_revision,
+                    &job.input_config_hash,
+                    &reason,
+                )
+                .await
+                {
+                    error!(
+                        job_id = %job.id,
+                        error = %error,
+                        "could not record rejected managed build job"
+                    );
+                }
+            }
+            // Transient trouble (a busy database, IO) must keep retrying
+            // rather than burn the job down, so it still aborts the cycle.
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("sync managed build job {}", job.id));
+            }
+        }
     }
     if desired.build_jobs_complete {
         db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await?;
@@ -6547,7 +6592,11 @@ fn is_valid_header_value(value: &str) -> bool {
 }
 
 fn safe_error(err: &anyhow::Error) -> String {
-    let text = err.to_string();
+    // `{:#}` walks the whole cause chain. Plain Display shows only the
+    // outermost context, which named the failing job but never the reason --
+    // "sync managed build job <uuid>" repeated for hours with the actual
+    // validation error nowhere in the journal.
+    let text = format!("{err:#}");
     for sensitive in ["managed_token", "enrollment_secret", "private_key"] {
         if text.to_ascii_lowercase().contains(sensitive) {
             return "managed sync failed; see service configuration".to_string();

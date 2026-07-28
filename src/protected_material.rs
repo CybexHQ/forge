@@ -223,8 +223,7 @@ fn contains_unsafe_credential_assignment(text: &str) -> bool {
         if canonical == "hashedpassword" && assignment_value == "\"!\"" {
             continue;
         }
-        if canonical == "passwd" && safe_nixos_nss_passwd_assignment(text, equals, assignment_value)
-        {
+        if safe_nixos_nss_database_assignment(text, equals) {
             continue;
         }
         if is_credential_reference_key(&canonical)
@@ -237,7 +236,35 @@ fn contains_unsafe_credential_assignment(text: &str) -> bool {
     false
 }
 
-fn safe_nixos_nss_passwd_assignment(text: &str, equals: usize, value: &str) -> bool {
+/// `system.nssDatabases.*` lists NSS *service module* names (`files`, `authd`,
+/// `sss`, `himmelblau`), never credential material, but `passwd` trips
+/// [`is_credential_key`]. Accept the whole option family whenever the value is
+/// a list of bare service identifiers, optionally wrapped in a priority helper.
+///
+/// This deliberately does not pin one literal spelling. It used to accept only
+/// `lib.mkOrder 490 [ "authd" ]`; when `cybex-authd.nix` dropped that wrapper
+/// to fix an NSS lookup deadlock, every Blueprint build began failing this
+/// check, and because a rejected job never reaches the local database it could
+/// not be reported either -- Manage showed the builds queued forever. Any
+/// literal password smuggled into the value is still caught by the modular
+/// password hash and credential URL scans, which run over the same text.
+fn safe_nixos_nss_database_assignment(text: &str, equals: usize) -> bool {
+    let Some(option) = dotted_option_key(text, equals) else {
+        return false;
+    };
+    let Some(database) = option.strip_prefix("system.nssDatabases.") else {
+        return false;
+    };
+    if database.is_empty() || database.contains('.') {
+        return false;
+    }
+    nss_service_list_value(text, equals)
+}
+
+/// Walk back from `=` over a full dotted NixOS option path. [`assignment_key`]
+/// deliberately stops at `.` (it wants the leaf for credential matching), so
+/// the option family needs its own reader.
+fn dotted_option_key(text: &str, equals: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut end = equals;
     while end > 0 && bytes[end - 1].is_ascii_whitespace() {
@@ -250,15 +277,86 @@ fn safe_nixos_nss_passwd_assignment(text: &str, equals: usize, value: &str) -> b
     {
         start -= 1;
     }
-    if &text[start..end] != "system.nssDatabases.passwd" {
-        return false;
-    }
+    (start < end).then(|| &text[start..end])
+}
 
-    let compact = value.split_whitespace().collect::<String>();
-    matches!(
-        compact.as_str(),
-        r#"lib.mkOrder490["authd"]"# | r#"lib.mkOrder490[\"authd\"]"#
-    )
+/// Read the assignment value up to its terminating `;`, then check it is a
+/// (possibly priority-wrapped) Nix list of bare NSS service names.
+///
+/// This reads to `;` rather than reusing [`assignment_value`], which also stops
+/// at newlines: NSS database lists are routinely written across several lines.
+fn nss_service_list_value(text: &str, equals: usize) -> bool {
+    const MAX_NSS_ASSIGNMENT_BYTES: usize = 4096;
+
+    let remainder = &text[equals + 1..];
+    let bounded = &remainder[..remainder.len().min(MAX_NSS_ASSIGNMENT_BYTES)];
+    let Some(terminator) = bounded.find(';') else {
+        return false;
+    };
+
+    // Strip an optional priority wrapper. NixOS modules use these to order
+    // themselves against other modules' NSS entries; they carry no value.
+    let list = strip_nss_priority_wrapper(bounded[..terminator].trim());
+    let Some(inner) = list
+        .trim()
+        .strip_prefix('[')
+        .and_then(|list| list.strip_suffix(']'))
+    else {
+        return false;
+    };
+    nss_service_names_only(inner)
+}
+
+fn strip_nss_priority_wrapper(value: &str) -> &str {
+    for prefix in ["lib.mkOrder", "mkOrder"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            let digits = rest.len()
+                - rest
+                    .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                    .len();
+            if digits > 0 {
+                return &rest[digits..];
+            }
+        }
+    }
+    for prefix in ["lib.mkBefore", "mkBefore", "lib.mkAfter", "mkAfter"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    value
+}
+
+/// The list body must be nothing but quoted bare service names. Whitespace is
+/// skipped between entries but never allowed inside one, so a quoted phrase
+/// does not pass as a service name. Quotes may be escaped when the module text
+/// is itself nested inside a Nix string.
+fn nss_service_names_only(inner: &str) -> bool {
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        let quote: &str = if rest.starts_with("\\\"") {
+            "\\\""
+        } else {
+            "\""
+        };
+        let Some(after_open) = rest.strip_prefix(quote) else {
+            return false;
+        };
+        let Some(close) = after_open.find(quote) else {
+            return false;
+        };
+        let name = &after_open[..close];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return false;
+        }
+        rest = after_open[close + quote.len()..].trim_start();
+    }
+    true
 }
 
 fn assignment_key(text: &str, equals: usize) -> Option<&str> {
@@ -689,32 +787,77 @@ mod tests {
     }
 
     #[test]
-    fn allows_only_the_exact_nixos_authd_passwd_database_declaration() {
+    fn allows_any_nixos_nss_database_service_list() {
         for desktop_module_nix in [
+            // The wrapped form, and the bare form cybex-authd.nix moved to
+            // when ordering authd ahead of files deadlocked NSS lookups.
             r#"{ ... }: {
               system.nssDatabases.passwd = lib.mkOrder 490 [ "authd" ];
             }"#,
             r#"{ ... }: {
-              embedded = "system.nssDatabases.passwd = lib.mkOrder 490 [ \"authd\" ];";
+              system.nssDatabases.passwd = [ "authd" ];
+            }"#,
+            r#"{ ... }: {
+              system.nssDatabases.passwd = lib.mkOrder 1501 [ "himmelblau" ];
+            }"#,
+            r#"{ ... }: {
+              system.nssDatabases.passwd = mkAfter [ "sss" ];
+              system.nssDatabases.passwd = lib.mkBefore [ "files" "authd" ];
+            }"#,
+            // Lists routinely wrap across lines.
+            r#"{ ... }: {
+              system.nssDatabases.passwd = [
+                "files"
+                "authd"
+              ];
+            }"#,
+            // The module text is itself nested inside a Nix string.
+            r#"{ ... }: {
+              embedded = "system.nssDatabases.passwd = [ \"authd\" ];";
             }"#,
         ] {
             validate_desktop_module_nix(desktop_module_nix).unwrap();
         }
 
         for rejected in [
+            // Only the real option family is exempt.
             r#"services.example.passwd = lib.mkOrder 490 [ "authd" ];"#,
-            r#"system.nssDatabases.passwd = lib.mkOrder 491 [ "authd" ];"#,
-            r#"system.nssDatabases.passwd = lib.mkOrder 490 [ "files" ];"#,
-            r#"system.nssDatabases.passwd = lib.mkOrder 490 [ "authd" "files" ];"#,
-            r#"system.nssDatabases.passwd = "literal-secret";"#,
             r#"passwd = lib.mkOrder 490 [ "authd" ];"#,
+            r#"system.nssDatabases.deeper.passwd = [ "authd" ];"#,
+            // ... and only when the value really is a service-name list.
+            r#"system.nssDatabases.passwd = "literal-secret";"#,
+            r#"system.nssDatabases.passwd = [ "authd" "sneaky secret" ];"#,
+            r#"system.nssDatabases.passwd = builtins.readFile "literal-secret";"#,
         ] {
             let error = validate_desktop_module_nix(rejected)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("literal credential assignment"));
+            assert!(
+                error.contains("literal credential assignment"),
+                "{rejected}"
+            );
             assert!(!error.contains("literal-secret"));
         }
+    }
+
+    #[test]
+    fn nss_database_exemption_still_catches_embedded_password_hashes() {
+        // The exemption only silences the credential-assignment scan; the
+        // hash, activation-secret, and credential-URL scans still cover the
+        // same text, so the widened rule cannot become a smuggling route.
+        let error = validate_desktop_module_nix(&format!(
+            r#"system.nssDatabases.passwd = [ "authd" ]; # {PASSWORD_HASH}"#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("modular password hash"));
+
+        let error = validate_desktop_module_nix(
+            r#"system.nssDatabases.passwd = [ "authd" ]; # https://u:pw@example.test/x"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("credential-bearing URL"));
     }
 
     #[test]

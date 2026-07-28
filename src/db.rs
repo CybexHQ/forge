@@ -561,6 +561,7 @@ struct BuildJobRow {
     progress_message: Option<String>,
     logs: String,
     error: String,
+    rejection_code: String,
     output_path: String,
     output_sha256: String,
     output_size_bytes: i64,
@@ -592,6 +593,7 @@ impl TryFrom<BuildJobRow> for BuildJob {
             progress_message: row.progress_message,
             logs: row.logs,
             error: row.error,
+            rejection_code: row.rejection_code,
             output_path: row.output_path,
             output_sha256: row.output_sha256,
             output_size_bytes: row.output_size_bytes,
@@ -1477,6 +1479,129 @@ pub async fn upsert_managed_build_job(
     .await?;
 
     get_build_job_by_managed_id(pool, &managed_job_id).await
+}
+
+/// Persist a managed job that this Forge can never build as a terminal local
+/// failure, so the reason reaches Manage on the next report.
+///
+/// [`upsert_managed_build_job`] validates before it writes, so a job Manage
+/// considers valid but this Forge rejects leaves *no local row at all* -- and
+/// the Forge report is assembled from local rows, so the job stayed `queued`
+/// in Manage forever with no way to see why. Recording the rejection turns an
+/// invisible stall into a visible failure an operator can act on.
+///
+/// Every field is sanitized rather than validated: this path must not be able
+/// to fail for the same reason the strict path did.
+///
+/// The reason travels as an enumerated `rejection_code` as well as prose.
+/// Manage screens reported free text for words like "credential" and blanks
+/// the whole value when it finds one -- which is every protected-material
+/// rejection -- so the prose alone reaches operators as "[redacted]".
+#[allow(clippy::too_many_arguments)]
+pub async fn record_rejected_managed_build_job(
+    pool: &SqlitePool,
+    managed_job_id: &str,
+    requested_artifact_type: &str,
+    target: Option<&str>,
+    system: Option<&str>,
+    input_revision: &str,
+    input_config_hash: &str,
+    reason: &str,
+) -> AppResult<()> {
+    // The managed id is the row key, so it is the one field that still has to
+    // be well formed. A malformed id is a Manage-side bug we cannot record
+    // against any job; the caller logs and moves on.
+    let managed_job_id = normalize_managed_id(managed_job_id, "managed_job_id")?;
+    let error = format!("Forge rejected this build job: {reason}");
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO forge_build_jobs
+         (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision,
+          input_config_hash, status, progress_percent, progress_stage, progress_message,
+          error, rejection_code, cache_metadata, completed_at, created_at, updated_at)
+         VALUES (?, ?, '{}', ?, ?, ?, ?, 'failed', 100, 'failed', ?, ?, ?, '{}', ?, ?, ?)
+         ON CONFLICT(managed_job_id) DO UPDATE SET
+             status = 'failed',
+             progress_percent = 100,
+             progress_stage = 'failed',
+             progress_message = excluded.progress_message,
+             error = excluded.error,
+             rejection_code = excluded.rejection_code,
+             completed_at = COALESCE(forge_build_jobs.completed_at, excluded.updated_at),
+             updated_at = excluded.updated_at
+         WHERE forge_build_jobs.status = 'queued'",
+    )
+    .bind(&managed_job_id)
+    .bind(sanitize_report_field(
+        requested_artifact_type,
+        64,
+        "unknown",
+    ))
+    .bind(sanitize_report_field(target.unwrap_or_default(), 64, ""))
+    .bind(sanitize_report_field(
+        system.unwrap_or_default(),
+        64,
+        "x86_64-linux",
+    ))
+    .bind(sanitize_report_field(input_revision, 256, ""))
+    .bind(sanitize_report_field(input_config_hash, 64, ""))
+    .bind(truncate_chars("Rejected by Forge validation", 256))
+    .bind(truncate_chars(&error, 2048))
+    .bind(classify_validation_rejection(reason))
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Map a validation reason onto a stable, enumerated rejection code.
+///
+/// Every reason reaching here is produced by the normalizers and the protected
+/// material validator in this crate, so matching on their wording is a
+/// same-repo concern -- no cross-component contract can drift out from under
+/// it. Only the codes are a contract, and they are a closed set that can never
+/// carry tenant data.
+pub fn classify_validation_rejection(reason: &str) -> &'static str {
+    const CODES: &[(&str, &str)] = &[
+        ("contains protected material", "protected_material"),
+        ("build_spec must be", "invalid_build_spec"),
+        ("cache_metadata must be", "invalid_cache_metadata"),
+        ("managed_job_id", "invalid_job_identity"),
+        ("requested_artifact_type must be", "invalid_artifact_type"),
+        ("target must be", "invalid_target"),
+        ("system must be", "invalid_system"),
+        ("input_revision", "invalid_input_revision"),
+        ("input_config_hash must be", "invalid_input_config_hash"),
+    ];
+    CODES
+        .iter()
+        .find(|(needle, _)| reason.contains(needle))
+        .map(|(_, code)| *code)
+        // An unrecognized reason is still a real rejection; Manage renders a
+        // generic message rather than dropping the job back into limbo.
+        .unwrap_or("rejected")
+}
+
+/// Best-effort cleanup for values that are only ever echoed back to Manage.
+/// Drops control characters, bounds the length, and falls back when empty.
+fn sanitize_report_field(value: &str, max_chars: usize, fallback: &str) -> String {
+    let cleaned = value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_chars)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 pub async fn cancel_absent_managed_build_jobs(
@@ -3843,6 +3968,175 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_managed_build_job_is_recorded_so_manage_can_see_it() {
+        let pool = test_pool().await;
+        // A spec this Forge refuses: upsert leaves no row, so before the
+        // rejection is recorded there is nothing to report and Manage sees the
+        // job sit in `queued` forever.
+        let rejected_spec = json!({
+            "build_input": { "desktop_module_nix": "services.example.password = \"literal\";" }
+        });
+        let error = upsert_managed_build_job(
+            &pool,
+            "managed-rejected-1",
+            "nixos_closure",
+            Some(rejected_spec),
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-rejected",
+            &"a".repeat(64),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
+        assert!(
+            get_build_job_by_managed_id(&pool, "managed-rejected-1")
+                .await
+                .is_err()
+        );
+
+        record_rejected_managed_build_job(
+            &pool,
+            "managed-rejected-1",
+            "nixos_closure",
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-rejected",
+            &"a".repeat(64),
+            "build_spec contains protected material",
+        )
+        .await
+        .unwrap();
+
+        let recorded = get_build_job_by_managed_id(&pool, "managed-rejected-1")
+            .await
+            .unwrap();
+        assert_eq!(recorded.status, "failed");
+        assert_eq!(recorded.progress_percent, Some(100));
+        assert!(recorded.error.contains("protected material"));
+        // The prose may be redacted in transit; the code is what Manage renders.
+        assert_eq!(recorded.rejection_code, "protected_material");
+        assert!(recorded.completed_at.is_some());
+        // The rejected spec itself is never persisted.
+        assert_eq!(recorded.build_spec, json!({}));
+
+        // Repeated sync cycles must not keep rewriting a terminal row.
+        let before = recorded.updated_at.clone();
+        record_rejected_managed_build_job(
+            &pool,
+            "managed-rejected-1",
+            "nixos_closure",
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-rejected",
+            &"a".repeat(64),
+            "a different reason",
+        )
+        .await
+        .unwrap();
+        let unchanged = get_build_job_by_managed_id(&pool, "managed-rejected-1")
+            .await
+            .unwrap();
+        assert_eq!(unchanged.updated_at, before);
+        assert!(unchanged.error.contains("protected material"));
+    }
+
+    #[test]
+    fn validation_reasons_classify_to_stable_rejection_codes() {
+        // Drive the classifier from the real normalizers rather than from
+        // hand-copied strings, so rewording a message fails this test instead
+        // of silently degrading every rejection to the generic code.
+        let cases: Vec<(AppError, &str)> = vec![
+            (
+                normalize_artifact_type("nope", "requested_artifact_type").unwrap_err(),
+                "invalid_artifact_type",
+            ),
+            (
+                normalize_build_target(Some("Not A Target"), "nixos_closure").unwrap_err(),
+                "invalid_target",
+            ),
+            (
+                normalize_build_system("bad system").unwrap_err(),
+                "invalid_system",
+            ),
+            (
+                normalize_input_revision("").unwrap_err(),
+                "invalid_input_revision",
+            ),
+            (
+                normalize_sha256("short", "input_config_hash", false).unwrap_err(),
+                "invalid_input_config_hash",
+            ),
+            (
+                normalize_managed_id("", "managed_job_id").unwrap_err(),
+                "invalid_job_identity",
+            ),
+        ];
+        for (error, expected) in cases {
+            let AppError::Validation(reason) = error else {
+                panic!("expected a validation error");
+            };
+            assert_eq!(classify_validation_rejection(&reason), expected, "{reason}");
+        }
+
+        let protected = build_spec_to_string(
+            Some(json!({"build_input": {"generated_nix": "apiKey = \"literal\";"}})),
+            "nixos_closure",
+            "blueprint",
+            "x86_64-linux",
+            "rev",
+            &"a".repeat(64),
+        )
+        .unwrap_err();
+        let AppError::Validation(reason) = protected else {
+            panic!("expected a validation error");
+        };
+        assert_eq!(classify_validation_rejection(&reason), "protected_material");
+
+        assert_eq!(classify_validation_rejection("something new"), "rejected");
+    }
+
+    #[tokio::test]
+    async fn recording_a_rejection_never_disturbs_a_live_build() {
+        let pool = test_pool().await;
+        let job = upsert_managed_build_job(
+            &pool,
+            "managed-live-1",
+            "nixos_closure",
+            None,
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-live",
+            &"a".repeat(64),
+            None,
+        )
+        .await
+        .unwrap();
+        let claimed = claim_next_build_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job.id);
+
+        record_rejected_managed_build_job(
+            &pool,
+            "managed-live-1",
+            "nixos_closure",
+            Some("blueprint"),
+            Some("x86_64-linux"),
+            "rev-live",
+            &"a".repeat(64),
+            "should not apply to a running build",
+        )
+        .await
+        .unwrap();
+
+        let still_running = get_build_job_by_managed_id(&pool, "managed-live-1")
+            .await
+            .unwrap();
+        assert_eq!(still_running.status, "running");
+        assert!(still_running.error.is_empty());
     }
 
     #[tokio::test]
