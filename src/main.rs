@@ -21,10 +21,23 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    let command = cli.command.clone().unwrap_or(Command::Serve);
+    if let Command::ValidateApplianceMedia {
+        installed_version,
+        media_version,
+    } = &command
+    {
+        cybex_forge::updater::validate_appliance_media_version(installed_version, media_version)?;
+        return Ok(());
+    }
+
     let config = cybex_forge::config::AppConfig::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
-    let command = cli.command.clone().unwrap_or(Command::Serve);
+    if matches!(command, Command::ValidateApplianceConfig) {
+        config.validate_appliance_config()?;
+        return Ok(());
+    }
 
     if matches!(command, Command::PrintConfig) {
         println!(
@@ -32,6 +45,17 @@ async fn main() -> anyhow::Result<()> {
             toml::to_string_pretty(&config.redacted_for_display())?
         );
         return Ok(());
+    }
+
+    if matches!(command, Command::ReconcileAppliance) {
+        #[cfg(unix)]
+        if effective_uid() != 0 {
+            anyhow::bail!("appliance recovery reconciliation must run as root");
+        }
+        config
+            .validate_appliance_config()
+            .context("refusing appliance reconciliation with unsafe configuration")?;
+        return cybex_forge::updater::reconcile_appliance_recovery(&config);
     }
 
     ensure_managed_command_is_not_root(&config, &command)?;
@@ -115,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("apply-runtime-config exits before database setup")
         }
         Command::PrintConfig => unreachable!("print-config exits before database setup"),
+        Command::ValidateApplianceConfig => {
+            unreachable!("validate-appliance-config exits before database setup")
+        }
+        Command::ValidateApplianceMedia { .. } => {
+            unreachable!("media validation exits before config loading")
+        }
+        Command::ReconcileAppliance => {
+            unreachable!("appliance reconciliation exits before database setup")
+        }
     }
 }
 
@@ -200,7 +233,15 @@ fn managed_command_requires_service_user(
     config: &cybex_forge::config::AppConfig,
     command: &Command,
 ) -> bool {
-    config.manage.enabled && !matches!(command, Command::PrintConfig | Command::ApplyRuntimeConfig)
+    config.manage.enabled
+        && !matches!(
+            command,
+            Command::PrintConfig
+                | Command::ValidateApplianceConfig
+                | Command::ApplyRuntimeConfig
+                | Command::ValidateApplianceMedia { .. }
+                | Command::ReconcileAppliance
+        )
 }
 
 #[cfg(unix)]
@@ -336,7 +377,22 @@ mod tests {
         ));
         assert!(!managed_command_requires_service_user(
             &config,
+            &Command::ValidateApplianceConfig
+        ));
+        assert!(!managed_command_requires_service_user(
+            &config,
             &Command::ApplyRuntimeConfig
+        ));
+        assert!(!managed_command_requires_service_user(
+            &config,
+            &Command::ValidateApplianceMedia {
+                installed_version: "0.1.1".to_string(),
+                media_version: "0.1.2".to_string(),
+            }
+        ));
+        assert!(!managed_command_requires_service_user(
+            &config,
+            &Command::ReconcileAppliance
         ));
 
         config.manage.enabled = false;

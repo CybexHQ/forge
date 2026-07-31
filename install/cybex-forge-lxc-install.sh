@@ -10,14 +10,16 @@ NIXPKGS_FLAKE="github:NixOS/nixpkgs/$NIXPKGS_REVISION"
 usage() {
   cat <<'EOF'
 Usage:
-  cybex-forge-lxc-install.sh --api-url URL --organization-id UUID --auth-code CODE [options]
+  cybex-forge-lxc-install.sh --api-url URL --organization-id UUID [options]
 
 Run this inside a Debian/Ubuntu Proxmox LXC that will host Cybex Forge.
 
 Required:
   --api-url URL             Cybex Manage public API URL, for example https://manage.example.com
   --organization-id UUID    Cybex organization UUID from the install authorization
-  --auth-code CODE          One-time Cybex Forge install authorization code
+Enrollment secret (choose exactly one):
+  --auth-code-file PATH     Root-owned mode-0600 file below a root-owned, non-writable path; consumed after staging
+  --auth-code CODE          Legacy process-visible input; converted to a protected file
 
 Options:
   --public-base-url URL     Override the auto-detected URL PXE clients use for this Forge node
@@ -31,12 +33,15 @@ Options:
   --menu-timeout-ms MS      Boot menu timeout desired by Cybex Manage; 0 disables it (default: 0)
   --update-trusted-public-key KEY
                             Standard-Base64 raw 32-byte Ed25519 update public key
+  --allow-insecure-manage-http
+                            Explicit development-only opt-in to an HTTP Manage URL
   --dry-run, --validate-only
                             Validate inputs/environment without installing or enrolling
   -h, --help                Show this help
 
 Environment alternatives:
   CYBEX_MANAGE_API_URL, CYBEX_ORGANIZATION_ID, CYBEX_FORGE_AUTH_CODE,
+  CYBEX_FORGE_AUTH_CODE_FILE,
   CYBEX_FORGE_PUBLIC_BASE_URL, CYBEX_FORGE_SOURCE_DIR, CYBEX_FORGE_GIT_URL,
   CYBEX_FORGE_REF, CYBEX_FORGE_LISTEN_ADDR, CYBEX_FORGE_TFTP_ROOT,
   CYBEX_FORGE_HTTP_ROOT, CYBEX_FORGE_BOOTLOADER_FILENAME,
@@ -47,6 +52,8 @@ EOF
 api_url="${CYBEX_MANAGE_API_URL:-}"
 organization_id="${CYBEX_ORGANIZATION_ID:-}"
 auth_code="${CYBEX_FORGE_AUTH_CODE:-}"
+unset CYBEX_FORGE_AUTH_CODE
+auth_code_file="${CYBEX_FORGE_AUTH_CODE_FILE:-}"
 public_base_url="${CYBEX_FORGE_PUBLIC_BASE_URL:-}"
 source_dir="${CYBEX_FORGE_SOURCE_DIR:-$FORGE_SOURCE_DIR_DEFAULT}"
 git_url="${CYBEX_FORGE_GIT_URL:-$FORGE_GIT_URL_DEFAULT}"
@@ -57,13 +64,48 @@ http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
 update_trusted_public_key="${CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY:-}"
+allow_insecure_manage_http="${CYBEX_FORGE_ALLOW_INSECURE_MANAGE_HTTP:-0}"
 dry_run=0
+temporary_auth_code_file=""
+bootstrap_auth_code_file="/var/lib/cybex-forge/bootstrap/enrollment-code"
+bootstrap_auth_code_tomb="/var/lib/cybex-forge/bootstrap/.enrollment-code.consumed"
+bootstrap_auth_code_staged_file="/var/lib/cybex-forge/bootstrap/.enrollment-code.staged"
+bootstrap_auth_code_identity_file="/var/lib/cybex-forge-bootstrap.identity"
+bootstrap_auth_code_identity=""
+bootstrap_auth_code_pending=0
+
+cleanup_sensitive_auth_codes() {
+  local status="$?"
+  local cleanup_failed=0
+  trap - EXIT
+  if [ "$bootstrap_auth_code_pending" -eq 1 ]; then
+    if ! secure_remove_bootstrap_auth_code; then
+      echo "failed to securely remove the staged Forge enrollment code" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if [ -n "$temporary_auth_code_file" ] && [ -f "$temporary_auth_code_file" ]; then
+    if command -v shred >/dev/null 2>&1; then
+      shred -u -n 1 -z -- "$temporary_auth_code_file" >/dev/null 2>&1 ||
+        rm -f -- "$temporary_auth_code_file" || cleanup_failed=1
+    else
+      rm -f -- "$temporary_auth_code_file" || cleanup_failed=1
+    fi
+  fi
+  if [ "$cleanup_failed" -eq 1 ] && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup_sensitive_auth_codes EXIT
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --api-url) api_url="${2:-}"; shift 2 ;;
     --organization-id) organization_id="${2:-}"; shift 2 ;;
     --auth-code) auth_code="${2:-}"; shift 2 ;;
+    --auth-code-file) auth_code_file="${2:-}"; shift 2 ;;
     --public-base-url) public_base_url="${2:-}"; shift 2 ;;
     --source-dir) source_dir="${2:-}"; shift 2 ;;
     --git-url) git_url="${2:-}"; shift 2 ;;
@@ -74,6 +116,7 @@ while [ "$#" -gt 0 ]; do
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
     --update-trusted-public-key) update_trusted_public_key="${2:-}"; shift 2 ;;
+    --allow-insecure-manage-http) allow_insecure_manage_http=1; shift ;;
     --dry-run|--validate-only) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -137,6 +180,23 @@ validate_url() {
   esac
 }
 
+validate_manage_transport() {
+  case "$allow_insecure_manage_http" in
+    0|1) ;;
+    *) echo "CYBEX_FORGE_ALLOW_INSECURE_MANAGE_HTTP must be 0 or 1" >&2; exit 2 ;;
+  esac
+  case "$api_url" in
+    https://*) ;;
+    http://*)
+      if [ "$allow_insecure_manage_http" -ne 1 ]; then
+        echo "--api-url must use HTTPS; development HTTP requires --allow-insecure-manage-http" >&2
+        exit 2
+      fi
+      ;;
+    *) echo "--api-url must use HTTPS" >&2; exit 2 ;;
+  esac
+}
+
 validate_plain_value() {
   local name="$1"
   local value="$2"
@@ -154,16 +214,207 @@ validate_organization_id() {
   fi
 }
 
-validate_auth_code() {
-  validate_plain_value "--auth-code" "$auth_code"
-  if [ "${#auth_code}" -lt 16 ]; then
-    echo "--auth-code is too short" >&2
+validate_auth_code_value() {
+  local value="$1"
+  validate_plain_value "Forge install authorization code" "$value"
+  if [ "${#value}" -lt 16 ]; then
+    echo "Forge install authorization code is too short" >&2
     exit 2
   fi
-  if printf '%s' "$auth_code" | LC_ALL=C grep -q '[[:space:]]'; then
-    echo "--auth-code contains unsupported characters" >&2
+  if [ "${#value}" -gt 512 ]; then
+    echo "Forge install authorization code is too long" >&2
     exit 2
   fi
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
+    echo "Forge install authorization code contains unsupported characters" >&2
+    exit 2
+  fi
+}
+
+validate_root_protected_auth_code_parent() {
+  local path="$1"
+  local label="$2"
+  local parent canonical current component owner mode mode_value
+  local -a components=()
+  parent="$(dirname -- "$path")"
+  canonical="$(realpath -e -- "$parent")" || {
+    echo "$label parent path must exist" >&2
+    exit 2
+  }
+  if [ "$canonical" != "$parent" ]; then
+    echo "$label parent path must be canonical and contain no symlink" >&2
+    exit 2
+  fi
+  IFS='/' read -r -a components <<< "${parent#/}"
+  current="/"
+  for component in "" "${components[@]}"; do
+    if [ -n "$component" ]; then
+      current="${current%/}/$component"
+    fi
+    if [ -L "$current" ] || [ ! -d "$current" ]; then
+      echo "$label parent path must contain only directories, not symlinks" >&2
+      exit 2
+    fi
+    owner="$(stat -c '%u' -- "$current")"
+    mode="$(stat -c '%a' -- "$current")"
+    if [ "$owner" != "0" ]; then
+      echo "$label parent path must be entirely root-owned" >&2
+      exit 2
+    fi
+    if ! [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+      echo "$label parent path has invalid permissions" >&2
+      exit 2
+    fi
+    mode_value=$((8#$mode))
+    if (( (mode_value & 0022) != 0 )); then
+      echo "$label parent path must not be group- or other-writable" >&2
+      exit 2
+    fi
+  done
+}
+
+validate_auth_code_file() {
+  local path="$1"
+  local expected_uid="$2"
+  local label="$3"
+  local owner mode links size value
+  validate_absolute_path "$label" "$path"
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    echo "$label must be a regular file, not a symlink" >&2
+    exit 2
+  fi
+  owner="$(stat -c '%u' -- "$path")"
+  mode="$(stat -c '%a' -- "$path")"
+  links="$(stat -c '%h' -- "$path")"
+  size="$(stat -c '%s' -- "$path")"
+  if [ "$owner" != "$expected_uid" ] || [ "$mode" != "600" ] || [ "$links" != "1" ]; then
+    echo "$label has unsafe ownership, permissions, or link count" >&2
+    exit 2
+  fi
+  if [ "$size" -gt 512 ]; then
+    echo "$label is too large" >&2
+    exit 2
+  fi
+  value="$(<"$path")"
+  validate_auth_code_value "$value"
+  value=""
+}
+
+secure_remove_bootstrap_auth_code() {
+  local helper="/usr/local/libexec/cybex-forge-secure-input"
+  local candidate=""
+  local present=0
+  local source_present=0
+  local tomb_present=0
+  local staged_present=0
+  [ "$bootstrap_auth_code_pending" -eq 1 ] || return 0
+  if [ -e "$bootstrap_auth_code_file" ] || [ -L "$bootstrap_auth_code_file" ]; then
+    source_present=1
+  fi
+  if [ -e "$bootstrap_auth_code_tomb" ] || [ -L "$bootstrap_auth_code_tomb" ]; then
+    tomb_present=1
+  fi
+  if [ -e "$bootstrap_auth_code_staged_file" ] || [ -L "$bootstrap_auth_code_staged_file" ]; then
+    staged_present=1
+  fi
+  present=$((source_present + tomb_present + staged_present))
+  if [ "$present" -gt 1 ]; then
+    echo "multiple Forge enrollment code paths exist" >&2
+    return 1
+  fi
+  if [ "$source_present" -eq 1 ]; then
+    candidate="$bootstrap_auth_code_file"
+  elif [ "$tomb_present" -eq 1 ]; then
+    candidate="$bootstrap_auth_code_tomb"
+  elif [ "$staged_present" -eq 1 ]; then
+    candidate="$bootstrap_auth_code_staged_file"
+  fi
+  if [ -n "$candidate" ]; then
+    local rebound_identity
+    [ -x "$helper" ] || return 1
+    if [ -z "$bootstrap_auth_code_identity" ] &&
+      [ -e "$bootstrap_auth_code_identity_file" ] &&
+      [ ! -L "$bootstrap_auth_code_identity_file" ] &&
+      [ -f "$bootstrap_auth_code_identity_file" ] &&
+      [ "$(stat -c '%u:%a:%h' -- "$bootstrap_auth_code_identity_file")" = "$(id -u):600:1" ]; then
+      bootstrap_auth_code_identity="$(<"$bootstrap_auth_code_identity_file")"
+    fi
+    if [ "$bootstrap_auth_code_identity" = "pending" ] ||
+      ! printf '%s' "$bootstrap_auth_code_identity" | grep -Eq '^[0-9]+(:[0-9]+){6}$'; then
+      rebound_identity="$(runuser -u cybex-forge -- \
+        "$helper" identity "$candidate" 512 secret)" || return 1
+      bootstrap_auth_code_identity="$rebound_identity"
+    elif ! runuser -u cybex-forge -- \
+      "$helper" erase-if-same "$candidate" "$bootstrap_auth_code_identity" \
+      >/dev/null 2>&1; then
+      rebound_identity="$(runuser -u cybex-forge -- \
+        "$helper" identity "$candidate" 512 secret)" || return 1
+      [ "${rebound_identity%:*:*:*:*}" = \
+        "${bootstrap_auth_code_identity%:*:*:*:*}" ] || return 1
+      bootstrap_auth_code_identity="$rebound_identity"
+    else
+      bootstrap_auth_code_identity=""
+    fi
+    if [ -n "$bootstrap_auth_code_identity" ]; then
+      runuser -u cybex-forge -- \
+        "$helper" erase-if-same "$candidate" "$bootstrap_auth_code_identity" ||
+        return 1
+    fi
+  fi
+  [ ! -e "$bootstrap_auth_code_file" ] && [ ! -L "$bootstrap_auth_code_file" ] || return 1
+  [ ! -e "$bootstrap_auth_code_tomb" ] && [ ! -L "$bootstrap_auth_code_tomb" ] || return 1
+  [ ! -e "$bootstrap_auth_code_staged_file" ] && [ ! -L "$bootstrap_auth_code_staged_file" ] || return 1
+  if [ -e "$bootstrap_auth_code_identity_file" ] || [ -L "$bootstrap_auth_code_identity_file" ]; then
+    [ ! -L "$bootstrap_auth_code_identity_file" ] &&
+      [ -f "$bootstrap_auth_code_identity_file" ] &&
+      [ "$(stat -c '%u:%a:%h' -- "$bootstrap_auth_code_identity_file")" = "$(id -u):600:1" ] ||
+      return 1
+    : > "$bootstrap_auth_code_identity_file"
+    sync -f "$bootstrap_auth_code_identity_file"
+    rm -f -- "$bootstrap_auth_code_identity_file"
+    sync -f "$(dirname "$bootstrap_auth_code_identity_file")"
+  fi
+  bootstrap_auth_code_identity=""
+  bootstrap_auth_code_pending=0
+}
+
+persist_bootstrap_auth_code_identity() {
+  local identity="$1"
+  local identity_temporary
+  if [ "$identity" != "pending" ] &&
+    ! printf '%s' "$identity" | grep -Eq '^[0-9]+(:[0-9]+){6}$'; then
+    echo "refusing to persist an invalid Forge enrollment code identity" >&2
+    return 1
+  fi
+  identity_temporary="$(mktemp "${bootstrap_auth_code_identity_file}.tmp.XXXXXX")"
+  printf '%s\n' "$identity" > "$identity_temporary"
+  chown root:root "$identity_temporary"
+  chmod 0600 "$identity_temporary"
+  sync -f "$identity_temporary"
+  mv -T -- "$identity_temporary" "$bootstrap_auth_code_identity_file"
+  sync -f "$(dirname "$bootstrap_auth_code_identity_file")"
+}
+
+prepare_auth_code_source() {
+  if [ -n "$auth_code" ] && [ -n "$auth_code_file" ]; then
+    echo "--auth-code and --auth-code-file are mutually exclusive" >&2
+    exit 2
+  fi
+  if [ -z "$auth_code" ] && [ -z "$auth_code_file" ]; then
+    echo "one of --auth-code-file or --auth-code is required" >&2
+    exit 2
+  fi
+  if [ -n "$auth_code" ]; then
+    validate_auth_code_value "$auth_code"
+    umask 077
+    temporary_auth_code_file="$(mktemp /run/cybex-forge-enrollment-code.XXXXXX)"
+    printf '%s\n' "$auth_code" > "$temporary_auth_code_file"
+    chmod 0600 "$temporary_auth_code_file"
+    auth_code=""
+    auth_code_file="$temporary_auth_code_file"
+  fi
+  validate_root_protected_auth_code_parent "$auth_code_file" "--auth-code-file"
+  validate_auth_code_file "$auth_code_file" "$(id -u)" "--auth-code-file"
 }
 
 validate_listen_addr() {
@@ -346,6 +597,8 @@ require_command() {
 installer_preflight() {
   require_root
   require_command apt-get
+  require_command realpath
+  require_command stat
   require_command systemctl
   if [ ! -d /run/systemd/system ]; then
     echo "systemd is not running inside this LXC" >&2
@@ -566,6 +819,7 @@ verify_source_compatibility() {
     systemd/cybex-forge-sentinel.service \
     systemd/cybex-forge-sentinel.timer \
     systemd/nix-daemon-cybex-forge.conf \
+    appliance/cybex-forge-secure-input.c \
     install/cybex-forge-check \
     install/cybex-forge-sync-once \
     install/cybex-forge-sentinel; do
@@ -613,15 +867,23 @@ verify_source_compatibility() {
   require_source_file_contains "$source_dir/src/manage.rs" "apply_runtime_config_once" "root managed runtime apply command"
   require_source_file_contains "$source_dir/src/manage.rs" "managed runtime configuration is pending adoption; skipping apply" "pending runtime apply no-op"
   require_source_file_contains "$source_dir/src/config.rs" "organization_id" "managed organization id enrollment"
-  require_source_file_contains "$source_dir/src/config.rs" "forge_install_code" "managed Forge install code enrollment"
+  require_source_file_contains "$source_dir/src/config.rs" "forge_install_code_file" "protected file-backed Forge install code enrollment"
 }
 
 install_binary() {
+  local secure_input
   # shellcheck disable=SC1091
   [ -f /root/.cargo/env ] && . /root/.cargo/env
   cargo build --quiet --release --manifest-path "$source_dir/Cargo.toml"
   rm -f /usr/local/bin/cybex-forge
   install -m 0755 -o root -g root "$source_dir/target/release/cybex-forge" /usr/local/bin/cybex-forge
+  secure_input="$(mktemp /run/cybex-forge-secure-input.XXXXXX)"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$source_dir/appliance/cybex-forge-secure-input.c" -o "$secure_input"
+  install -d -m 0755 -o root -g root /usr/local/libexec
+  install -m 0755 -o root -g root \
+    "$secure_input" /usr/local/libexec/cybex-forge-secure-input
+  rm -f -- "$secure_input"
 }
 
 prepare_user_and_dirs() {
@@ -633,7 +895,7 @@ prepare_user_and_dirs() {
   fi
   install -m 0750 -o root -g cybex-forge -d /etc/cybex-forge
   install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge
-  install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge/build /var/lib/cybex-forge/build-outputs /var/lib/cybex-forge/cache /var/lib/cybex-forge/updates
+  install -m 0700 -o cybex-forge -g cybex-forge -d /var/lib/cybex-forge/bootstrap /var/lib/cybex-forge/build /var/lib/cybex-forge/build-outputs /var/lib/cybex-forge/cache /var/lib/cybex-forge/updates
   install -m 0755 -o root -g root -d /opt/cybex-forge/releases
   install -m 0755 -o root -g cybex-forge -d /srv/cybex-forge
   install -m 0755 -o cybex-forge -g cybex-forge -d "$http_root" "$http_root/isos" "$http_root/assets" "$http_root/cache"
@@ -651,6 +913,61 @@ prepare_user_and_dirs() {
     rmdir /srv/cybex-forge/app
   fi
   harden_tftp_tree
+}
+
+install_enrollment_code() {
+  local rebound_identity
+  local source="$auth_code_file"
+  validate_root_protected_auth_code_parent "$source" "--auth-code-file"
+  validate_auth_code_file "$source" "$(id -u)" "--auth-code-file"
+  if [ -e "$bootstrap_auth_code_file" ] || [ -L "$bootstrap_auth_code_file" ] \
+    || [ -e "$bootstrap_auth_code_tomb" ] || [ -L "$bootstrap_auth_code_tomb" ] \
+    || [ -e "$bootstrap_auth_code_staged_file" ] || [ -L "$bootstrap_auth_code_staged_file" ] \
+    || [ -e "$bootstrap_auth_code_identity_file" ] || [ -L "$bootstrap_auth_code_identity_file" ]; then
+    echo "refusing to overwrite residual Forge enrollment credential state" >&2
+    exit 1
+  fi
+  bootstrap_auth_code_pending=1
+  bootstrap_auth_code_identity="pending"
+  persist_bootstrap_auth_code_identity "$bootstrap_auth_code_identity"
+  install -m 0600 -o cybex-forge -g cybex-forge -- \
+    "$source" "$bootstrap_auth_code_staged_file"
+  validate_auth_code_file "$bootstrap_auth_code_staged_file" \
+    "$(id -u cybex-forge)" "staged enrollment code"
+  bootstrap_auth_code_identity="$(runuser -u cybex-forge -- \
+    /usr/local/libexec/cybex-forge-secure-input \
+    identity "$bootstrap_auth_code_staged_file" 512 secret)"
+  if ! printf '%s' "$bootstrap_auth_code_identity" | \
+    grep -Eq '^[0-9]+(:[0-9]+){6}$'; then
+    echo "could not bind staged Forge enrollment code identity" >&2
+    exit 1
+  fi
+  persist_bootstrap_auth_code_identity "$bootstrap_auth_code_identity"
+  mv -T -- "$bootstrap_auth_code_staged_file" "$bootstrap_auth_code_file"
+  sync -f "$(dirname "$bootstrap_auth_code_file")"
+  rebound_identity="$(runuser -u cybex-forge -- \
+    /usr/local/libexec/cybex-forge-secure-input \
+    identity "$bootstrap_auth_code_file" 512 secret)"
+  [ "${rebound_identity%:*:*:*:*}" = \
+    "${bootstrap_auth_code_identity%:*:*:*:*}" ] || {
+    echo "staged Forge enrollment code identity changed during publication" >&2
+    exit 1
+  }
+  bootstrap_auth_code_identity="$rebound_identity"
+  persist_bootstrap_auth_code_identity "$bootstrap_auth_code_identity"
+  validate_auth_code_file "$bootstrap_auth_code_file" "$(id -u cybex-forge)" "installed enrollment code"
+
+  if [ "$source" != "$bootstrap_auth_code_file" ]; then
+    if command -v shred >/dev/null 2>&1; then
+      shred -u -n 1 -z -- "$source" >/dev/null 2>&1 || rm -f -- "$source"
+    else
+      rm -f -- "$source"
+    fi
+  fi
+  if [ "$temporary_auth_code_file" = "$source" ]; then
+    temporary_auth_code_file=""
+  fi
+  auth_code_file="$bootstrap_auth_code_file"
 }
 
 install_theme_assets() {
@@ -729,7 +1046,7 @@ trusted_public_key = "$update_trusted_public_key"
 enabled = true
 api_url = "$api_url"
 organization_id = "$organization_id"
-forge_install_code = "$auth_code"
+forge_install_code_file = "$bootstrap_auth_code_file"
 state_path = "/var/lib/cybex-forge/manage-state.json"
 sync_interval_seconds = 30
 enrollment_poll_seconds = 10
@@ -1352,6 +1669,16 @@ submit_enrollment() {
     echo "enrollment command failed; inspect journalctl -u cybex-forge" >&2
     exit 1
   }
+  if [ -e "$bootstrap_auth_code_file" ] || [ -L "$bootstrap_auth_code_file" ] \
+    || [ -e "$bootstrap_auth_code_tomb" ] || [ -L "$bootstrap_auth_code_tomb" ] \
+    || [ -e "$bootstrap_auth_code_staged_file" ] || [ -L "$bootstrap_auth_code_staged_file" ]; then
+    echo "enrollment succeeded but the one-time credential was not scrubbed" >&2
+    exit 1
+  fi
+  secure_remove_bootstrap_auth_code || {
+    echo "enrollment succeeded but credential cleanup could not be finalized" >&2
+    exit 1
+  }
   fix_database_permissions
 }
 
@@ -1367,12 +1694,12 @@ verify_installation() {
 installer_preflight
 require_value "--api-url" "$api_url"
 require_value "--organization-id" "$organization_id"
-require_value "--auth-code" "$auth_code"
+prepare_auth_code_source
 validate_url "--api-url" "$api_url"
+validate_manage_transport
 ensure_public_base_url
 validate_url "--git-url" "$git_url"
 validate_organization_id
-validate_auth_code
 validate_listen_addr
 validate_absolute_path "--source-dir" "$source_dir"
 validate_runtime_roots
@@ -1397,6 +1724,7 @@ prepare_source
 verify_source_compatibility
 install_binary
 prepare_user_and_dirs
+install_enrollment_code
 install_theme_assets
 validate_pinned_build_inputs
 write_config

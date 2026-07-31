@@ -1,9 +1,14 @@
 #[cfg(unix)]
 use std::os::{
     fd::AsRawFd,
-    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
 };
 use std::{
+    cmp::Ordering,
+    collections::HashSet,
     fs,
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -19,9 +24,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use chrono::{SecondsFormat, Utc};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, time::sleep};
 
@@ -31,9 +36,18 @@ const REQUEST_FILE: &str = "request.json";
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "apply.lock";
 const APPLY_STATE_FILE: &str = "apply-state.json";
+const MEDIA_REBASE_EVENTS_DIR: &str = "media-rebase-events";
 const RELEASE_SCHEMA: &str = "cybex.forge.update-request.v1";
 const APPLY_LOCK_SCHEMA: &str = "cybex.forge.update-lock.v1";
 const APPLY_STATE_SCHEMA: &str = "cybex.forge.apply-state.v1";
+const MEDIA_REBASE_SCHEMA: &str = "cybex.forge.media-rebase.v1";
+const MEDIA_REBASE_TRANSACTION_FILE: &str = "media-rebase-transaction.json";
+const BINARY_RECOVERY_SCHEMA: &str = "cybex.forge.appliance.binary-recovery.v1";
+const BINARY_RECOVERY_FILE: &str = "binary-recovery.json";
+const INSTALL_ENROLLMENT_STAGE_FILE: &str = ".enrollment-code.staged";
+const MAX_INSTALL_ENROLLMENT_STAGE_BYTES: u64 = 512;
+const MAX_MEDIA_REBASE_EVENT_BYTES: u64 = 4 * 1024;
+pub const MAX_MEDIA_REBASE_EVENTS_PER_REPORT: usize = 16;
 pub const UPDATE_ONLY_PROJECTION_SCHEMA: &str = "cybex.forge.update-projection.v1";
 const MAX_UPDATE_ONLY_PROJECTION_BYTES: u64 = 4 * 1024;
 
@@ -69,6 +83,20 @@ pub struct ManagedUpdateRequest {
     #[serde(default)]
     pub notes_url: String,
     pub requested_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaRebaseEvidence {
+    pub schema: String,
+    pub event_id: String,
+    pub media_sequence: u64,
+    pub mode: String,
+    pub resulting_version: String,
+    pub previous_request_attempt_id: Option<String>,
+    pub previous_target_version: Option<String>,
+    pub previous_status: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -135,6 +163,14 @@ struct ApplyState {
     started_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryRecoveryJournal {
+    schema: String,
+    embedded_version: String,
+    reason: String,
+}
+
 trait UpdateRuntime {
     fn restart_service(&self, config: &AppConfig) -> Result<()>;
 
@@ -199,6 +235,11 @@ pub async fn store_update_request(
         return Ok(());
     }
 
+    if validate_update_target_version(&request.version).is_err() {
+        write_version_policy_status(config, &request)?;
+        return Ok(());
+    }
+
     write_status(
         config,
         ForgeUpdateStatusReport {
@@ -245,6 +286,602 @@ pub fn stored_status_report(config: &AppConfig) -> Result<Option<ForgeUpdateStat
         return Ok(None);
     }
     read_status(config)
+}
+
+pub fn media_rebase_events(config: &AppConfig) -> Result<Vec<MediaRebaseEvidence>> {
+    let directory = media_rebase_events_path(config);
+    let directory_metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", directory.display())),
+    };
+    if !directory_metadata.file_type().is_dir() {
+        bail!("Forge media-rebase event queue is not a directory");
+    }
+    #[cfg(unix)]
+    if directory_metadata.uid() != unsafe { libc::geteuid() }
+        || directory_metadata.mode() & 0o777 != 0o700
+    {
+        bail!("Forge media-rebase event queue has unsafe ownership or permissions");
+    }
+
+    let mut events = Vec::new();
+    for entry in
+        fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", directory.display()))?;
+        let filename = entry.file_name();
+        let filename = filename
+            .to_str()
+            .ok_or_else(|| anyhow!("Forge media-rebase event filename is not UTF-8"))?;
+        if filename.starts_with(".media-rebase.") {
+            continue;
+        }
+        let event_id_from_name = filename
+            .strip_suffix(".json")
+            .ok_or_else(|| anyhow!("Forge media-rebase event filename is invalid"))?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_MEDIA_REBASE_EVENT_BYTES {
+            bail!("Forge media-rebase event is not a bounded regular file");
+        }
+        #[cfg(unix)]
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            bail!("Forge media-rebase event has unsafe ownership, permissions, or links");
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let opened = file
+            .metadata()
+            .with_context(|| format!("reinspect {}", path.display()))?;
+        #[cfg(unix)]
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.uid() != unsafe { libc::geteuid() }
+            || opened.mode() & 0o777 != 0o600
+            || opened.nlink() != 1
+        {
+            bail!("Forge media-rebase event changed while opening");
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_MEDIA_REBASE_EVENT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", path.display()))?;
+        if bytes.len() as u64 > MAX_MEDIA_REBASE_EVENT_BYTES {
+            bail!("Forge media-rebase event exceeds its size limit");
+        }
+        let event: MediaRebaseEvidence =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        validate_media_rebase_event(&event)?;
+        if event.event_id != event_id_from_name {
+            bail!("Forge media-rebase event filename does not match its event ID");
+        }
+        events.push(event);
+    }
+    events.sort_by(|left, right| {
+        left.media_sequence
+            .cmp(&right.media_sequence)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    let mut distinct = HashSet::new();
+    if events
+        .iter()
+        .any(|event| !distinct.insert(event.event_id.as_str()))
+    {
+        bail!("Forge media-rebase event IDs are not distinct");
+    }
+    if events
+        .windows(2)
+        .any(|pair| pair[0].media_sequence == pair[1].media_sequence)
+    {
+        bail!("Forge media-rebase event sequences are not distinct");
+    }
+    events.truncate(MAX_MEDIA_REBASE_EVENTS_PER_REPORT);
+    Ok(events)
+}
+
+pub fn acknowledge_media_rebase_events(
+    config: &AppConfig,
+    reported: &[MediaRebaseEvidence],
+    acknowledged_event_ids: &[String],
+) -> Result<()> {
+    if acknowledged_event_ids.len() > reported.len() {
+        bail!("Manage acknowledged more media-rebase events than Forge reported");
+    }
+    let reported_ids = reported
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut acknowledged = HashSet::new();
+    for event_id in acknowledged_event_ids {
+        validate_media_rebase_event_id(event_id)?;
+        if !acknowledged.insert(event_id.as_str()) || !reported_ids.contains(event_id.as_str()) {
+            bail!("Manage returned an invalid media-rebase acknowledgement");
+        }
+    }
+    for event_id in acknowledged_event_ids {
+        let path = media_rebase_events_path(config).join(format!("{event_id}.json"));
+        remove_owned_regular_file_if_exists(&path)?;
+        sync_parent_directory(&path)?;
+    }
+    Ok(())
+}
+
+/// Complete any appliance transaction which must be durable before Forge is
+/// allowed to start. The NixOS boot-owned reconciliation unit invokes this
+/// through the currently installed, governed Forge executable.
+pub fn reconcile_appliance_recovery(config: &AppConfig) -> Result<()> {
+    config
+        .validate_appliance_config()
+        .context("refusing appliance reconciliation with unsafe configuration")?;
+    scrub_interrupted_install_enrollment_stage(config)?;
+    // A media rebase deliberately supersedes every updater projection. Record
+    // binary recovery first, then let the journaled rebase atomically replace
+    // it with the required idle projection and durable media evidence.
+    reconcile_binary_recovery(config)?;
+    finalize_media_rebase_transaction(config)
+}
+
+/// Remove an interrupted installer staging file before the unprivileged Forge
+/// service can start. Current media keeps one Forge-owned persistent copy and
+/// atomically renames it from the bootstrap stage to the final path; legacy
+/// pre-release media used a second root-owned appliance path. Both fixed paths
+/// are rebound by inode before overwrite/unlink, and cleanup is replay-safe.
+fn scrub_interrupted_install_enrollment_stage(config: &AppConfig) -> Result<()> {
+    // Current media stages beside the final credential so publication is one
+    // atomic rename with no second persistent copy. Also reconcile the legacy
+    // root-owned appliance path used by pre-release media.
+    for path in [
+        config
+            .paths
+            .data_dir
+            .join("bootstrap")
+            .join(INSTALL_ENROLLMENT_STAGE_FILE),
+        appliance_metadata_path(config).join(INSTALL_ENROLLMENT_STAGE_FILE),
+    ] {
+        scrub_interrupted_install_enrollment_stage_path(&path)?;
+    }
+    Ok(())
+}
+
+fn scrub_interrupted_install_enrollment_stage_path(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_INSTALL_ENROLLMENT_STAGE_BYTES {
+        bail!("interrupted installer enrollment stage must be a bounded regular file");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("interrupted installer enrollment stage has no parent"))?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).with_context(|| format!("inspect {}", parent.display()))?;
+    if !parent_metadata.file_type().is_dir() {
+        bail!("interrupted installer enrollment stage parent is not a directory");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != parent_metadata.uid()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || parent_metadata.mode() & 0o777 != 0o700
+    {
+        bail!("interrupted installer enrollment stage parent has unsafe metadata");
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect open {}", path.display()))?;
+    if !opened.file_type().is_file() || opened.len() > MAX_INSTALL_ENROLLMENT_STAGE_BYTES {
+        bail!("interrupted installer enrollment stage changed while opening");
+    }
+    #[cfg(unix)]
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != metadata.uid()
+        || opened.mode() != metadata.mode()
+        || opened.nlink() != 1
+        || opened.len() != metadata.len()
+    {
+        bail!("interrupted installer enrollment stage changed while opening");
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .context("seek interrupted installer enrollment stage")?;
+    let zeroes = vec![0_u8; opened.len() as usize];
+    file.write_all(&zeroes)
+        .context("overwrite interrupted installer enrollment stage")?;
+    file.set_len(0)
+        .context("truncate interrupted installer enrollment stage")?;
+    file.sync_all()
+        .context("sync interrupted installer enrollment stage")?;
+    let erased = file
+        .metadata()
+        .context("reinspect interrupted installer enrollment stage")?;
+    let named =
+        fs::symlink_metadata(path).with_context(|| format!("reinspect {}", path.display()))?;
+    #[cfg(unix)]
+    if erased.dev() != opened.dev()
+        || erased.ino() != opened.ino()
+        || erased.nlink() != 1
+        || named.dev() != erased.dev()
+        || named.ino() != erased.ino()
+        || !named.file_type().is_file()
+    {
+        bail!("refusing to unlink a replaced installer enrollment stage");
+    }
+    drop(file);
+    fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    sync_parent_directory(path)
+}
+
+fn finalize_media_rebase_transaction(config: &AppConfig) -> Result<()> {
+    let journal = appliance_metadata_path(config).join(MEDIA_REBASE_TRANSACTION_FILE);
+    let Some(event) = read_protected_json_if_exists::<MediaRebaseEvidence>(
+        &journal,
+        MAX_MEDIA_REBASE_EVENT_BYTES,
+        effective_uid(),
+    )?
+    else {
+        return Ok(());
+    };
+    validate_media_rebase_event(&event).context("validate media-rebase transaction")?;
+
+    let event_directory = media_rebase_events_path(config);
+    let event_directory_metadata = fs::symlink_metadata(&event_directory)
+        .with_context(|| format!("inspect {}", event_directory.display()))?;
+    if !event_directory_metadata.file_type().is_dir() {
+        bail!("Forge media-rebase transaction event queue is not a directory");
+    }
+    #[cfg(unix)]
+    if event_directory_metadata.mode() & 0o777 != 0o700 {
+        bail!("Forge media-rebase transaction event queue must have mode 0700");
+    }
+
+    // The journal already contains the complete event. Deleting any subset of
+    // these exact files is therefore replayable after sudden power loss.
+    for path in [
+        request_path(config),
+        status_path(config),
+        apply_state_path(config),
+        lock_path(config),
+    ] {
+        remove_rebase_control_path(&path)?;
+    }
+
+    publish_media_rebase_event_noreplace(config, &event, &event_directory_metadata)?;
+    remove_rebase_control_path(&journal)?;
+    Ok(())
+}
+
+fn reconcile_binary_recovery(config: &AppConfig) -> Result<()> {
+    let journal = appliance_metadata_path(config).join(BINARY_RECOVERY_FILE);
+    let Some(recovery) = read_protected_json_if_exists::<BinaryRecoveryJournal>(
+        &journal,
+        MAX_MEDIA_REBASE_EVENT_BYTES,
+        effective_uid(),
+    )?
+    else {
+        return Ok(());
+    };
+    if recovery.schema != BINARY_RECOVERY_SCHEMA || recovery.reason != "missing_or_nonexecutable" {
+        bail!("Forge appliance binary-recovery journal is invalid");
+    }
+    parse_semantic_version(&recovery.embedded_version)
+        .context("Forge appliance embedded recovery version is invalid")?;
+    let actual_version =
+        installed_binary_version(config).context("identify restored Forge appliance binary")?;
+    if actual_version != recovery.embedded_version {
+        bail!("restored Forge appliance binary does not match the journaled embedded version");
+    }
+
+    let existing = read_status(config)?;
+    let (target_version, attempt_id, started_at) = existing
+        .as_ref()
+        .map(|status| {
+            (
+                status.target_version.clone(),
+                status.attempt_id.clone(),
+                status.started_at.clone(),
+            )
+        })
+        .unwrap_or_default();
+    write_status(
+        config,
+        ForgeUpdateStatusReport {
+            status: if target_version.is_empty() {
+                "failed".to_string()
+            } else {
+                "rolled_back".to_string()
+            },
+            stage: "appliance_binary_recovery".to_string(),
+            progress_percent: Some(100),
+            error: "appliance_binary_recovered: restored embedded baseline after the live binary was missing or non-executable".to_string(),
+            target_version,
+            current_version: actual_version,
+            attempt_id,
+            started_at,
+            completed_at: Some(now_rfc3339()),
+        },
+    )?;
+    remove_rebase_control_path(&journal)?;
+    Ok(())
+}
+
+fn publish_media_rebase_event_noreplace(
+    config: &AppConfig,
+    event: &MediaRebaseEvidence,
+    directory_metadata: &fs::Metadata,
+) -> Result<()> {
+    let path = media_rebase_events_path(config).join(format!("{}.json", event.event_id));
+    if path.exists() || fs::symlink_metadata(&path).is_ok() {
+        let existing = read_protected_json_if_exists::<MediaRebaseEvidence>(
+            &path,
+            MAX_MEDIA_REBASE_EVENT_BYTES,
+            metadata_uid(directory_metadata),
+        )?
+        .ok_or_else(|| anyhow!("published media-rebase event disappeared"))?;
+        if existing != *event {
+            bail!("media-rebase transaction event ID collides with different evidence");
+        }
+        return Ok(());
+    }
+
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("media-rebase event path has no parent"))?;
+    let temporary = directory.join(format!(
+        ".media-rebase-reconcile-{}-{}.tmp",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let body = serde_json::to_vec(event).context("serialize media-rebase transaction event")?;
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        #[cfg(unix)]
+        align_service_state_owner(&file, directory_metadata)?;
+        file.write_all(&body)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temporary.display()))?;
+        drop(file);
+        rename_noreplace(&temporary, &path)
+            .with_context(|| format!("publish {}", path.display()))?;
+        fs::File::open(directory)
+            .with_context(|| format!("open {}", directory.display()))?
+            .sync_all()
+            .with_context(|| format!("sync {}", directory.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_protected_json_if_exists<T: DeserializeOwned>(
+    path: &Path,
+    maximum_bytes: u64,
+    expected_uid: u32,
+) -> Result<Option<T>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > maximum_bytes {
+        bail!("protected appliance journal is not a bounded regular file");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != expected_uid || metadata.mode() & 0o777 != 0o600 || metadata.nlink() != 1 {
+        bail!("protected appliance journal ownership or permissions are unsafe");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("reinspect {}", path.display()))?;
+    #[cfg(unix)]
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != expected_uid
+        || opened.mode() & 0o777 != 0o600
+        || opened.nlink() != 1
+        || opened.len() != metadata.len()
+    {
+        bail!("protected appliance journal changed while opening");
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > maximum_bytes {
+        bail!("protected appliance journal exceeds its size limit");
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
+fn remove_rebase_control_path(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).with_context(|| format!("inspect {}", parent.display()))?;
+    if !parent_metadata.file_type().is_dir() {
+        bail!("media-rebase control parent is not a directory");
+    }
+    #[cfg(unix)]
+    if parent_metadata.mode() & 0o022 != 0 {
+        bail!("media-rebase control parent is group/other writable");
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_symlink() && !metadata.file_type().is_file() {
+        bail!(
+            "refusing non-file media-rebase control path {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.file_type().is_file()
+        && (metadata.uid() != parent_metadata.uid() || metadata.nlink() != 1)
+    {
+        bail!("media-rebase control file ownership or links are unsafe");
+    }
+    fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("open {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", parent.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    // libc does not expose the renameat2 wrapper on every Linux libc target
+    // (notably the static musl appliance target), but it does expose the
+    // architecture-correct syscall number and variadic syscall entry point.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)
+}
+
+#[cfg(unix)]
+fn metadata_uid(metadata: &fs::Metadata) -> u32 {
+    metadata.uid()
+}
+
+#[cfg(not(unix))]
+fn metadata_uid(_metadata: &fs::Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn effective_uid() -> u32 {
+    0
+}
+
+fn validate_media_rebase_event(event: &MediaRebaseEvidence) -> Result<()> {
+    if event.schema != MEDIA_REBASE_SCHEMA {
+        bail!("unsupported Forge media-rebase event schema");
+    }
+    validate_media_rebase_event_id(&event.event_id)?;
+    if event.media_sequence == 0 {
+        bail!("Forge media-rebase sequence must be positive");
+    }
+    if !matches!(event.mode.as_str(), "repair" | "recovery") {
+        bail!("Forge media-rebase mode is invalid");
+    }
+    parse_semantic_version(&event.resulting_version)
+        .context("Forge media-rebase resulting version is invalid")?;
+    if let Some(version) = &event.previous_target_version {
+        parse_semantic_version(version)
+            .context("Forge media-rebase previous target version is invalid")?;
+    }
+    if let Some(attempt_id) = &event.previous_request_attempt_id {
+        if attempt_id.is_empty()
+            || attempt_id.len() > 128
+            || !attempt_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("Forge media-rebase previous attempt ID is invalid");
+        }
+    }
+    if let Some(status) = &event.previous_status {
+        if !matches!(
+            status.as_str(),
+            "idle"
+                | "requested"
+                | "queued"
+                | "waiting"
+                | "preflight"
+                | "downloading"
+                | "verifying"
+                | "staged"
+                | "applying"
+                | "restarting"
+                | "health_checking"
+                | "succeeded"
+                | "failed"
+                | "rolled_back"
+                | "unsupported"
+        ) {
+            bail!("Forge media-rebase previous status is invalid");
+        }
+    }
+    chrono::DateTime::parse_from_rfc3339(&event.created_at)
+        .context("Forge media-rebase timestamp is invalid")?;
+    Ok(())
+}
+
+fn validate_media_rebase_event_id(event_id: &str) -> Result<()> {
+    let parsed = uuid::Uuid::parse_str(event_id).context("parse Forge media-rebase event ID")?;
+    if parsed.is_nil() || parsed.hyphenated().to_string() != event_id {
+        bail!("Forge media-rebase event ID is not a canonical nonzero UUID");
+    }
+    Ok(())
 }
 
 /// Read a narrow, non-secret updater projection for an update-only report.
@@ -381,8 +1018,15 @@ async fn apply_requested_update_with_runtime(
             && status.attempt_id == request_attempt_id(&request)
             && update_status_is_terminal(&status.status)
         {
+            if !terminal_status_matches_installed_binary(config, &status, &request)? {
+                record_terminal_binary_identity_mismatch(config, status)?;
+            }
             return Ok(());
         }
+    }
+    if validate_update_target_version(&request.version).is_err() {
+        write_version_policy_status(config, &request)?;
+        return Ok(());
     }
 
     let started_at = now_rfc3339();
@@ -392,6 +1036,7 @@ async fn apply_requested_update_with_runtime(
     prune_stale_update_files(config, &attempt_id, &request.version);
     if let Err(err) = apply_result {
         let message = err.to_string();
+        let current_version = installed_binary_version(config).unwrap_or_default();
         write_status(
             config,
             ForgeUpdateStatusReport {
@@ -400,7 +1045,7 @@ async fn apply_requested_update_with_runtime(
                 progress_percent: Some(100),
                 error: message.clone(),
                 target_version: request.version.clone(),
-                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                current_version,
                 attempt_id: attempt_id.clone(),
                 started_at: Some(started_at.clone()),
                 completed_at: Some(now_rfc3339()),
@@ -409,6 +1054,49 @@ async fn apply_requested_update_with_runtime(
         return Err(anyhow!(message));
     }
     Ok(())
+}
+
+fn terminal_status_matches_installed_binary(
+    config: &AppConfig,
+    status: &ForgeUpdateStatusReport,
+    request: &ManagedUpdateRequest,
+) -> Result<bool> {
+    let actual_version = match installed_binary_version(config) {
+        Ok(version) => version,
+        Err(_) => return Ok(false),
+    };
+    if actual_version != status.current_version {
+        return Ok(false);
+    }
+    if status.status == "succeeded" {
+        if actual_version != request.version {
+            return Ok(false);
+        }
+        let actual_sha256 = sha256_regular_file(&config.update.binary_path)?;
+        if actual_sha256 != request.sha256.to_ascii_lowercase() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn record_terminal_binary_identity_mismatch(
+    config: &AppConfig,
+    mut status: ForgeUpdateStatusReport,
+) -> Result<()> {
+    status.status = if status.status == "succeeded" {
+        "rolled_back".to_string()
+    } else {
+        "failed".to_string()
+    };
+    status.stage = "binary_identity_mismatch".to_string();
+    status.progress_percent = Some(100);
+    status.error =
+        "installed_binary_identity_mismatch: terminal updater state did not match the live executable"
+            .to_string();
+    status.current_version = installed_binary_version(config).unwrap_or_default();
+    status.completed_at = Some(now_rfc3339());
+    write_status(config, status)
 }
 
 async fn apply_requested_update_inner(
@@ -455,7 +1143,7 @@ async fn apply_requested_update_inner(
 
     let staged = stage_artifact(config, request, &artifact)?;
     write_progress(config, request, attempt_id, started_at, "staged", 70, "")?;
-    smoke_test_binary(config, &staged)?;
+    smoke_test_binary(config, &staged, &request.version)?;
 
     install_and_activate_candidate(config, request, attempt_id, started_at, &staged, runtime).await
 }
@@ -594,6 +1282,8 @@ fn rollback_after_activation_failure(
     if let Err(err) = restore_binary(config, backup) {
         bail!("rollback_failed: trigger={trigger}; restore_binary={err}");
     }
+    let restored_version = installed_binary_version(config)
+        .with_context(|| format!("rollback_failed: trigger={trigger}; restored_binary_identity"))?;
     if let Err(err) = runtime.restart_service(config) {
         bail!("rollback_failed: trigger={trigger}; restored_binary_restart={err}");
     }
@@ -605,7 +1295,7 @@ fn rollback_after_activation_failure(
             progress_percent: Some(100),
             error: format!("activation_failed: {trigger}; restored previous binary"),
             target_version: request.version.clone(),
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: restored_version,
             attempt_id: attempt_id.to_string(),
             started_at: Some(started_at.to_string()),
             completed_at: Some(now_rfc3339()),
@@ -645,6 +1335,16 @@ fn recover_interrupted_apply(config: &AppConfig, runtime: &dyn UpdateRuntime) ->
             format!("restore_binary={err}"),
         ));
     }
+    let restored_version = match installed_binary_version(config) {
+        Ok(version) => version,
+        Err(err) => {
+            return Err(record_interrupted_recovery_failure(
+                config,
+                &state,
+                format!("restored_binary_identity={err}"),
+            ));
+        }
+    };
     if let Err(err) = runtime.restart_service(config) {
         return Err(record_interrupted_recovery_failure(
             config,
@@ -663,7 +1363,7 @@ fn recover_interrupted_apply(config: &AppConfig, runtime: &dyn UpdateRuntime) ->
                 state.phase
             ),
             target_version: state.target_version,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: restored_version,
             attempt_id: state.attempt_id,
             started_at: Some(state.started_at),
             completed_at: Some(now_rfc3339()),
@@ -689,7 +1389,7 @@ fn record_interrupted_recovery_failure(
             progress_percent: Some(100),
             error: message.clone(),
             target_version: state.target_version.clone(),
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: installed_binary_version(config).unwrap_or_default(),
             attempt_id: state.attempt_id.clone(),
             started_at: Some(state.started_at.clone()),
             completed_at: Some(now_rfc3339()),
@@ -709,6 +1409,7 @@ async fn download_artifact(config: &AppConfig, request: &ManagedUpdateRequest) -
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5 * 60))
         .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build update HTTP client")?;
     let mut response = client
@@ -776,7 +1477,7 @@ fn verify_signature(config: &AppConfig, request: &ManagedUpdateRequest) -> Resul
     let sig_bytes = decode_b64(request.signature.trim()).context("decode update signature")?;
     let signature = Signature::from_slice(&sig_bytes).context("parse update signature")?;
     let message = update_signature_message(request);
-    key.verify(message.as_bytes(), &signature)
+    key.verify_strict(message.as_bytes(), &signature)
         .context("verify update signature")
 }
 
@@ -792,7 +1493,12 @@ fn parse_trusted_public_key(value: &str) -> Result<VerifyingKey> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("trusted update public key must be a 32-byte Ed25519 key"))?;
-    VerifyingKey::from_bytes(&key_array).context("parse trusted update public key")
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_array).context("parse trusted update public key")?;
+    if verifying_key.is_weak() {
+        bail!("trusted update public key must not be a weak Ed25519 key");
+    }
+    Ok(verifying_key)
 }
 
 fn stage_artifact(
@@ -813,7 +1519,13 @@ fn stage_artifact(
     Ok(staged)
 }
 
-fn smoke_test_binary(config: &AppConfig, binary: &Path) -> Result<()> {
+fn smoke_test_binary(config: &AppConfig, binary: &Path, expected_version: &str) -> Result<()> {
+    let actual_version = installed_binary_version_at(binary)
+        .with_context(|| format!("read version from staged binary {}", binary.display()))?;
+    if actual_version != expected_version {
+        bail!("staged binary version does not match the signed update version");
+    }
+
     let mut command = Command::new(binary);
     command
         .arg("--config")
@@ -828,6 +1540,71 @@ fn smoke_test_binary(config: &AppConfig, binary: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn installed_binary_version(config: &AppConfig) -> Result<String> {
+    installed_binary_version_at(&config.update.binary_path)
+}
+
+fn installed_binary_version_at(binary: &Path) -> Result<String> {
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    let output = command_output_with_transient_exec_retry(&mut command)
+        .with_context(|| format!("execute {} --version", binary.display()))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("installed Forge binary identity check failed");
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("installed Forge binary version output is not UTF-8")?;
+    let version = stdout
+        .strip_prefix("cybex-forge ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .filter(|value| !value.contains('\n'))
+        .ok_or_else(|| anyhow!("installed Forge binary version output is not canonical"))?;
+    parse_semantic_version(version).context("installed Forge binary version is not canonical")?;
+    Ok(version.to_string())
+}
+
+fn sha256_regular_file(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect installed binary {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("installed Forge binary is not a regular file");
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!("installed Forge binary has an unsafe link count");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open installed binary {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("reinspect installed binary {}", path.display()))?;
+    #[cfg(unix)]
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.nlink() != 1
+        || opened.len() != metadata.len()
+    {
+        bail!("installed Forge binary changed while opening");
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash installed binary {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn backup_current_binary(config: &AppConfig, attempt_id: &str) -> Result<PathBuf> {
@@ -1049,15 +1826,8 @@ fn validate_apply_state(config: &AppConfig, state: &ApplyState) -> Result<()> {
     {
         bail!("Forge apply-state backup filename is invalid");
     }
-    validate_request(&ManagedUpdateRequest {
-        version: state.target_version.clone(),
-        artifact_url: "https://invalid.example/cybex-forge".to_string(),
-        sha256: "0".repeat(64),
-        signature: String::new(),
-        release_url: String::new(),
-        notes_url: String::new(),
-        requested_at: None,
-    })?;
+    parse_semantic_version(&state.target_version)
+        .context("Forge apply-state target version is invalid")?;
     let backup = config.update.releases_dir.join(&state.backup_filename);
     let metadata = fs::symlink_metadata(&backup)
         .with_context(|| format!("inspect Forge apply-state backup {}", backup.display()))?;
@@ -1465,23 +2235,173 @@ fn validate_update_projection_version(version: &str, field: &str) -> Result<()> 
 }
 
 fn validate_request(request: &ManagedUpdateRequest) -> Result<()> {
-    if request.version.trim().is_empty()
-        || request.version.len() > 128
-        || request.version.contains('/')
-        || request.version.contains('\\')
-        || request
-            .version
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        bail!("invalid update version");
-    }
+    parse_semantic_version(&request.version)?;
     let url = Url::parse(&request.artifact_url).context("parse update artifact URL")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         bail!("update artifact URL must be absolute http:// or https://");
     }
     if request.sha256.len() != 64 || !request.sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
         bail!("update sha256 must be a 64-character hex digest");
+    }
+    Ok(())
+}
+
+fn write_version_policy_status(config: &AppConfig, request: &ManagedUpdateRequest) -> Result<()> {
+    write_status(
+        config,
+        ForgeUpdateStatusReport {
+            status: "unsupported".to_string(),
+            stage: "version_policy".to_string(),
+            progress_percent: Some(100),
+            error: "managed update target is not newer than the running Forge version; use appliance recovery for governed rollback".to_string(),
+            target_version: request.version.clone(),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            attempt_id: request_attempt_id(request),
+            started_at: None,
+            completed_at: Some(now_rfc3339()),
+        },
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SemanticVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Option<Vec<SemanticIdentifier>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SemanticIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+fn parse_semantic_version(value: &str) -> Result<SemanticVersion> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        bail!("update version must be canonical SemVer");
+    }
+    let mut build_split = value.split('+');
+    let version_and_pre = build_split.next().unwrap_or_default();
+    let build = build_split.next();
+    if build_split.next().is_some() {
+        bail!("update version must be canonical SemVer");
+    }
+    if let Some(build) = build {
+        validate_semantic_identifiers(build, false)?;
+    }
+
+    let (core, prerelease_text) = match version_and_pre.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (version_and_pre, None),
+    };
+    let mut core_parts = core.split('.');
+    let major = parse_semantic_numeric(core_parts.next().unwrap_or_default())?;
+    let minor = parse_semantic_numeric(core_parts.next().unwrap_or_default())?;
+    let patch = parse_semantic_numeric(core_parts.next().unwrap_or_default())?;
+    if core_parts.next().is_some() {
+        bail!("update version must be canonical SemVer");
+    }
+    let prerelease = prerelease_text
+        .map(|value| validate_semantic_identifiers(value, true))
+        .transpose()?;
+    Ok(SemanticVersion {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
+}
+
+fn parse_semantic_numeric(value: &str) -> Result<u64> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        bail!("update version must be canonical SemVer");
+    }
+    value
+        .parse::<u64>()
+        .context("update version numeric component is too large")
+}
+
+fn validate_semantic_identifiers(value: &str, prerelease: bool) -> Result<Vec<SemanticIdentifier>> {
+    value
+        .split('.')
+        .map(|identifier| {
+            if identifier.is_empty()
+                || !identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                bail!("update version must be canonical SemVer");
+            }
+            if prerelease && identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+                Ok(SemanticIdentifier::Numeric(parse_semantic_numeric(
+                    identifier,
+                )?))
+            } else {
+                Ok(SemanticIdentifier::Text(identifier.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn semantic_version_precedence(left: &SemanticVersion, right: &SemanticVersion) -> Ordering {
+    let core = (left.major, left.minor, left.patch).cmp(&(right.major, right.minor, right.patch));
+    if core != Ordering::Equal {
+        return core;
+    }
+    match (&left.prerelease, &right.prerelease) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(left_ids), Some(right_ids)) => {
+            for (left_id, right_id) in left_ids.iter().zip(right_ids) {
+                let ordering = match (left_id, right_id) {
+                    (SemanticIdentifier::Numeric(left), SemanticIdentifier::Numeric(right)) => {
+                        left.cmp(right)
+                    }
+                    (SemanticIdentifier::Numeric(_), SemanticIdentifier::Text(_)) => Ordering::Less,
+                    (SemanticIdentifier::Text(_), SemanticIdentifier::Numeric(_)) => {
+                        Ordering::Greater
+                    }
+                    (SemanticIdentifier::Text(left), SemanticIdentifier::Text(right)) => {
+                        left.cmp(right)
+                    }
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            left_ids.len().cmp(&right_ids.len())
+        }
+    }
+}
+
+fn validate_update_target_version(target: &str) -> Result<()> {
+    let target = parse_semantic_version(target)?;
+    let current = parse_semantic_version(env!("CARGO_PKG_VERSION"))
+        .context("running Forge version is not canonical SemVer")?;
+    if semantic_version_precedence(&target, &current) != Ordering::Greater {
+        bail!("signed update target must be newer than the running Forge version");
+    }
+    Ok(())
+}
+
+pub fn validate_appliance_media_version(installed: &str, media: &str) -> Result<()> {
+    let installed = parse_semantic_version(installed)
+        .context("protected installed appliance version is not canonical SemVer")?;
+    let media = parse_semantic_version(media)
+        .context("replacement appliance media version is not canonical SemVer")?;
+    if semantic_version_precedence(&media, &installed) == Ordering::Less {
+        bail!("replacement appliance media is older than protected installed state");
     }
     Ok(())
 }
@@ -1560,6 +2480,14 @@ fn status_path(config: &AppConfig) -> PathBuf {
     config.update.work_dir.join(STATUS_FILE)
 }
 
+fn appliance_metadata_path(config: &AppConfig) -> PathBuf {
+    config.paths.data_dir.join("appliance")
+}
+
+fn media_rebase_events_path(config: &AppConfig) -> PathBuf {
+    config.update.work_dir.join(MEDIA_REBASE_EVENTS_DIR)
+}
+
 fn lock_path(config: &AppConfig) -> PathBuf {
     config.update.releases_dir.join(LOCK_FILE)
 }
@@ -1584,14 +2512,20 @@ fn set_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
     use std::{
         collections::VecDeque,
         sync::{
-            Mutex,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+
+    const BASELINE_BINARY: &[u8] =
+        b"#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 2\nprintf 'cybex-forge 0.1.1\\n'\n";
+    const CANDIDATE_BINARY: &[u8] =
+        b"#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 2\nprintf 'cybex-forge 0.1.3\\n'\n";
 
     #[derive(Default)]
     struct ScriptedRuntime {
@@ -1651,12 +2585,12 @@ mod tests {
 
     fn test_request(requested_at: &str) -> ManagedUpdateRequest {
         ManagedUpdateRequest {
-            version: "v0.1.1".to_string(),
+            version: "0.1.3".to_string(),
             artifact_url: "https://example.com/cybex-forge".to_string(),
             sha256: "a".repeat(64),
             signature: String::new(),
-            release_url: "https://example.com/releases/v0.1.1".to_string(),
-            notes_url: "https://example.com/releases/v0.1.1".to_string(),
+            release_url: "https://example.com/releases/v0.1.3".to_string(),
+            notes_url: "https://example.com/releases/v0.1.3".to_string(),
             requested_at: Some(requested_at.to_string()),
         }
     }
@@ -1668,6 +2602,7 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let mut config = AppConfig::default();
+        config.paths.data_dir = root.join("data");
         config.update.work_dir = root.join("updates");
         config.update.releases_dir = root.join("releases");
         (config, root)
@@ -1680,11 +2615,11 @@ mod tests {
         fs::create_dir_all(config.update.binary_path.parent().unwrap()).unwrap();
         fs::create_dir_all(&config.update.work_dir).unwrap();
         fs::create_dir_all(&config.update.releases_dir).unwrap();
-        fs::write(&config.update.binary_path, b"baseline").unwrap();
+        fs::write(&config.update.binary_path, BASELINE_BINARY).unwrap();
         set_executable(&config.update.binary_path).unwrap();
         fs::write(&config.update.config_path, b"").unwrap();
-        let staged = config.update.releases_dir.join("cybex-forge-0.1.1");
-        fs::write(&staged, b"candidate").unwrap();
+        let staged = config.update.releases_dir.join("cybex-forge-0.1.3");
+        fs::write(&staged, CANDIDATE_BINARY).unwrap();
         set_executable(&staged).unwrap();
         let request = test_request("2026-07-06T00:00:00Z");
         let attempt_id = request_attempt_id(&request);
@@ -1698,6 +2633,272 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    fn write_media_rebase_event(
+        config: &AppConfig,
+        event_id: &str,
+        media_sequence: u64,
+        created_at: &str,
+        resulting_version: &str,
+    ) {
+        let directory = media_rebase_events_path(config);
+        fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join(format!("{event_id}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&MediaRebaseEvidence {
+                schema: MEDIA_REBASE_SCHEMA.to_string(),
+                event_id: event_id.to_string(),
+                media_sequence,
+                mode: "recovery".to_string(),
+                resulting_version: resulting_version.to_string(),
+                previous_request_attempt_id: Some("a".repeat(64)),
+                previous_target_version: Some("0.1.3".to_string()),
+                previous_status: Some("succeeded".to_string()),
+                created_at: created_at.to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn appliance_media_version_gate_is_semver_aware_and_never_allows_downgrade() {
+        validate_appliance_media_version("1.2.3", "1.2.3").unwrap();
+        validate_appliance_media_version("1.2.3", "1.2.4-alpha.1").unwrap();
+        validate_appliance_media_version("1.2.3-alpha.1", "1.2.3").unwrap();
+        assert!(validate_appliance_media_version("1.2.3", "1.2.2").is_err());
+        assert!(validate_appliance_media_version("1.2.3", "1.2.3-rc.1").is_err());
+        assert!(validate_appliance_media_version("not-semver", "1.2.3").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_reconciliation_scrubs_current_and_legacy_installer_secret_stages() {
+        let (config, root) = test_config();
+        let stages = [
+            config
+                .paths
+                .data_dir
+                .join("bootstrap")
+                .join(INSTALL_ENROLLMENT_STAGE_FILE),
+            appliance_metadata_path(&config).join(INSTALL_ENROLLMENT_STAGE_FILE),
+        ];
+        for (index, stage) in stages.iter().enumerate() {
+            let parent = stage.parent().unwrap();
+            fs::create_dir_all(parent).unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(stage, format!("interrupted-secret-stage-{index}-123")).unwrap();
+            fs::set_permissions(stage, fs::Permissions::from_mode(0o600)).unwrap();
+
+            scrub_interrupted_install_enrollment_stage(&config).unwrap();
+            assert!(!stage.exists(), "{} survived boot cleanup", stage.display());
+            // Cleanup is replay-safe after an interruption which already
+            // removed the pathname.
+            scrub_interrupted_install_enrollment_stage(&config).unwrap();
+        }
+
+        let bootstrap = stages[0].parent().unwrap();
+        let protected_target = bootstrap.join("must-survive");
+        fs::write(&protected_target, b"not-the-staged-secret").unwrap();
+        std::os::unix::fs::symlink(&protected_target, &stages[0]).unwrap();
+        let error = scrub_interrupted_install_enrollment_stage(&config).unwrap_err();
+        assert!(error.to_string().contains("bounded regular file"));
+        assert_eq!(
+            fs::read(&protected_target).unwrap(),
+            b"not-the-staged-secret"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_reconciliation_rejects_unsafe_config_before_secret_stage_mutation() {
+        let (config, root) = test_config();
+        let stage = config
+            .paths
+            .data_dir
+            .join("bootstrap")
+            .join(INSTALL_ENROLLMENT_STAGE_FILE);
+        fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        fs::set_permissions(stage.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&stage, b"interrupted-secret-stage-123456").unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = reconcile_appliance_recovery(&config).unwrap_err();
+        assert!(error.to_string().contains("unsafe configuration"));
+        assert_eq!(
+            fs::read(&stage).unwrap(),
+            b"interrupted-secret-stage-123456"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_rebase_transaction_replays_partial_deletion_and_publish_interruptions() {
+        let (config, root) = test_config();
+        let appliance = appliance_metadata_path(&config);
+        let event_directory = media_rebase_events_path(&config);
+        fs::create_dir_all(&appliance).unwrap();
+        fs::create_dir_all(&event_directory).unwrap();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&appliance, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&event_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for path in [
+            request_path(&config),
+            status_path(&config),
+            apply_state_path(&config),
+            lock_path(&config),
+        ] {
+            fs::write(path, b"control").unwrap();
+        }
+
+        let event = MediaRebaseEvidence {
+            schema: MEDIA_REBASE_SCHEMA.to_string(),
+            event_id: "32018c33-09e3-4c4a-b1b8-25d0f86cb0a6".to_string(),
+            media_sequence: 7,
+            mode: "repair".to_string(),
+            resulting_version: "0.1.2".to_string(),
+            previous_request_attempt_id: Some("a".repeat(32)),
+            previous_target_version: Some("0.1.3".to_string()),
+            previous_status: Some("applying".to_string()),
+            created_at: "2026-07-31T12:00:00Z".to_string(),
+        };
+        let journal = appliance.join(MEDIA_REBASE_TRANSACTION_FILE);
+        fs::write(&journal, serde_json::to_vec(&event).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Simulate power loss after the first control deletion.
+        fs::remove_file(request_path(&config)).unwrap();
+        finalize_media_rebase_transaction(&config).unwrap();
+        for path in [
+            request_path(&config),
+            status_path(&config),
+            apply_state_path(&config),
+            lock_path(&config),
+            journal.clone(),
+        ] {
+            assert!(!path.exists(), "{} survived reconciliation", path.display());
+        }
+        let published = event_directory.join(format!("{}.json", event.event_id));
+        let first_bytes = fs::read(&published).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<MediaRebaseEvidence>(&first_bytes).unwrap(),
+            event
+        );
+
+        // Simulate power loss after atomic publication but before journal clear.
+        fs::write(&journal, serde_json::to_vec(&event).unwrap()).unwrap();
+        fs::write(status_path(&config), b"stale-control").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        finalize_media_rebase_transaction(&config).unwrap();
+        assert!(!journal.exists());
+        assert!(!status_path(&config).exists());
+        assert_eq!(fs::read(&published).unwrap(), first_bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reboot_recovery_replaces_stale_success_with_restored_binary_truth() {
+        let (config, root, _staged, request, attempt_id) = activation_fixture();
+        let appliance = appliance_metadata_path(&config);
+        fs::create_dir_all(&appliance).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&appliance, fs::Permissions::from_mode(0o700)).unwrap();
+        write_status(
+            &config,
+            ForgeUpdateStatusReport {
+                status: "succeeded".to_string(),
+                stage: "complete".to_string(),
+                progress_percent: Some(100),
+                error: String::new(),
+                target_version: request.version,
+                current_version: "0.1.3".to_string(),
+                attempt_id,
+                started_at: Some("2026-07-30T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-30T00:01:00Z".to_string()),
+            },
+        )
+        .unwrap();
+        let journal = appliance.join(BINARY_RECOVERY_FILE);
+        fs::write(
+            &journal,
+            serde_json::to_vec(&BinaryRecoveryJournal {
+                schema: BINARY_RECOVERY_SCHEMA.to_string(),
+                embedded_version: "0.1.1".to_string(),
+                reason: "missing_or_nonexecutable".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+
+        reconcile_binary_recovery(&config).unwrap();
+
+        let recovered = read_status(&config).unwrap().unwrap();
+        assert_eq!(recovered.status, "rolled_back");
+        assert_eq!(recovered.stage, "appliance_binary_recovery");
+        assert_eq!(recovered.current_version, "0.1.1");
+        assert!(recovered.error.contains("appliance_binary_recovered"));
+        assert!(!journal.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_success_never_short_circuits_a_different_live_binary() {
+        let (config, root, _staged, request, attempt_id) = activation_fixture();
+        write_json_atomic(
+            &request_path(&config),
+            &StoredUpdateRequest {
+                schema: RELEASE_SCHEMA.to_string(),
+                request: request.clone(),
+            },
+        )
+        .unwrap();
+        write_status(
+            &config,
+            ForgeUpdateStatusReport {
+                status: "succeeded".to_string(),
+                stage: "complete".to_string(),
+                progress_percent: Some(100),
+                error: String::new(),
+                target_version: request.version,
+                current_version: "0.1.3".to_string(),
+                attempt_id,
+                started_at: Some("2026-07-30T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-30T00:01:00Z".to_string()),
+            },
+        )
+        .unwrap();
+
+        apply_requested_update_with_runtime(
+            &config,
+            &ScriptedRuntime::with_results(std::iter::empty(), std::iter::empty()),
+        )
+        .await
+        .unwrap();
+
+        let corrected = read_status(&config).unwrap().unwrap();
+        assert_eq!(corrected.status, "rolled_back");
+        assert_eq!(corrected.stage, "binary_identity_mismatch");
+        assert_eq!(corrected.current_version, "0.1.1");
+        assert!(
+            corrected
+                .error
+                .contains("installed_binary_identity_mismatch")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1734,6 +2935,67 @@ mod tests {
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>(),
             vec![projection.file_name().unwrap().to_os_string()]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_rebase_events_are_ordered_and_removed_only_after_exact_ack() {
+        let (config, root) = test_config();
+        let later_id = "22222222-2222-4222-8222-222222222222";
+        let earlier_id = "11111111-1111-4111-8111-111111111111";
+        write_media_rebase_event(&config, later_id, 2, "2026-07-31T12:00:01Z", "0.1.2");
+        write_media_rebase_event(&config, earlier_id, 1, "2026-07-31T12:00:00Z", "0.1.2");
+
+        let reported = media_rebase_events(&config).unwrap();
+        assert_eq!(
+            reported
+                .iter()
+                .map(|event| event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![earlier_id, later_id]
+        );
+        assert!(
+            acknowledge_media_rebase_events(
+                &config,
+                &reported,
+                &["33333333-3333-4333-8333-333333333333".to_string()]
+            )
+            .is_err()
+        );
+        assert_eq!(media_rebase_events(&config).unwrap().len(), 2);
+
+        acknowledge_media_rebase_events(&config, &reported, &[earlier_id.to_string()]).unwrap();
+        let remaining = media_rebase_events(&config).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_id, later_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_rebase_sequence_survives_a_backward_clock_and_rejects_reuse() {
+        let (config, root) = test_config();
+        let first_id = "11111111-1111-4111-8111-111111111111";
+        let second_id = "22222222-2222-4222-8222-222222222222";
+        write_media_rebase_event(&config, first_id, 41, "2026-07-31T12:00:00Z", "0.1.1");
+        write_media_rebase_event(&config, second_id, 42, "2024-01-01T00:00:00Z", "0.1.2");
+
+        let events = media_rebase_events(&config).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.media_sequence, event.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(41, first_id), (42, second_id)]
+        );
+
+        let third_id = "33333333-3333-4333-8333-333333333333";
+        write_media_rebase_event(&config, third_id, 42, "2027-01-01T00:00:00Z", "0.1.3");
+        assert!(
+            media_rebase_events(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("sequences are not distinct")
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -1843,6 +3105,77 @@ mod tests {
     }
 
     #[test]
+    fn managed_updates_require_a_canonical_strictly_newer_semver() {
+        let current = parse_semantic_version(env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(validate_update_target_version(env!("CARGO_PKG_VERSION")).is_err());
+        let older = if current.patch > 0 {
+            format!("{}.{}.{}", current.major, current.minor, current.patch - 1)
+        } else if current.minor > 0 {
+            format!("{}.{}.0", current.major, current.minor - 1)
+        } else {
+            "0.0.0-alpha".to_string()
+        };
+        let current_prerelease = format!(
+            "{}.{}.{}-alpha.1",
+            current.major, current.minor, current.patch
+        );
+        let next_prerelease = format!(
+            "{}.{}.{}-alpha.1",
+            current.major,
+            current.minor,
+            current.patch.checked_add(1).unwrap()
+        );
+        assert!(validate_update_target_version(&older).is_err());
+        assert!(validate_update_target_version(&current_prerelease).is_err());
+        assert!(validate_update_target_version(&next_prerelease).is_ok());
+        assert_eq!(
+            semantic_version_precedence(
+                &parse_semantic_version("1.0.0-alpha.1").unwrap(),
+                &parse_semantic_version("1.0.0-alpha.beta").unwrap()
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            semantic_version_precedence(&current, &current),
+            std::cmp::Ordering::Equal
+        );
+        for invalid in [
+            "v0.1.3",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2",
+            "1.2.3-alpha.01",
+            "1.2.3+",
+            "1.2.3 alpha",
+        ] {
+            assert!(
+                parse_semantic_version(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_version_must_match_the_signed_request_exactly() {
+        let (config, root) = test_config();
+        fs::create_dir_all(&root).unwrap();
+        let candidate = root.join("candidate");
+        fs::write(
+            &candidate,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'cybex-forge 0.1.3\\n' ;;\n  --config) printf '{}\\n' ;;\n  *) exit 2 ;;\nesac\n",
+        )
+        .unwrap();
+        set_executable(&candidate).unwrap();
+
+        smoke_test_binary(&config, &candidate, "0.1.3").unwrap();
+        let error = smoke_test_binary(&config, &candidate, "0.1.4").unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verify_signature_requires_trusted_public_key() {
         let (config, _root) = test_config();
         assert!(config.update.trusted_public_key.trim().is_empty());
@@ -1890,6 +3223,91 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn updater_rejects_the_weak_identity_key_and_legacy_forgery() {
+        let (mut config, root) = test_config();
+        config.update.enabled = true;
+        let mut identity = [0_u8; 32];
+        identity[0] = 1;
+        let weak_key = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(weak_key.is_weak());
+
+        let mut forged_bytes = [0_u8; 64];
+        forged_bytes[0] = 1;
+        let forged_signature = Signature::from_slice(&forged_bytes).unwrap();
+        let mut request = test_request("2026-07-06T00:00:00Z");
+        request.signature = STANDARD.encode(forged_bytes);
+        assert!(
+            weak_key
+                .verify(
+                    update_signature_message(&request).as_bytes(),
+                    &forged_signature,
+                )
+                .is_ok(),
+            "the regression fixture must exercise legacy non-strict verification"
+        );
+
+        config.update.trusted_public_key = STANDARD.encode(identity);
+        let error = verify_signature(&config, &request).unwrap_err().to_string();
+        assert!(error.contains("weak Ed25519 key"));
+        assert!(!capabilities_enabled(&config));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn update_download_refuses_redirects_without_fetching_the_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let target_fetches = Arc::new(AtomicUsize::new(0));
+        let server_fetches = Arc::clone(&target_fetches);
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let _ = first.read(&mut request).await.unwrap();
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            if let Ok(Ok((mut redirected, _))) =
+                timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                let mut request = vec![0u8; 2048];
+                let read = redirected.read(&mut request).await.unwrap();
+                if String::from_utf8_lossy(&request[..read]).contains("GET /target ") {
+                    server_fetches.fetch_add(1, Ordering::SeqCst);
+                }
+                redirected
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let (mut config, root) = test_config();
+        fs::create_dir_all(&config.update.releases_dir).unwrap();
+        config.update.max_artifact_size_bytes = 1024;
+        let mut request = test_request("2026-07-06T00:00:00Z");
+        request.artifact_url = format!("http://{address}/redirect");
+
+        let error = download_artifact(&config, &request).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 302"));
+        server.await.unwrap();
+        assert_eq!(target_fetches.load(Ordering::SeqCst), 0);
+        assert!(
+            !config
+                .update
+                .releases_dir
+                .join(".artifact.download")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn successful_activation_commits_candidate_and_clears_recovery_state() {
         let (config, root, staged, request, attempt_id) = activation_fixture();
@@ -1906,7 +3324,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"candidate");
+        assert_eq!(
+            fs::read(&config.update.binary_path).unwrap(),
+            CANDIDATE_BINARY
+        );
         let status = read_status(&config).unwrap().unwrap();
         assert_eq!(status.status, "succeeded");
         assert_eq!(status.current_version, request.version);
@@ -1935,9 +3356,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        assert_eq!(
+            fs::read(&config.update.binary_path).unwrap(),
+            BASELINE_BINARY
+        );
         let status = read_status(&config).unwrap().unwrap();
         assert_eq!(status.status, "rolled_back");
+        assert_eq!(status.current_version, "0.1.1");
         assert!(status.error.contains("candidate_restart_failed"));
         assert_eq!(runtime.restart_count.load(Ordering::SeqCst), 2);
         assert_eq!(runtime.health_count.load(Ordering::SeqCst), 0);
@@ -1961,9 +3386,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        assert_eq!(
+            fs::read(&config.update.binary_path).unwrap(),
+            BASELINE_BINARY
+        );
         let status = read_status(&config).unwrap().unwrap();
         assert_eq!(status.status, "rolled_back");
+        assert_eq!(status.current_version, "0.1.1");
         assert!(status.error.contains("candidate_health_check_failed"));
         assert_eq!(runtime.restart_count.load(Ordering::SeqCst), 2);
         let _ = fs::remove_dir_all(root);
@@ -1992,7 +3421,10 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("rollback_failed:"));
         assert!(err.to_string().contains("restored_binary_restart"));
-        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        assert_eq!(
+            fs::read(&config.update.binary_path).unwrap(),
+            BASELINE_BINARY
+        );
         assert!(apply_state_path(&config).is_file());
 
         let recovery_runtime = ScriptedRuntime::with_results([None], std::iter::empty());
@@ -2004,6 +3436,7 @@ mod tests {
         assert!(recovery_error.to_string().contains("rollback_failed:"));
         let failed_status = read_status(&config).unwrap().unwrap();
         assert_eq!(failed_status.status, "failed");
+        assert_eq!(failed_status.current_version, "0.1.1");
         assert!(failed_status.error.contains("restored_binary_restart"));
         assert!(recover_interrupted_apply(&config, &recovery_runtime).unwrap());
         assert_eq!(read_status(&config).unwrap().unwrap().status, "rolled_back");
@@ -2033,11 +3466,51 @@ mod tests {
 
         assert!(recover_interrupted_apply(&config, &runtime).unwrap());
 
-        assert_eq!(fs::read(&config.update.binary_path).unwrap(), b"baseline");
+        assert_eq!(
+            fs::read(&config.update.binary_path).unwrap(),
+            BASELINE_BINARY
+        );
         let status = read_status(&config).unwrap().unwrap();
         assert_eq!(status.status, "rolled_back");
+        assert_eq!(status.current_version, "0.1.1");
+        assert_ne!(status.current_version, env!("CARGO_PKG_VERSION"));
         assert!(status.error.contains("interrupted_apply_recovered"));
         assert!(!apply_state_path(&config).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_recovery_reports_unknown_when_restored_identity_cannot_be_proven() {
+        let (config, root, _staged, request, attempt_id) = activation_fixture();
+        let backup = backup_current_binary(&config, &attempt_id).unwrap();
+        fs::write(&backup, b"#!/bin/sh\nprintf 'not-a-forge-version\\n'\n").unwrap();
+        set_executable(&backup).unwrap();
+        fs::write(&config.update.binary_path, CANDIDATE_BINARY).unwrap();
+        set_executable(&config.update.binary_path).unwrap();
+        write_apply_state(
+            &config,
+            &ApplyState {
+                schema: APPLY_STATE_SCHEMA.to_string(),
+                attempt_id,
+                target_version: request.version,
+                backup_filename: backup.file_name().unwrap().to_str().unwrap().to_string(),
+                phase: "candidate_installed".to_string(),
+                started_at: "2026-07-06T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let error = recover_interrupted_apply(
+            &config,
+            &ScriptedRuntime::with_results(std::iter::empty(), std::iter::empty()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("restored_binary_identity"));
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "failed");
+        assert!(status.current_version.is_empty());
+        assert!(apply_state_path(&config).is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2172,7 +3645,7 @@ mod tests {
         assert_eq!(
             update_signature_message(&request),
             format!(
-                "v0.1.1\n{}\nhttps://example.com/cybex-forge\n",
+                "0.1.3\n{}\nhttps://example.com/cybex-forge\n",
                 "a".repeat(64)
             )
         );
@@ -2216,6 +3689,27 @@ mod tests {
         assert_eq!(retry_status.attempt_id, request_attempt_id(&second));
         assert_ne!(retry_status.attempt_id, request_attempt_id(&first));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn equal_update_is_reported_as_unsupported_without_artifact_mutation() {
+        let (config, root) = test_config();
+        let mut request = test_request("2026-07-06T00:00:00Z");
+        request.version = env!("CARGO_PKG_VERSION").to_string();
+
+        store_update_request(&config, Some(request.clone()))
+            .await
+            .unwrap();
+
+        let status = read_status(&config).unwrap().unwrap();
+        assert_eq!(status.status, "unsupported");
+        assert_eq!(status.stage, "version_policy");
+        assert_eq!(status.target_version, request.version);
+        assert_eq!(status.attempt_id, request_attempt_id(&request));
+        assert!(status.error.contains("not newer"));
+        assert!(!config.update.releases_dir.exists());
+        assert!(request_path(&config).is_file());
         let _ = fs::remove_dir_all(root);
     }
 }

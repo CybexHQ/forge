@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -743,18 +743,7 @@ fn parse_strong_sha256(value: &str, field: &str) -> Result<[u8; 32]> {
 }
 
 fn verify_narinfo_signature(narinfo: &ParsedNarInfo, public_key: &str) -> Result<()> {
-    let (key_name, encoded_key) = public_key
-        .split_once(':')
-        .filter(|(name, encoded)| !name.is_empty() && !encoded.is_empty())
-        .ok_or_else(|| anyhow!("Forge cache public key had an invalid shape"))?;
-    let key_bytes = BASE64_STANDARD
-        .decode(encoded_key)
-        .context("decode Forge cache public key")?;
-    let key_bytes: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| anyhow!("Forge cache public key was not 256-bit"))?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).context("parse Forge cache public key")?;
+    let (key_name, verifying_key) = parse_cache_public_key(public_key)?;
     let nar_hash = encode_nix_base32_sha256(&parse_strong_sha256(&narinfo.nar_hash, "NarHash")?);
     let fingerprint = format!(
         "1;{};sha256:{};{};{}",
@@ -778,13 +767,32 @@ fn verify_narinfo_signature(narinfo: &ParsedNarInfo, public_key: &str) -> Result
             return false;
         };
         verifying_key
-            .verify(fingerprint.as_bytes(), &signature)
+            .verify_strict(fingerprint.as_bytes(), &signature)
             .is_ok()
     });
     if !verified {
         bail!("NARInfo did not carry a valid signature from the active Forge cache key");
     }
     Ok(())
+}
+
+fn parse_cache_public_key(public_key: &str) -> Result<(&str, VerifyingKey)> {
+    let (key_name, encoded_key) = public_key
+        .split_once(':')
+        .filter(|(name, encoded)| !name.is_empty() && !encoded.is_empty())
+        .ok_or_else(|| anyhow!("Forge cache public key had an invalid shape"))?;
+    let key_bytes = BASE64_STANDARD
+        .decode(encoded_key)
+        .context("decode Forge cache public key")?;
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow!("Forge cache public key was not 256-bit"))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).context("parse Forge cache public key")?;
+    if verifying_key.is_weak() {
+        bail!("Forge cache public key must not be a weak Ed25519 key");
+    }
+    Ok((key_name, verifying_key))
 }
 
 fn decode_nix_base32_sha256(encoded: &str) -> Result<[u8; 32]> {
@@ -1757,6 +1765,7 @@ fn read_public_key(path: &Path) -> Result<String> {
     {
         bail!("cache public key has an invalid shape");
     }
+    parse_cache_public_key(&public_key)?;
     Ok(public_key)
 }
 
@@ -1966,7 +1975,7 @@ fn bounded_command_error(stderr: &[u8], private_key: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
     use std::{
         sync::mpsc,
         thread,
@@ -2638,6 +2647,52 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
             "cybex-test:4Cm07ebfb3cchJi1+QERxySdvysSmmX1BihUlu5qfL0=",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn narinfo_verification_rejects_the_weak_identity_key_and_legacy_forgery() {
+        let mut identity = [0_u8; 32];
+        identity[0] = 1;
+        let weak_key = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(weak_key.is_weak());
+        let mut forged_bytes = [0_u8; 64];
+        forged_bytes[0] = 1;
+        let forged_signature = Signature::from_slice(&forged_bytes).unwrap();
+        let narinfo = ParsedNarInfo {
+            store_path: test_store_path('a', "weak-key"),
+            url: "nar/weak.nar".to_string(),
+            compression: "none".to_string(),
+            file_hash: format!("sha256:{}", "0".repeat(64)),
+            file_size: 1,
+            nar_hash: format!("sha256:{}", "0".repeat(64)),
+            nar_size: 1,
+            references: Vec::new(),
+            signatures: vec![format!(
+                "weak-cache:{}",
+                BASE64_STANDARD.encode(forged_bytes)
+            )],
+        };
+        let nar_hash =
+            encode_nix_base32_sha256(&parse_strong_sha256(&narinfo.nar_hash, "NarHash").unwrap());
+        let fingerprint = format!(
+            "1;{};sha256:{};{};{}",
+            narinfo.store_path,
+            nar_hash,
+            narinfo.nar_size,
+            narinfo.references.join(",")
+        );
+        assert!(
+            weak_key
+                .verify(fingerprint.as_bytes(), &forged_signature)
+                .is_ok(),
+            "the regression fixture must exercise legacy non-strict verification"
+        );
+
+        let public_key = format!("weak-cache:{}", BASE64_STANDARD.encode(identity));
+        let error = verify_narinfo_signature(&narinfo, &public_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("weak Ed25519 key"));
     }
 
     #[test]

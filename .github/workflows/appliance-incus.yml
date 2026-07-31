@@ -1,0 +1,181 @@
+name: Forge Appliance Incus Gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-appliance-incus-live
+  cancel-in-progress: false
+
+jobs:
+  forge-appliance-incus:
+    name: Exact-source signed ISO lifecycle
+    # This job receives live API credentials and runs only for repository-owned
+    # pushed commits/tags. Pull requests are limited to hosted contract checks.
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, cybex-proxmox]
+    environment: forge-appliance-qualification
+    timeout-minutes: 360
+    env:
+      CYBEX_API_URL: ${{ vars.CYBEX_API_URL }}
+      CYBEX_E2E_MANAGE_REF: ${{ vars.CYBEX_E2E_MANAGE_REF }}
+      CYBEX_E2E_EXPECTED_MANAGE_SOURCE_REVISION: ${{ vars.CYBEX_E2E_MANAGE_REF }}
+      CYBEX_E2E_EXPECTED_MANAGE_SOURCE_DIRTY: "false"
+      CYBEX_FORGE_SOURCE_DIR: ${{ github.workspace }}/.cybex-forge
+      CYBEX_TESTBENCH_SUITE_ID: forge-appliance
+      CYBEX_FORGE_APPLIANCE_RUN_ID: forge-appliance-forge-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout exact Forge event source
+        # actions/checkout v5.1.0; rotate only after reviewing the official tag.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          path: .cybex-forge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate governed Forge event source
+        shell: bash
+        working-directory: .cybex-forge
+        run: |
+          set -Eeuo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "::error::Privileged appliance qualification is restricted to main and v* tags"; exit 1 ;;
+          esac
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::GitHub event SHA is not an immutable commit"
+            exit 1
+          fi
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo "::error::The governed origin/main ref was not fetched"
+            exit 1
+          }
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "::error::The event commit is not reachable from governed origin/main"
+            exit 1
+          }
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA,,}"
+          test -z "$(git status --porcelain)"
+
+      - name: Validate coordinated Manage ref
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$CYBEX_E2E_MANAGE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Set CYBEX_E2E_MANAGE_REF to an immutable Manage commit SHA"
+            exit 1
+          fi
+
+      - name: Checkout exact Manage controller
+        # actions/checkout v5.1.0; rotate only after reviewing the official tag.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: CybexHQ/manage
+          ref: ${{ env.CYBEX_E2E_MANAGE_REF }}
+          path: .cybex-manage
+          token: ${{ secrets.CYBEX_MANAGE_REPO_TOKEN || github.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact clean qualification sources and credentials
+        shell: bash
+        working-directory: .cybex-manage
+        env:
+          CYBEX_API_TOKEN: ${{ secrets.CYBEX_GOLDEN_ISO_API_TOKEN || secrets.CYBEX_API_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          : "${CYBEX_API_URL:?configure the qualification Manage API URL}"
+          : "${CYBEX_API_TOKEN:?configure CYBEX_GOLDEN_ISO_API_TOKEN or CYBEX_API_TOKEN}"
+          case "$CYBEX_API_URL" in
+            https://*) ;;
+            *) echo "::error::CYBEX_API_URL must use HTTPS"; exit 1 ;;
+          esac
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::GitHub event SHA is not an immutable commit"
+            exit 1
+          fi
+          test "$(git -C "$CYBEX_FORGE_SOURCE_DIR" rev-parse HEAD)" = "${GITHUB_SHA,,}"
+          test "$(git rev-parse HEAD)" = "${CYBEX_E2E_MANAGE_REF,,}"
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo "::error::The governed Manage origin/main ref was not fetched"
+            exit 1
+          }
+          git merge-base --is-ancestor "${CYBEX_E2E_MANAGE_REF,,}" refs/remotes/origin/main || {
+            echo "::error::The coordinated Manage commit is not reachable from governed origin/main"
+            exit 1
+          }
+          test -z "$(git -C "$CYBEX_FORGE_SOURCE_DIR" status --porcelain)"
+          test -z "$(git status --porcelain)"
+          test "$(dirname "$CYBEX_FORGE_SOURCE_DIR")" = "$GITHUB_WORKSPACE"
+          test "$(realpath "$CYBEX_FORGE_SOURCE_DIR/..")" = "$(realpath ..)"
+
+      - name: Validate appliance controller contracts
+        working-directory: .cybex-manage
+        run: |
+          python3 -B testbench/incus/labctl.py self-test
+          python3 -B testbench/incus/refactor_contract_test.py
+          python3 -B testbench/incus/labctl_test.py
+          python3 -B -m unittest testbench.tier2.tier2_test
+
+      - name: Validate exact Manage and web builds
+        working-directory: .cybex-manage
+        run: |
+          cargo fmt --all --check
+          cargo test --locked
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: Prepare Incus lab
+        working-directory: .cybex-manage
+        run: python3 -B testbench/incus/labctl.py prepare-incus --execute
+
+      - name: Qualify signed Forge appliance
+        working-directory: .cybex-manage
+        env:
+          CYBEX_API_TOKEN: ${{ secrets.CYBEX_GOLDEN_ISO_API_TOKEN || secrets.CYBEX_API_TOKEN }}
+        run: |
+          timeout --signal=INT --kill-after=120s 300m \
+            python3 -B testbench/incus/labctl.py forge-appliance \
+            --execute \
+            --run-id "$CYBEX_FORGE_APPLIANCE_RUN_ID"
+
+      - name: Recover exact interrupted appliance run
+        if: failure() || cancelled()
+        continue-on-error: true
+        working-directory: .cybex-manage
+        env:
+          CYBEX_API_TOKEN: ${{ secrets.CYBEX_GOLDEN_ISO_API_TOKEN || secrets.CYBEX_API_TOKEN }}
+        run: |
+          python3 -B testbench/incus/labctl.py forge-appliance-recover \
+            --yes \
+            --run-id "$CYBEX_FORGE_APPLIANCE_RUN_ID"
+
+      - name: Summarize appliance evidence
+        if: always()
+        continue-on-error: true
+        working-directory: .cybex-manage
+        run: >-
+          python3 -B testbench/incus/labctl.py evidence-summary
+          --run-id "$CYBEX_FORGE_APPLIANCE_RUN_ID"
+
+      - name: Export bounded public evidence
+        if: always()
+        working-directory: .cybex-manage
+        run: |
+          python3 -B testbench/incus/labctl.py evidence-export \
+            --run-id "$CYBEX_FORGE_APPLIANCE_RUN_ID" \
+            --output "var/testbench/incus-public/${CYBEX_FORGE_APPLIANCE_RUN_ID}-evidence.json"
+
+      - name: Upload bounded public evidence
+        if: always()
+        # actions/upload-artifact v4.6.2; rotate only after reviewing the official tag.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cybex-${{ env.CYBEX_FORGE_APPLIANCE_RUN_ID }}
+          path: .cybex-manage/var/testbench/incus-public/${{ env.CYBEX_FORGE_APPLIANCE_RUN_ID }}-evidence.json
+          if-no-files-found: error
+          retention-days: 14

@@ -54,8 +54,31 @@ file, and secured through the opened file descriptor before it is locked.
 
 ## Installation
 
-Installation is currently supported only through the Proxmox installer generated
-inside Cybex Manage:
+Production installation supports both the signed Forge appliance ISO and the
+existing Proxmox LXC installer generated inside Cybex Manage. For new VM or
+bare-metal appliances, verify the signed ISO, boot it in UEFI mode with
+firmware Secure Boot disabled, and follow the guided installer. The release
+manifest authenticates the ISO bytes; the current custom image is not itself
+UEFI Secure Boot signed. The appliance requires a non-removable disk of at least
+128 GiB and preserves separate state and cache partitions for repair and
+recovery. Build details, unattended seed media, qualification markers,
+partitioning, and recovery procedures are in
+[appliance/README.md](appliance/README.md).
+
+Appliance seed inputs are bound with `O_NOFOLLOW` and stable inode/metadata
+checks before they are consumed through protected descriptors. The installed
+IPv4 PXE edge allows only GET/HEAD with bounded request/upstream timeouts;
+enrollment and managed apply use HTTPS with time synchronization. Offline
+repair/recovery reports a durable monotonic `media_sequence`, so an RTC reset
+cannot make a later media rollback look older than an earlier one.
+Repair and recovery restore config only from protected state, reject media
+older than the protected installed SemVer before mutation, and journal the
+complete rebase event before deleting updater controls. A boot-critical
+reconciler replays interrupted transactions and records embedded-binary
+restoration before Forge starts, keeping Manage/UI state aligned with the
+executable actually on disk.
+
+For Proxmox LXC:
 
 1. Sign in to [manage.cybex.net](https://manage.cybex.net).
 2. Open the Forge installer flow.
@@ -71,6 +94,19 @@ The installer uses Debian's Nix package to bootstrap `/nix/var/nix/profiles/defa
 to a current Nix release. Forge Build uses that profile client for managed
 flake builds, and the systemd daemon is pinned to the matching profile
 `nix-daemon` so modern structured derivations are interpreted consistently.
+
+The generated Proxmox command intentionally omits the one-time code. The host
+helper reads it through a hidden `/dev/tty` prompt, stages a root-owned mode-0600
+file in the guest, and passes only that filename to the LXC installer. Forge
+persists the signed enrollment response before atomically scrubbing the file;
+the code is never written into durable TOML. A supplied `--auth-code-file` is
+consumed after protected guest staging (and the guest/bootstrap copies are
+consumed after enrollment); do not expect to reuse it. Legacy `--auth-code` is
+process-visible. File-backed input must be under a canonical, symlink-free,
+root-owned parent chain with no group/other write permission (for example a
+mode-0700 directory below `/root` or `/run`); `/tmp` is intentionally rejected.
+Production Manage URLs must use HTTPS. Development HTTP is
+available only through the conspicuous `--allow-insecure-manage-http` opt-in.
 
 The generated Proxmox helper and the in-LXC installer accept
 `--update-trusted-public-key` (or
@@ -94,7 +130,8 @@ OOM, disk, timeout, and package failures are reported as distinct operator-facin
 states. Capacity detection supports finite cgroup limits, `/proc/meminfo`, and
 the LXC-virtualized `sysinfo(2)` fallback used when hardened systemd services
 hide non-process procfs files. Add further targets deliberately instead of using a broad build
-allowlist. Manual standalone installation is not currently supported.
+allowlist. Unsupported ad-hoc standalone installation is not a production
+path; use the signed appliance ISO or Manage-generated Proxmox flow.
 
 When a Blueprint disables source builds, Forge evaluates its closure in a
 fresh isolated local Nix store before the real build. Every advertised local

@@ -90,6 +90,11 @@ const BOOT_PROFILE_ISO_SOURCE_BOOT_PROFILE: &str = "boot_profile";
 const BOOT_PROFILE_ISO_SOURCE_ENROLLMENT: &str = "enrollment";
 const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-forge/reliability-state.json";
 const MAX_RELIABILITY_STATE_BYTES: usize = 16 * 1024;
+const APPLIANCE_INSTALL_STATE_SCHEMA: &str = "cybex.forge.appliance.install.v1";
+const APPLIANCE_RECOVERY_STATE_DIR: &str = "/var/lib/cybex-forge/appliance";
+const APPLIANCE_ACTIVE_CONFIG_PATH: &str = "/etc/cybex-forge/config.toml";
+const MAX_APPLIANCE_INSTALL_STATE_BYTES: u64 = 4 * 1024;
+const MAX_APPLIANCE_CONFIG_BYTES: usize = 64 * 1024;
 const FORGE_SERVICE_UNIT: &str = include_str!("../systemd/cybex-forge.service");
 const FORGE_CONTROL_SLICE_UNIT: &str = include_str!("../systemd/cybex-forge-control.slice");
 const FORGE_BUILD_SLICE_UNIT: &str = include_str!("../systemd/cybex-forge-build.slice");
@@ -201,6 +206,8 @@ struct AgentForgeConfigResponse {
 struct ForgeReportResponse {
     #[serde(default)]
     update: bool,
+    #[serde(default)]
+    acknowledged_media_rebase_event_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +216,8 @@ struct ForgeUpdateOnlyReportResponse {
     update: bool,
     report_scope: String,
     persisted_update: ForgePersistedUpdateAcknowledgement,
+    #[serde(default)]
+    acknowledged_media_rebase_event_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +406,7 @@ struct ForgeAgentReportRequest {
     capabilities: Vec<&'static str>,
     cache: crate::cache::CacheStatusReport,
     update: Option<ForgeUpdateStatusReport>,
+    media_rebase_events: Vec<crate::updater::MediaRebaseEvidence>,
     build_jobs: Vec<ForgeBuildJobReport>,
     cache_artifacts: Vec<ForgeCacheArtifactReport>,
     cache_inventory_instance_id: String,
@@ -412,6 +422,7 @@ struct ForgeUpdateOnlyReportRequest {
     report_scope: &'static str,
     capabilities: [&'static str; 1],
     update: ForgeUpdateStatusReport,
+    media_rebase_events: Vec<crate::updater::MediaRebaseEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -675,7 +686,7 @@ struct ForgeReportReceipt {
     updater: Option<SyncOnceUpdaterReport>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct NormalizedManagedSettings {
     public_base_url: String,
     listen_addr: String,
@@ -780,6 +791,8 @@ pub async fn sync_update_report_once(
         })?,
     };
     validate_expected_update_report(Some(&update), expected_update)?;
+    let media_rebase_events = crate::updater::media_rebase_events(config)?;
+    validate_media_rebase_projection(&media_rebase_events, &update)?;
 
     let updater = SyncOnceUpdaterReport::from(&update);
     let body = ForgeUpdateOnlyReportRequest {
@@ -787,6 +800,7 @@ pub async fn sync_update_report_once(
         report_scope: FORGE_REPORT_SCOPE_UPDATE_ONLY,
         capabilities: [CAPABILITY_UPDATER_V1],
         update,
+        media_rebase_events: media_rebase_events.clone(),
     };
     let body_bytes =
         serde_json::to_vec(&body).context("serialize update-only Forge report failed")?;
@@ -808,6 +822,11 @@ pub async fn sync_update_report_once(
     if response.status != "ok" {
         bail!("Manage returned an invalid update-only Forge report status");
     }
+    crate::updater::acknowledge_media_rebase_events(
+        config,
+        &media_rebase_events,
+        &response.acknowledged_media_rebase_event_ids,
+    )?;
     let persisted_update_acknowledged =
         persisted_update_ack_matches(&response.persisted_update, &updater);
     let receipt = ForgeReportReceipt {
@@ -831,6 +850,11 @@ pub async fn sync_update_report_once(
 
 pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
     ensure_root_supervisor()?;
+    if protected_appliance_identity_at(Path::new(APPLIANCE_RECOVERY_STATE_DIR))? {
+        config
+            .validate_appliance_config()
+            .context("refusing appliance runtime apply with unsafe configuration")?;
+    }
     let _apply_lock = acquire_runtime_apply_lock()?;
     ensure_manage_enabled_config(config)?;
     let managed = load_managed_state_from_config(config)?;
@@ -846,6 +870,10 @@ pub async fn apply_runtime_config_once(config: &AppConfig) -> Result<()> {
     let desired = fetch_boot_config_for_config(config, &managed).await?;
     let settings = normalize_managed_settings(&desired.settings, config)?;
     apply_runtime_settings_to_host(config, &settings)?;
+    refresh_appliance_recovery_config_if_present(
+        Path::new(APPLIANCE_ACTIVE_CONFIG_PATH),
+        Path::new(APPLIANCE_RECOVERY_STATE_DIR),
+    )?;
     crate::updater::apply_requested_update(config).await?;
     info!("managed runtime configuration applied");
     Ok(())
@@ -969,6 +997,14 @@ async fn current_boot_client_reports(pool: &SqlitePool) -> Result<Vec<BootAgentC
 }
 
 async fn ensure_enrolled(state: &AppState, managed: &mut ManagedState) -> Result<bool> {
+    // Once either a polling credential or an adopted identity is durable, the
+    // one-time bootstrap code is no longer needed. Retrying this cleanup on
+    // every pass also completes a scrub interrupted after the atomic rename.
+    if managed.device_id.is_some()
+        || (managed.enrollment_id.is_some() && managed.enrollment_secret.is_some())
+    {
+        scrub_forge_install_code_file(&state.config)?;
+    }
     if managed
         .device_id
         .as_deref()
@@ -983,6 +1019,10 @@ async fn ensure_enrolled(state: &AppState, managed: &mut ManagedState) -> Result
         // already-adopted idempotent retry. Persist it before polling so a
         // crash cannot lose the only recovery credential.
         save_managed_state(state, managed)?;
+        // Never remove the only bootstrap credential until the response and
+        // its rotated polling secret are fsynced. The rename makes the public
+        // path disappear atomically; the hidden tomb is then zeroed/unlinked.
+        scrub_forge_install_code_file(&state.config)?;
     }
 
     let status = poll_enrollment(state, managed).await?;
@@ -1033,6 +1073,14 @@ async fn submit_enrollment(state: &AppState, managed: &mut ManagedState) -> Resu
     let response: EnrollmentResponse =
         parse_success_json(response, "submit managed enrollment").await?;
     apply_enrollment_response(managed, response)?;
+    info!(
+        "CYBEX_FORGE_ENROLLMENT pairing_code={} public_key_fingerprint={}",
+        managed.pairing_code.as_deref().unwrap_or("unavailable"),
+        managed
+            .public_key_fingerprint
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
     info!("managed enrollment submitted or recovered; checking approval state");
     Ok(())
 }
@@ -1313,7 +1361,11 @@ async fn sync_forge_foundation(
     )
     .await?;
     crate::cache::enforce_retention(&state.db, &state.config).await?;
-    crate::updater::store_update_request(&state.config, desired.update).await?;
+    if crate::updater::media_rebase_events(&state.config)?.is_empty() {
+        crate::updater::store_update_request(&state.config, desired.update).await?;
+    } else if desired.update.is_some() {
+        info!("deferring managed update request until media-rebase evidence is acknowledged");
+    }
 
     report_forge_state(state, managed).await
 }
@@ -1348,11 +1400,18 @@ async fn report_forge_state(
     let cache_artifacts_complete = cache_artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
     let cache = crate::cache::status_report(&state.config, &state.db).await;
     let update = crate::updater::status_report(&state.config).await?;
+    let media_rebase_events = crate::updater::media_rebase_events(&state.config)?;
+    if let Some(update) = update.as_ref() {
+        validate_media_rebase_projection(&media_rebase_events, update)?;
+    } else if !media_rebase_events.is_empty() {
+        bail!("media-rebase evidence requires an enabled updater idle projection");
+    }
     let body = ForgeAgentReportRequest {
         protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
         capabilities: forge_capabilities(&state.config),
         cache,
         update,
+        media_rebase_events: media_rebase_events.clone(),
         build_jobs: build_jobs
             .into_iter()
             .take(MAX_REPORT_BUILD_JOBS)
@@ -1381,6 +1440,11 @@ async fn report_forge_state(
         .context("report managed forge state request failed")?;
     let response =
         parse_success_json::<ForgeReportResponse>(response, "report managed forge state").await?;
+    crate::updater::acknowledge_media_rebase_events(
+        &state.config,
+        &media_rebase_events,
+        &response.acknowledged_media_rebase_event_ids,
+    )?;
     let receipt = ForgeReportReceipt {
         update_acknowledged: response.update,
         scope_acknowledged: false,
@@ -1422,6 +1486,28 @@ fn validate_expected_update_report(
             expected.current_version,
             actual.current_version
         );
+    }
+    Ok(())
+}
+
+fn validate_media_rebase_projection(
+    events: &[crate::updater::MediaRebaseEvidence],
+    update: &ForgeUpdateStatusReport,
+) -> Result<()> {
+    let Some(final_event) = events.last() else {
+        return Ok(());
+    };
+    if update.status != "idle"
+        || update.stage != "idle"
+        || update.progress_percent.is_some()
+        || !update.error.is_empty()
+        || !update.target_version.is_empty()
+        || !update.attempt_id.is_empty()
+        || update.started_at.is_some()
+        || update.completed_at.is_some()
+        || update.current_version != final_event.resulting_version
+    {
+        bail!("media-rebase evidence requires the exact resulting idle updater projection");
     }
     Ok(())
 }
@@ -4622,13 +4708,18 @@ fn http_client_for_config(config: &AppConfig) -> Result<Client> {
     Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build managed HTTP client")
 }
 
 fn http_download_client(state: &AppState) -> Result<Client> {
+    http_download_client_for_config(&state.config)
+}
+
+fn http_download_client_for_config(config: &AppConfig) -> Result<Client> {
     let connect_timeout = Duration::from_secs(bounded_http_timeout_seconds(
-        state.config.manage.http_timeout_seconds,
+        config.manage.http_timeout_seconds,
     ))
     .min(Duration::from_secs(10));
     // No overall timeout: multi-GB ISO downloads legitimately run long. The
@@ -4637,6 +4728,7 @@ fn http_download_client(state: &AppState) -> Result<Client> {
     Client::builder()
         .connect_timeout(connect_timeout)
         .read_timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build managed ISO download HTTP client")
 }
@@ -4716,10 +4808,299 @@ fn organization_id(config: &AppConfig) -> Result<String> {
 
 fn forge_install_code(config: &AppConfig) -> Result<String> {
     let code = config.manage.forge_install_code.trim();
-    if code.is_empty() {
-        bail!("manage.forge_install_code is required for Forge install enrollment");
+    if !code.is_empty() {
+        return Ok(code.to_string());
     }
-    Ok(code.to_string())
+    let path = &config.manage.forge_install_code_file;
+    if path.as_os_str().is_empty() {
+        bail!(
+            "manage.forge_install_code_file is required for Forge install enrollment (legacy inline forge_install_code is also accepted)"
+        );
+    }
+    read_forge_install_code_file(path)
+}
+
+const MAX_FORGE_INSTALL_CODE_BYTES: u64 = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForgeInstallCodeIdentity {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    links: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+}
+
+fn forge_install_code_identity(metadata: &fs::Metadata) -> ForgeInstallCodeIdentity {
+    ForgeInstallCodeIdentity {
+        len: metadata.len(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        mode: metadata.mode(),
+        #[cfg(unix)]
+        uid: metadata.uid(),
+        #[cfg(unix)]
+        gid: metadata.gid(),
+        #[cfg(unix)]
+        links: metadata.nlink(),
+        #[cfg(unix)]
+        modified_seconds: metadata.mtime(),
+        #[cfg(unix)]
+        modified_nanoseconds: metadata.mtime_nsec(),
+    }
+}
+
+fn read_forge_install_code_file(path: &Path) -> Result<String> {
+    read_forge_install_code_file_bound(path).map(|(code, _identity)| code)
+}
+
+fn read_forge_install_code_file_bound(path: &Path) -> Result<(String, ForgeInstallCodeIdentity)> {
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect Forge install code file {}", path.display()))?;
+    if !path_metadata.file_type().is_file() || path_metadata.len() > MAX_FORGE_INSTALL_CODE_BYTES {
+        bail!("Forge install code file must be a bounded regular file");
+    }
+    #[cfg(unix)]
+    {
+        if path_metadata.nlink() != 1
+            || path_metadata.uid() != unsafe { libc::geteuid() }
+            || path_metadata.mode() & 0o077 != 0
+        {
+            bail!("Forge install code file ownership or permissions are unsafe");
+        }
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open Forge install code file {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect open Forge install code file {}", path.display()))?;
+    if !opened.file_type().is_file() || opened.len() > MAX_FORGE_INSTALL_CODE_BYTES {
+        bail!("Forge install code file must remain a bounded regular file");
+    }
+    #[cfg(unix)]
+    if opened.dev() != path_metadata.dev()
+        || opened.ino() != path_metadata.ino()
+        || opened.uid() != path_metadata.uid()
+        || opened.mode() != path_metadata.mode()
+        || opened.nlink() != path_metadata.nlink()
+        || opened.len() != path_metadata.len()
+    {
+        bail!("Forge install code file changed while opening");
+    }
+
+    let mut bytes = Vec::with_capacity((opened.len() + 1) as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_FORGE_INSTALL_CODE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read Forge install code file")?;
+    if bytes.len() as u64 > MAX_FORGE_INSTALL_CODE_BYTES {
+        bail!("Forge install code file exceeds its size limit");
+    }
+    let read_metadata = file
+        .metadata()
+        .context("reinspect Forge install code file")?;
+    #[cfg(unix)]
+    if read_metadata.dev() != opened.dev()
+        || read_metadata.ino() != opened.ino()
+        || read_metadata.len() != opened.len()
+        || read_metadata.mtime() != opened.mtime()
+        || read_metadata.mtime_nsec() != opened.mtime_nsec()
+    {
+        bail!("Forge install code file changed while reading");
+    }
+    let code = std::str::from_utf8(&bytes)
+        .context("Forge install code file is not UTF-8")?
+        .trim();
+    if code.len() < 16
+        || code.len() > MAX_FORGE_INSTALL_CODE_BYTES as usize
+        || code
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        bail!("Forge install code file does not contain a valid one-time code");
+    }
+    Ok((
+        code.to_string(),
+        forge_install_code_identity(&read_metadata),
+    ))
+}
+
+fn forge_install_code_tomb_path(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("Forge install code file must have a filename"))?;
+    let mut tomb = OsString::from(".");
+    tomb.push(name);
+    tomb.push(".consumed");
+    Ok(path.with_file_name(tomb))
+}
+
+fn securely_remove_forge_install_code_tomb(
+    path: &Path,
+    expected: &ForgeInstallCodeIdentity,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("consumed Forge install code tomb is not a regular file");
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("consumed Forge install code tomb ownership is unsafe");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open consumed Forge install code tomb {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .context("inspect consumed Forge install code tomb")?;
+    if forge_install_code_identity(&opened) != *expected {
+        bail!("consumed Forge install code tomb does not match the bound source identity");
+    }
+    #[cfg(unix)]
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.nlink() != 1
+        || opened.uid() != unsafe { libc::geteuid() }
+    {
+        bail!("consumed Forge install code tomb changed while opening");
+    }
+    let zero_len = usize::try_from(opened.len().min(MAX_FORGE_INSTALL_CODE_BYTES))
+        .context("Forge install code tomb length overflow")?;
+    if opened.len() > MAX_FORGE_INSTALL_CODE_BYTES {
+        bail!("consumed Forge install code tomb exceeds its size limit");
+    }
+    file.write_all(&vec![0_u8; zero_len])
+        .context("overwrite consumed Forge install code tomb")?;
+    file.set_len(0)
+        .context("truncate consumed Forge install code tomb")?;
+    file.sync_all()
+        .context("sync consumed Forge install code tomb")?;
+    let erased = file
+        .metadata()
+        .context("reinspect consumed Forge install code tomb after erasure")?;
+    #[cfg(unix)]
+    if erased.dev() != opened.dev() || erased.ino() != opened.ino() || erased.nlink() != 1 {
+        bail!("consumed Forge install code tomb changed while erasing");
+    }
+    let named = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "reinspect consumed Forge install code tomb {}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    if named.dev() != erased.dev() || named.ino() != erased.ino() || !named.file_type().is_file() {
+        bail!("refusing to unlink a replaced Forge install code tomb");
+    }
+    drop(file);
+    fs::remove_file(path)
+        .with_context(|| format!("remove consumed Forge install code tomb {}", path.display()))?;
+    sync_parent_dir(path)
+}
+
+fn scrub_forge_install_code_file(config: &AppConfig) -> Result<()> {
+    scrub_forge_install_code_file_with_hook(config, || {})
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn scrub_forge_install_code_file_with_hook<F>(config: &AppConfig, after_bind: F) -> Result<()>
+where
+    F: FnOnce(),
+{
+    let path = &config.manage.forge_install_code_file;
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let tomb = forge_install_code_tomb_path(path)?;
+    let source_exists = path_exists_without_following(path)?;
+    let tomb_exists = path_exists_without_following(&tomb)?;
+    if source_exists && tomb_exists {
+        bail!("Forge install code source and consumed tomb both exist; refusing ambiguous cleanup");
+    }
+    if tomb_exists {
+        // Complete a crash after the verified source was atomically renamed.
+        let (_code, tomb_identity) = read_forge_install_code_file_bound(&tomb)?;
+        securely_remove_forge_install_code_tomb(&tomb, &tomb_identity)?;
+        return Ok(());
+    }
+    if !source_exists {
+        return Ok(());
+    }
+    // Bind the exact source inode and stable metadata before the pathname
+    // rename. The post-rename comparison prevents a same-UID pathname swap
+    // from turning cleanup into deletion of an unrelated file.
+    let (_code, source_identity) = read_forge_install_code_file_bound(path)?;
+    after_bind();
+    match fs::rename(path, &tomb) {
+        Ok(()) => {
+            sync_parent_dir(path)?;
+            let moved = fs::symlink_metadata(&tomb).with_context(|| {
+                format!(
+                    "inspect consumed Forge install code tomb {}",
+                    tomb.display()
+                )
+            })?;
+            if forge_install_code_identity(&moved) != source_identity {
+                // Preserve the raced file. Restore it when the source name is
+                // free; if another file already occupies that name, leave
+                // both paths untouched for explicit operator recovery.
+                if !path_exists_without_following(path)? {
+                    fs::rename(&tomb, path).with_context(|| {
+                        format!(
+                            "restore replaced Forge install code source {}",
+                            path.display()
+                        )
+                    })?;
+                    sync_parent_dir(path)?;
+                }
+                bail!("Forge install code source changed before atomic consumption");
+            }
+            securely_remove_forge_install_code_tomb(&tomb, &source_identity)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "atomically consume Forge install code file {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn ensure_manage_enabled(state: &AppState) -> Result<()> {
@@ -5172,10 +5553,17 @@ fn apply_runtime_settings_to_host(
     config: &AppConfig,
     settings: &NormalizedManagedSettings,
 ) -> Result<()> {
-    ensure_runtime_directories(config, settings)?;
-    let runtime_files = runtime_managed_files(config, settings)?;
+    let appliance = protected_appliance_identity_at(Path::new(APPLIANCE_RECOVERY_STATE_DIR))?;
+    if appliance {
+        config
+            .validate_appliance_config()
+            .context("refusing appliance runtime apply with unsafe configuration")?;
+        validate_appliance_managed_settings(settings)?;
+    }
+    ensure_runtime_directories(config, settings, appliance)?;
+    let runtime_files = runtime_managed_files_for_platform(config, settings, appliance)?;
     let backups = capture_runtime_file_backups(&runtime_files)?;
-    let apply_result = apply_runtime_managed_files(settings, &runtime_files);
+    let apply_result = apply_runtime_managed_files(settings, &runtime_files, appliance);
     if let Err(err) = apply_result {
         if let Err(rollback_err) = rollback_runtime_files(&runtime_files, &backups) {
             return Err(err).context(format!(
@@ -5187,6 +5575,193 @@ fn apply_runtime_settings_to_host(
     Ok(())
 }
 
+fn validate_appliance_managed_settings(settings: &NormalizedManagedSettings) -> Result<()> {
+    if settings.listen_addr != "127.0.0.1:8080" {
+        bail!("appliance managed listen address must remain 127.0.0.1:8080");
+    }
+    if settings.tftp_root != Path::new("/srv/cybex-forge/tftp") {
+        bail!("appliance managed TFTP root must remain /srv/cybex-forge/tftp");
+    }
+    if settings.http_root != Path::new("/srv/cybex-forge/www") {
+        bail!("appliance managed HTTP root must remain /srv/cybex-forge/www");
+    }
+    Ok(())
+}
+
+fn protected_appliance_identity_at(appliance_state_dir: &Path) -> Result<bool> {
+    let directory_metadata = match fs::symlink_metadata(appliance_state_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspect {}", appliance_state_dir.display()));
+        }
+    };
+    if !directory_metadata.file_type().is_dir() {
+        bail!("appliance recovery metadata path is not a directory");
+    }
+    #[cfg(unix)]
+    if directory_metadata.uid() != unsafe { libc::geteuid() }
+        || directory_metadata.mode() & 0o777 != 0o700
+    {
+        bail!("appliance recovery metadata directory is not protected");
+    }
+    let identity_path = appliance_state_dir.join("install-state.json");
+    let metadata = match fs::symlink_metadata(&identity_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspect {}", identity_path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_APPLIANCE_INSTALL_STATE_BYTES {
+        bail!("appliance identity record is invalid");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        bail!("appliance identity record is not protected");
+    }
+    let identity: Value = serde_json::from_slice(
+        &fs::read(&identity_path).with_context(|| format!("read {}", identity_path.display()))?,
+    )
+    .context("parse appliance identity record")?;
+    if identity.get("schema").and_then(Value::as_str) != Some(APPLIANCE_INSTALL_STATE_SCHEMA)
+        || identity.get("status").and_then(Value::as_str) != Some("installed")
+    {
+        bail!("appliance identity record does not identify an installed Forge appliance");
+    }
+    Ok(true)
+}
+
+fn refresh_appliance_recovery_config_if_present(
+    active_config: &Path,
+    appliance_state_dir: &Path,
+) -> Result<bool> {
+    let directory_metadata = match fs::symlink_metadata(appliance_state_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspect appliance recovery directory {}",
+                    appliance_state_dir.display()
+                )
+            });
+        }
+    };
+    if !directory_metadata.file_type().is_dir() {
+        bail!("appliance recovery metadata path is not a directory");
+    }
+    #[cfg(unix)]
+    if directory_metadata.uid() != unsafe { libc::geteuid() }
+        || directory_metadata.mode() & 0o777 != 0o700
+    {
+        bail!("appliance recovery metadata directory is not protected");
+    }
+
+    let identity_path = appliance_state_dir.join("install-state.json");
+    let identity_metadata = match fs::symlink_metadata(&identity_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("inspect appliance identity {}", identity_path.display())
+            });
+        }
+    };
+    if !identity_metadata.file_type().is_file()
+        || identity_metadata.len() > MAX_APPLIANCE_INSTALL_STATE_BYTES
+    {
+        bail!("appliance identity record is invalid");
+    }
+    #[cfg(unix)]
+    if identity_metadata.uid() != unsafe { libc::geteuid() }
+        || identity_metadata.mode() & 0o777 != 0o600
+        || identity_metadata.nlink() != 1
+    {
+        bail!("appliance identity record is not protected");
+    }
+
+    let mut identity_options = fs::OpenOptions::new();
+    identity_options.read(true);
+    #[cfg(unix)]
+    identity_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let identity_file = identity_options
+        .open(&identity_path)
+        .with_context(|| format!("open appliance identity {}", identity_path.display()))?;
+    let opened_identity = identity_file
+        .metadata()
+        .context("reinspect appliance identity record")?;
+    #[cfg(unix)]
+    if opened_identity.dev() != identity_metadata.dev()
+        || opened_identity.ino() != identity_metadata.ino()
+        || opened_identity.uid() != unsafe { libc::geteuid() }
+        || opened_identity.mode() & 0o777 != 0o600
+        || opened_identity.nlink() != 1
+    {
+        bail!("appliance identity record changed while opening");
+    }
+    let mut identity_bytes = Vec::new();
+    identity_file
+        .take(MAX_APPLIANCE_INSTALL_STATE_BYTES + 1)
+        .read_to_end(&mut identity_bytes)
+        .context("read appliance identity record")?;
+    if identity_bytes.len() as u64 > MAX_APPLIANCE_INSTALL_STATE_BYTES {
+        bail!("appliance identity record exceeds its size limit");
+    }
+    let identity: Value =
+        serde_json::from_slice(&identity_bytes).context("parse appliance identity record")?;
+    if identity.get("schema").and_then(Value::as_str) != Some(APPLIANCE_INSTALL_STATE_SCHEMA)
+        || identity.get("status").and_then(Value::as_str) != Some("installed")
+    {
+        bail!("appliance identity record does not identify an installed Forge appliance");
+    }
+
+    let config_bytes = fs::read(active_config)
+        .with_context(|| format!("read active Forge config {}", active_config.display()))?;
+    if config_bytes.is_empty() || config_bytes.len() > MAX_APPLIANCE_CONFIG_BYTES {
+        bail!("active Forge config is empty or exceeds the appliance recovery limit");
+    }
+    let config_text =
+        std::str::from_utf8(&config_bytes).context("active Forge config is not UTF-8")?;
+    AppConfig::from_toml_str(config_text, active_config)
+        .context("validate exact active Forge config before recovery backup")?
+        .validate_appliance_config()
+        .context("refusing unsafe appliance recovery config")?;
+
+    let backup_path = appliance_state_dir.join("config.toml");
+    let tmp_path = secure_json_tmp_path(&backup_path)?;
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&tmp_path)
+            .with_context(|| format!("create recovery config {}", tmp_path.display()))?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&config_bytes)
+            .context("write appliance recovery config")?;
+        file.sync_all().context("sync appliance recovery config")?;
+        drop(file);
+        fs::rename(&tmp_path, &backup_path).with_context(|| {
+            format!(
+                "atomically replace appliance recovery config {}",
+                backup_path.display()
+            )
+        })?;
+        sync_parent_dir(&backup_path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result?;
+    Ok(true)
+}
+
 struct RuntimeManagedFile {
     path: &'static str,
     contents: String,
@@ -5196,10 +5771,39 @@ struct RuntimeManagedFile {
     component: &'static str,
 }
 
+#[cfg(test)]
 fn runtime_managed_files(
     config: &AppConfig,
     settings: &NormalizedManagedSettings,
 ) -> Result<Vec<RuntimeManagedFile>> {
+    runtime_managed_files_for_platform(config, settings, false)
+}
+
+fn runtime_managed_files_for_platform(
+    config: &AppConfig,
+    settings: &NormalizedManagedSettings,
+    appliance: bool,
+) -> Result<Vec<RuntimeManagedFile>> {
+    if appliance {
+        return Ok(vec![
+            RuntimeManagedFile {
+                path: "/etc/cybex-forge/config.toml",
+                contents: render_managed_config(config, settings)?,
+                mode: "0640",
+                owner: "root",
+                group: "cybex-forge",
+                component: "boot",
+            },
+            RuntimeManagedFile {
+                path: "/etc/nginx/sites-available/cybex-forge",
+                contents: render_nginx_config(settings),
+                mode: "0644",
+                owner: "root",
+                group: "root",
+                component: "nginx",
+            },
+        ]);
+    }
     Ok(vec![
         RuntimeManagedFile {
             path: "/etc/systemd/system/cybex-forge.service",
@@ -5362,6 +5966,7 @@ fn capture_runtime_file_backups(files: &[RuntimeManagedFile]) -> Result<Vec<Opti
 fn apply_runtime_managed_files(
     settings: &NormalizedManagedSettings,
     files: &[RuntimeManagedFile],
+    appliance: bool,
 ) -> Result<()> {
     let mut boot_changed = false;
     let mut nginx_changed = false;
@@ -5442,10 +6047,14 @@ fn apply_runtime_managed_files(
             "http://127.0.0.1/boot.ipxe?cybex_check=1",
         ],
     )?;
-    run_command(
-        "systemctl",
-        ["enable", "--now", "cybex-forge-sentinel.timer"],
-    )?;
+    if appliance {
+        run_command("systemctl", ["start", "cybex-forge-sentinel.timer"])?;
+    } else {
+        run_command(
+            "systemctl",
+            ["enable", "--now", "cybex-forge-sentinel.timer"],
+        )?;
+    }
     Ok(())
 }
 
@@ -5484,6 +6093,7 @@ fn rollback_runtime_files(files: &[RuntimeManagedFile], backups: &[Option<Vec<u8
 fn ensure_runtime_directories(
     config: &AppConfig,
     settings: &NormalizedManagedSettings,
+    appliance: bool,
 ) -> Result<()> {
     install_dir(Path::new("/etc/cybex-forge"), "0750", "root", "cybex-forge")?;
     install_dir(
@@ -5540,24 +6150,26 @@ fn ensure_runtime_directories(
         install_dir(parent, "0700", "cybex-forge", "cybex-forge")?;
     }
     install_dir(&settings.tftp_root, "0555", "root", "root")?;
-    install_dir(
-        Path::new("/etc/systemd/system/cybex-forge.service.d"),
-        "0755",
-        "root",
-        "root",
-    )?;
-    install_dir(
-        Path::new("/etc/systemd/system/nginx.service.d"),
-        "0755",
-        "root",
-        "root",
-    )?;
-    install_dir(
-        Path::new("/etc/systemd/system/tftpd-hpa.service.d"),
-        "0755",
-        "root",
-        "root",
-    )?;
+    if !appliance {
+        install_dir(
+            Path::new("/etc/systemd/system/cybex-forge.service.d"),
+            "0755",
+            "root",
+            "root",
+        )?;
+        install_dir(
+            Path::new("/etc/systemd/system/nginx.service.d"),
+            "0755",
+            "root",
+            "root",
+        )?;
+        install_dir(
+            Path::new("/etc/systemd/system/tftpd-hpa.service.d"),
+            "0755",
+            "root",
+            "root",
+        )?;
+    }
     Ok(())
 }
 
@@ -5586,6 +6198,9 @@ fn render_managed_config(
          [build]\n\
          enabled = {build_enabled}\n\
          max_concurrent_builds = {max_concurrent_builds}\n\
+         max_build_cores = {max_build_cores}\n\
+         minimum_memory_bytes = {minimum_memory_bytes}\n\
+         minimum_swap_bytes = {minimum_swap_bytes}\n\
          timeout_seconds = {build_timeout_seconds}\n\
          cancel_grace_seconds = {cancel_grace_seconds}\n\
          max_log_bytes = {max_log_bytes}\n\
@@ -5633,6 +6248,9 @@ fn render_managed_config(
         menu_timeout_ms = settings.menu_timeout_ms,
         build_enabled = config.build.enabled,
         max_concurrent_builds = config.build.max_concurrent_builds,
+        max_build_cores = config.build.max_build_cores,
+        minimum_memory_bytes = config.build.minimum_memory_bytes,
+        minimum_swap_bytes = config.build.minimum_swap_bytes,
         build_timeout_seconds = config.build.timeout_seconds,
         cancel_grace_seconds = config.build.cancel_grace_seconds,
         max_log_bytes = config.build.max_log_bytes,
@@ -5683,6 +6301,7 @@ server {{
     error_log  /var/log/nginx/cybex-forge.error.log crit;
 
     server_tokens off;
+    autoindex off;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;
     add_header Referrer-Policy no-referrer always;
@@ -5783,6 +6402,14 @@ server {{
         proxy_send_timeout 10s;
         proxy_read_timeout 300s;
         proxy_buffering off;
+    }}
+
+    location = /login {{
+        return 404;
+    }}
+
+    location /api/ {{
+        return 404;
     }}
 
     location = / {{
@@ -6006,6 +6633,9 @@ fn loader_embeds_boot_url(path: &Path, public_base_url: &str) -> Result<bool> {
 fn build_embedded_ipxe_loader(settings: &NormalizedManagedSettings) -> Result<bool> {
     let ipxe_dir = Path::new("/usr/local/src/ipxe");
     if !ipxe_dir.join("src").is_dir() {
+        if std::env::var_os("CYBEX_FORGE_REQUIRE_PINNED_IPXE_SOURCE").is_some() {
+            bail!("pinned appliance iPXE source is missing; refusing network source bootstrap");
+        }
         install_dir(Path::new("/usr/local/src"), "0755", "root", "root")?;
         run_command(
             "git",
@@ -6624,19 +7254,24 @@ mod tests {
         canonical_agent_payload, clean_optional, current_boot_client_reports,
         current_profile_sync_reports, enrollment_request_signature, enrollment_status_signature,
         ensure_key_material, failed_sync_interval_seconds, fit_boot_report_body,
-        forge_capabilities, generated_iso_raw_script_can_be_preserved,
-        has_unreported_known_profile_events, managed_api_error_detail,
+        forge_capabilities, forge_install_code, forge_install_code_tomb_path,
+        generated_iso_raw_script_can_be_preserved, has_unreported_known_profile_events,
+        http_client_for_config, http_download_client_for_config, managed_api_error_detail,
         managed_iso_error_is_retryable, managed_iso_retry_delay_seconds, managed_profile_map,
         managed_profile_needs_iso_sync, managed_profile_raw_script, managed_state_lock_path,
         managed_sync_interval_seconds, nixos_netboot_fstab, normalize_legacy_boot_config,
         normalize_managed_settings, optional_report_uuid, parse_nixos_netboot_ipxe_cmdline,
         parse_nixos_netboot_split_squashfs_capability, patch_nixos_netboot_squashfs_fstab,
         patch_nixos_netboot_squashfs_graphical_kiosk, patch_nixos_netboot_squashfs_injected_config,
-        read_newc_entry_start, read_valid_netboot_manifest, render_check_service,
-        render_managed_config, render_nixos_netboot_script, request_path_and_query,
-        rewrite_newc_archive_with_netboot_files, runtime_managed_files, serialize_boot_report_body,
-        sha256_hex, signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
-        sync_deleted_profiles, sync_profiles, sync_update_report_once, validate_boot_config,
+        read_newc_entry_start, read_valid_netboot_manifest,
+        refresh_appliance_recovery_config_if_present, render_check_service, render_managed_config,
+        render_nixos_netboot_script, request_path_and_query,
+        rewrite_newc_archive_with_netboot_files, runtime_managed_files,
+        runtime_managed_files_for_platform, scrub_forge_install_code_file,
+        scrub_forge_install_code_file_with_hook, serialize_boot_report_body, sha256_hex,
+        signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
+        sync_deleted_profiles, sync_profiles, sync_update_report_once,
+        validate_appliance_managed_settings, validate_boot_config,
         validate_component_compatibility, validate_expected_update_report,
         validate_forge_report_receipt, validate_profile, validate_update_only_sync_report,
         write_newc_file_from_bytes, write_newc_trailer, write_secure_json,
@@ -6664,12 +7299,35 @@ mod tests {
         io::{BufReader, Read},
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
+        time::Duration,
     };
-    use tokio::{net::TcpListener, sync::oneshot};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+        time::timeout,
+    };
     use uuid::Uuid;
 
     type UpdateOnlyCapture =
         Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Vec<u8>, serde_json::Value)>>>>;
+
+    fn appliance_test_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.build.work_dir = PathBuf::from("/srv/cybex-forge/build-work");
+        config.build.output_dir = PathBuf::from("/srv/cybex-forge/build-outputs");
+        config.build.nix_binary = "/run/current-system/sw/bin/nix".to_string();
+        config.update.health_url = "http://127.0.0.1:8080/healthz".to_string();
+        config.update.trusted_public_key = STANDARD.encode(
+            SigningKey::from_bytes(&[17_u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        config.manage.enabled = true;
+        config.manage.api_url = "https://manage.example".to_string();
+        config.manage.organization_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        config
+    }
 
     async fn capture_update_only_report(
         State(capture): State<UpdateOnlyCapture>,
@@ -6695,6 +7353,44 @@ mod tests {
                 "reported_at": "2026-07-23T10:00:00Z"
             }
         }))
+    }
+
+    async fn assert_client_does_not_follow_redirect(client: reqwest::Client) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = first.read(&mut request).await.unwrap();
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+        let response = client
+            .post(format!("http://{address}/enrollment"))
+            .body("one-time-enrollment-body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(!server.await.unwrap(), "redirect target was fetched");
+    }
+
+    #[tokio::test]
+    async fn managed_http_clients_refuse_redirects() {
+        let config = AppConfig::default();
+        assert_client_does_not_follow_redirect(http_client_for_config(&config).unwrap()).await;
+        assert_client_does_not_follow_redirect(http_download_client_for_config(&config).unwrap())
+            .await;
     }
 
     #[test]
@@ -7722,6 +8418,31 @@ mod tests {
     }
 
     #[test]
+    fn appliance_managed_runtime_endpoints_and_roots_are_pinned() {
+        let valid = NormalizedManagedSettings {
+            public_base_url: "http://forge.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp"),
+            http_root: PathBuf::from("/srv/cybex-forge/www"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 0,
+        };
+        validate_appliance_managed_settings(&valid).unwrap();
+
+        let mut changed = valid.clone();
+        changed.listen_addr = "127.0.0.1:9080".to_string();
+        assert!(validate_appliance_managed_settings(&changed).is_err());
+
+        let mut changed = valid.clone();
+        changed.tftp_root = PathBuf::from("/srv/cybex-forge/tftp-managed");
+        assert!(validate_appliance_managed_settings(&changed).is_err());
+
+        let mut changed = valid;
+        changed.http_root = PathBuf::from("/srv/cybex-forge/www-managed");
+        assert!(validate_appliance_managed_settings(&changed).is_err());
+    }
+
+    #[test]
     fn managed_settings_reject_overlapping_runtime_roots() {
         let app_config = AppConfig::default();
         let nested_http = ManagedBootSettings {
@@ -7771,6 +8492,29 @@ mod tests {
             "ReadWritePaths=/run /srv/cybex-forge/www-managed /var/lib/cybex-forge /var/lib/nginx /var/log/nginx"
         ));
         assert!(service.contains("ExecStart=/usr/local/bin/cybex-forge-check --quiet"));
+    }
+
+    #[test]
+    fn managed_nginx_public_edge_is_read_only_bounded_and_streaming() {
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://boot.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp"),
+            http_root: PathBuf::from("/srv/cybex-forge/www"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 0,
+        };
+
+        let nginx = super::render_nginx_config(&settings);
+
+        assert!(nginx.contains("listen 80 default_server"));
+        assert!(!nginx.contains("listen [::]:80"));
+        assert!(nginx.contains("if ($request_method !~ ^(GET|HEAD)$)"));
+        assert!(nginx.contains("client_max_body_size 1k"));
+        assert!(nginx.contains("client_header_timeout 5s"));
+        assert!(nginx.contains("location = /login"));
+        assert!(nginx.contains("location /api/"));
+        assert_eq!(nginx.matches("proxy_buffering off").count(), 2);
     }
 
     #[test]
@@ -7840,6 +8584,156 @@ mod tests {
         let rendered = render_managed_config(&config, &settings).unwrap();
 
         assert!(rendered.contains("health_url = \"http://127.0.0.1:9181/healthz\""));
+        assert!(!rendered.contains("forge_install_code ="));
+        assert!(!rendered.contains("forge_install_code_file ="));
+    }
+
+    #[test]
+    fn managed_config_preserves_appliance_build_admission_limits() {
+        let mut config = AppConfig::default();
+        config.manage.organization_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        config.build.max_build_cores = 4;
+        config.build.minimum_memory_bytes = 16_106_127_360;
+        config.build.minimum_swap_bytes = 8_053_063_680;
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://forge.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp"),
+            http_root: PathBuf::from("/srv/cybex-forge/www"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 0,
+        };
+
+        let rendered = render_managed_config(&config, &settings).unwrap();
+        let reparsed: AppConfig = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(reparsed.build.max_build_cores, 4);
+        assert_eq!(reparsed.build.minimum_memory_bytes, 16_106_127_360);
+        assert_eq!(reparsed.build.minimum_swap_bytes, 8_053_063_680);
+    }
+
+    #[test]
+    fn appliance_runtime_apply_never_writes_debian_systemd_or_checker_files() {
+        let mut config = AppConfig::default();
+        config.manage.organization_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://forge.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp"),
+            http_root: PathBuf::from("/srv/cybex-forge/www"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 0,
+        };
+
+        let files = runtime_managed_files_for_platform(&config, &settings, true).unwrap();
+        let paths = files.iter().map(|file| file.path).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "/etc/cybex-forge/config.toml",
+                "/etc/nginx/sites-available/cybex-forge"
+            ]
+        );
+        assert!(paths.iter().all(|path| !path.starts_with("/etc/systemd/")));
+        assert!(!paths.contains(&"/usr/local/bin/cybex-forge-check"));
+        assert!(!paths.contains(&"/etc/default/tftpd-hpa"));
+    }
+
+    #[test]
+    fn appliance_recovery_config_tracks_managed_truth_without_enrollment_secret() {
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-appliance-config-test-{}",
+            hex::encode(random)
+        ));
+        let appliance_dir = root.join("appliance");
+        fs::create_dir_all(&appliance_dir).unwrap();
+        fs::set_permissions(&appliance_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = appliance_dir.join("install-state.json");
+        fs::write(
+            &identity,
+            br#"{"schema":"cybex.forge.appliance.install.v1","version":"0.1.2","mode":"install","status":"installed"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut config = appliance_test_config();
+        config.manage.forge_install_code = "must-never-be-backed-up".to_string();
+        config.manage.forge_install_code_file =
+            PathBuf::from("/var/lib/cybex-forge/bootstrap/enrollment-code");
+        let settings = NormalizedManagedSettings {
+            public_base_url: "http://forge-after-managed-change.example".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+            tftp_root: PathBuf::from("/srv/cybex-forge/tftp"),
+            http_root: PathBuf::from("/srv/cybex-forge/www"),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 0,
+        };
+        let active_config = root.join("active.toml");
+        fs::write(
+            &active_config,
+            render_managed_config(&config, &settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            refresh_appliance_recovery_config_if_present(&active_config, &appliance_dir).unwrap()
+        );
+        let backup = fs::read_to_string(appliance_dir.join("config.toml")).unwrap();
+        assert!(backup.contains("http://forge-after-managed-change.example"));
+        assert!(!backup.contains("must-never-be-backed-up"));
+        assert!(!backup.contains("forge_install_code ="));
+        assert!(!backup.contains("forge_install_code_file ="));
+
+        let committed_backup = fs::read(appliance_dir.join("config.toml")).unwrap();
+        let committed_text = std::str::from_utf8(&committed_backup).unwrap();
+        for bypass in [
+            "forge_install_code=\"forge_code_1234567890\"\n",
+            "\"forge_install_code\" = \"forge_code_1234567890\"\n",
+            "forge_install_code_file=\"/run/arbitrary-code\"\n",
+        ] {
+            fs::write(&active_config, format!("{committed_text}\n{bypass}")).unwrap();
+            let error =
+                refresh_appliance_recovery_config_if_present(&active_config, &appliance_dir)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsafe appliance recovery config"),
+                "unexpected bypass error: {error:#}"
+            );
+            assert_eq!(
+                fs::read(appliance_dir.join("config.toml")).unwrap(),
+                committed_backup
+            );
+        }
+
+        for unsafe_config in [
+            committed_text.replace("127.0.0.1:8080", "127.0.0.1:9080"),
+            committed_text.replace(
+                "/usr/local/bin/cybex-forge",
+                "/opt/cybex-forge/unrelated-binary",
+            ),
+            committed_text.replace("https://manage.example", "http://manage.example"),
+        ] {
+            fs::write(&active_config, unsafe_config).unwrap();
+            let error =
+                refresh_appliance_recovery_config_if_present(&active_config, &appliance_dir)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsafe appliance recovery config"),
+                "unexpected invariant error: {error:#}"
+            );
+            assert_eq!(
+                fs::read(appliance_dir.join("config.toml")).unwrap(),
+                committed_backup
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -9120,6 +10014,7 @@ mod tests {
             keys,
             std::collections::BTreeSet::from([
                 "capabilities",
+                "media_rebase_events",
                 "protocol_version",
                 "report_scope",
                 "update",
@@ -9665,6 +10560,113 @@ mod tests {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
         pool
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forge_install_code_file_requires_a_private_regular_file() {
+        let root = temp_state_dir();
+        let code_path = root.join("enrollment-code");
+        fs::write(&code_path, "forge_code_1234567890\n").unwrap();
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = AppConfig::default();
+        config.manage.forge_install_code_file = code_path.clone();
+
+        assert_eq!(
+            forge_install_code(&config).unwrap(),
+            "forge_code_1234567890"
+        );
+
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            forge_install_code(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("permissions are unsafe")
+        );
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let linked_path = root.join("linked-code");
+        std::os::unix::fs::symlink(&code_path, &linked_path).unwrap();
+        config.manage.forge_install_code_file = linked_path;
+        assert!(
+            forge_install_code(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+
+        let hard_link_path = root.join("hard-linked-code");
+        fs::hard_link(&code_path, &hard_link_path).unwrap();
+        config.manage.forge_install_code_file = code_path;
+        assert!(
+            forge_install_code(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("ownership or permissions are unsafe")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forge_install_code_file_is_atomically_scrubbed_and_cleanup_is_restart_safe() {
+        let root = temp_state_dir();
+        let code_path = root.join("enrollment-code");
+        let tomb_path = forge_install_code_tomb_path(&code_path).unwrap();
+        fs::write(&code_path, "forge_code_1234567890\n").unwrap();
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = AppConfig::default();
+        config.manage.forge_install_code_file = code_path.clone();
+
+        scrub_forge_install_code_file(&config).unwrap();
+        assert!(!code_path.exists());
+        assert!(!tomb_path.exists());
+        scrub_forge_install_code_file(&config).unwrap();
+
+        fs::write(&code_path, "forge_code_abcdefghij\n").unwrap();
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&code_path, &tomb_path).unwrap();
+        scrub_forge_install_code_file(&config).unwrap();
+        assert!(!code_path.exists());
+        assert!(!tomb_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forge_install_code_scrub_preserves_a_pathname_replacement() {
+        let root = temp_state_dir();
+        let code_path = root.join("enrollment-code");
+        let original_path = root.join("original-code");
+        let tomb_path = forge_install_code_tomb_path(&code_path).unwrap();
+        fs::write(&code_path, "forge_code_1234567890\n").unwrap();
+        fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = AppConfig::default();
+        config.manage.forge_install_code_file = code_path.clone();
+
+        let error = scrub_forge_install_code_file_with_hook(&config, || {
+            fs::rename(&code_path, &original_path).unwrap();
+            fs::write(&code_path, "replacement_must_survive\n").unwrap();
+            fs::set_permissions(&code_path, fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before atomic consumption")
+        );
+        assert_eq!(
+            fs::read_to_string(&code_path).unwrap(),
+            "replacement_must_survive\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&original_path).unwrap(),
+            "forge_code_1234567890\n"
+        );
+        assert!(!tomb_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_state_dir() -> PathBuf {

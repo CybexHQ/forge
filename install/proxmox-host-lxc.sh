@@ -9,6 +9,8 @@ LXC_INSTALLER_RELATIVE_PATH="install/cybex-forge-lxc-install.sh"
 api_url="${CYBEX_MANAGE_API_URL:-}"
 organization_id="${CYBEX_ORGANIZATION_ID:-}"
 auth_code="${CYBEX_FORGE_AUTH_CODE:-}"
+unset CYBEX_FORGE_AUTH_CODE
+auth_code_file="${CYBEX_FORGE_AUTH_CODE_FILE:-}"
 public_base_url="${CYBEX_FORGE_PUBLIC_BASE_URL:-}"
 listen_addr="${CYBEX_FORGE_LISTEN_ADDR:-127.0.0.1:8080}"
 tftp_root="${CYBEX_FORGE_TFTP_ROOT:-/srv/cybex-forge/tftp}"
@@ -16,6 +18,7 @@ http_root="${CYBEX_FORGE_HTTP_ROOT:-/srv/cybex-forge/www}"
 bootloader_filename="${CYBEX_FORGE_BOOTLOADER_FILENAME:-snponly.efi}"
 menu_timeout_ms="${CYBEX_FORGE_BOOT_MENU_TIMEOUT_MS:-0}"
 update_trusted_public_key="${CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY:-}"
+allow_insecure_manage_http="${CYBEX_FORGE_ALLOW_INSECURE_MANAGE_HTTP:-0}"
 
 vmid="${CYBEX_FORGE_PROXMOX_VMID:-}"
 hostname="${CYBEX_FORGE_PROXMOX_HOSTNAME:-cybex-forge}"
@@ -35,20 +38,29 @@ created_container=0
 started_container=0
 completed=0
 current_step="initialization"
+temporary_auth_code_file=""
+guest_auth_code_file="/root/.cybex-forge-bootstrap/enrollment-code"
+guest_bootstrap_auth_code_file="/var/lib/cybex-forge/bootstrap/enrollment-code"
+guest_bootstrap_auth_code_tomb="/var/lib/cybex-forge/bootstrap/.enrollment-code.consumed"
+guest_bootstrap_auth_code_staged_file="/var/lib/cybex-forge/bootstrap/.enrollment-code.staged"
+guest_bootstrap_auth_code_identity_file="/var/lib/cybex-forge-bootstrap.identity"
+guest_auth_code_staged=0
 
 usage() {
   cat <<'EOF'
 Usage:
-  proxmox-host-lxc.sh --api-url URL --organization-id UUID --auth-code CODE [options]
+  proxmox-host-lxc.sh --api-url URL --organization-id UUID [options]
 
 Run this on a Proxmox host as root. It creates a Debian/Ubuntu LXC, clones
-Forge inside it, installs Cybex Forge, submits the one-time install code, and
+Forge inside it, installs Cybex Forge, submits a one-time install code, and
 leaves a pending cybex-forge enrollment in Cybex Manage.
 
 Required:
   --api-url URL                  Cybex Manage public API URL
   --organization-id UUID         Cybex organization UUID
-  --auth-code CODE               One-time Forge install authorization code
+Enrollment secret (choose one; otherwise a hidden /dev/tty prompt is used):
+  --auth-code CODE               Legacy process-visible automation input
+  --auth-code-file PATH          Root-owned mode-0600 code file below a root-owned, non-writable path; consumed after staging
 
 Generated resource options:
   --proxmox-disk-gb GiB          Root disk size (default/recommended: 128)
@@ -65,6 +77,7 @@ Boot runtime options:
   --menu-timeout-ms MS           Boot menu timeout; 0 disables it (default: 0)
   --update-trusted-public-key KEY
                                 Standard-Base64 raw 32-byte Ed25519 update public key
+  --allow-insecure-manage-http  Explicit development-only opt-in to an HTTP Manage URL
 
 Advanced Proxmox options:
   --vmid ID                      Container VMID (default: next cluster id)
@@ -101,24 +114,47 @@ die() {
 
 on_exit() {
   local status="$?"
-  [ "$completed" -eq 0 ] || return
-  [ "$status" -eq 0 ] && return
-  if [ "$created_container" -eq 0 ] && [ "$current_step" = "initialization" ]; then
-    return
+  local cleanup_failed=0
+  trap - EXIT
+  if [ "$guest_auth_code_staged" -eq 1 ] && [ -n "$vmid" ] && command -v pct >/dev/null 2>&1; then
+    secure_remove_guest_auth_code >/dev/null 2>&1 || {
+      warn "partial LXC may retain its protected bootstrap source credential"
+      cleanup_failed=1
+    }
   fi
-  printf '\nERROR: failed during %s (exit %s)\n' "$current_step" "$status" >&2
-  if [ -n "$vmid" ] && command -v pct >/dev/null 2>&1 && pct status "$vmid" >/dev/null 2>&1; then
-    pct status "$vmid" >&2 || true
-    if [ "$created_container" -eq 1 ]; then
-      printf 'Partial LXC VMID %s remains. Inspect it with: pct status %s; pct enter %s\n' "$vmid" "$vmid" "$vmid" >&2
-      if [ "$started_container" -eq 1 ]; then
-        printf 'The LXC was started before the failure; collect logs with: pct exec %s -- journalctl --no-pager -n 200\n' "$vmid" >&2
-      fi
-      printf 'Remove it after collecting evidence with: pct destroy %s\n' "$vmid" >&2
+  if [ "$started_container" -eq 1 ] && [ -n "$vmid" ] && command -v pct >/dev/null 2>&1; then
+    secure_remove_guest_bootstrap_auth_code >/dev/null 2>&1 || {
+      warn "partial LXC may retain protected Forge enrollment state; inspect it before reuse"
+      cleanup_failed=1
+    }
+  fi
+  if [ -n "$temporary_auth_code_file" ] && [ -f "$temporary_auth_code_file" ]; then
+    if command -v shred >/dev/null 2>&1; then
+      shred -u -n 1 -z -- "$temporary_auth_code_file" >/dev/null 2>&1 || rm -f -- "$temporary_auth_code_file"
+    else
+      rm -f -- "$temporary_auth_code_file"
     fi
-  elif [ "$created_container" -eq 1 ] && [ -n "$vmid" ]; then
-    printf 'LXC creation was attempted for VMID %s, but pct status is unavailable.\n' "$vmid" >&2
   fi
+  if [ "$cleanup_failed" -eq 1 ] && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  if [ "$completed" -eq 0 ] && [ "$status" -ne 0 ] &&
+    { [ "$created_container" -ne 0 ] || [ "$current_step" != "initialization" ]; }; then
+    printf '\nERROR: failed during %s (exit %s)\n' "$current_step" "$status" >&2
+    if [ -n "$vmid" ] && command -v pct >/dev/null 2>&1 && pct status "$vmid" >/dev/null 2>&1; then
+      pct status "$vmid" >&2 || true
+      if [ "$created_container" -eq 1 ]; then
+        printf 'Partial LXC VMID %s remains. Inspect it with: pct status %s; pct enter %s\n' "$vmid" "$vmid" "$vmid" >&2
+        if [ "$started_container" -eq 1 ]; then
+          printf 'The LXC was started before the failure; collect logs with: pct exec %s -- journalctl --no-pager -n 200\n' "$vmid" >&2
+        fi
+        printf 'Remove it after collecting evidence with: pct destroy %s\n' "$vmid" >&2
+      fi
+    elif [ "$created_container" -eq 1 ] && [ -n "$vmid" ]; then
+      printf 'LXC creation was attempted for VMID %s, but pct status is unavailable.\n' "$vmid" >&2
+    fi
+  fi
+  exit "$status"
 }
 
 trap on_exit EXIT
@@ -128,6 +164,7 @@ while [ "$#" -gt 0 ]; do
     --api-url) api_url="${2:-}"; shift 2 ;;
     --organization-id) organization_id="${2:-}"; shift 2 ;;
     --auth-code) auth_code="${2:-}"; shift 2 ;;
+    --auth-code-file) auth_code_file="${2:-}"; shift 2 ;;
     --public-base-url) public_base_url="${2:-}"; shift 2 ;;
     --listen) listen_addr="${2:-}"; shift 2 ;;
     --tftp-root) tftp_root="${2:-}"; shift 2 ;;
@@ -135,6 +172,7 @@ while [ "$#" -gt 0 ]; do
     --bootloader) bootloader_filename="${2:-}"; shift 2 ;;
     --menu-timeout-ms) menu_timeout_ms="${2:-}"; shift 2 ;;
     --update-trusted-public-key) update_trusted_public_key="${2:-}"; shift 2 ;;
+    --allow-insecure-manage-http) allow_insecure_manage_http=1; shift ;;
     --vmid) vmid="${2:-}"; shift 2 ;;
     --hostname) hostname="${2:-}"; shift 2 ;;
     --storage) storage="${2:-}"; shift 2 ;;
@@ -214,18 +252,217 @@ validate_url() {
   esac
 }
 
+validate_manage_transport() {
+  case "$allow_insecure_manage_http" in 0|1) ;; *) die "CYBEX_FORGE_ALLOW_INSECURE_MANAGE_HTTP must be 0 or 1" ;; esac
+  case "$api_url" in
+    https://*) ;;
+    http://*) [ "$allow_insecure_manage_http" -eq 1 ] || die "--api-url must use HTTPS; development HTTP requires --allow-insecure-manage-http" ;;
+    *) die "--api-url must use HTTPS" ;;
+  esac
+}
+
 validate_uuid() {
   validate_plain_value "--organization-id" "$organization_id"
   printf '%s' "$organization_id" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' ||
     die "--organization-id must be a UUID"
 }
 
-validate_auth_code() {
-  validate_plain_value "--auth-code" "$auth_code"
-  [ "${#auth_code}" -ge 16 ] || die "--auth-code is too short"
-  if printf '%s' "$auth_code" | LC_ALL=C grep -q '[[:space:]]'; then
-    die "--auth-code contains unsupported characters"
+validate_auth_code_value() {
+  local value="$1"
+  validate_plain_value "Forge install authorization code" "$value"
+  [ "${#value}" -ge 16 ] || die "Forge install authorization code is too short"
+  [ "${#value}" -le 512 ] || die "Forge install authorization code is too long"
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:space:]]'; then
+    die "Forge install authorization code contains unsupported characters"
   fi
+}
+
+validate_root_protected_auth_code_parent() {
+  local path="$1"
+  local label="${2:---auth-code-file}"
+  local parent canonical current component owner mode mode_value
+  local -a components=()
+  parent="$(dirname -- "$path")"
+  require_command realpath
+  canonical="$(realpath -e -- "$parent")" ||
+    die "$label parent path must exist"
+  [ "$canonical" = "$parent" ] ||
+    die "$label parent path must be canonical and contain no symlink"
+  IFS='/' read -r -a components <<< "${parent#/}"
+  current="/"
+  for component in "" "${components[@]}"; do
+    if [ -n "$component" ]; then
+      current="${current%/}/$component"
+    fi
+    if [ -L "$current" ] || [ ! -d "$current" ]; then
+      die "$label parent path must contain only directories, not symlinks"
+    fi
+    owner="$(stat -c '%u' -- "$current")"
+    mode="$(stat -c '%a' -- "$current")"
+    [ "$owner" = "0" ] ||
+      die "$label parent path must be entirely root-owned"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] ||
+      die "$label parent path has invalid permissions"
+    mode_value=$((8#$mode))
+    (( (mode_value & 0022) == 0 )) ||
+      die "$label parent path must not be group- or other-writable"
+  done
+}
+
+validate_auth_code_file() {
+  local path="$1"
+  local owner mode links size value
+  validate_absolute_path "--auth-code-file" "$path"
+  validate_root_protected_auth_code_parent "$path" "--auth-code-file"
+  [ ! -L "$path" ] || die "--auth-code-file must not be a symlink"
+  [ -f "$path" ] || die "--auth-code-file must be a regular file"
+  owner="$(stat -c '%u' -- "$path")"
+  mode="$(stat -c '%a' -- "$path")"
+  links="$(stat -c '%h' -- "$path")"
+  size="$(stat -c '%s' -- "$path")"
+  [ "$owner" = "$(id -u)" ] || die "--auth-code-file must be owned by root"
+  [ "$mode" = "600" ] || die "--auth-code-file must have mode 0600"
+  [ "$links" = "1" ] || die "--auth-code-file must have exactly one hard link"
+  [ "$size" -le 512 ] || die "--auth-code-file is too large"
+  value="$(<"$path")"
+  validate_auth_code_value "$value"
+  value=""
+}
+
+secure_remove_local_auth_code() {
+  local path="$1" size parent
+  validate_auth_code_file "$path"
+  size="$(stat -c '%s' -- "$path")"
+  if [ "$size" -gt 0 ]; then
+    dd if=/dev/zero of="$path" bs=1 count="$size" conv=notrunc status=none
+  fi
+  : > "$path"
+  sync -f "$path"
+  rm -f -- "$path"
+  parent="$(dirname "$path")"
+  sync -f "$parent"
+}
+
+secure_remove_guest_auth_code() {
+  # Expansion in this single-quoted program intentionally happens in the guest.
+  # shellcheck disable=SC2016
+  pct exec "$vmid" -- sh -ceu '
+    path=$1
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      exit 0
+    fi
+    [ ! -L "$path" ] && [ -f "$path" ] || exit 1
+    metadata=$(stat -c "%u:%a:%h:%s" -- "$path")
+    case "$metadata" in 0:600:1:*) ;; *) exit 1 ;; esac
+    size=${metadata##*:}
+    [ "$size" -ge 16 ] && [ "$size" -le 512 ] || exit 1
+    if [ "$size" -gt 0 ]; then
+      dd if=/dev/zero of="$path" bs=1 count="$size" conv=notrunc status=none
+    fi
+    : > "$path"
+    sync -f "$path"
+    rm -f -- "$path"
+    sync -f "$(dirname "$path")"
+  ' sh "$guest_auth_code_file"
+}
+
+secure_remove_guest_bootstrap_auth_code() {
+  # All paths are fixed constants. The guest helper binds the exact staged
+  # inode before erasure and refuses a same-UID pathname replacement.
+  # shellcheck disable=SC2016
+  pct exec "$vmid" -- bash -ceu '
+    source_path=$1
+    tomb_path=$2
+    staged_path=$3
+    identity_file=$4
+    helper=/usr/local/libexec/cybex-forge-secure-input
+    source_present=0
+    tomb_present=0
+    staged_present=0
+    [ ! -e "$source_path" ] && [ ! -L "$source_path" ] || source_present=1
+    [ ! -e "$tomb_path" ] && [ ! -L "$tomb_path" ] || tomb_present=1
+    [ ! -e "$staged_path" ] && [ ! -L "$staged_path" ] || staged_present=1
+    if [ $((source_present + tomb_present + staged_present)) -gt 1 ]; then
+      exit 1
+    fi
+    if [ ! -e "$identity_file" ] && [ ! -L "$identity_file" ]; then
+      identity=pending
+    else
+      [ ! -L "$identity_file" ] && [ -f "$identity_file" ] || exit 1
+      [ "$(stat -c "%u:%a:%h" -- "$identity_file")" = "$(id -u):600:1" ] || exit 1
+      identity=$(cat -- "$identity_file")
+      if [ "$identity" != pending ]; then
+        printf "%s" "$identity" | grep -Eq "^[0-9]+(:[0-9]+){6}$" || exit 1
+      fi
+    fi
+    if [ "$source_present" -eq 1 ]; then
+      candidate=$source_path
+    elif [ "$tomb_present" -eq 1 ]; then
+      candidate=$tomb_path
+    elif [ "$staged_present" -eq 1 ]; then
+      candidate=$staged_path
+    else
+      candidate=
+    fi
+    if [ -n "$candidate" ]; then
+      [ -x "$helper" ] || exit 1
+      if [ "$identity" = pending ]; then
+        rebound=$(runuser -u cybex-forge -- "$helper" identity "$candidate" 512 secret)
+        runuser -u cybex-forge -- "$helper" erase-if-same "$candidate" "$rebound"
+      elif ! runuser -u cybex-forge -- "$helper" erase-if-same "$candidate" "$identity"; then
+        rebound=$(runuser -u cybex-forge -- "$helper" identity "$candidate" 512 secret)
+        [ "${rebound%:*:*:*:*}" = "${identity%:*:*:*:*}" ] || exit 1
+        runuser -u cybex-forge -- "$helper" erase-if-same "$candidate" "$rebound"
+      fi
+    fi
+    [ ! -e "$source_path" ] && [ ! -L "$source_path" ] || exit 1
+    [ ! -e "$tomb_path" ] && [ ! -L "$tomb_path" ] || exit 1
+    [ ! -e "$staged_path" ] && [ ! -L "$staged_path" ] || exit 1
+    if [ -e "$identity_file" ] || [ -L "$identity_file" ]; then
+      : > "$identity_file"
+      sync -f "$identity_file"
+      rm -f -- "$identity_file"
+      sync -f "$(dirname "$identity_file")"
+    fi
+  ' bash \
+    "$guest_bootstrap_auth_code_file" \
+    "$guest_bootstrap_auth_code_tomb" \
+    "$guest_bootstrap_auth_code_staged_file" \
+    "$guest_bootstrap_auth_code_identity_file"
+}
+
+validate_staged_guest_auth_code() {
+  # Expansion in this single-quoted program intentionally happens in the guest.
+  # shellcheck disable=SC2016
+  pct exec "$vmid" -- sh -ceu '
+    path=$1
+    [ ! -L "$path" ] && [ -f "$path" ] || exit 1
+    metadata=$(stat -c "%u:%a:%h:%s" -- "$path")
+    case "$metadata" in 0:600:1:*) ;; *) exit 1 ;; esac
+    size=${metadata##*:}
+    [ "$size" -ge 16 ] && [ "$size" -le 512 ]
+  ' sh "$guest_auth_code_file"
+}
+
+prepare_auth_code_file() {
+  if [ -n "$auth_code" ] && [ -n "$auth_code_file" ]; then
+    die "--auth-code and --auth-code-file are mutually exclusive"
+  fi
+  if [ -z "$auth_code" ] && [ -z "$auth_code_file" ]; then
+    [ -r /dev/tty ] || die "no enrollment code was supplied and /dev/tty is unavailable; use --auth-code-file"
+    IFS= read -r -s -p "One-time Cybex Forge install code: " auth_code </dev/tty || die "could not read the enrollment code from /dev/tty"
+    printf '\n' >/dev/tty
+  fi
+  if [ -n "$auth_code" ]; then
+    validate_auth_code_value "$auth_code"
+    umask 077
+    temporary_auth_code_file="$(mktemp /run/cybex-forge-enrollment-code.XXXXXX)"
+    printf '%s\n' "$auth_code" > "$temporary_auth_code_file"
+    chmod 0600 "$temporary_auth_code_file"
+    auth_code=""
+    auth_code_file="$temporary_auth_code_file"
+  fi
+  validate_auth_code_file "$auth_code_file"
 }
 
 validate_int_range() {
@@ -463,7 +700,6 @@ validate_and_select_proxmox() {
 resource_warnings() {
   [ "$disk_gb" -ge 128 ] || warn "disk is below the 128 GiB recommendation"
   [ "$cpu_cores" -ge 4 ] || warn "CPU allocation is below the 4-core recommendation"
-  [ "$memory_mb" -ge 16384 ] || warn "memory is below the 16384 MiB minimum"
   [ "$swap_mb" -ge 8192 ] || warn "swap is below the 8192 MiB recommendation"
 }
 
@@ -584,14 +820,31 @@ prepare_forge_source() {
   ' sh "$forge_source_dir" "$forge_git_url" "$forge_ref"
 }
 
+stage_enrollment_code() {
+  section "Stage enrollment credential"
+  validate_auth_code_file "$auth_code_file"
+  pct exec "$vmid" -- install -m 0700 -o root -g root -d /root/.cybex-forge-bootstrap
+  pct push "$vmid" "$auth_code_file" "$guest_auth_code_file" --perms 0600
+  pct exec "$vmid" -- chown root:root "$guest_auth_code_file"
+  pct exec "$vmid" -- chmod 0600 "$guest_auth_code_file"
+  guest_auth_code_staged=1
+  validate_staged_guest_auth_code
+  secure_remove_local_auth_code "$auth_code_file"
+  if [ "$temporary_auth_code_file" = "$auth_code_file" ]; then
+    temporary_auth_code_file=""
+  fi
+  auth_code_file=""
+  info "The one-time credential is staged in a protected guest file and consumed on the host."
+}
+
 run_lxc_installer() {
   section "Install Cybex Forge"
-  info "Running the LXC installer. The one-time code is passed to the installer but not printed."
+  info "Running the LXC installer with a protected file-backed one-time credential."
   local installer="${forge_source_dir}/${LXC_INSTALLER_RELATIVE_PATH}"
-  pct exec "$vmid" -- "$installer" \
+  local installer_args=(
     --api-url "$api_url" \
     --organization-id "$organization_id" \
-    --auth-code "$auth_code" \
+    --auth-code-file "$guest_auth_code_file" \
     --public-base-url "$public_base_url" \
     --source-dir "$forge_source_dir" \
     --git-url "$forge_git_url" \
@@ -602,6 +855,12 @@ run_lxc_installer() {
     --bootloader "$bootloader_filename" \
     --menu-timeout-ms "$menu_timeout_ms" \
     --update-trusted-public-key "$update_trusted_public_key"
+  )
+  if [ "$allow_insecure_manage_http" -eq 1 ]; then
+    installer_args+=(--allow-insecure-manage-http)
+  fi
+  pct exec "$vmid" -- "$installer" "${installer_args[@]}"
+  guest_auth_code_staged=0
 }
 
 print_final() {
@@ -620,15 +879,16 @@ print_final() {
 
 require_value "--api-url" "$api_url"
 require_value "--organization-id" "$organization_id"
-require_value "--auth-code" "$auth_code"
+require_root
+prepare_auth_code_file
 validate_url "--api-url" "$api_url"
+validate_manage_transport
 if [ -n "$public_base_url" ]; then
   validate_url "--public-base-url" "$public_base_url"
 fi
 validate_url "--forge-git-url" "$forge_git_url"
 validate_forge_ref
 validate_uuid
-validate_auth_code
 validate_runtime_roots
 validate_absolute_path "--forge-source-dir" "$forge_source_dir"
 validate_bootloader_filename
@@ -638,7 +898,7 @@ if [ "$menu_timeout_ms" != "0" ]; then
 fi
 validate_int_range "--proxmox-disk-gb" "$disk_gb" 8 4096
 validate_int_range "--proxmox-cpu-cores" "$cpu_cores" 1 128
-validate_int_range "--proxmox-memory-mb" "$memory_mb" 1024 1048576
+validate_int_range "--proxmox-memory-mb" "$memory_mb" 16384 1048576
 validate_int_range "--proxmox-swap-mb" "$swap_mb" 0 1048576
 tooling_preflight
 validate_and_select_proxmox
@@ -654,6 +914,7 @@ create_container
 start_container
 ensure_public_base_url
 prepare_forge_source
+stage_enrollment_code
 run_lxc_installer
 print_final
 completed=1
