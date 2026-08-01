@@ -340,6 +340,11 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
         self.assertIn('systemd.services."getty@tty1".enable = false', iso)
+        self.assertIn('systemd.services."autovt@tty1".enable = false', iso)
+        self.assertIn(
+            'conflicts = [ "getty@tty1.service" "autovt@tty1.service" ];',
+            iso,
+        )
         self.assertIn('size = 8192', module)
         self.assertIn('options = "--delete-older-than 7d"', module)
         self.assertIn("${pkgs.ipxe.src}", module)

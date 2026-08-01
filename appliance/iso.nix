@@ -56,6 +56,7 @@ in
   # The guided installer is the sole tty1 owner; a concurrent getty can steal
   # keystrokes or interleave destructive confirmation prompts.
   systemd.services."getty@tty1".enable = false;
+  systemd.services."autovt@tty1".enable = false;
   services.getty.helpLine = ''
     Cybex Forge Appliance ${version}
     Guided setup starts on tty1. Rescue: cybex-forge-appliance-rescue --help
@@ -99,6 +100,8 @@ in
     wantedBy = [ "multi-user.target" ];
     after = [ "cybex-forge-seed-install.service" ];
     requires = [ "cybex-forge-seed-install.service" ];
+    before = [ "getty@tty1.service" "autovt@tty1.service" ];
+    conflicts = [ "getty@tty1.service" "autovt@tty1.service" ];
     path = installerRuntime ++ [ installer ];
     serviceConfig = {
       Type = "idle";
