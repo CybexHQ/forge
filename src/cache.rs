@@ -54,7 +54,42 @@ async fn acquire_cache_mutation_lock(config: &AppConfig) -> Result<CacheMutation
         .context("join cache mutation lock task")?
 }
 
+async fn try_acquire_cache_mutation_lock(config: &AppConfig) -> Result<Option<CacheMutationLock>> {
+    let cache_root = config.cache.root_dir.clone();
+    task::spawn_blocking(move || try_acquire_cache_mutation_lock_blocking(&cache_root))
+        .await
+        .context("join non-blocking cache mutation lock task")?
+}
+
 fn acquire_cache_mutation_lock_blocking(cache_root: &Path) -> Result<CacheMutationLock> {
+    let lock = open_cache_mutation_lock(cache_root)?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(CacheMutationLock(lock));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("lock cache mutation file in {}", cache_root.display()));
+        }
+    }
+}
+
+fn try_acquire_cache_mutation_lock_blocking(
+    cache_root: &Path,
+) -> Result<Option<CacheMutationLock>> {
+    let lock = open_cache_mutation_lock(cache_root)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(CacheMutationLock(lock)));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.kind(), io::ErrorKind::WouldBlock) {
+        return Ok(None);
+    }
+    Err(error).with_context(|| format!("try lock cache mutation file in {}", cache_root.display()))
+}
+
+fn open_cache_mutation_lock(cache_root: &Path) -> Result<fs::File> {
     fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache directory {}", cache_root.display()))?;
     let path = cache_root.join(CACHE_MUTATION_LOCK_FILENAME);
@@ -80,16 +115,7 @@ fn acquire_cache_mutation_lock_blocking(cache_root: &Path) -> Result<CacheMutati
     }
     lock.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("secure cache mutation lock {}", path.display()))?;
-    loop {
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(CacheMutationLock(lock));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error)
-                .with_context(|| format!("lock cache mutation file {}", path.display()));
-        }
-    }
+    Ok(lock)
 }
 
 fn command_output_with_transient_exec_retry(command: &mut Command) -> io::Result<Output> {
@@ -1195,6 +1221,22 @@ pub async fn enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<
     enforce_retention_locked(pool, config).await
 }
 
+/// Run opportunistic retention without delaying a managed heartbeat behind a
+/// cache export or another filesystem mutation. A skipped pass is safe: the
+/// next managed sync retries it, while publication and explicit deletions keep
+/// using the blocking cross-process lease.
+pub async fn try_enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Result<bool> {
+    if config.cache.max_bytes == 0 {
+        enforce_retention_locked(pool, config).await?;
+        return Ok(true);
+    }
+    let Some(_mutation_lock) = try_acquire_cache_mutation_lock(config).await? else {
+        return Ok(false);
+    };
+    enforce_retention_locked(pool, config).await?;
+    Ok(true)
+}
+
 async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
         tracing::warn!(
@@ -1331,6 +1373,14 @@ pub async fn scrub_cache_artifacts(
     limit: i64,
 ) -> Result<u64> {
     let _mutation_lock = acquire_cache_mutation_lock(config).await?;
+    scrub_cache_artifacts_locked(pool, config, limit).await
+}
+
+async fn scrub_cache_artifacts_locked(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    limit: i64,
+) -> Result<u64> {
     let candidates = db::cache_artifacts_due_for_verification(pool, limit).await?;
     if candidates.is_empty() {
         return Ok(0);
@@ -1361,6 +1411,22 @@ pub async fn scrub_cache_artifacts(
         sweep_unreachable_locked(config, retained).await?;
     }
     Ok(invalid_count)
+}
+
+/// Run the bounded integrity scrub only when its mutation lease is immediately
+/// available. This keeps periodic Manage reports live during a long `nix copy`
+/// without weakening the lock used by the scrub itself.
+pub async fn try_scrub_cache_artifacts(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    limit: i64,
+) -> Result<Option<u64>> {
+    let Some(_mutation_lock) = try_acquire_cache_mutation_lock(config).await? else {
+        return Ok(None);
+    };
+    scrub_cache_artifacts_locked(pool, config, limit)
+        .await
+        .map(Some)
 }
 
 async fn scrub_cache_artifact(
@@ -2086,6 +2152,11 @@ mod tests {
         };
         let lock_metadata = fs::metadata(cache_root.join(CACHE_MUTATION_LOCK_FILENAME)).unwrap();
         assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+        assert!(
+            try_acquire_cache_mutation_lock_blocking(&cache_root)
+                .unwrap()
+                .is_none()
+        );
 
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
@@ -2109,6 +2180,10 @@ mod tests {
             .unwrap();
         drop(acquired);
         contender.join().unwrap();
+        let immediate = try_acquire_cache_mutation_lock_blocking(&cache_root)
+            .unwrap()
+            .expect("non-blocking cache lease should become available after publication");
+        drop(immediate);
         fs::remove_dir_all(root).ok();
     }
 

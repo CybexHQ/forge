@@ -1360,7 +1360,9 @@ async fn sync_forge_foundation(
         desired.protected_cache_artifacts_complete,
     )
     .await?;
-    crate::cache::enforce_retention(&state.db, &state.config).await?;
+    if !crate::cache::try_enforce_retention(&state.db, &state.config).await? {
+        debug!("cache mutation is active; deferring retention until the next managed sync");
+    }
     if crate::updater::media_rebase_events(&state.config)?.is_empty() {
         crate::updater::store_update_request(&state.config, desired.update).await?;
     } else if desired.update.is_some() {
@@ -1392,8 +1394,14 @@ async fn report_forge_state(
     managed: &ManagedState,
 ) -> Result<ForgeReportReceipt> {
     let build_jobs = db::list_build_jobs(&state.db).await?;
-    if let Err(err) = crate::cache::scrub_cache_artifacts(&state.db, &state.config, 8).await {
-        warn!(error = %err, "Forge cache integrity scrub failed");
+    match crate::cache::try_scrub_cache_artifacts(&state.db, &state.config, 8).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            debug!(
+                "cache mutation is active; deferring integrity scrub until the next managed sync"
+            );
+        }
+        Err(err) => warn!(error = %err, "Forge cache integrity scrub failed"),
     }
     let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
     let cache_inventory = db::cache_inventory_state(&state.db).await?;
