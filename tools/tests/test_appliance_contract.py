@@ -342,7 +342,10 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', module)
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
-        self.assertIn('boot.initrd.kernelModules = [ "vfat" ];', module)
+        self.assertIn(
+            'boot.initrd.kernelModules = [ "nls_ascii" "nls_cp437" "vfat" ];',
+            module,
+        )
         self.assertIn("cybex-forge-boot-diagnostics", module)
         self.assertIn('wantedBy = [ "emergency.target" ];', module)
         self.assertIn('TTYPath = "/dev/ttyS0";', module)
