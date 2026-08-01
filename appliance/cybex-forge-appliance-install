@@ -374,6 +374,7 @@ resolve_mode_and_disk() {
   mode="${cli_mode:-$answer_mode}"
   disk="${cli_disk:-$answer_disk}"
   if [ -z "$mode" ] && [ -t 0 ]; then
+    marker guided ready "mode=interactive"
     printf 'Mode (install, repair, recovery): '
     IFS= read -r mode
   fi

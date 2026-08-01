@@ -323,6 +323,9 @@ class ApplianceContractTests(unittest.TestCase):
         expression = (APPLIANCE / "default.nix").read_text(encoding="utf-8")
         module = (APPLIANCE / "module.nix").read_text(encoding="utf-8")
         iso = (APPLIANCE / "iso.nix").read_text(encoding="utf-8")
+        installer = (APPLIANCE / "cybex-forge-appliance-install").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("74cc63f702f7d60a557e152a57b40fb1fd0f72ac", expression)
         self.assertIn("102brk31m46v3p5n630zdl230ni0hjxrigc6n601k10rds8dqyfi", expression)
         self.assertIn('lib.hasPrefix ".env" name', expression)
@@ -341,10 +344,12 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('"console=ttyS0,115200n8"', module)
         self.assertIn('systemd.services."getty@tty1".enable = false', iso)
         self.assertIn('systemd.services."autovt@tty1".enable = false', iso)
+        self.assertIn('ExecStartPre = "${pkgs.kbd}/bin/chvt 1";', iso)
         self.assertIn(
             'conflicts = [ "getty@tty1.service" "autovt@tty1.service" ];',
             iso,
         )
+        self.assertIn('marker guided ready "mode=interactive"', installer)
         self.assertIn('size = 8192', module)
         self.assertIn('options = "--delete-older-than 7d"', module)
         self.assertIn("${pkgs.ipxe.src}", module)

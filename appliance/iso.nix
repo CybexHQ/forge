@@ -106,6 +106,7 @@ in
     serviceConfig = {
       Type = "idle";
       ExecCondition = "${pkgs.bash}/bin/bash -c '! ${pkgs.util-linux}/bin/blkid -t LABEL=CYBEX_FORGE_SEED -o device | ${pkgs.gnugrep}/bin/grep -q .'";
+      ExecStartPre = "${pkgs.kbd}/bin/chvt 1";
       ExecStart = "${installer}/bin/cybex-forge-appliance-install";
       StandardInput = "tty-force";
       StandardOutput = "tty";
