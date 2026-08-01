@@ -31,7 +31,9 @@ in
   # virtual hardware where the filesystem alias is not automatically resolved
   # before local-fs.target starts.  Load vfat in the initrd and retain the
   # module for the installed system rather than relying on late autoloading.
-  boot.initrd.kernelModules = [ "nls_ascii" "nls_cp437" "vfat" ];
+  boot.initrd.kernelModules = [
+    "nls_ascii" "nls_cp437" "nls_iso8859-1" "vfat"
+  ];
   boot.initrd.availableKernelModules = [
     "ahci" "ata_piix" "nvme" "sd_mod" "sr_mod"
     "virtio_blk" "virtio_pci" "virtio_scsi" "xhci_pci"
