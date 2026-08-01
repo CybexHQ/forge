@@ -1203,6 +1203,8 @@ if "FORGE_CONFIG_SECRET_SENTINEL" in raw:
         self.assertIn('[ "$(stat -c %s "$media_sequence")" -le 20 ]', module)
         self.assertIn("ssh_host_ed25519_key", module)
         self.assertIn("root-authorized_keys", installer)
+        self.assertIn('chmod 0600 "$ssh_private"', installer)
+        self.assertIn('chmod 0644 "$ssh_public"', installer)
         self.assertIn("minimum_memory_bytes = 16106127360", installer)
 
     def test_appliance_public_edge_is_read_only_and_bounded(self) -> None:

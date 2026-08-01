@@ -1261,6 +1261,9 @@ ensure_persistent_host_identity() {
   fi
   if [ ! -e "$ssh_private" ] && [ ! -L "$ssh_private" ] && [ ! -e "$ssh_public" ] && [ ! -L "$ssh_public" ]; then
     ssh-keygen -q -t ed25519 -N '' -C cybex-forge-appliance -f "$ssh_private"
+    chown root:root "$ssh_private" "$ssh_public"
+    chmod 0600 "$ssh_private"
+    chmod 0644 "$ssh_public"
   fi
   validate_protected_recovery_file "$ssh_private" "appliance SSH host private key" 4096
   validate_public_recovery_file "$ssh_public" "appliance SSH host public key" 4096
