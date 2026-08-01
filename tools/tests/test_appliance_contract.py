@@ -342,6 +342,16 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', module)
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
+        self.assertIn('boot.initrd.kernelModules = [ "vfat" ];', module)
+        self.assertIn("cybex-forge-boot-diagnostics", module)
+        self.assertIn('wantedBy = [ "emergency.target" ];', module)
+        self.assertIn('TTYPath = "/dev/ttyS0";', module)
+        self.assertIn("CYBEX_FORGE_BOOT_DIAGNOSTIC status=storage-failure", module)
+        diagnostic = module.split(
+            "systemd.services.cybex-forge-boot-diagnostics", 1
+        )[1].split("users.groups.cybex-forge", 1)[0]
+        self.assertNotIn("config.toml", diagnostic)
+        self.assertNotIn("enrollment", diagnostic.lower())
         self.assertIn('systemd.services."getty@tty1".enable = false', iso)
         self.assertIn('systemd.services."autovt@tty1".enable = false', iso)
         self.assertIn('ExecStartPre = "${pkgs.kbd}/bin/chvt 1";', iso)

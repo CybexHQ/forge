@@ -27,6 +27,11 @@ in
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
   boot.kernelParams = [ "console=tty0" "console=ttyS0,115200n8" ];
+  # The EFI partition must remain mountable after switch-root, including on
+  # virtual hardware where the filesystem alias is not automatically resolved
+  # before local-fs.target starts.  Load vfat in the initrd and retain the
+  # module for the installed system rather than relying on late autoloading.
+  boot.initrd.kernelModules = [ "vfat" ];
   boot.initrd.availableKernelModules = [
     "ahci" "ata_piix" "nvme" "sd_mod" "sr_mod"
     "virtio_blk" "virtio_pci" "virtio_scsi" "xhci_pci"
@@ -50,6 +55,30 @@ in
     device = "/dev/disk/by-label/CYBEX_CACHE";
     fsType = "ext4";
     options = [ "nodev" "nosuid" ];
+  };
+
+  # If an operator reaches emergency mode, emit only bounded storage-unit
+  # diagnostics on the serial console.  This intentionally excludes the Forge
+  # service and configuration so enrollment material cannot enter the boot
+  # transcript captured by remote consoles or qualification tooling.
+  systemd.services.cybex-forge-boot-diagnostics = {
+    description = "Cybex Forge boot storage diagnostics";
+    wantedBy = [ "emergency.target" ];
+    before = [ "emergency.service" ];
+    unitConfig.DefaultDependencies = false;
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "tty";
+      StandardError = "tty";
+      TTYPath = "/dev/ttyS0";
+      ExecStart = pkgs.writeShellScript "cybex-forge-boot-diagnostics" ''
+        set -eu
+        echo "CYBEX_FORGE_BOOT_DIAGNOSTIC status=storage-failure"
+        ${pkgs.systemd}/bin/systemctl --no-pager --full status boot.mount || true
+        ${pkgs.systemd}/bin/journalctl --no-pager --quiet -b -n 20 \
+          -u boot.mount -u systemd-fsck@dev-disk-by\\x2dlabel-CYBEX_EFI.service || true
+      '';
+    };
   };
 
   users.groups.cybex-forge.gid = forgeUid;
