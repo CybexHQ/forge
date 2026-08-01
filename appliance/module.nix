@@ -4,7 +4,7 @@ let
   forgeUid = 980;
   forgePath = with pkgs; [
     bash binutils coreutils curl findutils gawk git gnumake gnugrep gnused
-    iproute2 ipxe mtools nginx openssl perl pkg-config shadow sqlite
+    iproute2 ipxe mtools nginx nix openssl perl pkg-config shadow sqlite
     squashfsTools systemd tftp-hpa util-linux xorriso xz zstd gcc
   ];
 in

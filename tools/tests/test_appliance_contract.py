@@ -342,6 +342,8 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', module)
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
+        forge_path = module.split("forgePath = with pkgs; [", 1)[1].split("];", 1)[0]
+        self.assertRegex(forge_path, r"\bnix\b")
         for boot_module in (
             "9p",
             "9pnet",
