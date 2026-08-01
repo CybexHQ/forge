@@ -1449,6 +1449,22 @@ write_install_state() {
   sync -f "$state_dir"
 }
 
+ensure_target_init() {
+  local init_target=/nix/var/nix/profiles/system/init
+  local init_link="$TARGET_MOUNT/sbin/init"
+  [ -x "$TARGET_MOUNT$init_target" ] \
+    || die "installed NixOS system profile has no executable init"
+  install -d -m 0755 -o root -g root "$TARGET_MOUNT/sbin"
+  if [ -L "$init_link" ]; then
+    [ "$(readlink -- "$init_link")" = "$init_target" ] \
+      || die "installed NixOS init link is not canonical"
+  elif [ -e "$init_link" ]; then
+    die "refusing to replace a non-link installed NixOS init path"
+  else
+    ln -s "$init_target" "$init_link"
+  fi
+}
+
 install_system() {
   local target_system package_path version
   target_system="$(tr -d '\n' < /etc/cybex-forge-appliance/target-system)"
@@ -1458,6 +1474,7 @@ install_system() {
   marker install running "mode=$mode version=$version"
   initialize_media_sequence
   NIXOS_INSTALL_BOOTLOADER=1 nixos-install --root "$TARGET_MOUNT" --system "$target_system" --no-root-passwd
+  ensure_target_init
   ensure_persistent_host_identity
   install -d -m 0755 "$TARGET_MOUNT/usr/local/bin"
   install -m 0755 -o root -g root "$package_path/bin/cybex-forge" "$TARGET_MOUNT/usr/local/bin/cybex-forge"
