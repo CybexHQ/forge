@@ -17,7 +17,7 @@ let
   };
   installerRuntime = with pkgs; [
     bash coreutils dosfstools e2fsprogs findutils gawk gnugrep gnused
-    gptfdisk iproute2 nix nixos-install-tools openssh systemd util-linux
+    gptfdisk iproute2 nix nixos-install-tools openssh parted systemd util-linux
   ] ++ [ secureInput ];
   installer = pkgs.writeShellApplication {
     name = "cybex-forge-appliance-install";

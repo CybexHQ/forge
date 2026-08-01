@@ -346,7 +346,7 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('systemd.services."autovt@tty1".enable = false', iso)
         self.assertIn('ExecStartPre = "${pkgs.kbd}/bin/chvt 1";', iso)
         self.assertIn(
-            "gptfdisk iproute2 nix nixos-install-tools openssh systemd util-linux",
+            "gptfdisk iproute2 nix nixos-install-tools openssh parted systemd util-linux",
             iso,
         )
         self.assertIn(
