@@ -32,7 +32,9 @@ in
   # before local-fs.target starts.  Load vfat in the initrd and retain the
   # module for the installed system rather than relying on late autoloading.
   boot.initrd.kernelModules = [
-    "nls_ascii" "nls_cp437" "nls_iso8859-1" "vfat"
+    "nf_tables" "nft_chain_nat" "nft_ct" "nft_fib_inet"
+    "nft_reject_inet" "nls_ascii" "nls_cp437" "nls_iso8859-1"
+    "vfat" "virtio_net"
   ];
   boot.initrd.availableKernelModules = [
     "ahci" "ata_piix" "nvme" "sd_mod" "sr_mod"
@@ -83,6 +85,27 @@ in
           | ${pkgs.coreutils}/bin/tail -n 20 || true
         ${pkgs.dosfstools}/bin/fsck.vfat -n \
           /dev/disk/by-label/CYBEX_EFI || true
+      '';
+    };
+  };
+
+  systemd.services.firewall.onFailure = [
+    "cybex-forge-firewall-diagnostics.service"
+  ];
+  systemd.services.cybex-forge-firewall-diagnostics = {
+    description = "Cybex Forge firewall diagnostics";
+    unitConfig.DefaultDependencies = false;
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "tty";
+      StandardError = "tty";
+      TTYPath = "/dev/ttyS0";
+      ExecStart = pkgs.writeShellScript "cybex-forge-firewall-diagnostics" ''
+        set -eu
+        echo "CYBEX_FORGE_NETWORK_DIAGNOSTIC status=firewall-failure"
+        ${pkgs.systemd}/bin/systemctl --no-pager --full status firewall.service || true
+        ${pkgs.systemd}/bin/journalctl --no-pager --quiet -b -n 30 \
+          -u firewall.service || true
       '';
     };
   };

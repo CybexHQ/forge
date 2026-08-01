@@ -342,13 +342,28 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', module)
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
-        self.assertIn('"nls_ascii" "nls_cp437" "nls_iso8859-1" "vfat"', module)
+        for boot_module in (
+            "nf_tables",
+            "nft_chain_nat",
+            "nft_ct",
+            "nft_fib_inet",
+            "nft_reject_inet",
+            "nls_ascii",
+            "nls_cp437",
+            "nls_iso8859-1",
+            "vfat",
+            "virtio_net",
+        ):
+            self.assertIn(f'"{boot_module}"', module)
         self.assertIn("cybex-forge-boot-diagnostics", module)
         self.assertIn('wantedBy = [ "emergency.target" ];', module)
         self.assertIn('TTYPath = "/dev/ttyS0";', module)
         self.assertIn("CYBEX_FORGE_BOOT_DIAGNOSTIC status=storage-failure", module)
         self.assertIn("/bin/dmesg --level=err,warn", module)
         self.assertIn("/bin/fsck.vfat -n", module)
+        self.assertIn("systemd.services.firewall.onFailure", module)
+        self.assertIn("cybex-forge-firewall-diagnostics.service", module)
+        self.assertIn("CYBEX_FORGE_NETWORK_DIAGNOSTIC status=firewall-failure", module)
         diagnostic = module.split(
             "systemd.services.cybex-forge-boot-diagnostics", 1
         )[1].split("users.groups.cybex-forge", 1)[0]
