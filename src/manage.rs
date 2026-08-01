@@ -6034,18 +6034,10 @@ fn apply_runtime_managed_files(
     for unit in ["cybex-forge.service", "nginx.service", "tftpd-hpa.service"] {
         run_command("systemctl", ["is-active", "--quiet", unit])?;
     }
+    run_command("curl", runtime_probe_curl_args("http://127.0.0.1/healthz"))?;
     run_command(
         "curl",
-        ["-fsS", "--max-time", "5", "http://127.0.0.1/healthz"],
-    )?;
-    run_command(
-        "curl",
-        [
-            "-fsS",
-            "--max-time",
-            "5",
-            "http://127.0.0.1/boot.ipxe?cybex_check=1",
-        ],
+        runtime_probe_curl_args("http://127.0.0.1/boot.ipxe?cybex_check=1"),
     )?;
     if appliance {
         run_command("systemctl", ["start", "cybex-forge-sentinel.timer"])?;
@@ -6056,6 +6048,22 @@ fn apply_runtime_managed_files(
         )?;
     }
     Ok(())
+}
+
+fn runtime_probe_curl_args(url: &str) -> [&str; 11] {
+    [
+        "-fsS",
+        "--retry",
+        "15",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "30",
+        "--retry-connrefused",
+        "--max-time",
+        "5",
+        url,
+    ]
 }
 
 fn rollback_runtime_files(files: &[RuntimeManagedFile], backups: &[Option<Vec<u8>>]) -> Result<()> {
@@ -7267,7 +7275,7 @@ mod tests {
         refresh_appliance_recovery_config_if_present, render_check_service, render_managed_config,
         render_nixos_netboot_script, request_path_and_query,
         rewrite_newc_archive_with_netboot_files, runtime_managed_files,
-        runtime_managed_files_for_platform, scrub_forge_install_code_file,
+        runtime_managed_files_for_platform, runtime_probe_curl_args, scrub_forge_install_code_file,
         scrub_forge_install_code_file_with_hook, serialize_boot_report_body, sha256_hex,
         signed_request_for_config, skip_padding, sync_clients, sync_deleted_clients,
         sync_deleted_profiles, sync_profiles, sync_update_report_once,
@@ -7327,6 +7335,18 @@ mod tests {
         config.manage.api_url = "https://manage.example".to_string();
         config.manage.organization_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
         config
+    }
+
+    #[test]
+    fn runtime_probe_retries_the_nginx_restart_window_boundedly() {
+        let args = runtime_probe_curl_args("http://127.0.0.1/healthz");
+        assert_eq!(args.last(), Some(&"http://127.0.0.1/healthz"));
+        assert!(args.windows(2).any(|pair| pair == ["--retry", "15"]));
+        assert!(args.contains(&"--retry-connrefused"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--retry-max-time", "30"])
+        );
     }
 
     async fn capture_update_only_report(
