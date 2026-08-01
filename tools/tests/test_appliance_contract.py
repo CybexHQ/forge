@@ -371,6 +371,19 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn("CYBEX_FORGE_NETWORK_DIAGNOSTIC status=firewall-failure", module)
         self.assertIn("CYBEX_FORGE_NETWORK_DIAGNOSTIC status=interface-snapshot", module)
         self.assertIn('OnBootSec = "45s";', module)
+        self.assertNotIn("system.activationScripts.cybexForgeMutableRuntime", module)
+        self.assertIn("systemd.services.cybex-forge-mutable-runtime", module)
+        self.assertIn('requiredBy = [ "multi-user.target" ];', module)
+        self.assertIn('after = [ "local-fs.target" ];', module)
+        self.assertIn('requires = [ "local-fs.target" ];', module)
+        self.assertIn('"cybex-forge.service"', module)
+        self.assertIn(
+            'chmod 0644 "$TARGET_MOUNT/etc/nginx/sites-available/cybex-forge"',
+            installer,
+        )
+        self.assertIn(
+            'chmod 0644 "$TARGET_MOUNT/etc/default/tftpd-hpa"', installer
+        )
         diagnostic = module.split(
             "systemd.services.cybex-forge-boot-diagnostics", 1
         )[1].split("users.groups.cybex-forge", 1)[0]

@@ -1182,12 +1182,16 @@ server {
   location / { return 404; }
 }
 EOF
+  chown root:root "$TARGET_MOUNT/etc/nginx/sites-available/cybex-forge"
+  chmod 0644 "$TARGET_MOUNT/etc/nginx/sites-available/cybex-forge"
   cat > "$TARGET_MOUNT/etc/default/tftpd-hpa" <<'EOF'
 TFTP_USERNAME="cybex-forge"
 TFTP_DIRECTORY="/srv/cybex-forge/tftp"
 TFTP_ADDRESS="0.0.0.0:69"
 TFTP_OPTIONS="--ipv4 --secure"
 EOF
+  chown root:root "$TARGET_MOUNT/etc/default/tftpd-hpa"
+  chmod 0644 "$TARGET_MOUNT/etc/default/tftpd-hpa"
   ensure_appliance_metadata_dir
   if [ -n "$ssh_authorized_key" ]; then
     ssh_key_temp="$(mktemp /run/cybex-forge-authorized-key.XXXXXX)"

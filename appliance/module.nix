@@ -179,7 +179,27 @@ in
     mode = "0444";
   };
 
-  system.activationScripts.cybexForgeMutableRuntime = lib.stringAfter [ "users" ] ''
+  # The appliance state and cache are separate filesystems mounted only after
+  # initrd activation.  Validate and prepare mutable runtime state after
+  # local-fs.target; doing this in an activation script would inspect the empty
+  # root-filesystem mountpoints and abort first boot before /run/current-system
+  # is published.
+  systemd.services.cybex-forge-mutable-runtime = {
+    description = "Prepare Cybex Forge mutable appliance runtime";
+    requiredBy = [ "multi-user.target" ];
+    before = [
+      "cybex-forge-appliance-reconcile.service" "cybex-forge.service"
+      "nginx.service" "sshd.service" "tftpd-hpa.service"
+    ];
+    after = [ "local-fs.target" ];
+    requires = [ "local-fs.target" ];
+    path = forgePath;
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      UMask = "0077";
+    };
+    script = ''
     exact_single_line() {
       [ "$(wc -l < "$1" | tr -d '[:space:]')" = 1 ] \
         && [ "$(tail -c 1 -- "$1" | od -An -t u1 | tr -d '[:space:]')" = 10 ]
@@ -300,7 +320,8 @@ in
     install -m 0755 -o root -g root ${forgePackage}/libexec/cybex-forge-appliance-rescue /usr/local/sbin/cybex-forge-appliance-rescue
     install -m 0644 -o cybex-forge -g cybex-forge ${forgePackage}/share/cybex-forge/pxe-menu.png \
       /srv/cybex-forge/www/assets/pxe-menu.png
-  '';
+    '';
+  };
 
   services.resolved.enable = true;
   services.timesyncd.enable = true;
