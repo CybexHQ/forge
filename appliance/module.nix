@@ -77,6 +77,10 @@ in
         ${pkgs.systemd}/bin/systemctl --no-pager --full status boot.mount || true
         ${pkgs.systemd}/bin/journalctl --no-pager --quiet -b -n 20 \
           -u boot.mount -u systemd-fsck@dev-disk-by\\x2dlabel-CYBEX_EFI.service || true
+        ${pkgs.util-linux}/bin/dmesg --level=err,warn \
+          | ${pkgs.coreutils}/bin/tail -n 20 || true
+        ${pkgs.dosfstools}/bin/fsck.vfat -n \
+          /dev/disk/by-label/CYBEX_EFI || true
       '';
     };
   };

@@ -350,6 +350,8 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('wantedBy = [ "emergency.target" ];', module)
         self.assertIn('TTYPath = "/dev/ttyS0";', module)
         self.assertIn("CYBEX_FORGE_BOOT_DIAGNOSTIC status=storage-failure", module)
+        self.assertIn("/bin/dmesg --level=err,warn", module)
+        self.assertIn("/bin/fsck.vfat -n", module)
         diagnostic = module.split(
             "systemd.services.cybex-forge-boot-diagnostics", 1
         )[1].split("users.groups.cybex-forge", 1)[0]
