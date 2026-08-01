@@ -32,9 +32,9 @@ in
   # before local-fs.target starts.  Load vfat in the initrd and retain the
   # module for the installed system rather than relying on late autoloading.
   boot.initrd.kernelModules = [
-    "nf_tables" "nft_chain_nat" "nft_ct" "nft_fib_inet"
+    "9p" "9pnet" "9pnet_virtio" "nf_tables" "nft_chain_nat" "nft_ct" "nft_fib_inet"
     "nft_reject_inet" "nls_ascii" "nls_cp437" "nls_iso8859-1"
-    "vfat" "virtio_net"
+    "vfat" "virtio_console" "virtio_net" "xt_pkttype"
   ];
   boot.initrd.availableKernelModules = [
     "ahci" "ata_piix" "nvme" "sd_mod" "sr_mod"
@@ -107,6 +107,31 @@ in
         ${pkgs.systemd}/bin/journalctl --no-pager --quiet -b -n 30 \
           -u firewall.service || true
       '';
+    };
+  };
+  systemd.services.cybex-forge-network-diagnostics = {
+    description = "Cybex Forge boot network diagnostics";
+    serviceConfig = {
+      Type = "oneshot";
+      StandardOutput = "tty";
+      StandardError = "tty";
+      TTYPath = "/dev/ttyS0";
+      ExecStart = pkgs.writeShellScript "cybex-forge-network-diagnostics" ''
+        set -eu
+        echo "CYBEX_FORGE_NETWORK_DIAGNOSTIC status=interface-snapshot"
+        ${pkgs.iproute2}/bin/ip -brief link || true
+        ${pkgs.iproute2}/bin/ip -brief address || true
+        ${pkgs.iproute2}/bin/ip route || true
+        ${pkgs.systemd}/bin/resolvectl --no-pager status || true
+      '';
+    };
+  };
+  systemd.timers.cybex-forge-network-diagnostics = {
+    description = "Capture Cybex Forge boot network state";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "45s";
+      Unit = "cybex-forge-network-diagnostics.service";
     };
   };
 

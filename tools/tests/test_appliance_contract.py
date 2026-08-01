@@ -343,6 +343,9 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('virtualisation.incus.agent.enable = true', iso)
         self.assertIn('"console=ttyS0,115200n8"', module)
         for boot_module in (
+            "9p",
+            "9pnet",
+            "9pnet_virtio",
             "nf_tables",
             "nft_chain_nat",
             "nft_ct",
@@ -352,7 +355,9 @@ class ApplianceContractTests(unittest.TestCase):
             "nls_cp437",
             "nls_iso8859-1",
             "vfat",
+            "virtio_console",
             "virtio_net",
+            "xt_pkttype",
         ):
             self.assertIn(f'"{boot_module}"', module)
         self.assertIn("cybex-forge-boot-diagnostics", module)
@@ -364,6 +369,8 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn("systemd.services.firewall.onFailure", module)
         self.assertIn("cybex-forge-firewall-diagnostics.service", module)
         self.assertIn("CYBEX_FORGE_NETWORK_DIAGNOSTIC status=firewall-failure", module)
+        self.assertIn("CYBEX_FORGE_NETWORK_DIAGNOSTIC status=interface-snapshot", module)
+        self.assertIn('OnBootSec = "45s";', module)
         diagnostic = module.split(
             "systemd.services.cybex-forge-boot-diagnostics", 1
         )[1].split("users.groups.cybex-forge", 1)[0]
