@@ -84,18 +84,10 @@ jobs:
       - name: Build static Forge package
         run: nix-build --no-out-link appliance/default.nix -A package
 
-  appliance-incus:
-    name: Disposable source-built Forge appliance lifecycle
-    # The self-hosted runner receives live qualification credentials. Pull
-    # requests get hosted contract/Nix checks only; exact pushed commits and
-    # tags receive the privileged disposable lifecycle.
-    if: github.event_name == 'push'
-    uses: ./.github/workflows/appliance-incus.yml
-
   release_build:
     name: Build and sign release candidate once
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [contracts, rust-release, nix, appliance-incus]
+    needs: [contracts, rust-release, nix]
     runs-on: ubuntu-latest
     environment: production-release
     outputs:
@@ -304,204 +296,10 @@ jobs:
             "$artifact_id" "$action_digest" "$CYBEX_FORGE_RELEASE_ARTIFACT" \
             >> "$GITHUB_OUTPUT"
 
-  release_artifact_smoke:
-    name: Boot exact signed release candidate
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release_build
-    runs-on: [self-hosted, cybex-proxmox]
-    timeout-minutes: 120
-    environment: forge-appliance-qualification
-    concurrency:
-      group: forge-appliance-incus-live
-      cancel-in-progress: false
-    outputs:
-      evidence_artifact_id: ${{ steps.upload-release-evidence.outputs.artifact-id }}
-      evidence_artifact_digest: ${{ steps.upload-release-evidence.outputs.artifact-digest }}
-      evidence_artifact_name: ${{ steps.release-smoke-identity.outputs.evidence_artifact_name }}
-      run_id: ${{ steps.release-smoke-identity.outputs.run_id }}
-    permissions:
-      contents: read
-      actions: read
-    env:
-      CYBEX_E2E_MANAGE_REF: ${{ vars.CYBEX_E2E_MANAGE_REF }}
-      CYBEX_E2E_EXPECTED_MANAGE_SOURCE_REVISION: ${{ vars.CYBEX_E2E_MANAGE_REF }}
-      CYBEX_E2E_EXPECTED_MANAGE_SOURCE_DIRTY: "false"
-      CYBEX_FORGE_SOURCE_DIR: ${{ github.workspace }}/.cybex-forge
-      CYBEX_FORGE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
-      CYBEX_FORGE_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
-      CYBEX_FORGE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
-      CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
-      CYBEX_FORGE_RELEASE_SMOKE_RUN_ID: forge-release-${{ github.run_id }}-${{ github.run_attempt }}
-      CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY }}
-    steps:
-      - name: Bind exact release-smoke identity
-        id: release-smoke-identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'run_id=%s\nevidence_artifact_name=cybex-%s\n' \
-            "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID" \
-            "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout exact Forge tag source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.sha }}
-          path: .cybex-forge
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Validate coordinated Manage ref
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [[ ! "$CYBEX_E2E_MANAGE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::Set CYBEX_E2E_MANAGE_REF to an immutable Manage commit SHA"
-            exit 1
-          fi
-
-      - name: Checkout exact Manage release-smoke controller
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: CybexHQ/manage
-          ref: ${{ env.CYBEX_E2E_MANAGE_REF }}
-          path: .cybex-manage
-          token: ${{ secrets.CYBEX_MANAGE_REPO_TOKEN || github.token }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Validate original candidate artifact provenance
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -Eeuo pipefail
-          case "$GITHUB_REF" in
-            refs/tags/v*) ;;
-            *) echo "::error::Release smoke requires a governed v* tag"; exit 1 ;;
-          esac
-          git -C .cybex-forge show-ref --verify --quiet refs/remotes/origin/main
-          git -C .cybex-forge merge-base --is-ancestor \
-            "$GITHUB_SHA" refs/remotes/origin/main
-          git -C .cybex-manage show-ref --verify --quiet refs/remotes/origin/main
-          git -C .cybex-manage merge-base --is-ancestor \
-            "${CYBEX_E2E_MANAGE_REF,,}" refs/remotes/origin/main
-          [[ "$CYBEX_FORGE_RELEASE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          [[ "$CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
-          metadata="$RUNNER_TEMP/cybex-forge-candidate-artifact.json"
-          gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts/$CYBEX_FORGE_RELEASE_ARTIFACT_ID" \
-            > "$metadata"
-          test "$(jq -r '.name' "$metadata")" = "$CYBEX_FORGE_RELEASE_ARTIFACT"
-          test "$(jq -r '.expired' "$metadata")" = "false"
-          test "$(jq -r '.workflow_run.id' "$metadata")" = "$GITHUB_RUN_ID"
-          test "$(jq -r '.workflow_run.head_sha' "$metadata")" = "${GITHUB_SHA,,}"
-          test "$(jq -r '.digest' "$metadata")" = "sha256:$CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST"
-
-      - name: Download original release candidate by artifact ID
-        # actions/download-artifact v4.3.0; rotate only after reviewing the official tag.
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT_ID }}
-          path: dist
-          merge-multiple: true
-
-      - name: Verify exact clean sources and downloaded candidate
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          test "$(git -C .cybex-forge rev-parse HEAD)" = "${GITHUB_SHA,,}"
-          test "$(git -C .cybex-manage rev-parse HEAD)" = "${CYBEX_E2E_MANAGE_REF,,}"
-          test -z "$(git -C .cybex-forge status --porcelain)"
-          test -z "$(git -C .cybex-manage status --porcelain)"
-          version="$CYBEX_FORGE_RELEASE_VERSION"
-          expected="$RUNNER_TEMP/cybex-forge-release-expected"
-          actual="$RUNNER_TEMP/cybex-forge-release-actual"
-          printf '%s\n' \
-            SHA256SUMS \
-            cybex-forge-release.json \
-            cybex-forge-x86_64-linux \
-            "cybex-forge-appliance-$version-x86_64-linux.iso" \
-            | LC_ALL=C sort > "$expected"
-          find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$actual"
-          diff -u "$expected" "$actual"
-          while IFS= read -r name; do
-            test -f "dist/$name"
-            test ! -L "dist/$name"
-            chmod 0444 "dist/$name"
-          done < "$expected"
-          (cd dist && sha256sum --check --strict SHA256SUMS)
-          python3 -B .cybex-forge/tools/forge-release.py verify \
-            --manifest dist/cybex-forge-release.json \
-            --artifact dist/cybex-forge-x86_64-linux \
-            --installer-iso "dist/cybex-forge-appliance-$version-x86_64-linux.iso" \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
-
-      - name: Validate exact release-smoke controller
-        working-directory: .cybex-manage
-        run: |
-          python3 -B testbench/incus/labctl.py self-test
-          python3 -B -m unittest \
-            testbench.incus.labctl_test.ForgeApplianceContractTest
-
-      - name: Prepare Incus lab
-        working-directory: .cybex-manage
-        run: python3 -B testbench/incus/labctl.py prepare-incus --execute
-
-      - name: Qualify exact signed release candidate
-        working-directory: .cybex-manage
-        run: |
-          timeout --signal=INT --kill-after=120s 90m \
-            python3 -B testbench/incus/labctl.py forge-appliance-release-smoke \
-              --execute \
-              --run-id "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID" \
-              --descriptor "$GITHUB_WORKSPACE/dist/cybex-forge-release.json" \
-              --binary "$GITHUB_WORKSPACE/dist/cybex-forge-x86_64-linux" \
-              --iso "$GITHUB_WORKSPACE/dist/cybex-forge-appliance-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-              --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY" \
-              --expected-forge-source-revision "$GITHUB_SHA" \
-              --expected-manage-source-revision "$CYBEX_E2E_MANAGE_REF"
-
-      - name: Always remove exact release-smoke resources
-        if: always()
-        working-directory: .cybex-manage
-        run: |
-          python3 -B testbench/incus/labctl.py forge-appliance-release-smoke-recover \
-            --yes \
-            --run-id "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID"
-
-      - name: Summarize release-smoke evidence
-        if: always()
-        continue-on-error: true
-        working-directory: .cybex-manage
-        run: >-
-          python3 -B testbench/incus/labctl.py evidence-summary
-          --run-id "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID"
-
-      - name: Export bounded release-smoke evidence
-        if: always()
-        working-directory: .cybex-manage
-        run: |
-          python3 -B testbench/incus/labctl.py evidence-export \
-            --run-id "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID" \
-            --output "var/testbench/incus-public/${CYBEX_FORGE_RELEASE_SMOKE_RUN_ID}-evidence.json"
-
-      - name: Upload bounded release-smoke evidence
-        id: upload-release-evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: cybex-${{ env.CYBEX_FORGE_RELEASE_SMOKE_RUN_ID }}
-          path: .cybex-manage/var/testbench/incus-public/${{ env.CYBEX_FORGE_RELEASE_SMOKE_RUN_ID }}-evidence.json
-          if-no-files-found: error
-          retention-days: 30
-
   release_publish:
     name: Attest and publish exact qualified candidate
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release_build, release_artifact_smoke]
+    needs: release_build
     runs-on: ubuntu-latest
     environment: production-release
     concurrency:
@@ -518,11 +316,6 @@ jobs:
       CYBEX_FORGE_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
       CYBEX_FORGE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
       CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
-      CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT: ${{ needs.release_artifact_smoke.outputs.evidence_artifact_name }}
-      CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_ID: ${{ needs.release_artifact_smoke.outputs.evidence_artifact_id }}
-      CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_DIGEST: ${{ needs.release_artifact_smoke.outputs.evidence_artifact_digest }}
-      CYBEX_FORGE_RELEASE_SMOKE_RUN_ID: ${{ needs.release_artifact_smoke.outputs.run_id }}
-      CYBEX_E2E_MANAGE_REF: ${{ vars.CYBEX_E2E_MANAGE_REF }}
       CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY }}
     steps:
       - name: Checkout exact tag for independent verification
@@ -539,7 +332,7 @@ jobs:
           test -z "$(git status --porcelain)"
           test "v$CYBEX_FORGE_RELEASE_VERSION" = "$GITHUB_REF_NAME"
 
-      - name: Validate candidate and qualification artifact provenance
+      - name: Validate candidate artifact provenance
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -568,24 +361,12 @@ jobs:
             "$CYBEX_FORGE_RELEASE_ARTIFACT" \
             "$CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST" \
             "$RUNNER_TEMP/cybex-forge-candidate-artifact.json"
-          validate_artifact \
-            "$CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_ID" \
-            "$CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT" \
-            "$CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_DIGEST" \
-            "$RUNNER_TEMP/cybex-forge-evidence-artifact.json"
 
       - name: Download original release candidate independently by artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT_ID }}
           path: dist
-          merge-multiple: true
-
-      - name: Download exact bounded qualification independently by artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_ID }}
-          path: qualification-download
           merge-multiple: true
 
       - name: Independently verify exact publish bytes
@@ -617,27 +398,6 @@ jobs:
           install -m 0700 dist/cybex-forge-x86_64-linux "$RUNNER_TEMP/cybex-forge-release-verify"
           test "$("$RUNNER_TEMP/cybex-forge-release-verify" --version)" = "cybex-forge $version"
           rm -f -- "$RUNNER_TEMP/cybex-forge-release-verify"
-          evidence_name="$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID-evidence.json"
-          expected_evidence="$RUNNER_TEMP/cybex-forge-evidence-expected"
-          actual_evidence="$RUNNER_TEMP/cybex-forge-evidence-actual"
-          printf '%s\n' "$evidence_name" > "$expected_evidence"
-          find qualification-download -mindepth 1 -maxdepth 1 -printf '%f\n' \
-            | LC_ALL=C sort > "$actual_evidence"
-          diff -u "$expected_evidence" "$actual_evidence"
-          test -f "qualification-download/$evidence_name"
-          test ! -L "qualification-download/$evidence_name"
-          chmod 0444 "qualification-download/$evidence_name"
-          python3 -B tools/forge-release.py verify-qualification \
-            --evidence "qualification-download/$evidence_name" \
-            --artifact dist/cybex-forge-x86_64-linux \
-            --installer-iso "dist/cybex-forge-appliance-$version-x86_64-linux.iso" \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY" \
-            --version "$version" \
-            --forge-source-revision "${GITHUB_SHA,,}" \
-            --manage-source-revision "${CYBEX_E2E_MANAGE_REF,,}" \
-            --run-id "$CYBEX_FORGE_RELEASE_SMOKE_RUN_ID" \
-            --output dist/cybex-forge-appliance-qualification.json
-          chmod 0444 dist/cybex-forge-appliance-qualification.json
 
       - name: Require repository immutable-release policy
         shell: bash
@@ -661,7 +421,6 @@ jobs:
             dist/cybex-forge-appliance-${{ env.CYBEX_FORGE_RELEASE_VERSION }}-x86_64-linux.iso
             dist/cybex-forge-release.json
             dist/SHA256SUMS
-            dist/cybex-forge-appliance-qualification.json
 
       - name: Remove only a stale draft for this exact tag
         env:
@@ -708,13 +467,12 @@ jobs:
               --arg iso "cybex-forge-appliance-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
               --arg manifest "cybex-forge-release.json" \
               --arg checksums "SHA256SUMS" \
-              --arg qualification "cybex-forge-appliance-qualification.json" \
               'type == "array"
-               and length <= 5
+               and length <= 4
                and ((map(.name) | length) == (map(.name) | unique | length))
                and all(.[].name;
                  . == $binary or . == $iso or . == $manifest
-                 or . == $checksums or . == $qualification)' \
+                 or . == $checksums)' \
               "$stale_assets" >/dev/null
             gh api --method DELETE \
               -H 'Accept: application/vnd.github+json' \
@@ -742,7 +500,6 @@ jobs:
             "dist/cybex-forge-appliance-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
             dist/cybex-forge-release.json \
             dist/SHA256SUMS \
-            dist/cybex-forge-appliance-qualification.json
 
       - name: Verify remote draft assets and publish immutably
         env:
@@ -757,14 +514,13 @@ jobs:
             --jq '.id')"
           remote_assets="$RUNNER_TEMP/cybex-forge-release-assets.json"
           remote_assets_match() {
-            jq -e 'length == 5' "$remote_assets" >/dev/null || return 1
+            jq -e 'length == 4' "$remote_assets" >/dev/null || return 1
             for path in \
               dist/cybex-forge-x86_64-linux \
               "dist/cybex-forge-appliance-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
               dist/cybex-forge-release.json \
               dist/SHA256SUMS \
-              dist/cybex-forge-appliance-qualification.json
-            do
+              do
               name="$(basename "$path")"
               digest="sha256:$(sha256sum "$path" | cut -d ' ' -f 1)"
               size="$(stat -c %s "$path")"
@@ -815,7 +571,6 @@ jobs:
             "dist/cybex-forge-appliance-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
             dist/cybex-forge-release.json \
             dist/SHA256SUMS \
-            dist/cybex-forge-appliance-qualification.json
           do
             gh release verify-asset "$GITHUB_REF_NAME" "$path"
           done

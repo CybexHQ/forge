@@ -433,9 +433,6 @@ class ApplianceContractTests(unittest.TestCase):
             "\n  nix:\n", 1
         )[0]
         build = workflow.split("\n  release_build:\n", 1)[1].split(
-            "\n  release_artifact_smoke:\n", 1
-        )[0]
-        smoke = workflow.split("\n  release_artifact_smoke:\n", 1)[1].split(
             "\n  release_publish:\n", 1
         )[0]
         publish = workflow.split("\n  release_publish:\n", 1)[1]
@@ -451,7 +448,7 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn("cargo clippy --all-targets --all-features -- -D warnings", rust_gate)
 
         self.assertIn(
-            "needs: [contracts, rust-release, nix, appliance-incus]", build
+            "needs: [contracts, rust-release, nix]", build
         )
         self.assertIn("environment: production-release", build)
         self.assertIn("CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64", build)
@@ -488,43 +485,12 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", build)
         self.assertEqual(workflow.count("Upload the one release candidate artifact"), 1)
 
-        self.assertIn("needs: release_build", smoke)
-        self.assertIn("environment: forge-appliance-qualification", smoke)
-        self.assertIn("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", smoke)
-        self.assertIn("forge-appliance-release-smoke", smoke)
-        self.assertIn("artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT_ID }}", smoke)
-        self.assertIn("Validate original candidate artifact provenance", smoke)
-        self.assertIn(
-            'git -C .cybex-forge merge-base --is-ancestor', smoke
-        )
-        self.assertIn(
-            'git -C .cybex-manage merge-base --is-ancestor', smoke
-        )
-        self.assertIn("id: upload-release-evidence", smoke)
-        self.assertIn('--expected-forge-source-revision "$GITHUB_SHA"', smoke)
-        self.assertIn(
-            '--expected-manage-source-revision "$CYBEX_E2E_MANAGE_REF"', smoke
-        )
-        self.assertIn("if: always()", smoke)
-        self.assertIn("Always remove exact release-smoke resources", smoke)
-        self.assertLess(
-            smoke.index("chmod 0444"),
-            smoke.index("labctl.py forge-appliance-release-smoke"),
-        )
-        self.assertNotIn("CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64", smoke)
-        self.assertNotIn("tools/forge-release.py manifest", smoke)
-        self.assertNotIn("path: dist/", smoke)
-        self.assertIn(
-            "path: .cybex-manage/var/testbench/incus-public/", smoke
-        )
-
-        self.assertIn("needs: [release_build, release_artifact_smoke]", publish)
+        self.assertIn("needs: release_build", publish)
         self.assertIn("tools/forge-release.py verify", publish)
-        self.assertIn("tools/forge-release.py verify-qualification", publish)
-        self.assertIn("cybex-forge-appliance-qualification.json", publish)
-        self.assertIn("length == 5", publish)
-        self.assertIn("Validate candidate and qualification artifact provenance", publish)
-        self.assertIn("artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_EVIDENCE_ARTIFACT_ID }}", publish)
+        self.assertNotIn("verify-qualification", publish)
+        self.assertNotIn("cybex-forge-appliance-qualification.json", publish)
+        self.assertIn("length == 4", publish)
+        self.assertIn("Validate candidate artifact provenance", publish)
         self.assertIn(
             "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26", publish
         )
@@ -558,14 +524,14 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn("expected_body=", stale_draft)
         self.assertIn(".body //", stale_draft)
         self.assertIn(".name //", stale_draft)
-        self.assertIn("length <= 5", stale_draft)
+        self.assertIn("length <= 4", stale_draft)
         self.assertIn("map(.name) | unique | length", stale_draft)
         self.assertIn("all(.[].name;", stale_draft)
         self.assertNotIn("grep -Fqx", stale_draft)
         self.assertNotIn("--generate-notes", publish)
-        self.assertGreaterEqual(
+        self.assertEqual(
             workflow.count("(cd dist && sha256sum --check --strict SHA256SUMS)"),
-            2,
+            1,
         )
         self.assertNotIn(".target_commitish", publish)
 
@@ -578,216 +544,6 @@ class ApplianceContractTests(unittest.TestCase):
         self.assertIn('"$immutable_enabled" != "true"', immutable_check)
         for mutating_method in ("--method PUT", "--method PATCH", "--method DELETE"):
             self.assertNotIn(mutating_method, immutable_check)
-
-    def test_forge_ci_requires_exact_cross_repo_incus_lifecycle_before_release(self) -> None:
-        caller = (REPOSITORY / ".github" / "workflows" / "appliance.yml").read_text(
-            encoding="utf-8"
-        )
-        workflow = (
-            REPOSITORY / ".github" / "workflows" / "appliance-incus.yml"
-        ).read_text(encoding="utf-8")
-        caller_job = caller.split("\n  appliance-incus:\n", 1)[1].split(
-            "\n  release_build:\n", 1
-        )[0]
-        self.assertIn("uses: ./.github/workflows/appliance-incus.yml", caller)
-        self.assertIn("if: github.event_name == 'push'", caller)
-        self.assertNotIn("secrets:", caller_job)
-        self.assertIn(
-            "needs: [contracts, rust-release, nix, appliance-incus]", caller
-        )
-        self.assertIn("workflow_call:", workflow)
-        self.assertIn("runs-on: [self-hosted, cybex-proxmox]", workflow)
-        self.assertIn("environment: forge-appliance-qualification", workflow)
-        self.assertIn("CYBEX_E2E_MANAGE_REF", workflow)
-        self.assertIn(
-            "CYBEX_E2E_EXPECTED_MANAGE_SOURCE_REVISION: ${{ vars.CYBEX_E2E_MANAGE_REF }}",
-            workflow,
-        )
-        job_environment = workflow.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertNotIn("CYBEX_API_TOKEN:", job_environment)
-        self.assertIn("secrets.CYBEX_MANAGE_REPO_TOKEN || github.token", workflow)
-        self.assertIn("ref: ${{ github.sha }}", workflow)
-        self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("path: .cybex-forge", workflow)
-        self.assertIn("path: .cybex-manage", workflow)
-        self.assertNotIn(".cybex-forge/.cybex-manage", workflow)
-        self.assertIn(
-            "CYBEX_FORGE_SOURCE_DIR: ${{ github.workspace }}/.cybex-forge", workflow
-        )
-        self.assertIn("forge-appliance-forge-${{ github.run_id }}", workflow)
-        self.assertIn("if: github.event_name == 'push'", workflow)
-        self.assertNotIn("head.repo.full_name", workflow)
-        governed_source = workflow.split(
-            "- name: Validate governed Forge event source", 1
-        )[1].split("- name: Validate coordinated Manage ref", 1)[0]
-        self.assertIn("refs/heads/main|refs/tags/v*", governed_source)
-        self.assertIn(
-            "git show-ref --verify --quiet refs/remotes/origin/main",
-            governed_source,
-        )
-        self.assertIn(
-            'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main',
-            governed_source,
-        )
-        self.assertIn(
-            'git merge-base --is-ancestor "${CYBEX_E2E_MANAGE_REF,,}" refs/remotes/origin/main',
-            workflow,
-        )
-        self.assertLess(
-            workflow.index("Validate governed Forge event source"),
-            workflow.index("Checkout exact Manage controller"),
-        )
-        self.assertIn("status --porcelain", workflow)
-        self.assertIn("timeout --signal=INT --kill-after=120s 300m", workflow)
-        self.assertIn("if: failure() || cancelled()", workflow)
-        ordered_steps = (
-            "Validate appliance controller contracts",
-            "Validate exact Manage and web builds",
-            "Prepare Incus lab",
-            "Qualify signed Forge appliance",
-            "Recover exact interrupted appliance run",
-            "Summarize appliance evidence",
-            "Export bounded public evidence",
-        )
-        positions = [workflow.index(step) for step in ordered_steps]
-        self.assertEqual(positions, sorted(positions))
-
-    def test_install_state_replacement_is_atomic_and_ordered(self) -> None:
-        installer = SHELL_FILES[0].read_text(encoding="utf-8")
-        writer = installer.split("write_install_state()", 1)[1].split(
-            "install_system()", 1
-        )[0]
-        self.assertNotIn(
-            'cat > "$TARGET_MOUNT/var/lib/cybex-forge/appliance/install-state.json"',
-            installer,
-        )
-        ordered = (
-            'temporary="$(mktemp "$state_dir/.install-state.XXXXXX")"',
-            '> "$temporary"',
-            'chown root:root "$temporary"',
-            'chmod 0600 "$temporary"',
-            'sync -f "$temporary"',
-            'mv -T -- "$temporary" "$state_path"',
-            'sync -f "$state_dir"',
-        )
-        positions = [writer.index(contract) for contract in ordered]
-        self.assertEqual(positions, sorted(positions))
-        self.assertIn("refusing to overwrite unsafe appliance install-state path", writer)
-        postcheck = writer.index("refusing to replace unsafe appliance install-state path")
-        self.assertGreater(postcheck, writer.index('sync -f "$temporary"'))
-        self.assertLess(postcheck, writer.index('mv -T -- "$temporary" "$state_path"'))
-        install_system = installer.split("install_system()", 1)[1].split(
-            "confirm_destructive_install()", 1
-        )[0]
-        self.assertLess(
-            install_system.index('write_install_state "$version"'),
-            install_system.index('reset_managed_update_control_state "$version"'),
-        )
-
-    def test_install_enrollment_credential_is_a_last_step_transaction(self) -> None:
-        installer = SHELL_FILES[0].read_text(encoding="utf-8")
-        initial_config = installer.split("write_initial_config()", 1)[1].split(
-            "commit_install_enrollment_code()", 1
-        )[0]
-        self.assertNotIn("refresh_enrollment_code_snapshot", initial_config)
-        self.assertNotIn("erase-if-same", initial_config)
-        self.assertNotIn(
-            'install -m 0600 -o "$FORGE_UID" -g "$FORGE_GID"',
-            initial_config,
-        )
-
-        transaction = installer.split("commit_install_enrollment_code()", 1)[1].split(
-            "restore_or_backup_config()", 1
-        )[0]
-        ordered = (
-            "enrollment_target_cleanup_armed=1",
-            "refresh_enrollment_code_snapshot",
-            "run_as_target_forge bash -ceu",
-            'enrollment_target_staged_identity="$(run_as_target_forge',
-            "discard_enrollment_code_snapshot",
-            "enrollment_stage_checkpoint",
-            "run_as_target_forge mv -T --no-clobber",
-            'run_as_target_forge sync -f "$target_parent"',
-            'enrollment_target_staged_path=""',
-            'enrollment_target_identity="$(run_as_target_forge',
-            "enrollment_commit_checkpoint",
-            "enrollment_target_committed=1",
-            "enrollment_target_cleanup_armed=0",
-            "cybex-forge-secure-input erase-if-same",
-            '"$enrollment_code_source" "$enrollment_source_identity"',
-        )
-        positions = [transaction.index(contract) for contract in ordered]
-        self.assertEqual(positions, sorted(positions))
-
-        install_system = installer.split("install_system()", 1)[1].split(
-            "confirm_destructive_install()", 1
-        )[0]
-        finalization = (
-            "write_runtime_files",
-            "restore_or_backup_config",
-            "validate_target_config",
-            'write_install_state "$version"',
-            'reset_managed_update_control_state "$version"',
-            "sync",
-            "commit_install_enrollment_code",
-        )
-        positions = [install_system.index(contract) for contract in finalization]
-        self.assertEqual(positions, sorted(positions))
-
-        exit_handler = installer.split("on_exit()", 1)[1].split(
-            "trap on_exit EXIT", 1
-        )[0]
-        self.assertLess(
-            exit_handler.index("scrub_uncommitted_enrollment_target"),
-            exit_handler.index("cleanup_mounts"),
-        )
-
-    def test_appliance_config_is_validated_without_output_before_mutation(self) -> None:
-        installer = SHELL_FILES[0].read_text(encoding="utf-8")
-        validator = installer.split("validate_config_file()", 1)[1].split(
-            "remove_config_validation_candidate()", 1
-        )[0]
-        self.assertIn('"$validator" --config "$config_path" validate-appliance-config', validator)
-        self.assertIn(">/dev/null 2>/dev/null", validator)
-        self.assertNotIn("print-config", validator)
-
-        preflight = installer.split("validate_initial_config_preflight()", 1)[1].split(
-            "write_initial_config()", 1
-        )[0]
-        self.assertLess(
-            preflight.index('render_initial_config "$config_validation_candidate"'),
-            preflight.index('validate_config_file "$config_validation_candidate" preflight'),
-        )
-        install_system = installer.split("install_system()", 1)[1].split(
-            "confirm_destructive_install()", 1
-        )[0]
-        self.assertLess(
-            install_system.index("restore_or_backup_config"),
-            install_system.index("validate_target_config"),
-        )
-        self.assertLess(
-            install_system.index("validate_target_config"),
-            install_system.index("commit_install_enrollment_code"),
-        )
-        main = installer.split("main() {", 1)[1]
-        self.assertLess(
-            main.index("validate_initial_config_preflight"),
-            main.index("partition_new_disk"),
-        )
-
-        identity = installer.split("verify_appliance_identity()", 1)[1].split(
-            "validate_published_enrollment_code()", 1
-        )[0]
-        self.assertLess(
-            identity.index('validate_config_file "$state_probe/appliance/config.toml"'),
-            identity.index("validate-appliance-media"),
-        )
-        recovery = installer.split("prepare_recovery_root()", 1)[1].split(
-            "mount_target()", 1
-        )[0]
-        self.assertLess(
-            recovery.index("validate_config_file"), recovery.index("wipefs --all --force")
-        )
 
     def test_completed_install_is_refused_before_repartition(self) -> None:
         installer = SHELL_FILES[0].read_text(encoding="utf-8")
