@@ -212,6 +212,7 @@ jobs:
           path: manage-source
           fetch-depth: 0
           persist-credentials: false
+          ssh-key: ${{ secrets.CYBEX_FORGE_MANAGE_SOURCE_SSH_KEY }}
 
       - name: Verify pinned Manage source and runtime version
         if: steps.release-candidate.outputs.reuse != 'true'
