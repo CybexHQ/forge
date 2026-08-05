@@ -63,17 +63,28 @@ api() {
 }
 
 create_response="$work_dir/create.json"
-api POST /v1/forge/provisioning-sessions '{"label":"release qualification"}' > "$create_response"
+create_body="$(jq -c \
+  '{label:"release qualification",qualification_candidate:{release_version:.version,installer_iso_template_v2:.installer_iso_template_v2}}' \
+  "$manifest")"
+api POST /v1/forge/provisioning-sessions "$create_body" > "$create_response"
 session_id="$(jq -er '.session.id' "$create_response")"
 media_secret="$(jq -er '.media_secret' "$create_response")"
 download_path="$(jq -er '.download_path' "$create_response")"
 [[ "$download_path" = "/v1/forge/provisioning-sessions/$session_id/appliance-iso" ]]
+personalization_path="$(jq -er '.personalization_path' "$create_response")"
+[[ "$personalization_path" = "/v1/forge/provisioning-sessions/$session_id/personalization-envelope" ]]
 
 headers="$work_dir/download.headers"
+envelope="$work_dir/personalization-envelope.bin"
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
   --header "Authorization: Bearer $token" \
   --header "X-Cybex-Forge-Provisioning-Secret: $media_secret" \
-  --dump-header "$headers" --output "$personalized" "$manage_origin$download_path"
+  --dump-header "$headers" --output "$envelope" "$manage_origin$personalization_path"
+test "$(stat -c '%s' "$envelope")" -eq 8192
+cp --reflink=auto -- "$template" "$personalized"
+personalization_offset="$(jq -er '.installer_iso_template_v2.personalization_offset' "$manifest")"
+dd if="$envelope" of="$personalized" bs=1 seek="$personalization_offset" conv=notrunc status=none
+rm -f -- "$envelope"
 verification="$work_dir/media-verification.json"
 CYBEX_FORGE_MEDIA_SECRET="$media_secret" \
   python3 -B "$repository_root/ubuntu-appliance/qualification/verify-personalized-media.py" \

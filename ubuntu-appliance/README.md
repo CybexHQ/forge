@@ -142,7 +142,10 @@ that never reaches the commit service.
 `.github/workflows/release.yml` builds a single candidate. Before publication,
 the self-hosted qualification job runs
 `ubuntu-appliance/qualification/run-lifecycle.sh` against those exact bytes.
-The harness verifies personalization, boots with OVMF Secure Boot, proves the
+The harness submits the release-signed candidate descriptor to Management,
+downloads only its signed fixed-size personalization envelope, applies that
+envelope to the local build-once template, verifies personalization, boots
+with OVMF Secure Boot, proves the
 disk prefix is unchanged before approval, claims and approves through
 Management, installs, rotates identity, reboots with media still attached,
 requires a healthy permanent-key appliance projection, completes a two-phase
