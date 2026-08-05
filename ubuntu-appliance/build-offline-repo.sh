@@ -117,7 +117,7 @@ declare -a packages=(
   util-linux
   watchdog
 )
-apt-get "${apt_options[@]}" --download-only --no-install-recommends install "${packages[@]}"
+apt-get "${apt_options[@]}" --yes --download-only --no-install-recommends install "${packages[@]}"
 
 find "$apt_root/var/cache/apt/archives" -maxdepth 1 -type f -name '*.deb' -exec cp -t "$output" -- {} +
 find "$local_packages" -maxdepth 1 -type f -name '*.deb' -exec cp -t "$output" -- {} +
