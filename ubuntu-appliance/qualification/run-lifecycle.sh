@@ -147,10 +147,11 @@ revision="$(jq -er '.session_revision' "$session")"
 inventory_sha="$(jq -er '.inventory_sha256' "$session")"
 disk_id="$(jq -er '.inventory.disks[] | select(.eligible == true) | .id' "$session")"
 interface_id="$(jq -er '.inventory.ethernet_interfaces[] | select(.link_up == true) | .id' "$session" | head -n 1)"
+session_suffix="${session_id%%-*}"
 approve_body="$(jq -cn \
   --argjson revision "$revision" --arg inventory "$inventory_sha" \
   --arg disk "$disk_id" --arg interface "$interface_id" --arg cidr "$management_cidr" \
-  --arg display_name "Forge release qualification $release_version" \
+  --arg display_name "Forge release qualification $release_version $session_suffix" \
   '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:0,start:"02:00",duration_minutes:120},management_cidrs:[$cidr]}')"
 api POST "/v1/forge/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
 
