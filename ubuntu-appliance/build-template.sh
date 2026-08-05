@@ -192,7 +192,7 @@ test ! -e "$output_iso" || {
 xorriso \
   -indev "$base_iso" \
   -outdev "$output_iso" \
-  -map "$iso_tree" / \
+  -update_r "$iso_tree" / \
   -boot_image any replay \
   -compliance no_emul_toc \
   -padding 0
