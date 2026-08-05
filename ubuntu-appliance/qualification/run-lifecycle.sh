@@ -32,14 +32,26 @@ bridge="${CYBEX_FORGE_QUALIFICATION_BRIDGE:?set the isolated qualification bridg
 management_cidr="${CYBEX_FORGE_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
 token="$(tr -d '\r\n' < "$token_file")"
 test -n "$token"
+release_version="$(jq -er '.version' "$manifest")"
 
 work_dir="$(mktemp -d)"
 qemu_pid=""
+session_id=""
+lifecycle_succeeded=false
 personalized="$work_dir/personalized.iso"
 cleanup() {
   if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$session_id" && "$lifecycle_succeeded" != true ]]; then
+    cleanup_session="$work_dir/cleanup-session.json"
+    if api GET "/v1/forge/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
+      && [[ "$(jq -r '.destructive_started_at // ""' "$cleanup_session")" = "" ]] \
+      && [[ "$(jq -r '.state' "$cleanup_session")" =~ ^(created|claimed|awaiting_approval|approved|failed)$ ]]
+    then
+      api POST "/v1/forge/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
+    fi
   fi
   if [[ -f "$personalized" ]]; then
     shred -u -n 1 -z -- "$personalized" 2>/dev/null || rm -f -- "$personalized"
@@ -107,10 +119,10 @@ qemu-system-x86_64 \
   -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
   -drive "if=none,id=system,format=raw,file=$disk,cache=none" \
-  -device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=system \
+  -device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=system,serial=CYBEXQUALIFICATION \
   -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$personalized" \
   -device ide-cd,drive=installer \
-  -netdev "bridge,id=net0,br=$bridge" -device virtio-net-pci,netdev=net0 \
+  -netdev "bridge,id=net0,br=$bridge" -device virtio-net-pci,netdev=net0,mac=52:54:00:c7:be:01 \
   -boot once=d,menu=off -display none -serial "file:$work_dir/serial.log" &
 qemu_pid=$!
 
@@ -138,7 +150,8 @@ interface_id="$(jq -er '.inventory.ethernet_interfaces[] | select(.link_up == tr
 approve_body="$(jq -cn \
   --argjson revision "$revision" --arg inventory "$inventory_sha" \
   --arg disk "$disk_id" --arg interface "$interface_id" --arg cidr "$management_cidr" \
-  '{session_revision:$revision,inventory_sha256:$inventory,display_name:"Forge release qualification",target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:0,start:"02:00",duration_minutes:120},management_cidrs:[$cidr]}')"
+  --arg display_name "Forge release qualification $release_version" \
+  '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:0,start:"02:00",duration_minutes:120},management_cidrs:[$cidr]}')"
 api POST "/v1/forge/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
 
 ready=false
@@ -247,3 +260,4 @@ jq -n \
   '{schema:$schema,ok:true,session_id:$session_id,template_sha256:$template_sha256,personalized_sha256:$personalized_sha256,secure_boot:true,no_disk_write_before_approval:true,identity_rotation:true,installed_media_left_attached:true,appliance_projection_healthy:true,two_phase_network_acknowledged:true,exact_principal_ssh_certificate:true,final_state:"ready",completed_at:$completed_at}' \
   > "$output"
 chmod 0644 "$output"
+lifecycle_succeeded=true

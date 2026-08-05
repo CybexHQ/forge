@@ -160,6 +160,9 @@ The automated boot entry mirrors Ubuntu to the first serial port so early
 installer failures are visible in the protected job. Qualification stops after
 five minutes when an approved candidate has not acknowledged its plan or begun
 destructive work, and includes only bounded console and session diagnostics.
+The protected VM uses a fixed virtual NIC address and disk serial so retries
+represent the same hardware. A failed pre-write qualification is revoked
+automatically, releasing its unused reserved device identity.
 
 Production qualification must also cover the documented VM controller matrix
 and representative Dell, HP, Lenovo, Intel/AMD, Ethernet, SATA/NVMe/VMD, and
