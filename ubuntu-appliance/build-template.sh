@@ -165,10 +165,10 @@ jq -n \
   '{schema:$schema,release_id:$release_id,ubuntu_snapshot_id:$ubuntu_snapshot_id,filename:$filename,sha256:$sha256,size_bytes:$size_bytes,required_package_versions:$required_package_versions,expected_kernel:$required_package_versions["linux-generic"],minimum_protocol:4,minimum_state_schema:1,rollback_compatible:true}' \
   > "$package_metadata"
 
-kernel_arguments='autoinstall ds=nocloud\;s=/cdrom/nocloud/'
+kernel_arguments='autoinstall ds=nocloud\\;s=/cdrom/nocloud/'
 while IFS= read -r -d '' grub_config; do
   if ! grep -F 'ds=nocloud' "$grub_config" >/dev/null; then
-    sed -i -E "s#([[:space:]]+---[[:space:]]*)$# ${kernel_arguments} ---#" "$grub_config"
+    sed -i -E "s#([[:space:]]+---[[:space:]]*)\$# ${kernel_arguments} ---#" "$grub_config"
   fi
 done < <(find "$iso_tree" -type f \( -name 'grub.cfg' -o -name 'loopback.cfg' -o -name 'txt.cfg' \) -print0)
 
