@@ -70,7 +70,9 @@ jobs:
         uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f # v31.10.5
 
       - name: Parse workstation expressions
-        run: nix-instantiate --parse release/workstation-netboot.nix >/dev/null
+        run: |
+          nix-instantiate --parse release/workstation-netboot.nix >/dev/null
+          nix-instantiate --parse release/release-tools.nix >/dev/null
 
   release_build:
     name: Build and sign release candidate once
@@ -261,10 +263,10 @@ jobs:
             install -m 0644 "result-workstation-netboot/$component" "$staging/$component"
             touch --date="@$source_epoch" "$staging/$component"
           done
-          nix-shell -p dracut squashfsTools --run \
+          nix-shell release/release-tools.nix --run \
             "bash manage-source/deploy/nixos/check-installer-netboot-release.sh --inspect-only --bundle-tree '$staging'"
           bundle="dist/${{ steps.workstation-source.outputs.bundle_name }}"
-          nix-shell -p gnutar zstd --run \
+          nix-shell release/release-tools.nix --run \
             "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -19 --threads=1 --no-progress --no-dictID -o '$bundle'"
           python3 tools/forge-release.py inspect-workstation-netboot \
             --workstation-netboot-bundle "$bundle" \
