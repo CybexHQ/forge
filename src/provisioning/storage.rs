@@ -430,15 +430,7 @@ pub(crate) fn write_autoinstall(
             "locale": "en_US.UTF-8",
             "keyboard": {"layout": "us"},
             "refresh-installer": {"update": false},
-            "apt": {
-                "preserve_sources_list": false,
-                "fallback": "offline-install",
-                "sources": {
-                    "cybex-offline.list": {
-                        "source": "deb [trusted=yes] file:///cdrom/cybex/apt ./"
-                    }
-                }
-            },
+            "apt": offline_apt_config(),
             "storage": {"config": storage_config(disk)},
             "packages": [
                 "cybex-forge",
@@ -474,6 +466,20 @@ pub(crate) fn write_autoinstall(
     });
     let body = serde_json::to_vec_pretty(&config).context("serialize autoinstall plan")?;
     atomic_write(path, &body, 0o600)
+}
+
+fn offline_apt_config() -> Value {
+    json!({
+        "preserve_sources_list": false,
+        "fallback": "offline-install",
+        // Curtin's `sources` form immediately runs apt-get update while
+        // Subiquity is still configuring its temporary source overlay. The
+        // installation media is not bind-mounted there yet, so a file:///cdrom
+        // source fails before installation starts. A complete sources-list
+        // template is written without that eager probe and is consumed after
+        // Subiquity makes /cdrom available to the installation environment.
+        "sources_list": "deb [trusted=yes] file:///cdrom/cybex/apt ./"
+    })
 }
 
 fn storage_config(disk: &str) -> Value {
@@ -911,6 +917,18 @@ mod tests {
                 .validate(1024, 2047, "8200", "CYBEX_STATE")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn offline_apt_source_does_not_trigger_curtins_early_repository_probe() {
+        let config = offline_apt_config();
+        assert_eq!(config["preserve_sources_list"], false);
+        assert_eq!(config["fallback"], "offline-install");
+        assert_eq!(
+            config["sources_list"],
+            "deb [trusted=yes] file:///cdrom/cybex/apt ./"
+        );
+        assert!(config.get("sources").is_none());
     }
 
     #[test]

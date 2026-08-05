@@ -160,6 +160,14 @@ for _attempt in $(seq 1 1080); do
   api GET "/v1/forge/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = ready ]]; then ready=true; break; fi
+  if [[ -s "$work_dir/serial.log" ]] \
+    && grep -aF 'An error occurred. Press enter to start a shell' "$work_dir/serial.log" >/dev/null
+  then
+    echo 'error: Ubuntu installer entered its fatal recovery shell' >&2
+    echo 'bounded qualification serial console follows:' >&2
+    tail -n 500 "$work_dir/serial.log" >&2
+    exit 1
+  fi
   if [[ "$state" = failed || "$state" = revoked || "$state" = expired ]]; then
     jq '{state,failure_code,failure_message,progress}' "$session" >&2
     exit 1
