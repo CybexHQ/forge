@@ -1,5 +1,6 @@
 use super::inventory::{
     ForgeProvisioningDisk, ForgeProvisioningEthernetInterface, ForgeProvisioningInventory,
+    hardware_digest, inventory_sha256,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{
@@ -75,6 +76,7 @@ pub struct SignedInstallPlan {
     pub session_id: Uuid,
     pub session_revision: i64,
     pub inventory_sha256: String,
+    pub hardware_digest: String,
     pub provisioning_public_key_fingerprint: String,
     pub reserved_device_id: String,
     pub display_name: String,
@@ -289,29 +291,31 @@ pub(crate) fn verify_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory_sha256: &str,
+    inventory: &ForgeProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
-    verify_install_plan_inner(value, signing_key, envelope, inventory_sha256, false)
+    verify_install_plan_inner(value, signing_key, envelope, inventory, false)
 }
 
 pub(crate) fn verify_durable_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory_sha256: &str,
+    inventory: &ForgeProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
-    verify_install_plan_inner(value, signing_key, envelope, inventory_sha256, true)
+    verify_install_plan_inner(value, signing_key, envelope, inventory, true)
 }
 
 fn verify_install_plan_inner(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory_sha256: &str,
+    inventory: &ForgeProvisioningInventory,
     acknowledged_attempt: bool,
 ) -> Result<SignedInstallPlan> {
     let plan: SignedInstallPlan =
         serde_json::from_value(value.clone()).context("parse signed install plan")?;
+    let expected_inventory_sha256 = inventory_sha256(inventory)?;
+    let expected_hardware_digest = hardware_digest(inventory)?;
     let expected_provisioning_fingerprint = sha256_hex(
         derive_provisioning_key(&envelope.media_secret)?
             .verifying_key()
@@ -321,7 +325,8 @@ fn verify_install_plan_inner(
         || plan.session_id != envelope.session_id
         || plan.organization_id.is_nil()
         || plan.release_version != envelope.release_version
-        || plan.inventory_sha256 != inventory_sha256
+        || plan.inventory_sha256 != expected_inventory_sha256
+        || plan.hardware_digest != expected_hardware_digest
         || plan.provisioning_public_key_fingerprint != expected_provisioning_fingerprint
         || plan.base_os != "ubuntu"
         || plan.base_os_version != "26.04"

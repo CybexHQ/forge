@@ -96,7 +96,6 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 
     let provisioning_key = protocol::derive_provisioning_key(&verified.envelope.media_secret)?;
     let inventory = inventory::collect_inventory().await?;
-    let inventory_sha256 = inventory::inventory_sha256(&inventory)?;
     let hardware_digest = inventory::hardware_digest(&inventory)?;
     let client = protocol::ProvisioningClient::new(
         &verified.envelope.manage_origin,
@@ -117,7 +116,7 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
                 plan,
                 &verified.signing_key,
                 &verified.envelope,
-                &inventory_sha256,
+                &inventory,
             )?;
         }
         match session.state.as_str() {
@@ -255,12 +254,11 @@ async fn resume_prepare(
         bail!("durable appliance recovery state does not match this signed media")
     }
     let inventory = inventory::collect_inventory().await?;
-    let inventory_sha256 = inventory::inventory_sha256(&inventory)?;
     let signed_plan = protocol::verify_durable_install_plan(
         serde_json::to_value(&durable.plan)?,
         &verified.signing_key,
         &verified.envelope,
-        &inventory_sha256,
+        &inventory,
     )?;
     inventory::revalidate_durable_plan_hardware(&signed_plan, &inventory)?;
     inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)

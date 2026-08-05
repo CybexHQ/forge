@@ -142,12 +142,25 @@ approve_body="$(jq -cn \
 api POST "/v1/forge/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
 
 ready=false
+pre_destructive_deadline=$((SECONDS + 300))
 for _attempt in $(seq 1 1080); do
   api GET "/v1/forge/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = ready ]]; then ready=true; break; fi
   if [[ "$state" = failed || "$state" = revoked || "$state" = expired ]]; then
     jq '{state,failure_code,failure_message,progress}' "$session" >&2
+    exit 1
+  fi
+  if [[ "$state" = approved ]] \
+    && [[ "$(jq -r '.destructive_started_at // ""' "$session")" = "" ]] \
+    && ((SECONDS >= pre_destructive_deadline))
+  then
+    echo 'error: approved Forge candidate did not acknowledge its plan before the qualification deadline' >&2
+    jq '{state,heartbeat_at,destructive_started_at,progress,failure_code,failure_message}' "$session" >&2
+    if [[ -s "$work_dir/serial.log" ]]; then
+      echo 'bounded qualification serial console follows:' >&2
+      tail -n 500 "$work_dir/serial.log" >&2
+    fi
     exit 1
   fi
   kill -0 "$qemu_pid"

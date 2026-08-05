@@ -156,6 +156,11 @@ state, generation commit/rollback, and network rollback helpers. Publication
 downloads the qualified artifact by ID/digest and fails if it is missing,
 expired, changed, or rebuilt.
 
+The automated boot entry mirrors Ubuntu to the first serial port so early
+installer failures are visible in the protected job. Qualification stops after
+five minutes when an approved candidate has not acknowledged its plan or begun
+destructive work, and includes only bounded console and session diagnostics.
+
 Production qualification must also cover the documented VM controller matrix
 and representative Dell, HP, Lenovo, Intel/AMD, Ethernet, SATA/NVMe/VMD, and
 firmware generations before the release is promoted.

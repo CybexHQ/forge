@@ -129,8 +129,8 @@ pub(crate) fn revalidate_plan_hardware(
     plan: &SignedInstallPlan,
     inventory: &ForgeProvisioningInventory,
 ) -> Result<()> {
-    if inventory_sha256(inventory)? != plan.inventory_sha256 {
-        bail!("hardware inventory changed after approval")
+    if hardware_digest(inventory)? != plan.hardware_digest {
+        bail!("stable hardware identity changed after approval")
     }
     if inventory.boot_mode != "uefi" || !inventory.secure_boot {
         bail!("UEFI Secure Boot must remain enabled")
@@ -143,6 +143,17 @@ pub(crate) fn revalidate_plan_hardware(
     if disk != &plan.target_disk || !disk.eligible {
         bail!("approved disk identity or eligibility changed")
     }
+    let interface = inventory
+        .ethernet_interfaces
+        .iter()
+        .find(|interface| interface.id == plan.network_interface.id)
+        .ok_or_else(|| anyhow!("approved wired interface is missing"))?;
+    if interface.name != plan.network_interface.name
+        || interface.mac != plan.network_interface.mac
+        || !interface.link_up
+    {
+        bail!("approved wired interface identity or link state changed")
+    }
     Ok(())
 }
 
@@ -150,7 +161,7 @@ pub(crate) fn revalidate_durable_plan_hardware(
     plan: &SignedInstallPlan,
     inventory: &ForgeProvisioningInventory,
 ) -> Result<()> {
-    if inventory_sha256(inventory)? != plan.inventory_sha256
+    if hardware_digest(inventory)? != plan.hardware_digest
         || inventory.boot_mode != "uefi"
         || !inventory.secure_boot
     {
@@ -921,6 +932,59 @@ fn canonical_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stable_inventory_fixture() -> ForgeProvisioningInventory {
+        ForgeProvisioningInventory {
+            manufacturer: "Cybex".into(),
+            model: "Qualification VM".into(),
+            serial_number: "vm-1".into(),
+            asset_tag: "lab".into(),
+            cpu_model: "test cpu".into(),
+            cpu_cores: 4,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+            firmware_version: "firmware-a".into(),
+            kernel_version: "kernel-a".into(),
+            boot_mode: "uefi".into(),
+            secure_boot: true,
+            virtualization: "kvm".into(),
+            ethernet_interfaces: vec![ForgeProvisioningEthernetInterface {
+                id: "pci-0000:00:03.0".into(),
+                name: "enp0s3".into(),
+                mac: "52:54:00:12:34:56".into(),
+                link_up: true,
+                addresses: vec!["10.62.52.76/24".into()],
+                gateway: Some("10.62.52.1".into()),
+            }],
+            disks: vec![ForgeProvisioningDisk {
+                id: "scsi-qualification".into(),
+                path: "/dev/sda".into(),
+                model: "QEMU disk".into(),
+                serial: "disk-1".into(),
+                wwn: String::new(),
+                size_bytes: 160 * 1024 * 1024 * 1024,
+                removable: false,
+                mounted: false,
+                held: false,
+                eligible: true,
+                blocker_codes: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn stable_hardware_digest_ignores_volatile_network_and_software_inventory() {
+        let inventory = stable_inventory_fixture();
+        let expected = hardware_digest(&inventory).unwrap();
+        let mut changed = inventory.clone();
+        changed.ethernet_interfaces[0].addresses = vec!["10.62.52.99/24".into()];
+        changed.ethernet_interfaces[0].gateway = Some("10.62.52.254".into());
+        changed.firmware_version = "firmware-b".into();
+        changed.kernel_version = "kernel-b".into();
+        assert_eq!(hardware_digest(&changed).unwrap(), expected);
+
+        changed.memory_bytes += 1024 * 1024 * 1024;
+        assert_ne!(hardware_digest(&changed).unwrap(), expected);
+    }
 
     #[test]
     fn subnet_validation_is_exact() {

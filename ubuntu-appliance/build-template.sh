@@ -172,7 +172,7 @@ jq -n \
   '{schema:$schema,release_id:$release_id,ubuntu_snapshot_id:$ubuntu_snapshot_id,filename:$filename,sha256:$sha256,size_bytes:$size_bytes,required_package_versions:$required_package_versions,expected_kernel:$required_package_versions["linux-generic"],minimum_protocol:4,minimum_state_schema:1,rollback_compatible:true}' \
   > "$package_metadata"
 
-kernel_arguments='autoinstall ds=nocloud\\;s=/cdrom/nocloud/'
+kernel_arguments='autoinstall ds=nocloud\\;s=/cdrom/nocloud/ console=tty0 console=ttyS0,115200n8'
 while IFS= read -r -d '' grub_config; do
   if ! grep -F 'ds=nocloud' "$grub_config" >/dev/null; then
     sed -i -E "s#([[:space:]]+---[[:space:]]*)\$# ${kernel_arguments} ---#" "$grub_config"
