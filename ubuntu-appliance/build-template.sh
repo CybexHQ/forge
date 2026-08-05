@@ -87,8 +87,12 @@ test "$(jq -er '.architecture' "$lock_file")" = "amd64"
 base_iso="$cache_dir/$base_filename"
 checksums="$cache_dir/SHA256SUMS"
 checksums_signature="$cache_dir/SHA256SUMS.gpg"
-curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$base_iso.part" "$base_url"
-mv -- "$base_iso.part" "$base_iso"
+if [[ ! -f "$base_iso" ]] \
+  || [[ "$(stat -c '%s' "$base_iso")" != "$base_size" ]] \
+  || [[ "$(sha256sum "$base_iso" | awk '{print $1}')" != "$base_sha256" ]]; then
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$base_iso.part" "$base_url"
+  mv -- "$base_iso.part" "$base_iso"
+fi
 curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums.part" "$checksums_url"
 mv -- "$checksums.part" "$checksums"
 curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums_signature.part" "$signature_url"
