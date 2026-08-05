@@ -1,14 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
 use axum::serve as axum_serve;
 use clap::Parser;
 use cybex_forge::{
-    AppState, assets,
+    AppState,
     config::{Cli, Command},
-    db,
-    manage::ExpectedUpdateReport,
-    router,
+    db, router,
 };
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
@@ -22,12 +20,22 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.clone().unwrap_or(Command::Serve);
-    if let Command::ValidateApplianceMedia {
-        installed_version,
-        media_version,
-    } = &command
-    {
-        cybex_forge::updater::validate_appliance_media_version(installed_version, media_version)?;
+    if matches!(command, Command::VerifyApplianceUpdate) {
+        #[cfg(unix)]
+        if effective_uid() != 0 {
+            anyhow::bail!("appliance package verification must run as root");
+        }
+        let packages = cybex_forge::appliance::verify_and_extract_stored_update()?;
+        println!("{}", packages.display());
+        return Ok(());
+    }
+    if matches!(command, Command::VerifyApplianceNetworkChange) {
+        #[cfg(unix)]
+        if effective_uid() != 0 {
+            anyhow::bail!("appliance network verification must run as root");
+        }
+        let candidate = cybex_forge::appliance::verify_and_materialize_network_change()?;
+        println!("{}", candidate.display());
         return Ok(());
     }
 
@@ -47,37 +55,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if matches!(command, Command::ReconcileAppliance) {
-        #[cfg(unix)]
-        if effective_uid() != 0 {
-            anyhow::bail!("appliance recovery reconciliation must run as root");
-        }
-        config
-            .validate_appliance_config()
-            .context("refusing appliance reconciliation with unsafe configuration")?;
-        return cybex_forge::updater::reconcile_appliance_recovery(&config);
-    }
-
     ensure_managed_command_is_not_root(&config, &command)?;
-
-    if matches!(command, Command::ApplyRuntimeConfig) {
-        return cybex_forge::manage::apply_runtime_config_once(&config).await;
-    }
-
-    if let CommandStartup::UpdateOnly {
-        projection_file,
-        expected_update,
-    } = command_startup(&command)?
-    {
-        let outcome = cybex_forge::manage::sync_update_report_once(
-            &config,
-            projection_file.as_deref(),
-            expected_update.as_ref(),
-        )
-        .await?;
-        println!("{}", serde_json::to_string(&outcome)?);
-        return Ok(());
-    }
 
     if !config.manage.enabled && config.auth.admin_token == "change-me" {
         warn!("admin token is still set to the example value");
@@ -100,116 +78,22 @@ async fn main() -> anyhow::Result<()> {
             info!("database migrations completed");
             Ok(())
         }
-        Command::ScanIsos => {
-            let summary = assets::scan_iso_dir(&config, &pool)
-                .await
-                .context("ISO scan failed")?;
-            info!(
-                count = summary.discovered,
-                hashed = summary.hashed,
-                reused = summary.reused,
-                "ISO scan completed"
-            );
-            Ok(())
-        }
-        Command::Enroll => {
-            let state = AppState::new(config, pool);
-            cybex_forge::manage::enroll_once(&state).await
-        }
-        Command::SyncOnce {
-            update_only,
-            update_projection_file,
-            expect_update_status,
-            expect_update_attempt,
-            expect_update_current_version,
-        } => {
-            debug_assert!(
-                !update_only
-                    && update_projection_file.is_none()
-                    && expect_update_status.is_none()
-                    && expect_update_attempt.is_none()
-                    && expect_update_current_version.is_none()
-            );
+        Command::SyncOnce => {
             let state = AppState::new(config, pool);
             let outcome = cybex_forge::manage::sync_once(&state).await?;
             println!("{}", serde_json::to_string(&outcome)?);
             Ok(())
         }
-        Command::ApplyRuntimeConfig => {
-            unreachable!("apply-runtime-config exits before database setup")
-        }
         Command::PrintConfig => unreachable!("print-config exits before database setup"),
         Command::ValidateApplianceConfig => {
             unreachable!("validate-appliance-config exits before database setup")
         }
-        Command::ValidateApplianceMedia { .. } => {
-            unreachable!("media validation exits before config loading")
+        Command::VerifyApplianceUpdate => {
+            unreachable!("appliance update verification exits before config loading")
         }
-        Command::ReconcileAppliance => {
-            unreachable!("appliance reconciliation exits before database setup")
+        Command::VerifyApplianceNetworkChange => {
+            unreachable!("appliance network verification exits before config loading")
         }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CommandStartup {
-    DatabaseBacked,
-    UpdateOnly {
-        projection_file: Option<PathBuf>,
-        expected_update: Option<ExpectedUpdateReport>,
-    },
-}
-
-fn command_startup(command: &Command) -> anyhow::Result<CommandStartup> {
-    let Command::SyncOnce {
-        update_only,
-        update_projection_file,
-        expect_update_status,
-        expect_update_attempt,
-        expect_update_current_version,
-    } = command
-    else {
-        return Ok(CommandStartup::DatabaseBacked);
-    };
-    match (
-        *update_only,
-        expect_update_status,
-        expect_update_attempt,
-        expect_update_current_version,
-    ) {
-        (true, Some(status), Some(attempt_id), Some(current_version)) => {
-            if update_projection_file.is_some() && status != "idle" {
-                bail!("explicit update-only Forge projections are restricted to idle status");
-            }
-            if status == "idle" && !attempt_id.is_empty() {
-                bail!("idle update-only Forge sync requires an empty expected attempt ID");
-            }
-            if status != "idle" && attempt_id.is_empty() {
-                bail!(
-                    "non-idle update-only Forge sync requires a 32-character expected attempt ID"
-                );
-            }
-            Ok(CommandStartup::UpdateOnly {
-                projection_file: update_projection_file.clone(),
-                expected_update: Some(ExpectedUpdateReport {
-                    status: status.clone(),
-                    attempt_id: attempt_id.clone(),
-                    current_version: current_version.clone(),
-                }),
-            })
-        }
-        (true, None, None, None) if update_projection_file.is_none() => {
-            Ok(CommandStartup::UpdateOnly {
-                projection_file: None,
-                expected_update: None,
-            })
-        }
-        (false, None, None, None) if update_projection_file.is_none() => {
-            Ok(CommandStartup::DatabaseBacked)
-        }
-        _ => bail!(
-            "update-only Forge sync requires all three update expectation arguments when any is set"
-        ),
     }
 }
 
@@ -221,7 +105,7 @@ fn ensure_managed_command_is_not_root(
     {
         if managed_command_requires_service_user(config, command) && effective_uid() == 0 {
             bail!(
-                "managed Cybex Forge stateful commands must not run as root; use systemctl for the service or cybex-forge-sync-once for manual sync checks"
+                "managed Cybex Forge stateful commands must not run as root; use systemctl for the service"
             );
         }
     }
@@ -238,9 +122,8 @@ fn managed_command_requires_service_user(
             command,
             Command::PrintConfig
                 | Command::ValidateApplianceConfig
-                | Command::ApplyRuntimeConfig
-                | Command::ValidateApplianceMedia { .. }
-                | Command::ReconcileAppliance
+                | Command::VerifyApplianceUpdate
+                | Command::VerifyApplianceNetworkChange
         )
 }
 
@@ -265,6 +148,7 @@ async fn run_server(
         warn!(error = %err, "Forge Cache initialization failed; substituters will reject this cache until resolved");
     }
     cybex_forge::build::spawn(state.clone());
+    cybex_forge::netboot::spawn_maintenance(state.clone());
     if state.config.manage.enabled {
         cybex_forge::manage::spawn(state.clone());
     }
@@ -345,30 +229,16 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use cybex_forge::config::AppConfig;
 
-    use super::{Command, CommandStartup, command_startup, managed_command_requires_service_user};
+    use super::{Command, managed_command_requires_service_user};
 
     #[test]
     fn managed_stateful_commands_require_service_user() {
         let mut config = AppConfig::default();
         config.manage.enabled = true;
 
-        for command in [
-            Command::Serve,
-            Command::Migrate,
-            Command::ScanIsos,
-            Command::Enroll,
-            Command::SyncOnce {
-                update_only: false,
-                update_projection_file: None,
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            },
-        ] {
+        for command in [Command::Serve, Command::Migrate, Command::SyncOnce] {
             assert!(managed_command_requires_service_user(&config, &command));
         }
         assert!(!managed_command_requires_service_user(
@@ -379,112 +249,10 @@ mod tests {
             &config,
             &Command::ValidateApplianceConfig
         ));
-        assert!(!managed_command_requires_service_user(
-            &config,
-            &Command::ApplyRuntimeConfig
-        ));
-        assert!(!managed_command_requires_service_user(
-            &config,
-            &Command::ValidateApplianceMedia {
-                installed_version: "0.1.1".to_string(),
-                media_version: "0.1.2".to_string(),
-            }
-        ));
-        assert!(!managed_command_requires_service_user(
-            &config,
-            &Command::ReconcileAppliance
-        ));
-
         config.manage.enabled = false;
         assert!(!managed_command_requires_service_user(
             &config,
-            &Command::SyncOnce {
-                update_only: false,
-                update_projection_file: None,
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            }
+            &Command::SyncOnce
         ));
-    }
-
-    #[test]
-    fn update_only_sync_uses_the_database_free_startup_path() {
-        let command = Command::SyncOnce {
-            update_only: true,
-            update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
-            expect_update_status: Some("idle".to_string()),
-            expect_update_attempt: Some(String::new()),
-            expect_update_current_version: Some("0.1.1".to_string()),
-        };
-
-        let startup = command_startup(&command).unwrap();
-
-        assert!(matches!(
-            &startup,
-            CommandStartup::UpdateOnly {
-                projection_file: Some(_),
-                expected_update: Some(_),
-            }
-        ));
-        assert_ne!(startup, CommandStartup::DatabaseBacked);
-        assert_eq!(
-            command_startup(&Command::SyncOnce {
-                update_only: false,
-                update_projection_file: None,
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            })
-            .unwrap(),
-            CommandStartup::DatabaseBacked
-        );
-        assert_eq!(
-            command_startup(&Command::SyncOnce {
-                update_only: true,
-                update_projection_file: None,
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            })
-            .unwrap(),
-            CommandStartup::UpdateOnly {
-                projection_file: None,
-                expected_update: None,
-            }
-        );
-
-        for invalid in [
-            Command::SyncOnce {
-                update_only: true,
-                update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            },
-            Command::SyncOnce {
-                update_only: true,
-                update_projection_file: Some(PathBuf::from("/tmp/update-projection.json")),
-                expect_update_status: Some("failed".to_string()),
-                expect_update_attempt: Some("a".repeat(32)),
-                expect_update_current_version: Some("0.1.1".to_string()),
-            },
-            Command::SyncOnce {
-                update_only: true,
-                update_projection_file: None,
-                expect_update_status: Some("idle".to_string()),
-                expect_update_attempt: Some("a".repeat(32)),
-                expect_update_current_version: Some("0.1.1".to_string()),
-            },
-            Command::SyncOnce {
-                update_only: true,
-                update_projection_file: None,
-                expect_update_status: Some("failed".to_string()),
-                expect_update_attempt: Some(String::new()),
-                expect_update_current_version: Some("0.1.1".to_string()),
-            },
-        ] {
-            assert!(command_startup(&invalid).is_err());
-        }
     }
 }

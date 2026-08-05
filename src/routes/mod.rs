@@ -12,7 +12,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::AppState;
+use crate::{AppState, netboot};
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 1024;
 const CONTENT_SECURITY_POLICY: &str = concat!(
@@ -28,10 +28,19 @@ pub fn router(state: AppState) -> Router {
         .route("/boot", get(boot::boot_root))
         .route("/boot.ipxe", get(boot::boot_root))
         .route("/boot/:mac", get(boot::boot_mac))
+        .route("/boot/:mac/kexec.json", get(boot::boot_kexec))
         .route("/boot/by-serial/:serial", get(boot::boot_serial))
         .route("/boot/select/:profile_id", get(boot::boot_select_profile))
         .route("/files/*path", get(files::boot_file))
         .route("/cache/*path", get(files::cache_file))
+        .route(
+            "/netboot/:bundle_sha256/:component",
+            get(netboot::serve_component),
+        )
+        .route(
+            "/boot-session/:session_id/context.cpio",
+            get(netboot::serve_context),
+        )
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(add_security_headers))
         .layer(TraceLayer::new_for_http().make_span_with(request_trace_span))
@@ -49,7 +58,11 @@ fn request_trace_span(request: &Request<Body>) -> tracing::Span {
 }
 
 fn request_trace_path(uri: &Uri) -> &str {
-    uri.path()
+    if uri.path().starts_with("/boot-session/") {
+        "/boot-session/:session_id/context.cpio"
+    } else {
+        uri.path()
+    }
 }
 
 async fn healthz() -> Response {
@@ -272,7 +285,6 @@ public_base_url = "http://boot.example"
 data_dir = "{root}/data"
 database_path = "{root}/data/cybex-forge.sqlite"
 boot_assets_dir = "{root}/www"
-iso_dir = "{root}/www/isos"
 static_dir = "{root}/www/assets"
 tftp_dir = "{root}/tftp"
 
@@ -284,10 +296,6 @@ output_dir = "{root}/build/outputs"
 root_dir = "{root}/www/cache"
 private_key_path = "{root}/cache/cache-priv-key.pem"
 public_key_path = "{root}/cache/cache-pub-key.pem"
-
-[update]
-work_dir = "{root}/updates"
-releases_dir = "{root}/releases"
 
 [manage]
 state_path = "{root}/manage-state.json"

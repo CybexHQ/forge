@@ -1,0 +1,43 @@
+[Unit]
+Description=Cybex Forge managed appliance service
+After=network-online.target nix-daemon.service
+Wants=network-online.target
+RequiresMountsFor=/var/lib/cybex-forge/state /var/cache/cybex-forge /nix
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=30s
+User=cybex-forge
+Group=cybex-forge
+ExecStart=/usr/bin/cybex-forge --config /etc/cybex-forge/config.toml serve
+WorkingDirectory=/var/lib/cybex-forge
+Restart=always
+RestartSec=3s
+UMask=0077
+ReadWritePaths=/var/lib/cybex-forge /var/cache/cybex-forge
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

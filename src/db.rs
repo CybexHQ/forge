@@ -14,7 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         BootEvent, BootProfile, BootProfileType, BuildJob, CacheArtifact, CreateBootProfileRequest,
-        CreateBuildJobRequest, CreateCacheArtifactRequest, CreateDeviceRequest, Device, IsoAsset,
+        CreateBuildJobRequest, CreateCacheArtifactRequest, CreateDeviceRequest, Device,
         NewBootEvent, UpdateBootProfileRequest, UpdateDeviceRequest, clean_optional_string,
         clean_tags, normalize_mac,
     },
@@ -64,7 +64,6 @@ pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
     fs::create_dir_all(&config.paths.data_dir)?;
     set_private_dir_permissions(&config.paths.data_dir)?;
     fs::create_dir_all(&config.paths.boot_assets_dir)?;
-    fs::create_dir_all(&config.paths.iso_dir)?;
     fs::create_dir_all(&config.paths.static_dir)?;
     fs::create_dir_all(&config.paths.tftp_dir)?;
     fs::create_dir_all(&config.build.work_dir)?;
@@ -72,9 +71,6 @@ pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
     fs::create_dir_all(&config.build.output_dir)?;
     set_private_dir_permissions(&config.build.output_dir)?;
     fs::create_dir_all(&config.cache.root_dir)?;
-    fs::create_dir_all(&config.update.work_dir)?;
-    set_private_dir_permissions(&config.update.work_dir)?;
-    fs::create_dir_all(&config.update.releases_dir)?;
     if let Some(parent) = config.cache.private_key_path.parent() {
         fs::create_dir_all(parent)?;
         set_private_dir_permissions(parent)?;
@@ -396,22 +392,10 @@ struct BootProfileRow {
     name: String,
     description: String,
     profile_type: String,
-    installer_iso_source: String,
     enabled: i64,
     is_default: i64,
     one_time: i64,
-    kernel_path: Option<String>,
-    initrd_path: Option<String>,
-    iso_path: Option<String>,
-    cmdline: Option<String>,
     raw_script: Option<String>,
-    desired_iso_artifact_id: String,
-    desired_iso_filename: String,
-    desired_iso_size_bytes: i64,
-    desired_iso_sha256: String,
-    desired_iso_built_at: Option<String>,
-    desired_iso_url: String,
-    desired_iso_download_url: String,
     created_at: String,
     updated_at: String,
 }
@@ -426,22 +410,10 @@ impl TryFrom<BootProfileRow> for BootProfile {
             name: row.name,
             description: row.description,
             profile_type: BootProfileType::from_str(&row.profile_type)?,
-            installer_iso_source: row.installer_iso_source,
             enabled: row.enabled != 0,
             is_default: row.is_default != 0,
             one_time: row.one_time != 0,
-            kernel_path: row.kernel_path,
-            initrd_path: row.initrd_path,
-            iso_path: row.iso_path,
-            cmdline: row.cmdline,
             raw_script: row.raw_script,
-            desired_iso_artifact_id: row.desired_iso_artifact_id,
-            desired_iso_filename: row.desired_iso_filename,
-            desired_iso_size_bytes: row.desired_iso_size_bytes,
-            desired_iso_sha256: row.desired_iso_sha256,
-            desired_iso_built_at: row.desired_iso_built_at,
-            desired_iso_url: row.desired_iso_url,
-            desired_iso_download_url: row.desired_iso_download_url,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -475,72 +447,6 @@ impl From<BootEventRow> for BootEvent {
             selected_profile_name: row.selected_profile_name,
             known_device: row.known_device != 0,
             created_at: row.created_at,
-        }
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct IsoAssetRow {
-    id: i64,
-    filename: String,
-    relative_path: String,
-    size_bytes: i64,
-    checksum_sha256: String,
-    last_scanned_at: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IsoAssetFileIdentity {
-    pub size_bytes: i64,
-    pub device: i64,
-    pub inode: i64,
-    pub mtime_seconds: i64,
-    pub mtime_nanoseconds: i64,
-    pub ctime_seconds: i64,
-    pub ctime_nanoseconds: i64,
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct IsoAssetScanState {
-    pub relative_path: String,
-    pub checksum_sha256: String,
-    pub checksum_verified_at: Option<String>,
-    size_bytes: i64,
-    file_device: Option<i64>,
-    file_inode: Option<i64>,
-    file_mtime_seconds: Option<i64>,
-    file_mtime_nanoseconds: Option<i64>,
-    file_ctime_seconds: Option<i64>,
-    file_ctime_nanoseconds: Option<i64>,
-}
-
-impl IsoAssetScanState {
-    pub fn file_identity(&self) -> Option<IsoAssetFileIdentity> {
-        Some(IsoAssetFileIdentity {
-            size_bytes: self.size_bytes,
-            device: self.file_device?,
-            inode: self.file_inode?,
-            mtime_seconds: self.file_mtime_seconds?,
-            mtime_nanoseconds: self.file_mtime_nanoseconds?,
-            ctime_seconds: self.file_ctime_seconds?,
-            ctime_nanoseconds: self.file_ctime_nanoseconds?,
-        })
-    }
-}
-
-impl From<IsoAssetRow> for IsoAsset {
-    fn from(row: IsoAssetRow) -> Self {
-        Self {
-            id: row.id,
-            filename: row.filename,
-            relative_path: row.relative_path,
-            size_bytes: row.size_bytes,
-            checksum_sha256: row.checksum_sha256,
-            last_scanned_at: row.last_scanned_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
         }
     }
 }
@@ -1013,24 +919,15 @@ pub async fn create_profile(
     let enabled = input.enabled.unwrap_or(true);
     let is_default = input.is_default.unwrap_or(false);
     let one_time = input.one_time.unwrap_or(false);
-    let kernel_path = clean_optional_string(input.kernel_path);
-    let initrd_path = clean_optional_string(input.initrd_path);
-    let iso_path = clean_optional_string(input.iso_path);
-    let cmdline = clean_optional_string(input.cmdline);
     let raw_script = clean_optional_string(input.raw_script);
-    validate_profile_path(kernel_path.as_deref(), "kernel_path")?;
-    validate_profile_path(initrd_path.as_deref(), "initrd_path")?;
-    validate_profile_path(iso_path.as_deref(), "iso_path")?;
-    validate_profile_cmdline(cmdline.as_deref())?;
     validate_profile_description(Some(&description))?;
     validate_profile_raw_script(raw_script.as_deref())?;
+    validate_profile_shape(input.profile_type, raw_script.as_deref())?;
     if is_default {
         validate_assignable_profile_fields(
             "default profile",
             enabled,
             input.profile_type,
-            kernel_path.as_deref(),
-            iso_path.as_deref(),
             raw_script.as_deref(),
         )?;
         clear_default_profiles(pool).await?;
@@ -1040,8 +937,8 @@ pub async fn create_profile(
     let result = sqlx::query(
         "INSERT INTO boot_profiles
          (name, description, profile_type, enabled, is_default, one_time,
-          kernel_path, initrd_path, iso_path, cmdline, raw_script, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          raw_script, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(description)
@@ -1049,10 +946,6 @@ pub async fn create_profile(
     .bind(bool_to_i64(enabled))
     .bind(bool_to_i64(is_default))
     .bind(bool_to_i64(one_time))
-    .bind(kernel_path)
-    .bind(initrd_path)
-    .bind(iso_path)
-    .bind(cmdline)
     .bind(raw_script)
     .bind(&now)
     .bind(&now)
@@ -1075,51 +968,24 @@ pub async fn update_profile(
     let enabled = input.enabled.unwrap_or(current.enabled);
     let is_default = input.is_default.unwrap_or(current.is_default);
     let one_time = input.one_time.unwrap_or(current.one_time);
-    let kernel_path = input
-        .kernel_path
-        .map(clean_optional_string)
-        .unwrap_or(current.kernel_path);
-    let initrd_path = input
-        .initrd_path
-        .map(clean_optional_string)
-        .unwrap_or(current.initrd_path);
-    let iso_path = input
-        .iso_path
-        .map(clean_optional_string)
-        .unwrap_or(current.iso_path);
-    let cmdline = input
-        .cmdline
-        .map(clean_optional_string)
-        .unwrap_or(current.cmdline);
     let raw_script = input
         .raw_script
         .map(clean_optional_string)
         .unwrap_or(current.raw_script);
 
-    validate_profile_path(kernel_path.as_deref(), "kernel_path")?;
-    validate_profile_path(initrd_path.as_deref(), "initrd_path")?;
-    validate_profile_path(iso_path.as_deref(), "iso_path")?;
-    validate_profile_cmdline(cmdline.as_deref())?;
     validate_profile_description(Some(&description))?;
     validate_profile_raw_script(raw_script.as_deref())?;
+    validate_profile_shape(profile_type, raw_script.as_deref())?;
 
     if is_default {
         validate_assignable_profile_fields(
             "default profile",
             enabled,
             profile_type,
-            kernel_path.as_deref(),
-            iso_path.as_deref(),
             raw_script.as_deref(),
         )?;
         clear_default_profiles(pool).await?;
-    } else if !profile_fields_have_boot_action(
-        profile_type,
-        kernel_path.as_deref(),
-        iso_path.as_deref(),
-        raw_script.as_deref(),
-    ) || !enabled
-    {
+    } else if !profile_fields_have_boot_action(profile_type, raw_script.as_deref()) || !enabled {
         validate_profile_has_no_device_assignments(pool, id).await?;
     }
 
@@ -1127,8 +993,7 @@ pub async fn update_profile(
     sqlx::query(
         "UPDATE boot_profiles
          SET name = ?, description = ?, profile_type = ?, enabled = ?, is_default = ?,
-             one_time = ?, kernel_path = ?, initrd_path = ?, iso_path = ?, cmdline = ?,
-             raw_script = ?, updated_at = ?
+             one_time = ?, raw_script = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(name.trim())
@@ -1137,10 +1002,6 @@ pub async fn update_profile(
     .bind(bool_to_i64(enabled))
     .bind(bool_to_i64(is_default))
     .bind(bool_to_i64(one_time))
-    .bind(kernel_path)
-    .bind(initrd_path)
-    .bind(iso_path)
-    .bind(cmdline)
     .bind(raw_script)
     .bind(&now)
     .bind(id)
@@ -1239,102 +1100,6 @@ async fn get_boot_event(pool: &SqlitePool, id: i64) -> AppResult<BootEvent> {
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(row.into())
-}
-
-pub async fn list_iso_assets(pool: &SqlitePool) -> AppResult<Vec<IsoAsset>> {
-    let rows = sqlx::query_as::<_, IsoAssetRow>(
-        "SELECT * FROM iso_assets ORDER BY filename COLLATE NOCASE ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(IsoAsset::from).collect())
-}
-
-pub async fn list_iso_asset_scan_states(pool: &SqlitePool) -> AppResult<Vec<IsoAssetScanState>> {
-    Ok(sqlx::query_as::<_, IsoAssetScanState>(
-        "SELECT relative_path, checksum_sha256, checksum_verified_at,
-                size_bytes, file_device, file_inode,
-                file_mtime_seconds, file_mtime_nanoseconds,
-                file_ctime_seconds, file_ctime_nanoseconds
-         FROM iso_assets",
-    )
-    .fetch_all(pool)
-    .await?)
-}
-
-pub async fn upsert_iso_asset(
-    pool: &SqlitePool,
-    filename: &str,
-    relative_path: &str,
-    identity: IsoAssetFileIdentity,
-    checksum_sha256: &str,
-    checksum_verified_at: &str,
-) -> AppResult<IsoAsset> {
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO iso_assets
-         (filename, relative_path, size_bytes, checksum_sha256,
-          file_device, file_inode, file_mtime_seconds, file_mtime_nanoseconds,
-          file_ctime_seconds, file_ctime_nanoseconds, checksum_verified_at,
-          last_scanned_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(relative_path) DO UPDATE SET
-             filename = excluded.filename,
-             size_bytes = excluded.size_bytes,
-             checksum_sha256 = excluded.checksum_sha256,
-             file_device = excluded.file_device,
-             file_inode = excluded.file_inode,
-             file_mtime_seconds = excluded.file_mtime_seconds,
-             file_mtime_nanoseconds = excluded.file_mtime_nanoseconds,
-             file_ctime_seconds = excluded.file_ctime_seconds,
-             file_ctime_nanoseconds = excluded.file_ctime_nanoseconds,
-             checksum_verified_at = excluded.checksum_verified_at,
-             last_scanned_at = excluded.last_scanned_at,
-             updated_at = excluded.updated_at",
-    )
-    .bind(filename)
-    .bind(relative_path)
-    .bind(identity.size_bytes)
-    .bind(checksum_sha256)
-    .bind(identity.device)
-    .bind(identity.inode)
-    .bind(identity.mtime_seconds)
-    .bind(identity.mtime_nanoseconds)
-    .bind(identity.ctime_seconds)
-    .bind(identity.ctime_nanoseconds)
-    .bind(checksum_verified_at)
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
-    .execute(pool)
-    .await?;
-
-    let row = sqlx::query_as::<_, IsoAssetRow>("SELECT * FROM iso_assets WHERE relative_path = ?")
-        .bind(relative_path)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok(row.into())
-}
-
-pub async fn prune_missing_iso_assets(
-    pool: &SqlitePool,
-    retained_relative_paths: &[String],
-) -> AppResult<usize> {
-    let retained: HashSet<&str> = retained_relative_paths.iter().map(String::as_str).collect();
-    let current = list_iso_assets(pool).await?;
-    let mut removed = 0usize;
-    for asset in current {
-        if retained.contains(asset.relative_path.as_str()) {
-            continue;
-        }
-        sqlx::query("DELETE FROM iso_assets WHERE relative_path = ?")
-            .bind(&asset.relative_path)
-            .execute(pool)
-            .await?;
-        removed += 1;
-    }
-    Ok(removed)
 }
 
 pub async fn list_build_jobs(pool: &SqlitePool) -> AppResult<Vec<BuildJob>> {
@@ -2308,8 +2073,6 @@ fn validate_assignable_profile(profile: &BootProfile, field: &str) -> AppResult<
         field,
         profile.enabled,
         profile.profile_type,
-        profile.kernel_path.as_deref(),
-        profile.iso_path.as_deref(),
         profile.raw_script.as_deref(),
     )
 }
@@ -2318,8 +2081,6 @@ fn validate_assignable_profile_fields(
     field: &str,
     enabled: bool,
     profile_type: BootProfileType,
-    kernel_path: Option<&str>,
-    iso_path: Option<&str>,
     raw_script: Option<&str>,
 ) -> AppResult<()> {
     if !enabled {
@@ -2327,7 +2088,7 @@ fn validate_assignable_profile_fields(
             "{field} must target an enabled profile"
         )));
     }
-    if !profile_fields_have_boot_action(profile_type, kernel_path, iso_path, raw_script) {
+    if !profile_fields_have_boot_action(profile_type, raw_script) {
         return Err(AppError::Validation(format!(
             "{field} must target a profile with a runnable boot action"
         )));
@@ -2337,28 +2098,28 @@ fn validate_assignable_profile_fields(
 
 fn profile_fields_have_boot_action(
     profile_type: BootProfileType,
-    kernel_path: Option<&str>,
-    iso_path: Option<&str>,
     raw_script: Option<&str>,
 ) -> bool {
-    if raw_script
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return true;
-    }
     match profile_type {
-        BootProfileType::LocalDisk => true,
-        BootProfileType::LinuxInstaller | BootProfileType::IsoLive => {
-            kernel_path
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-                || iso_path
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-        }
-        BootProfileType::CustomIpxe => false,
+        BootProfileType::LocalDisk | BootProfileType::ForgeInstaller => true,
+        BootProfileType::CustomIpxe => raw_script
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
     }
+}
+
+fn validate_profile_shape(
+    profile_type: BootProfileType,
+    raw_script: Option<&str>,
+) -> AppResult<()> {
+    if profile_type != BootProfileType::CustomIpxe
+        && raw_script.is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(AppError::Validation(
+            "raw_script is only supported for custom_ipxe profiles".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_profile_has_no_device_assignments(
@@ -2394,29 +2155,6 @@ fn validate_profile_name(name: &str) -> AppResult<()> {
     if trimmed.chars().any(char::is_control) {
         return Err(AppError::Validation(
             "profile name must not contain control characters".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_profile_path(value: Option<&str>, field: &str) -> AppResult<()> {
-    if let Some(value) = value {
-        if !value.trim().is_empty() && sanitize_relative_path(value).is_err() {
-            return Err(AppError::Validation(format!(
-                "{field} must be a relative path under the boot assets directory"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_profile_cmdline(value: Option<&str>) -> AppResult<()> {
-    if value
-        .map(|value| value.chars().any(char::is_control))
-        .unwrap_or(false)
-    {
-        return Err(AppError::Validation(
-            "profile cmdline must not contain control characters".to_string(),
         ));
     }
     Ok(())
@@ -3119,14 +2857,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: Some("netboot/initrd.img".to_string()),
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3176,14 +2910,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Stale installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
-                kernel_path: Some("netboot/stale-vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3194,14 +2924,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Current installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
-                kernel_path: Some("netboot/current-vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3240,14 +2966,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3515,31 +3237,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_cmdline_rejects_control_characters() {
-        let pool = test_pool().await;
-        let err = create_profile(
-            &pool,
-            CreateBootProfileRequest {
-                name: "Installer".to_string(),
-                description: None,
-                profile_type: BootProfileType::LinuxInstaller,
-                enabled: Some(true),
-                is_default: Some(false),
-                one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: Some("auto=true\nshell".to_string()),
-                raw_script: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err.to_string().contains("cmdline"));
-    }
-
-    #[tokio::test]
     async fn profile_name_rejects_control_characters() {
         let pool = test_pool().await;
         let err = create_profile(
@@ -3547,14 +3244,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer\nshell".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3572,14 +3265,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: Some("x".repeat(MAX_PROFILE_DESCRIPTION_CHARS + 1)),
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3601,10 +3290,6 @@ mod tests {
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: None,
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: Some("echo x\n".repeat((MAX_PROFILE_RAW_SCRIPT_BYTES / 7) + 1)),
             },
         )
@@ -3628,14 +3313,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Broken default".to_string(),
                 description: None,
-                profile_type: BootProfileType::IsoLive,
+                profile_type: BootProfileType::CustomIpxe,
                 enabled: Some(true),
                 is_default: Some(true),
                 one_time: Some(false),
-                kernel_path: None,
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3685,14 +3366,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "No assets".to_string(),
                 description: None,
-                profile_type: BootProfileType::IsoLive,
+                profile_type: BootProfileType::CustomIpxe,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: None,
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3703,14 +3380,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Disabled installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(false),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3762,14 +3435,10 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Assigned installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::LinuxInstaller,
+                profile_type: BootProfileType::ForgeInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
-                kernel_path: Some("netboot/vmlinuz".to_string()),
-                initrd_path: None,
-                iso_path: None,
-                cmdline: None,
                 raw_script: None,
             },
         )
@@ -3794,7 +3463,7 @@ mod tests {
             &pool,
             profile.id,
             UpdateBootProfileRequest {
-                kernel_path: Some(None),
+                profile_type: Some(BootProfileType::CustomIpxe),
                 ..UpdateBootProfileRequest::default()
             },
         )
@@ -3803,53 +3472,7 @@ mod tests {
         let unchanged = get_profile(&pool, profile.id).await.unwrap();
 
         assert!(err.to_string().contains("assigned profile"));
-        assert_eq!(unchanged.kernel_path.as_deref(), Some("netboot/vmlinuz"));
-    }
-
-    #[tokio::test]
-    async fn prune_missing_iso_assets_removes_unseen_rows() {
-        let pool = test_pool().await;
-        let identity = IsoAssetFileIdentity {
-            size_bytes: 10,
-            device: 1,
-            inode: 2,
-            mtime_seconds: 3,
-            mtime_nanoseconds: 4,
-            ctime_seconds: 5,
-            ctime_nanoseconds: 6,
-        };
-        upsert_iso_asset(
-            &pool,
-            "keep.iso",
-            "keep.iso",
-            identity,
-            &"a".repeat(64),
-            "2026-07-15T00:00:00Z",
-        )
-        .await
-        .unwrap();
-        upsert_iso_asset(
-            &pool,
-            "stale.iso",
-            "nested/stale.iso",
-            IsoAssetFileIdentity {
-                size_bytes: 20,
-                ..identity
-            },
-            &"b".repeat(64),
-            "2026-07-15T00:00:00Z",
-        )
-        .await
-        .unwrap();
-
-        let removed = prune_missing_iso_assets(&pool, &["keep.iso".to_string()])
-            .await
-            .unwrap();
-        let assets = list_iso_assets(&pool).await.unwrap();
-
-        assert_eq!(removed, 1);
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].relative_path, "keep.iso");
+        assert_eq!(unchanged.profile_type, BootProfileType::ForgeInstaller);
     }
 
     #[tokio::test]

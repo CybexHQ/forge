@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+if (($# != 2)); then
+  echo "usage: $0 SIGNED-CANDIDATE ACK-FILE" >&2
+  exit 2
+fi
+candidate="$1"
+ack_file="$2"
+active=/etc/netplan/90-cybex-forge.yaml
+state_dir=/var/lib/cybex-forge/state
+backup="$state_dir/netplan-before-change.yaml"
+pending="$state_dir/netplan-pending.sha256"
+test -f "$candidate" && test ! -L "$candidate"
+test "$(stat -c '%U:%G:%a' "$candidate")" = root:root:600
+candidate_sha="$(sha256sum "$candidate" | awk '{print $1}')"
+install -m 0600 "$active" "$backup"
+install -m 0600 "$candidate" "$active"
+printf '%s\n' "$candidate_sha" > "$pending"
+
+rollback() {
+  install -m 0600 "$backup" "$active"
+  netplan generate
+  netplan apply
+  rm -f "$pending"
+}
+trap rollback ERR
+netplan generate
+netplan apply
+
+for _attempt in $(seq 1 120); do
+  if [[ -f "$ack_file" ]] && [[ "$(tr -d '\n' < "$ack_file")" = "$candidate_sha" ]]; then
+    install -m 0600 "$candidate" "$state_dir/netplan-approved.json"
+    rm -f "$pending" "$backup" "$ack_file"
+    trap - ERR
+    exit 0
+  fi
+  sleep 1
+done
+echo "error: Management did not acknowledge the network change; rolling back" >&2
+false

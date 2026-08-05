@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-forge/state
+request="$state_dir/appliance-network-change-request.json"
+status="$state_dir/appliance-network-change-status.json"
+ack="$state_dir/netplan-ack.sha256"
+lock="$state_dir/appliance-network-change.lock"
+exec 9>"$lock"
+flock -n 9 || exit 0
+test -s "$request"
+
+change_id="$(jq -er '.id' "$request")"
+config_sha256="$(jq -er '.config_sha256' "$request")"
+[[ "$change_id" =~ ^[0-9a-f-]{36}$ ]]
+[[ "$config_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+write_status() {
+  local result="$1" stage="$2" candidate="${3:-}" failure="${4:-}"
+  jq -n --arg status "$result" --arg stage "$stage" --arg change_id "$change_id" \
+    --arg config_sha256 "$config_sha256" --arg candidate_sha256 "$candidate" \
+    --arg failure_code "$failure" --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    '{status:$status,stage:$stage,change_id:$change_id,config_sha256:$config_sha256,
+      candidate_sha256:$candidate_sha256,failure_code:$failure_code,
+      reported_at:$reported_at}' > "$status.tmp"
+  chmod 0600 "$status.tmp"
+  mv -f "$status.tmp" "$status"
+  sync -f "$state_dir"
+}
+
+candidate=""
+rollback() {
+  trap - ERR
+  candidate_sha256=""
+  [[ -s "$state_dir/netplan-pending.sha256" ]] \
+    && candidate_sha256="$(tr -d '\n' < "$state_dir/netplan-pending.sha256")"
+  write_status rolled_back rollback "$candidate_sha256" acknowledgement_timeout
+  rm -f "$request" "$ack" "$candidate"
+}
+trap rollback ERR
+
+write_status applying preflight
+candidate="$(/usr/bin/cybex-forge verify-appliance-network-change)"
+test "$candidate" = "/run/cybex-forge-network-change/$change_id.yaml"
+candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+write_status applying netplan_try "$candidate_sha256"
+/usr/lib/cybex-forge/cybex-forge-netplan-apply "$candidate" "$ack"
+write_status acknowledged committed "$candidate_sha256"
+rm -f "$request" "$candidate"
+trap - ERR

@@ -32,6 +32,7 @@ allowed_systems = ["x86_64-linux"]
 work_dir = "/var/lib/cybex-forge/build"
 output_dir = "/var/lib/cybex-forge/build-outputs"
 nix_binary = "/nix/var/nix/profiles/default/bin/nix"
+manage_source_url_template = "github:CybexHQ/manage/{revision}"
 
 # Add one or more allowlisted Nix targets before queueing production jobs.
 # For generated Blueprint closure builds, flake is the nixpkgs input
@@ -53,26 +54,13 @@ max_bytes = 68719476736
 retain_recent_builds = 50
 
 [update]
-enabled = true
-work_dir = "/var/lib/cybex-forge/updates"
-releases_dir = "/opt/cybex-forge/releases"
-binary_path = "/usr/local/bin/cybex-forge"
-config_path = "/etc/cybex-forge/config.toml"
-service_name = "cybex-forge.service"
-# Empty means derive the local health probe from server.listen_addr.
-health_url = ""
-max_artifact_size_bytes = 134217728
-# Ed25519 public key for release verification. REQUIRED when update.enabled:
-# Forge refuses to apply an update while this is empty. Manage release
-# manifests must include a signature over:
-# version + "\n" + sha256 + "\n" + artifact_url + "\n".
+# Ed25519 key used to verify signed workstation-netboot release bundles.
 trusted_public_key = ""
 
 [manage]
 enabled = false
 api_url = "https://manage.example.com"
 organization_slug = "default"
-state_path = "/var/lib/cybex-forge/manage-state.json"
+state_path = "/var/lib/cybex-forge/state/manage-state.json"
 sync_interval_seconds = 30
-enrollment_poll_seconds = 10
 http_timeout_seconds = 30

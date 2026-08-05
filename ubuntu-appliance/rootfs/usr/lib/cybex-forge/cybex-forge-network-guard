@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-forge/state
+approved="$state_dir/netplan-approved.json"
+fallback="$state_dir/netplan-dhcp-fallback.json"
+active=/etc/netplan/90-cybex-forge.yaml
+plan="$state_dir/install-plan.json"
+test -s "$approved" && test -s "$fallback" && test -s "$plan"
+
+install -m 0600 "$approved" "$active"
+netplan generate
+netplan apply
+origin="$(jq -er '.manage_origin // empty' "$state_dir/provisioning-state.json" 2>/dev/null || true)"
+if [[ -z "$origin" ]]; then
+  origin=https://manage.cybex.net
+fi
+
+if timeout 30 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+  --output /dev/null "$origin/healthz"; then
+  rm -f "$state_dir/network-fallback-active"
+  exit 0
+fi
+
+mode="$(jq -er '.network.mode' "$plan")"
+if [[ "$mode" != static ]]; then
+  echo "error: DHCP could not reach Cybex Management" >&2
+  exit 1
+fi
+install -m 0600 "$fallback" "$active"
+netplan generate
+netplan apply
+touch "$state_dir/network-fallback-active"
+timeout 60 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+  --output /dev/null "$origin/healthz"

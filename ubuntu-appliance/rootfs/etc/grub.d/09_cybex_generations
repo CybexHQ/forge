@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+root_uuid="$(findmnt -n -o UUID /)"
+fsroot="$(findmnt -n -o FSROOT /)"
+case "$fsroot" in
+  /)
+    generations=/.cybex-root-generations
+    [ -d "$generations" ] || exit 0
+    ;;
+  /.cybex-root-generations/[0-9]*)
+    root_top="$(mktemp -d /run/cybex-grub-root.XXXXXX)"
+    cleanup() {
+      umount "$root_top" 2>/dev/null || true
+      rmdir "$root_top" 2>/dev/null || true
+    }
+    trap cleanup EXIT HUP INT TERM
+    mount -t btrfs -o ro,subvolid=5 "UUID=$root_uuid" "$root_top"
+    generations="$root_top/.cybex-root-generations"
+    ;;
+  *)
+    echo "Cybex Forge root is not a managed Btrfs generation" >&2
+    exit 1
+    ;;
+esac
+for generation in $(find "$generations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -n); do
+  case "$generation" in *[!0-9]*|'') continue ;; esac
+  kernel="$(find "$generations/$generation/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort -V | tail -n 1)"
+  [ -n "$kernel" ] || continue
+  version="${kernel##*/vmlinuz-}"
+  initrd="/.cybex-root-generations/$generation/boot/initrd.img-$version"
+  cat <<EOF
+menuentry 'Cybex Forge generation $generation' --id 'cybex-forge-generation-$generation' {
+    insmod gzio
+    insmod part_gpt
+    insmod btrfs
+    search --no-floppy --fs-uuid --set=root $root_uuid
+    linux /.cybex-root-generations/$generation/boot/vmlinuz-$version root=UUID=$root_uuid ro rootflags=subvol=.cybex-root-generations/$generation
+    initrd $initrd
+}
+EOF
+done

@@ -33,8 +33,12 @@ use crate::{
 
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
+const INSTALLER_TARGET_BUILD_INPUT_KIND: &str = "installer_target_nixos_module";
+const INSTALLER_TARGET_BUILD_SCHEMA: &str = "cybex.installer-target.build.v1";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
+const MAX_HARDWARE_MODULE_NIX_BYTES: usize = 1024 * 1024;
+const MAX_TARGET_MODULE_NIX_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_LOG_LINE_BYTES: usize = 64 * 1024;
 const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 /// Progress range reserved for the nix build itself; the phases before
@@ -130,6 +134,14 @@ pub struct BlueprintBuildInput {
     #[serde(default)]
     #[serde(alias = "desktop_experience_revision")]
     pub blueprint_revision: Option<i64>,
+    #[serde(default)]
+    pub hardware_module_nix: Option<String>,
+    #[serde(default)]
+    pub target_module_nix: Option<String>,
+    #[serde(default)]
+    pub manage_source_revision: Option<String>,
+    #[serde(default)]
+    pub installer_target: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,11 +163,16 @@ struct ValidatedBuildSpec {
 
 #[derive(Clone, Debug)]
 struct ValidatedBlueprintBuildInput {
+    kind: String,
     generated_nix: String,
     desktop_module_nix: Option<String>,
     expected_state: Option<Value>,
     blueprint_name: Option<String>,
     blueprint_revision: Option<i64>,
+    hardware_module_nix: Option<String>,
+    target_module_nix: Option<String>,
+    manage_source_revision: Option<String>,
+    installer_target: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -911,10 +928,13 @@ fn validate_blueprint_build_input(
     let kind = input.kind.trim();
     if !matches!(
         kind,
-        BLUEPRINT_BUILD_INPUT_KIND | LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND
+        BLUEPRINT_BUILD_INPUT_KIND
+            | LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND
+            | INSTALLER_TARGET_BUILD_INPUT_KIND
     ) {
         bail!("unsupported build_input kind");
     }
+    let installer_target_build = kind == INSTALLER_TARGET_BUILD_INPUT_KIND;
     if input.generated_nix.trim().is_empty() {
         bail!("build_input.generated_nix is required");
     }
@@ -948,7 +968,50 @@ fn validate_blueprint_build_input(
     } else if input.expected_state.is_some() {
         bail!("build_input.expected_state requires desktop_module_nix");
     }
+    if installer_target_build {
+        let hardware_module_nix = input
+            .hardware_module_nix
+            .as_deref()
+            .ok_or_else(|| anyhow!("installer target requires hardware_module_nix"))?;
+        validate_bounded_nix_input(
+            "build_input.hardware_module_nix",
+            hardware_module_nix,
+            MAX_HARDWARE_MODULE_NIX_BYTES,
+        )?;
+        let target_module_nix = input
+            .target_module_nix
+            .as_deref()
+            .ok_or_else(|| anyhow!("installer target requires target_module_nix"))?;
+        validate_bounded_nix_input(
+            "build_input.target_module_nix",
+            target_module_nix,
+            MAX_TARGET_MODULE_NIX_BYTES,
+        )?;
+        let manage_source_revision = input
+            .manage_source_revision
+            .as_deref()
+            .ok_or_else(|| anyhow!("installer target requires manage_source_revision"))?;
+        normalize_nixpkgs_commit(manage_source_revision)
+            .context("normalize installer target Manage revision")?;
+        validate_installer_target_identity(
+            input
+                .installer_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("installer target identity is required"))?,
+            manage_source_revision,
+        )?;
+        if input.desktop_module_nix.is_none() || input.expected_state.is_none() {
+            bail!("installer target requires the reviewed desktop module and expected state");
+        }
+    } else if input.hardware_module_nix.is_some()
+        || input.target_module_nix.is_some()
+        || input.manage_source_revision.is_some()
+        || input.installer_target.is_some()
+    {
+        bail!("installer target fields require installer_target_nixos_module");
+    }
     Ok(ValidatedBlueprintBuildInput {
+        kind: kind.to_string(),
         generated_nix: input.generated_nix,
         desktop_module_nix: input.desktop_module_nix,
         expected_state: input.expected_state,
@@ -957,7 +1020,153 @@ fn validate_blueprint_build_input(
             .map(|value| bounded_metadata_text(&value, 200))
             .filter(|value| !value.is_empty()),
         blueprint_revision: input.blueprint_revision.filter(|value| *value > 0),
+        hardware_module_nix: input.hardware_module_nix,
+        target_module_nix: input.target_module_nix,
+        manage_source_revision: input.manage_source_revision,
+        installer_target: input.installer_target,
     })
+}
+
+fn validate_bounded_nix_input(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if value.len() > max_bytes {
+        bail!("{field} is too large");
+    }
+    if value.bytes().any(|byte| byte == 0) {
+        bail!("{field} must not contain NUL bytes");
+    }
+    // The whole BuildSpec has already passed the protected-material scanner;
+    // keep this helper focused on the bounded text contract.
+    Ok(())
+}
+
+fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("installer_target must be an object"))?;
+    let expected = [
+        "schema",
+        "preparation_id",
+        "device_id",
+        "device_incarnation_id",
+        "blueprint_id",
+        "blueprint_revision_id",
+        "hardware_facts_sha256",
+        "hardware_driver_policy",
+        "disk_layout_sha256",
+        "forge_device_id",
+        "bundle_sha256",
+        "profile_id",
+        "managed_device_id",
+        "reinstall_request_id",
+        "manage_source_revision",
+        "nixpkgs_revision",
+        "source_lock_sha256",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let actual = object.keys().map(String::as_str).collect::<HashSet<_>>();
+    if actual != expected {
+        bail!("installer_target does not match its schema");
+    }
+    if object.get("schema").and_then(Value::as_str) != Some(INSTALLER_TARGET_BUILD_SCHEMA) {
+        bail!("unsupported installer_target schema");
+    }
+    for field in [
+        "preparation_id",
+        "device_incarnation_id",
+        "blueprint_id",
+        "blueprint_revision_id",
+        "profile_id",
+    ] {
+        normalize_optional_uuidish(
+            field,
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("installer_target.{field} is required"))?,
+        )?;
+    }
+    for field in ["managed_device_id", "reinstall_request_id"] {
+        if let Some(value) = object.get(field).and_then(Value::as_str) {
+            if field == "reinstall_request_id" {
+                normalize_optional_uuidish(field, value)?;
+            } else {
+                normalize_public_identifier(field, value, 160)?;
+            }
+        } else if !object.get(field).is_some_and(Value::is_null) {
+            bail!("installer_target.{field} must be a string or null");
+        }
+    }
+    if object.get("managed_device_id").is_some_and(Value::is_null)
+        != object
+            .get("reinstall_request_id")
+            .is_some_and(Value::is_null)
+    {
+        bail!("installer_target reinstall bindings must both be present or both be null");
+    }
+    for field in ["device_id", "forge_device_id"] {
+        normalize_public_identifier(
+            field,
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("installer_target.{field} is required"))?,
+            160,
+        )?;
+    }
+    for field in [
+        "hardware_facts_sha256",
+        "disk_layout_sha256",
+        "bundle_sha256",
+        "source_lock_sha256",
+    ] {
+        normalize_sha256(
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("installer_target.{field} is required"))?,
+        )?;
+    }
+    let identity_manage_revision = object
+        .get("manage_source_revision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("installer_target.manage_source_revision is required"))?;
+    if normalize_nixpkgs_commit(identity_manage_revision)? != manage_revision {
+        bail!("installer target Manage revision fields do not match");
+    }
+    normalize_nixpkgs_commit(
+        object
+            .get("nixpkgs_revision")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("installer_target.nixpkgs_revision is required"))?,
+    )?;
+    let policy = object
+        .get("hardware_driver_policy")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("installer_target.hardware_driver_policy is required"))?;
+    if !matches!(
+        policy,
+        "auto" | "open_graphics" | "nvidia_open" | "nvidia_proprietary" | "disabled"
+    ) {
+        bail!("installer_target.hardware_driver_policy is invalid");
+    }
+    Ok(())
+}
+
+fn normalize_public_identifier(field: &str, value: &str, max_chars: usize) -> Result<String> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.chars().count() > max_chars
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        bail!("{field} is invalid");
+    }
+    Ok(value.to_string())
 }
 
 fn build_target<'a>(
@@ -992,15 +1201,16 @@ fn build_target_names_compatible(configured: &str, requested: &str) -> bool {
     configured == requested
         || matches!(
             (configured, requested),
-            ("desktop_experience", "blueprint") | ("blueprint", "desktop_experience")
+            ("desktop_experience", "blueprint")
+                | ("blueprint", "desktop_experience")
+                | ("blueprint", "installer_target")
+                | ("desktop_experience", "installer_target")
         )
 }
 
 fn build_capacity() -> Result<BuildCapacity> {
-    // Hardened systemd units may use ProcSubset=pid, which intentionally hides
-    // /proc/meminfo. LXC virtualizes sysinfo(2), so keep it as the fallback
-    // when the cgroup controller reports an unbounded root and procfs omits
-    // the host-adjusted totals.
+    // Hardened systemd units may hide /proc/meminfo, so retain sysinfo(2) as a
+    // fallback when the cgroup controller reports an unbounded root.
     let sysinfo = kernel_sysinfo_capacity();
     let memory_bytes = read_cgroup_limit("/sys/fs/cgroup/memory.max")?
         .or_else(|| read_meminfo_bytes("MemTotal"))
@@ -3950,12 +4160,16 @@ fn success_result_metadata(
     );
     object.insert(
         "build_input_kind".to_string(),
-        json!(
-            spec.build_input
-                .as_ref()
-                .map(|_| BLUEPRINT_BUILD_INPUT_KIND)
-        ),
+        json!(spec.build_input.as_ref().map(|input| input.kind.as_str())),
     );
+    if let Some(input) = spec.build_input.as_ref() {
+        if let Some(revision) = input.manage_source_revision.as_deref() {
+            object.insert("manage_source_revision".to_string(), json!(revision));
+        }
+        if let Some(identity) = input.installer_target.as_ref() {
+            object.insert("installer_target".to_string(), identity.clone());
+        }
+    }
     object.insert("cache".to_string(), json!("exported"));
     if let Some(commit) = spec.nixpkgs_commit.as_deref() {
         object.insert("nixpkgs_revision".to_string(), json!(commit));
@@ -4143,13 +4357,24 @@ fn blueprint_nix_build_command(
             .context("serialize Blueprint expected state")?;
         write_job_input_file(input_dir.join("expected-state.json"), &expected_state)?;
     }
+    if let Some(hardware_module_nix) = build_input.hardware_module_nix.as_deref() {
+        write_job_input_file(input_dir.join("hardware.nix"), hardware_module_nix)?;
+    }
+    if let Some(target_module_nix) = build_input.target_module_nix.as_deref() {
+        write_job_input_file(input_dir.join("target.nix"), target_module_nix)?;
+    }
+    let compatibility_module = if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+        installer_target_compat_module()
+    } else {
+        blueprint_compat_module(build_input.desktop_module_nix.is_some())
+    };
     write_job_input_file(
         input_dir.join("cybex-compat-options.nix"),
-        blueprint_compat_module(build_input.desktop_module_nix.is_some()),
+        compatibility_module,
     )?;
     write_job_input_file(
         input_dir.join("configuration.nix"),
-        &forge_nixos_configuration(build_input.desktop_module_nix.is_some()),
+        &forge_nixos_configuration(build_input),
     )?;
     write_job_input_file(
         input_dir.join("flake.nix"),
@@ -4162,6 +4387,7 @@ fn blueprint_nix_build_command(
             ),
             &spec.system,
             build_input,
+            &config.build.manage_source_url_template,
         ),
     )?;
 
@@ -4236,6 +4462,7 @@ fn forge_nixos_flake(
     nixpkgs_flake: &str,
     system: &str,
     build_input: &ValidatedBlueprintBuildInput,
+    manage_source_url_template: &str,
 ) -> String {
     let name = build_input.blueprint_name.as_deref().unwrap_or("Blueprint");
     let revision = build_input
@@ -4248,6 +4475,51 @@ fn forge_nixos_flake(
     .unwrap_or_else(|_| "\"Cybex Forge Blueprint build\"".to_string());
     let nixpkgs_flake =
         serde_json::to_string(nixpkgs_flake).unwrap_or_else(|_| "\"nixpkgs\"".to_string());
+    if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+        let manage_revision = build_input
+            .manage_source_revision
+            .as_deref()
+            .expect("validated installer target Manage revision");
+        let manage_flake = serde_json::to_string(
+            &manage_source_url_template.replace("{revision}", manage_revision),
+        )
+        .unwrap_or_else(|_| "\"manage\"".to_string());
+        return format!(
+            r#"{{
+  description = {description};
+
+  inputs.nixpkgs.url = {nixpkgs_flake};
+  inputs.manage = {{
+    url = {manage_flake};
+    flake = false;
+  }};
+
+  outputs = {{ self, nixpkgs, manage }}:
+    let
+      system = "{system}";
+      pkgs = import nixpkgs {{ inherit system; }};
+      cybexAgent = pkgs.rustPlatform.buildRustPackage {{
+        pname = "cybex-agent";
+        version = "installer-target";
+        src = manage + "/agent/cybex-agent";
+        cargoLock.lockFile = manage + "/agent/cybex-agent/Cargo.lock";
+        doCheck = false;
+      }};
+    in {{
+      packages.${{system}}.desktop-experience =
+        (nixpkgs.lib.nixosSystem {{
+          inherit system;
+          specialArgs = {{
+            manageSource = manage;
+            inherit cybexAgent;
+          }};
+          modules = [ ./configuration.nix ];
+        }}).config.system.build.toplevel;
+    }};
+}}
+"#
+        );
+    }
     format!(
         r#"{{
   description = {description};
@@ -4271,7 +4543,23 @@ fn forge_nixos_flake(
     )
 }
 
-fn forge_nixos_configuration(include_desktop_module: bool) -> String {
+fn forge_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> String {
+    let include_desktop_module = build_input.desktop_module_nix.is_some();
+    if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+        return r#"{ ... }:
+
+{
+  imports = [
+    ./cybex-compat-options.nix
+    ./cybex-blueprints.nix
+    ./blueprint.nix
+    ./hardware.nix
+    ./target.nix
+  ];
+}
+"#
+        .to_string();
+    }
     let desktop_module_import = if include_desktop_module {
         "    ./cybex-blueprints.nix\n"
     } else {
@@ -4370,6 +4658,46 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
     description = "Cybex Agent policy accepted while Forge prebuilds a generic NixOS closure.";
+  };
+}
+"#
+}
+
+fn installer_target_compat_module() -> &'static str {
+    r#"{ lib, ... }:
+
+{
+  imports = [
+    (lib.mkAliasOptionModule
+      [ "cybex" "catalog" "applications" ]
+      [ "cybex" "blueprint" "applications" ])
+  ];
+
+  options.cybex.desktop.environment = lib.mkOption {
+    type = lib.types.str;
+    default = "";
+    description = "Cybex desktop environment metadata from the assigned Blueprint.";
+  };
+
+  options.cybex.blueprint.applications = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.submodule {
+      options = {
+        package = lib.mkOption { type = lib.types.str; default = ""; };
+        source = lib.mkOption { type = lib.types.str; default = ""; };
+        policy = lib.mkOption { type = lib.types.str; default = ""; };
+        channel = lib.mkOption { type = lib.types.str; default = ""; };
+        version = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+        pinned = lib.mkOption { type = lib.types.bool; default = false; };
+      };
+    });
+    default = {};
+    description = "Cybex application metadata from the assigned Blueprint.";
+  };
+
+  options.cybex.security.luks.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = "Cybex disk-encryption intent metadata.";
   };
 }
 "#
@@ -4891,6 +5219,61 @@ mod tests {
 
     use super::*;
 
+    fn valid_installer_target_identity() -> Value {
+        json!({
+            "schema": INSTALLER_TARGET_BUILD_SCHEMA,
+            "preparation_id": "00000000-0000-4000-8000-000000000001",
+            "device_id": "device_1",
+            "device_incarnation_id": "00000000-0000-4000-8000-000000000002",
+            "blueprint_id": "00000000-0000-4000-8000-000000000003",
+            "blueprint_revision_id": "00000000-0000-4000-8000-000000000004",
+            "hardware_facts_sha256": "11".repeat(32),
+            "hardware_driver_policy": "auto",
+            "disk_layout_sha256": "22".repeat(32),
+            "forge_device_id": "forge_1",
+            "bundle_sha256": "33".repeat(32),
+            "profile_id": "00000000-0000-4000-8000-000000000005",
+            "managed_device_id": null,
+            "reinstall_request_id": null,
+            "manage_source_revision": "4".repeat(40),
+            "nixpkgs_revision": "5".repeat(40),
+            "source_lock_sha256": "66".repeat(32)
+        })
+    }
+
+    #[test]
+    fn installer_target_identity_is_exact_and_bound_to_manage_source() {
+        let valid = valid_installer_target_identity();
+        validate_installer_target_identity(&valid, &"4".repeat(40)).unwrap();
+
+        let mut wrong_manage = valid.clone();
+        wrong_manage["manage_source_revision"] = json!("7".repeat(40));
+        assert!(
+            validate_installer_target_identity(&wrong_manage, &"4".repeat(40))
+                .unwrap_err()
+                .to_string()
+                .contains("Manage revision fields do not match")
+        );
+
+        let mut one_sided_reinstall = valid.clone();
+        one_sided_reinstall["managed_device_id"] = json!("device_1");
+        assert!(
+            validate_installer_target_identity(&one_sided_reinstall, &"4".repeat(40))
+                .unwrap_err()
+                .to_string()
+                .contains("reinstall bindings")
+        );
+
+        let mut unknown = valid;
+        unknown["unexpected"] = json!(true);
+        assert!(
+            validate_installer_target_identity(&unknown, &"4".repeat(40))
+                .unwrap_err()
+                .to_string()
+                .contains("does not match its schema")
+        );
+    }
+
     fn import_from_derivation_is_disabled(args: &[String]) -> bool {
         args.windows(DISABLE_IFD_NIX_OPTION.len())
             .any(|window| window.iter().map(String::as_str).eq(DISABLE_IFD_NIX_OPTION))
@@ -5192,6 +5575,10 @@ sleep 5
             expected_state: None,
             blueprint_name: None,
             blueprint_revision: None,
+            hardware_module_nix: None,
+            target_module_nix: None,
+            manage_source_revision: None,
+            installer_target: None,
         };
 
         let err = validate_blueprint_build_input(input).unwrap_err();
@@ -5305,11 +5692,16 @@ sleep 5
             source_lock_sha256: Some("b".repeat(64)),
             software_package_refs: Vec::new(),
             build_input: Some(ValidatedBlueprintBuildInput {
+                kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
                 generated_nix: "{ ... }: {}".to_string(),
                 desktop_module_nix: None,
                 expected_state: None,
                 blueprint_name: None,
                 blueprint_revision: None,
+                hardware_module_nix: None,
+                target_module_nix: None,
+                manage_source_revision: None,
+                installer_target: None,
             }),
             allow_source_builds: false,
         };
@@ -6960,6 +7352,7 @@ esac
             source_lock_sha256: Some("d".repeat(64)),
             software_package_refs: vec!["firefox".to_string()],
             build_input: Some(ValidatedBlueprintBuildInput {
+                kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
                 generated_nix: "{ lib, ... }: { networking.hostName = lib.mkDefault \"test\"; }"
                     .to_string(),
                 desktop_module_nix: Some(
@@ -6972,6 +7365,10 @@ esac
                 })),
                 blueprint_name: Some("Standard Workstation".to_string()),
                 blueprint_revision: Some(8),
+                hardware_module_nix: None,
+                target_module_nix: None,
+                manage_source_revision: None,
+                installer_target: None,
             }),
             allow_source_builds: false,
         };
@@ -7075,6 +7472,7 @@ esac
             source_lock_sha256: Some("d".repeat(64)),
             software_package_refs: Vec::new(),
             build_input: Some(ValidatedBlueprintBuildInput {
+                kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
                 generated_nix: format!(
                     "{{ ... }}: {{ users.users.alice.hashedPassword = \"{sentinel}\"; }}"
                 ),
@@ -7082,6 +7480,10 @@ esac
                 expected_state: None,
                 blueprint_name: None,
                 blueprint_revision: None,
+                hardware_module_nix: None,
+                target_module_nix: None,
+                manage_source_revision: None,
+                installer_target: None,
             }),
             allow_source_builds: false,
         };

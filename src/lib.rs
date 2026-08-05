@@ -1,3 +1,4 @@
+pub mod appliance;
 pub mod assets;
 pub mod boot;
 pub mod build;
@@ -7,13 +8,15 @@ pub mod db;
 pub mod disk;
 pub mod error;
 pub mod host;
+pub mod maintenance;
 pub mod manage;
 pub mod models;
+pub mod netboot;
 pub mod nix_log;
 pub(crate) mod protected_material;
+pub mod provisioning;
 pub(crate) mod redact;
 pub mod routes;
-pub mod updater;
 
 use std::sync::{Arc, RwLock};
 

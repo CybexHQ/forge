@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply a signed two-phase Cybex Forge Netplan change
+After=network-online.target cybex-forge.service
+Wants=network-online.target cybex-forge.service
+ConditionPathExists=/var/lib/cybex-forge/state/appliance-network-change-request.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-forge/cybex-forge-network-change
+TimeoutStartSec=5min
+

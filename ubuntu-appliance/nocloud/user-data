@@ -1,0 +1,11 @@
+#cloud-config
+autoinstall:
+  version: 1
+  interactive-sections: []
+  refresh-installer:
+    update: false
+  early-commands:
+    - /cdrom/cybex/bootstrap/cybex-forge-bootstrap prepare --envelope /cdrom/CYBEX_PROVISIONING.BIN --provisioning-keys /cdrom/cybex/provisioning-public-keys --autoinstall /autoinstall.yaml --state-mount /run/cybex-state
+  error-commands:
+    - /bin/sh -c 'journalctl -b --no-pager -n 500 > /run/cybex-installer-error.log || true'
+  shutdown: reboot

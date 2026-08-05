@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     AppState, boot as boot_logic, db,
     error::{AppError, AppResult},
-    models::{NewBootEvent, normalize_mac},
+    models::{BootProfile, BootProfileType, Device, NewBootEvent, normalize_mac},
 };
 
 const MAX_BOOT_SERIAL_LEN: usize = 128;
@@ -95,7 +95,7 @@ pub async fn boot_select_profile(
         return Err(AppError::NotFound);
     }
 
-    let mut device = None;
+    let mut device: Option<Device> = None;
     let mut known_device = false;
     let checker = is_local_checker_request(&query, &headers, connect.as_ref().map(|value| value.0));
     let mac = normalized_optional_mac(query.mac)?;
@@ -118,6 +118,11 @@ pub async fn boot_select_profile(
         }
     }
 
+    let selected_mac = mac
+        .as_deref()
+        .or_else(|| device.as_ref().map(|device| device.mac.as_str()));
+    let script = render_selected_profile(&state, &profile, selected_mac, device.as_ref()).await?;
+
     if !checker {
         db::insert_boot_event(
             &state.db,
@@ -139,11 +144,32 @@ pub async fn boot_select_profile(
         .await?;
     }
 
-    let runtime = state.runtime_settings();
-    Ok(ipxe_response(boot_logic::render_profile_script(
-        &profile,
-        &runtime.public_base_url,
-    )?))
+    Ok(ipxe_response(script))
+}
+
+pub async fn boot_kexec(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> AppResult<Response> {
+    let mac = normalize_mac(&mac)?;
+    let device = db::get_device_by_mac(&state.db, &mac)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let profile_id = device.one_time_profile_id.ok_or(AppError::NotFound)?;
+    let profile = db::get_profile(&state.db, profile_id).await?;
+    if !profile.enabled || profile.profile_type != BootProfileType::ForgeInstaller {
+        return Err(AppError::NotFound);
+    }
+    let launch = create_installer_launch(&state, &profile, &device.mac, Some(&device)).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store, max-age=0"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        axum::Json(launch),
+    )
+        .into_response())
 }
 
 async fn build_boot_script(
@@ -179,6 +205,15 @@ async fn build_boot_script(
     let selection = boot_logic::choose_profile(selection_device, &profiles);
 
     let selected_profile = selection.profile.cloned();
+    let selected_script = if let Some(profile) = selected_profile.as_ref() {
+        let selected_mac = mac
+            .as_deref()
+            .or_else(|| device.as_ref().map(|device| device.mac.as_str()));
+        Some(render_selected_profile(state, profile, selected_mac, device.as_ref()).await?)
+    } else {
+        None
+    };
+
     if !checker {
         if let (Some(device), Some(profile)) = (device.as_ref(), selected_profile.as_ref()) {
             match selection.source {
@@ -218,9 +253,8 @@ async fn build_boot_script(
         .await?;
     }
 
-    if let Some(profile) = selected_profile {
-        let runtime = state.runtime_settings();
-        boot_logic::render_profile_script(&profile, &runtime.public_base_url)
+    if selected_profile.is_some() {
+        Ok(selected_script.expect("selected profile has a rendered script"))
     } else {
         let runtime = state.runtime_settings();
         Ok(boot_logic::render_menu(
@@ -231,6 +265,51 @@ async fn build_boot_script(
             runtime.menu_timeout_ms,
         ))
     }
+}
+
+async fn render_selected_profile(
+    state: &AppState,
+    profile: &BootProfile,
+    mac: Option<&str>,
+    device: Option<&Device>,
+) -> AppResult<String> {
+    if profile.profile_type != BootProfileType::ForgeInstaller {
+        let runtime = state.runtime_settings();
+        return boot_logic::render_profile_script(profile, &runtime.public_base_url);
+    }
+    let mac = mac.ok_or_else(|| {
+        AppError::Validation("a normalized MAC is required for Forge installer boot".to_string())
+    })?;
+    let launch = create_installer_launch(state, profile, mac, device).await?;
+    Ok(crate::netboot::render_ipxe_launch(&launch))
+}
+
+async fn create_installer_launch(
+    state: &AppState,
+    profile: &BootProfile,
+    mac: &str,
+    device: Option<&Device>,
+) -> AppResult<crate::netboot::BootSessionLaunch> {
+    let profile_id = profile.managed_profile_id.as_deref().ok_or_else(|| {
+        AppError::Config("Forge installer profile has no managed identity".to_string())
+    })?;
+    let binding: Option<(Option<String>, Option<String>)> = if let Some(device) = device {
+        sqlx::query_as("SELECT managed_device_id, reinstall_request_id FROM devices WHERE id = ?")
+            .bind(device.id)
+            .fetch_optional(&state.db)
+            .await?
+    } else {
+        None
+    };
+    crate::netboot::create_boot_session(
+        state,
+        mac,
+        Some(profile_id),
+        binding.as_ref().and_then(|value| value.0.as_deref()),
+        binding.as_ref().and_then(|value| value.1.as_deref()),
+    )
+    .await
+    .map_err(|_| AppError::Config("could not create signed Forge boot session".to_string()))
 }
 
 fn normalized_optional_mac(mac: Option<String>) -> AppResult<Option<String>> {

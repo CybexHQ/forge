@@ -36,132 +36,14 @@ pub struct Cli {
 pub enum Command {
     Serve,
     Migrate,
-    ScanIsos,
-    Enroll,
-    /// Compare protected installed appliance state with replacement media.
-    ValidateApplianceMedia {
-        #[arg(long, allow_hyphen_values = true)]
-        installed_version: String,
-        #[arg(long, allow_hyphen_values = true)]
-        media_version: String,
-    },
     /// Validate a complete appliance configuration without printing it.
     ValidateApplianceConfig,
-    /// Replay durable appliance recovery journals before the service starts.
-    ReconcileAppliance,
-    SyncOnce {
-        /// Post only the local updater status without opening Forge state.
-        #[arg(long)]
-        update_only: bool,
-
-        /// Read an explicit, sanitized updater projection instead of status.json.
-        #[arg(
-            long,
-            requires_all = [
-                "update_only",
-                "expect_update_status",
-                "expect_update_attempt",
-                "expect_update_current_version"
-            ],
-            value_name = "ABSOLUTE_JSON_PATH"
-        )]
-        update_projection_file: Option<PathBuf>,
-
-        /// Fail unless the Forge report contains this exact updater status.
-        #[arg(
-            long,
-            requires_all = [
-                "update_only",
-                "expect_update_attempt",
-                "expect_update_current_version"
-            ],
-            value_parser = parse_expected_update_status
-        )]
-        expect_update_status: Option<String>,
-
-        /// Fail unless the report contains this attempt ID (empty only for idle).
-        #[arg(
-            long,
-            requires_all = [
-                "update_only",
-                "expect_update_status",
-                "expect_update_current_version"
-            ],
-            value_parser = parse_expected_update_attempt
-        )]
-        expect_update_attempt: Option<String>,
-
-        /// Fail unless the report contains this exact current Forge version.
-        #[arg(
-            long,
-            requires_all = [
-                "update_only",
-                "expect_update_status",
-                "expect_update_attempt"
-            ],
-            allow_hyphen_values = true,
-            value_parser = parse_expected_update_version
-        )]
-        expect_update_current_version: Option<String>,
-    },
-    ApplyRuntimeConfig,
+    /// Re-verify and extract the currently staged signed Ubuntu package update.
+    VerifyApplianceUpdate,
+    /// Re-verify and materialize the currently staged signed Netplan change.
+    VerifyApplianceNetworkChange,
+    SyncOnce,
     PrintConfig,
-}
-
-fn parse_expected_update_status(value: &str) -> Result<String, String> {
-    if matches!(
-        value,
-        "idle"
-            | "requested"
-            | "waiting"
-            | "preflight"
-            | "downloading"
-            | "verifying"
-            | "staged"
-            | "applying"
-            | "restarting"
-            | "health_checking"
-            | "succeeded"
-            | "failed"
-            | "rolled_back"
-            | "unsupported"
-    ) {
-        Ok(value.to_string())
-    } else {
-        Err("expected updater status is not supported".to_string())
-    }
-}
-
-fn parse_expected_update_attempt(value: &str) -> Result<String, String> {
-    if value.is_empty()
-        || (value.len() == 32
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
-    {
-        Ok(value.to_string())
-    } else {
-        Err(
-            "expected updater attempt must be empty for idle or exactly 32 lowercase hexadecimal characters"
-                .to_string(),
-        )
-    }
-}
-
-fn parse_expected_update_version(value: &str) -> Result<String, String> {
-    if !value.is_empty()
-        && value.len() <= 128
-        && !value.starts_with('-')
-        && !value.ends_with(['-', '.'])
-        && !value.contains("..")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
-    {
-        Ok(value.to_string())
-    } else {
-        Err("expected updater current version is not canonical".to_string())
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -174,6 +56,7 @@ pub struct AppConfig {
     pub build: BuildConfig,
     pub cache: CacheConfig,
     pub update: UpdateConfig,
+    pub workstation_netboot: WorkstationNetbootConfig,
     pub manage: ManageConfig,
 }
 
@@ -190,7 +73,6 @@ pub struct PathsConfig {
     pub data_dir: PathBuf,
     pub database_path: PathBuf,
     pub boot_assets_dir: PathBuf,
-    pub iso_dir: PathBuf,
     pub static_dir: PathBuf,
     pub tftp_dir: PathBuf,
 }
@@ -225,6 +107,9 @@ pub struct BuildConfig {
     pub work_dir: PathBuf,
     pub output_dir: PathBuf,
     pub nix_binary: String,
+    /// Immutable Manage source used by installer-target builds. The exact
+    /// signed revision replaces `{revision}` before Nix evaluates the input.
+    pub manage_source_url_template: String,
     pub targets: Vec<BuildTargetConfig>,
 }
 
@@ -250,38 +135,30 @@ pub struct CacheConfig {
     pub retain_recent_builds: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
-    pub enabled: bool,
-    pub work_dir: PathBuf,
-    pub releases_dir: PathBuf,
-    pub binary_path: PathBuf,
-    pub config_path: PathBuf,
-    pub service_name: String,
-    pub health_url: String,
-    pub max_artifact_size_bytes: u64,
     pub trusted_public_key: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
+pub struct WorkstationNetbootConfig {
+    /// Allows isolated test fixtures to use HTTP or non-public addresses.
+    /// Production appliances must leave this disabled.
+    pub allow_private_release_urls: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ManageConfig {
     pub enabled: bool,
     pub api_url: String,
     pub organization_id: String,
     #[serde(default)]
-    pub forge_install_code: String,
-    /// Preferred one-time enrollment secret source. The service consumes and
-    /// atomically removes this file after persisting the initial enrollment
-    /// response, so the secret never needs to live in durable TOML.
-    #[serde(default)]
-    pub forge_install_code_file: PathBuf,
-    #[serde(default)]
     pub organization_slug: String,
     pub state_path: PathBuf,
     pub sync_interval_seconds: u64,
-    pub enrollment_poll_seconds: u64,
     pub http_timeout_seconds: u64,
 }
 
@@ -334,7 +211,6 @@ impl AppConfig {
                 "paths.boot_assets_dir",
                 self.paths.boot_assets_dir.as_path(),
             ),
-            ("paths.iso_dir", self.paths.iso_dir.as_path()),
             ("paths.static_dir", self.paths.static_dir.as_path()),
             ("build.work_dir", self.build.work_dir.as_path()),
             ("build.output_dir", self.build.output_dir.as_path()),
@@ -356,35 +232,6 @@ impl AppConfig {
             "/var/lib/cybex-forge/cache/cache-pub-key.pem",
         )?;
 
-        if !self.update.enabled {
-            bail!("appliance updates must remain enabled");
-        }
-        require_appliance_path(
-            "update.work_dir",
-            &self.update.work_dir,
-            "/var/lib/cybex-forge/updates",
-        )?;
-        require_appliance_path(
-            "update.releases_dir",
-            &self.update.releases_dir,
-            "/opt/cybex-forge/releases",
-        )?;
-        require_appliance_path(
-            "update.binary_path",
-            &self.update.binary_path,
-            "/usr/local/bin/cybex-forge",
-        )?;
-        require_appliance_path(
-            "update.config_path",
-            &self.update.config_path,
-            "/etc/cybex-forge/config.toml",
-        )?;
-        if self.update.service_name != "cybex-forge.service" {
-            bail!("appliance update.service_name must remain cybex-forge.service");
-        }
-        if self.update.health_url != "http://127.0.0.1:8080/healthz" {
-            bail!("appliance update.health_url must remain http://127.0.0.1:8080/healthz");
-        }
         if self.update.trusted_public_key.is_empty() {
             bail!("appliance update trust key must not be empty");
         }
@@ -393,6 +240,9 @@ impl AppConfig {
             &self.update.trusted_public_key,
         )
         .context("validate appliance update trust key")?;
+        if self.workstation_netboot.allow_private_release_urls {
+            bail!("appliance workstation netboot fixture URLs must remain disabled");
+        }
 
         if !self.manage.enabled {
             bail!("appliance managed mode must remain enabled");
@@ -407,23 +257,14 @@ impl AppConfig {
         require_appliance_path(
             "manage.state_path",
             &self.manage.state_path,
-            "/var/lib/cybex-forge/manage-state.json",
+            "/var/lib/cybex-forge/state/manage-state.json",
         )?;
-        if !self.manage.forge_install_code.is_empty() {
-            bail!("appliance config must not contain an inline Forge install code");
-        }
-        let code_file = self.manage.forge_install_code_file.as_path();
-        let expected = Path::new("/var/lib/cybex-forge/bootstrap/enrollment-code");
-        if !code_file.as_os_str().is_empty() && code_file != expected {
-            bail!("appliance config install-code file must use the fixed bootstrap path");
-        }
         Ok(())
     }
 
     pub fn redacted_for_display(&self) -> Self {
         let mut redacted = self.clone();
         redacted.auth.admin_token = redact_secret(&redacted.auth.admin_token);
-        redacted.manage.forge_install_code = redact_secret(&redacted.manage.forge_install_code);
         redacted
     }
 
@@ -437,7 +278,6 @@ impl AppConfig {
             normalize_absolute_config_path("paths.database_path", &self.paths.database_path)?;
         self.paths.boot_assets_dir =
             normalize_absolute_config_path("paths.boot_assets_dir", &self.paths.boot_assets_dir)?;
-        self.paths.iso_dir = normalize_absolute_config_path("paths.iso_dir", &self.paths.iso_dir)?;
         self.paths.static_dir =
             normalize_absolute_config_path("paths.static_dir", &self.paths.static_dir)?;
         self.paths.tftp_dir =
@@ -467,6 +307,10 @@ impl AppConfig {
         self.build.output_dir =
             normalize_absolute_config_path("build.output_dir", &self.build.output_dir)?;
         self.build.nix_binary = normalize_program_name("build.nix_binary", &self.build.nix_binary)?;
+        self.build.manage_source_url_template = normalize_manage_source_url_template(
+            &self.build.manage_source_url_template,
+            self.workstation_netboot.allow_private_release_urls,
+        )?;
         self.build.allowed_systems =
             normalize_allowed_systems(&self.build.allowed_systems, "build.allowed_systems")?;
         for target in &mut self.build.targets {
@@ -485,25 +329,6 @@ impl AppConfig {
             .max_bytes
             .clamp(16 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
         self.cache.retain_recent_builds = self.cache.retain_recent_builds.clamp(1, 10_000);
-        self.update.work_dir =
-            normalize_absolute_config_path("update.work_dir", &self.update.work_dir)?;
-        self.update.releases_dir =
-            normalize_absolute_config_path("update.releases_dir", &self.update.releases_dir)?;
-        self.update.binary_path =
-            normalize_absolute_config_path("update.binary_path", &self.update.binary_path)?;
-        self.update.config_path =
-            normalize_absolute_config_path("update.config_path", &self.update.config_path)?;
-        self.update.service_name =
-            normalize_systemd_unit_name("update.service_name", &self.update.service_name)?;
-        self.update.health_url = if self.update.health_url.trim().is_empty() {
-            local_health_url_from_listen_addr(&self.server.listen_addr)?
-        } else {
-            normalize_http_url("update.health_url", &self.update.health_url)?
-        };
-        self.update.max_artifact_size_bytes = self
-            .update
-            .max_artifact_size_bytes
-            .clamp(1024 * 1024, 1024 * 1024 * 1024);
         self.update.trusted_public_key = normalize_optional_public_key_text(
             "update.trusted_public_key",
             &self.update.trusted_public_key,
@@ -514,19 +339,6 @@ impl AppConfig {
             normalize_http_url("manage.api_url", &self.manage.api_url)?
         };
         self.manage.organization_id = normalize_organization_id(&self.manage.organization_id)?;
-        self.manage.forge_install_code =
-            normalize_forge_install_code(&self.manage.forge_install_code)?;
-        self.manage.forge_install_code_file = normalize_optional_absolute_config_path(
-            "manage.forge_install_code_file",
-            &self.manage.forge_install_code_file,
-        )?;
-        if !self.manage.forge_install_code.is_empty()
-            && !self.manage.forge_install_code_file.as_os_str().is_empty()
-        {
-            bail!(
-                "manage.forge_install_code and manage.forge_install_code_file are mutually exclusive"
-            );
-        }
         self.manage.organization_slug =
             normalize_optional_organization_slug(&self.manage.organization_slug)?;
         self.manage.state_path =
@@ -562,10 +374,6 @@ impl AppConfig {
                 "cache.public_key_path",
                 self.cache.public_key_path.as_path(),
             ),
-            ("update.work_dir", self.update.work_dir.as_path()),
-            ("update.releases_dir", self.update.releases_dir.as_path()),
-            ("update.binary_path", self.update.binary_path.as_path()),
-            ("update.config_path", self.update.config_path.as_path()),
             ("manage.state_path", self.manage.state_path.as_path()),
         ];
         for (field, private_path) in private_paths {
@@ -573,15 +381,6 @@ impl AppConfig {
                 .with_context(|| format!("resolve {field} for public-cache boundary validation"))?;
             if paths_overlap(&cache_root, &private_path) {
                 bail!("cache.root_dir must be path-disjoint from {field}");
-            }
-        }
-        if !self.manage.forge_install_code_file.as_os_str().is_empty() {
-            let bootstrap_path = path_identity_for_overlap(&self.manage.forge_install_code_file)
-                .context(
-                    "resolve manage.forge_install_code_file for public-cache boundary validation",
-                )?;
-            if paths_overlap(&cache_root, &bootstrap_path) {
-                bail!("cache.root_dir must be path-disjoint from manage.forge_install_code_file");
             }
         }
         Ok(())
@@ -709,38 +508,6 @@ pub(crate) fn normalize_http_url(field: &str, value: &str) -> anyhow::Result<Str
     Ok(url)
 }
 
-fn local_health_url_from_listen_addr(listen_addr: &str) -> anyhow::Result<String> {
-    let parsed: SocketAddr = listen_addr.parse().with_context(
-        || "server.listen_addr must be an IP socket address such as 127.0.0.1:8080",
-    )?;
-    let host = if parsed.ip().is_unspecified() {
-        "127.0.0.1".to_string()
-    } else if parsed.ip().is_ipv6() {
-        format!("[{}]", parsed.ip())
-    } else {
-        parsed.ip().to_string()
-    };
-    Ok(format!("http://{host}:{}/healthz", parsed.port()))
-}
-
-fn normalize_systemd_unit_name(field: &str, value: &str) -> anyhow::Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        bail!("{field} must not be empty");
-    }
-    if value.len() > 160
-        || value.starts_with(['.', '-'])
-        || value.contains('/')
-        || value.contains('\\')
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
-    {
-        bail!("{field} must be a safe systemd unit name");
-    }
-    Ok(value.to_string())
-}
-
 fn normalize_optional_public_key_text(field: &str, value: &str) -> anyhow::Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -810,14 +577,6 @@ pub(crate) fn normalize_absolute_config_path(field: &str, path: &Path) -> anyhow
     Ok(PathBuf::from(raw.as_ref()))
 }
 
-fn normalize_optional_absolute_config_path(field: &str, path: &Path) -> anyhow::Result<PathBuf> {
-    if path.as_os_str().is_empty() {
-        Ok(PathBuf::new())
-    } else {
-        normalize_absolute_config_path(field, path)
-    }
-}
-
 pub(crate) fn validate_menu_timeout_ms(value: u32) -> anyhow::Result<()> {
     if value != 0 && !(1_000..=600_000).contains(&value) {
         bail!("boot.menu_timeout_ms must be 0 or between 1000 and 600000");
@@ -858,21 +617,6 @@ fn normalize_organization_id(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn normalize_forge_install_code(value: &str) -> anyhow::Result<String> {
-    let code = value.trim();
-    if code.is_empty() {
-        return Ok(String::new());
-    }
-    if code.len() > 512
-        || code
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        bail!("manage.forge_install_code contains unsupported characters");
-    }
-    Ok(code.to_string())
-}
-
 fn normalize_build_target_config(target: &mut BuildTargetConfig) -> anyhow::Result<()> {
     target.artifact_type = normalize_build_artifact_type(&target.artifact_type)?;
     target.target = normalize_safe_identifier("build.targets.target", &target.target, 64)?;
@@ -883,6 +627,36 @@ fn normalize_build_target_config(target: &mut BuildTargetConfig) -> anyhow::Resu
     }
     target.attr = normalize_build_attr("build.targets.attr", &target.attr)?;
     Ok(())
+}
+
+fn normalize_manage_source_url_template(
+    value: &str,
+    allow_private_fixture: bool,
+) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
+        bail!("build.manage_source_url_template is invalid");
+    }
+    if value.matches("{revision}").count() != 1 {
+        bail!("build.manage_source_url_template must contain exactly one {{revision}} placeholder");
+    }
+    if value == "github:CybexHQ/manage/{revision}" {
+        return Ok(value.to_string());
+    }
+    let candidate = value.replace("{revision}", &"0".repeat(40));
+    let parsed = Url::parse(&candidate)
+        .context("build.manage_source_url_template must be an absolute source URL")?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("build.manage_source_url_template must not contain credentials");
+    }
+    match parsed.scheme() {
+        "https" | "git+https" => {}
+        "file" | "git+file" if allow_private_fixture => {}
+        _ => bail!(
+            "build.manage_source_url_template must use HTTPS; file fixtures require workstation_netboot.allow_private_release_urls"
+        ),
+    }
+    Ok(value.to_string())
 }
 
 pub fn pinned_nixpkgs_revision(flake: &str) -> anyhow::Result<&str> {
@@ -1023,7 +797,6 @@ impl Default for PathsConfig {
             data_dir: PathBuf::from("/var/lib/cybex-forge"),
             database_path: PathBuf::from("/var/lib/cybex-forge/cybex-forge.sqlite"),
             boot_assets_dir: PathBuf::from("/srv/cybex-forge/www"),
-            iso_dir: PathBuf::from("/srv/cybex-forge/www/isos"),
             static_dir: PathBuf::from("/srv/cybex-forge/www/assets"),
             tftp_dir: PathBuf::from("/srv/cybex-forge/tftp"),
         }
@@ -1064,6 +837,7 @@ impl Default for BuildConfig {
             work_dir: PathBuf::from("/var/lib/cybex-forge/build"),
             output_dir: PathBuf::from("/var/lib/cybex-forge/build-outputs"),
             nix_binary: "nix".to_string(),
+            manage_source_url_template: "github:CybexHQ/manage/{revision}".to_string(),
             targets: Vec::new(),
         }
     }
@@ -1083,34 +857,15 @@ impl Default for CacheConfig {
     }
 }
 
-impl Default for UpdateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            work_dir: PathBuf::from("/var/lib/cybex-forge/updates"),
-            releases_dir: PathBuf::from("/opt/cybex-forge/releases"),
-            binary_path: PathBuf::from("/usr/local/bin/cybex-forge"),
-            config_path: PathBuf::from("/etc/cybex-forge/config.toml"),
-            service_name: "cybex-forge.service".to_string(),
-            health_url: String::new(),
-            max_artifact_size_bytes: 128 * 1024 * 1024,
-            trusted_public_key: String::new(),
-        }
-    }
-}
-
 impl Default for ManageConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             api_url: String::new(),
             organization_id: String::new(),
-            forge_install_code: String::new(),
-            forge_install_code_file: PathBuf::new(),
             organization_slug: String::new(),
-            state_path: PathBuf::from("/var/lib/cybex-forge/manage-state.json"),
+            state_path: PathBuf::from("/var/lib/cybex-forge/state/manage-state.json"),
             sync_interval_seconds: 30,
-            enrollment_poll_seconds: 10,
             http_timeout_seconds: 30,
         }
     }
@@ -1126,7 +881,6 @@ mod tests {
         config.build.work_dir = PathBuf::from("/srv/cybex-forge/build-work");
         config.build.output_dir = PathBuf::from("/srv/cybex-forge/build-outputs");
         config.build.nix_binary = "/run/current-system/sw/bin/nix".to_string();
-        config.update.health_url = "http://127.0.0.1:8080/healthz".to_string();
         config.update.trusted_public_key = STANDARD.encode(
             SigningKey::from_bytes(&[7u8; 32])
                 .verifying_key()
@@ -1142,26 +896,21 @@ mod tests {
     fn print_config_view_redacts_admin_token() {
         let mut config = AppConfig::default();
         config.auth.admin_token = "secret-token".to_string();
-        config.manage.forge_install_code = "install-secret".to_string();
         config.server.public_base_url = "http://boot.example".to_string();
 
         let redacted = config.redacted_for_display();
 
         assert_eq!(redacted.auth.admin_token, "REDACTED");
-        assert_eq!(redacted.manage.forge_install_code, "REDACTED");
         assert_eq!(redacted.server.public_base_url, "http://boot.example");
         assert_eq!(config.auth.admin_token, "secret-token");
-        assert_eq!(config.manage.forge_install_code, "install-secret");
     }
 
     #[test]
     fn print_config_view_preserves_blank_admin_token() {
         let mut config = AppConfig::default();
         config.auth.admin_token = "   ".to_string();
-        config.manage.forge_install_code = "   ".to_string();
 
         assert_eq!(config.redacted_for_display().auth.admin_token, "");
-        assert_eq!(config.redacted_for_display().manage.forge_install_code, "");
     }
 
     #[test]
@@ -1170,199 +919,6 @@ mod tests {
 
         assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(result.to_string().contains(env!("CARGO_PKG_VERSION")));
-    }
-
-    #[test]
-    fn sync_once_cli_accepts_an_exact_update_fence() {
-        let attempt_id = "a".repeat(32);
-        let cli = Cli::try_parse_from([
-            "cybex-forge",
-            "--config",
-            "/tmp/qualification.toml",
-            "sync-once",
-            "--update-only",
-            "--expect-update-status",
-            "failed",
-            "--expect-update-attempt",
-            &attempt_id,
-            "--expect-update-current-version",
-            "0.1.1",
-        ])
-        .unwrap();
-
-        assert_eq!(cli.config, PathBuf::from("/tmp/qualification.toml"));
-        let Some(Command::SyncOnce {
-            update_only,
-            update_projection_file,
-            expect_update_status,
-            expect_update_attempt,
-            expect_update_current_version,
-        }) = cli.command
-        else {
-            panic!("expected sync-once command");
-        };
-        assert!(update_only);
-        assert!(update_projection_file.is_none());
-        assert_eq!(expect_update_status.as_deref(), Some("failed"));
-        assert_eq!(expect_update_attempt.as_deref(), Some(attempt_id.as_str()));
-        assert_eq!(expect_update_current_version.as_deref(), Some("0.1.1"));
-    }
-
-    #[test]
-    fn sync_once_cli_requires_the_complete_update_fence() {
-        for args in [
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--expect-update-status",
-                "failed",
-            ],
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--expect-update-status",
-                "failed",
-                "--expect-update-attempt",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--expect-update-current-version",
-                "0.1.1",
-            ],
-        ] {
-            let error = Cli::try_parse_from(args).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument
-            );
-        }
-    }
-
-    #[test]
-    fn sync_once_cli_accepts_update_only_without_an_expectation() {
-        let cli = Cli::try_parse_from(["cybex-forge", "sync-once", "--update-only"]).unwrap();
-
-        assert!(matches!(
-            cli.command,
-            Some(Command::SyncOnce {
-                update_only: true,
-                update_projection_file: None,
-                expect_update_status: None,
-                expect_update_attempt: None,
-                expect_update_current_version: None,
-            })
-        ));
-    }
-
-    #[test]
-    fn sync_once_cli_accepts_a_fenced_idle_projection() {
-        let cli = Cli::try_parse_from([
-            "cybex-forge",
-            "sync-once",
-            "--update-only",
-            "--update-projection-file",
-            "/run/cybex-forge/idle-projection.json",
-            "--expect-update-status",
-            "idle",
-            "--expect-update-attempt",
-            "",
-            "--expect-update-current-version",
-            "0.1.1",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            cli.command,
-            Some(Command::SyncOnce {
-                update_only: true,
-                update_projection_file: Some(path),
-                expect_update_status: Some(status),
-                expect_update_attempt: Some(attempt),
-                expect_update_current_version: Some(current_version),
-            }) if path == PathBuf::from("/run/cybex-forge/idle-projection.json")
-                && status == "idle"
-                && attempt.is_empty()
-                && current_version == "0.1.1"
-        ));
-    }
-
-    #[test]
-    fn sync_once_cli_requires_a_full_fence_for_a_projection() {
-        let error = Cli::try_parse_from([
-            "cybex-forge",
-            "sync-once",
-            "--update-only",
-            "--update-projection-file",
-            "/run/cybex-forge/idle-projection.json",
-        ])
-        .unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-    }
-
-    #[test]
-    fn sync_once_cli_rejects_noncanonical_update_fences() {
-        for args in [
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--update-only",
-                "--expect-update-status",
-                "unexpected",
-                "--expect-update-attempt",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--expect-update-current-version",
-                "0.1.1",
-            ],
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--update-only",
-                "--expect-update-status",
-                "failed",
-                "--expect-update-attempt",
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "--expect-update-current-version",
-                "0.1.1",
-            ],
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--update-only",
-                "--expect-update-status",
-                "failed",
-                "--expect-update-attempt",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--expect-update-current-version",
-                "0..1",
-            ],
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--update-only",
-                "--expect-update-status",
-                "failed",
-                "--expect-update-attempt",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--expect-update-current-version",
-                "-0.1.1",
-            ],
-            vec![
-                "cybex-forge",
-                "sync-once",
-                "--update-only",
-                "--expect-update-status",
-                "failed",
-                "--expect-update-attempt",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--expect-update-current-version",
-                "0.1.1.",
-            ],
-        ] {
-            let error = Cli::try_parse_from(args).unwrap_err();
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        }
     }
 
     #[test]
@@ -1404,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_managed_nginx_lxc_layout() {
+    fn defaults_match_ubuntu_appliance_layout() {
         let config = AppConfig::default();
 
         assert_eq!(config.server.listen_addr, "127.0.0.1:8080");
@@ -1412,10 +968,6 @@ mod tests {
         assert_eq!(
             config.paths.boot_assets_dir,
             PathBuf::from("/srv/cybex-forge/www")
-        );
-        assert_eq!(
-            config.paths.iso_dir,
-            PathBuf::from("/srv/cybex-forge/www/isos")
         );
         assert_eq!(
             config.paths.static_dir,
@@ -1473,7 +1025,6 @@ public_base_url = " http://boot.example/// "
 enabled = true
 api_url = " https://manage.example/api/// "
 organization_id = "550e8400-e29b-41d4-a716-446655440000"
-forge_install_code = " boot_test "
 organization_slug = " Default "
 "#,
         );
@@ -1487,56 +1038,22 @@ organization_slug = " Default "
             config.manage.organization_id,
             "550e8400-e29b-41d4-a716-446655440000"
         );
-        assert_eq!(config.manage.forge_install_code, "boot_test");
         assert_eq!(config.manage.organization_slug, "default");
     }
 
     #[test]
-    fn config_load_accepts_an_absolute_install_code_file_without_exposing_a_secret() {
-        let path = write_temp_config(
-            r#"
-[manage]
-forge_install_code_file = "/var/lib/cybex-forge/bootstrap/enrollment-code"
-"#,
-        );
-
-        let config = AppConfig::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(
-            config.manage.forge_install_code_file,
-            PathBuf::from("/var/lib/cybex-forge/bootstrap/enrollment-code")
-        );
-        assert!(config.manage.forge_install_code.is_empty());
-    }
-
-    #[test]
-    fn appliance_config_accepts_only_the_fixed_non_inline_install_code_contract() {
-        let mut config = appliance_config();
-        config.validate_appliance_config().unwrap();
-
-        config.manage.forge_install_code_file =
-            PathBuf::from("/var/lib/cybex-forge/bootstrap/enrollment-code");
-        config.validate_appliance_config().unwrap();
-
-        config.manage.forge_install_code = "secret-must-not-be-persisted".to_string();
-        assert!(
-            config
-                .validate_appliance_config()
-                .unwrap_err()
-                .to_string()
-                .contains("must not contain an inline")
-        );
-        config.manage.forge_install_code.clear();
-
-        config.manage.forge_install_code_file = PathBuf::from("/run/arbitrary-code");
-        assert!(
-            config
-                .validate_appliance_config()
-                .unwrap_err()
-                .to_string()
-                .contains("fixed bootstrap path")
-        );
+    fn config_rejects_removed_install_code_and_executable_updater_fields() {
+        for raw in [
+            "[manage]\nforge_install_code = \"removed\"\n",
+            "[manage]\nforge_install_code_file = \"/run/removed\"\n",
+            "[update]\nenabled = true\n",
+            "[update]\nwork_dir = \"/var/lib/cybex-forge/updates\"\n",
+        ] {
+            let path = write_temp_config(raw);
+            let error = AppConfig::load(&path).unwrap_err();
+            let _ = fs::remove_file(&path);
+            assert!(error.to_string().contains("unknown field"));
+        }
     }
 
     #[test]
@@ -1591,31 +1108,6 @@ forge_install_code_file = "/var/lib/cybex-forge/bootstrap/enrollment-code"
             |config| config.cache.public_key_path = PathBuf::from("/tmp/cache-public-key"),
             "cache.public_key_path",
         );
-        rejected(|config| config.update.enabled = false, "updates");
-        rejected(
-            |config| config.update.work_dir = PathBuf::from("/tmp/updates"),
-            "update.work_dir",
-        );
-        rejected(
-            |config| config.update.releases_dir = PathBuf::from("/tmp/releases"),
-            "update.releases_dir",
-        );
-        rejected(
-            |config| config.update.binary_path = PathBuf::from("/opt/cybex-forge/bin/forge"),
-            "update.binary_path",
-        );
-        rejected(
-            |config| config.update.config_path = PathBuf::from("/tmp/config.toml"),
-            "update.config_path",
-        );
-        rejected(
-            |config| config.update.service_name = "unrelated.service".to_string(),
-            "update.service_name",
-        );
-        rejected(
-            |config| config.update.health_url = "http://127.0.0.1:9080/healthz".to_string(),
-            "update.health_url",
-        );
         rejected(
             |config| config.update.trusted_public_key.clear(),
             "trust key",
@@ -1629,26 +1121,6 @@ forge_install_code_file = "/var/lib/cybex-forge/bootstrap/enrollment-code"
             |config| config.manage.state_path = PathBuf::from("/tmp/manage-state.json"),
             "manage.state_path",
         );
-    }
-
-    #[test]
-    fn config_load_rejects_ambiguous_or_relative_install_code_sources() {
-        for raw in [
-            r#"
-[manage]
-forge_install_code = "forge_code_1234567890"
-forge_install_code_file = "/var/lib/cybex-forge/bootstrap/enrollment-code"
-"#,
-            r#"
-[manage]
-forge_install_code_file = "bootstrap/enrollment-code"
-"#,
-        ] {
-            let path = write_temp_config(raw);
-            let error = AppConfig::load(&path).unwrap_err();
-            let _ = fs::remove_file(&path);
-            assert!(error.to_string().contains("forge_install_code"));
-        }
     }
 
     #[test]

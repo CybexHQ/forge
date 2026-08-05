@@ -29,22 +29,10 @@ pub struct BootProfile {
     pub name: String,
     pub description: String,
     pub profile_type: BootProfileType,
-    pub installer_iso_source: String,
     pub enabled: bool,
     pub is_default: bool,
     pub one_time: bool,
-    pub kernel_path: Option<String>,
-    pub initrd_path: Option<String>,
-    pub iso_path: Option<String>,
-    pub cmdline: Option<String>,
     pub raw_script: Option<String>,
-    pub desired_iso_artifact_id: String,
-    pub desired_iso_filename: String,
-    pub desired_iso_size_bytes: i64,
-    pub desired_iso_sha256: String,
-    pub desired_iso_built_at: Option<String>,
-    pub desired_iso_url: String,
-    pub desired_iso_download_url: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -53,8 +41,7 @@ pub struct BootProfile {
 #[serde(rename_all = "snake_case")]
 pub enum BootProfileType {
     LocalDisk,
-    IsoLive,
-    LinuxInstaller,
+    ForgeInstaller,
     CustomIpxe,
 }
 
@@ -62,8 +49,7 @@ impl BootProfileType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalDisk => "local_disk",
-            Self::IsoLive => "iso_live",
-            Self::LinuxInstaller => "linux_installer",
+            Self::ForgeInstaller => "forge_installer",
             Self::CustomIpxe => "custom_ipxe",
         }
     }
@@ -81,26 +67,13 @@ impl FromStr for BootProfileType {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "local_disk" => Ok(Self::LocalDisk),
-            "iso_live" => Ok(Self::IsoLive),
-            "linux_installer" => Ok(Self::LinuxInstaller),
+            "forge_installer" => Ok(Self::ForgeInstaller),
             "custom_ipxe" => Ok(Self::CustomIpxe),
             other => Err(AppError::Validation(format!(
                 "unsupported boot profile type '{other}'"
             ))),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IsoAsset {
-    pub id: i64,
-    pub filename: String,
-    pub relative_path: String,
-    pub size_bytes: i64,
-    pub checksum_sha256: String,
-    pub last_scanned_at: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,10 +234,6 @@ pub struct CreateBootProfileRequest {
     pub enabled: Option<bool>,
     pub is_default: Option<bool>,
     pub one_time: Option<bool>,
-    pub kernel_path: Option<String>,
-    pub initrd_path: Option<String>,
-    pub iso_path: Option<String>,
-    pub cmdline: Option<String>,
     pub raw_script: Option<String>,
 }
 
@@ -276,10 +245,6 @@ pub struct UpdateBootProfileRequest {
     pub enabled: Option<bool>,
     pub is_default: Option<bool>,
     pub one_time: Option<bool>,
-    pub kernel_path: Option<Option<String>>,
-    pub initrd_path: Option<Option<String>>,
-    pub iso_path: Option<Option<String>>,
-    pub cmdline: Option<Option<String>>,
     pub raw_script: Option<Option<String>>,
 }
 
