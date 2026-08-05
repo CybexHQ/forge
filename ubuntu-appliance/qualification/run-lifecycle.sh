@@ -102,7 +102,7 @@ test -f "$vars_template" && test -f "$code"
 cp -- "$vars_template" "$work_dir/OVMF_VARS.fd"
 
 qemu-system-x86_64 \
-  -enable-kvm -machine q35,smm=on -cpu host -smp 4 -m 16384 \
+  -enable-kvm -machine q35,smm=on -cpu host -smp 4 -m 32768 \
   -global driver=cfi.pflash01,property=secure,value=on \
   -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
