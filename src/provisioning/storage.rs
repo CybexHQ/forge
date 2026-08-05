@@ -431,35 +431,13 @@ pub(crate) fn write_autoinstall(
             "refresh-installer": {"update": false},
             "apt": offline_apt_config(),
             "storage": {"config": storage_config(prepared)?},
-            "packages": [
-                "cybex-forge",
-                "cybex-forge-bootstrap",
-                "cybex-forge-appliance",
-                "linux-generic",
-                "linux-firmware",
-                "intel-microcode",
-                "amd64-microcode",
-                "nginx-core",
-                "tftpd-hpa",
-                "ipxe",
-                "nix-bin",
-                "nix-setup-systemd",
-                "openssh-server",
-                "btrfs-progs",
-                "watchdog"
-            ],
             "ssh": {"install-server": true, "allow-pw": false},
             "user-data": {
                 "hostname": hostname,
                 "disable_root": true,
                 "users": []
             },
-            "late-commands": [
-                "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage installing_packages --status succeeded --progress-percent 80 --message 'Offline Ubuntu and Cybex packages installed'",
-                "/cdrom/cybex/bootstrap/cybex-forge-bootstrap finalize-target --target /target --state-mount /run/cybex-state",
-                "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage installing_bootloader --status succeeded --progress-percent 95 --message 'Signed Ubuntu bootloader installed'",
-                "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage rebooting --status succeeded --progress-percent 99 --message 'Rebooting into the managed appliance'"
-            ],
+            "late-commands": offline_package_install_commands(),
             "shutdown": "reboot"
         }
     });
@@ -479,6 +457,42 @@ fn offline_apt_config() -> Value {
         // Subiquity makes /cdrom available to the installation environment.
         "sources_list": "deb [trusted=yes] file:///cdrom/cybex/apt ./"
     })
+}
+
+fn offline_package_install_commands() -> Value {
+    let packages = [
+        "cybex-forge",
+        "cybex-forge-bootstrap",
+        "cybex-forge-appliance",
+        "linux-generic",
+        "linux-firmware",
+        "intel-microcode",
+        "amd64-microcode",
+        "nginx-core",
+        "tftpd-hpa",
+        "ipxe",
+        "nix-bin",
+        "nix-setup-systemd",
+        "openssh-server",
+        "btrfs-progs",
+        "watchdog",
+    ];
+    let install = format!(
+        "mkdir -p /target/cdrom; \
+         mount --bind /cdrom /target/cdrom; \
+         trap 'umount /target/cdrom' EXIT; \
+         curtin in-target --target=/target -- apt-get update -o Acquire::Languages=none; \
+         curtin in-target --target=/target -- env DEBIAN_FRONTEND=noninteractive \
+         apt-get install --yes --no-install-recommends {}",
+        packages.join(" ")
+    );
+    json!([
+        ["sh", "-ceu", install],
+        "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage installing_packages --status succeeded --progress-percent 80 --message 'Offline Ubuntu and Cybex packages installed'",
+        "/cdrom/cybex/bootstrap/cybex-forge-bootstrap finalize-target --target /target --state-mount /run/cybex-state",
+        "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage installing_bootloader --status succeeded --progress-percent 95 --message 'Signed Ubuntu bootloader installed'",
+        "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage rebooting --status succeeded --progress-percent 99 --message 'Rebooting into the managed appliance'"
+    ])
 }
 
 fn storage_config(prepared: &PreparedStorage) -> Result<Value> {
@@ -945,6 +959,46 @@ mod tests {
             "deb [trusted=yes] file:///cdrom/cybex/apt ./"
         );
         assert!(config.get("sources").is_none());
+    }
+
+    #[test]
+    fn offline_packages_install_only_after_media_is_visible_inside_target() {
+        let commands = offline_package_install_commands();
+        let commands = commands.as_array().unwrap();
+        let install_command = commands[0].as_array().unwrap();
+        assert_eq!(install_command[0], "sh");
+        assert_eq!(install_command[1], "-ceu");
+        let install = install_command[2].as_str().unwrap();
+        let mkdir = install.find("mkdir -p /target/cdrom").unwrap();
+        let mount = install.find("mount --bind /cdrom /target/cdrom").unwrap();
+        let update = install.find("apt-get update").unwrap();
+        let packages = install.find("apt-get install").unwrap();
+        assert!(mkdir < mount && mount < update && update < packages);
+        assert!(install.contains("trap 'umount /target/cdrom' EXIT"));
+        assert!(install.contains("DEBIAN_FRONTEND=noninteractive"));
+        assert!(
+            StdCommand::new("sh")
+                .args(["-n", "-c", install])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for package in [
+            "cybex-forge",
+            "cybex-forge-bootstrap",
+            "cybex-forge-appliance",
+            "linux-generic",
+            "openssh-server",
+            "btrfs-progs",
+        ] {
+            assert!(install.split_ascii_whitespace().any(|item| item == package));
+        }
+        assert!(
+            commands[1]
+                .as_str()
+                .unwrap()
+                .contains("installing_packages")
+        );
     }
 
     #[test]
