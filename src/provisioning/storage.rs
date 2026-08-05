@@ -299,13 +299,26 @@ impl ExistingPartition {
     ) -> Result<()> {
         if self.first_sector != first_sector
             || self.last_sector != last_sector
-            || !self.type_code.eq_ignore_ascii_case(type_code)
+            || !partition_type_matches(&self.type_code, type_code)
             || self.name != name
         {
             bail!("existing appliance partition does not match the approved layout")
         }
         Ok(())
     }
+}
+
+fn partition_type_matches(reported: &str, expected_short_code: &str) -> bool {
+    if reported.eq_ignore_ascii_case(expected_short_code) {
+        return true;
+    }
+    let expected_guid = match expected_short_code.to_ascii_lowercase().as_str() {
+        "ef00" => "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+        "8300" => "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "8200" => "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F",
+        _ => return false,
+    };
+    reported.eq_ignore_ascii_case(expected_guid)
 }
 
 async fn validate_existing_partition(
@@ -878,7 +891,7 @@ mod tests {
 
     #[test]
     fn existing_sgdisk_partition_fields_are_parsed_exactly() {
-        let body = "Partition GUID code: 8300 (Linux filesystem)\n\
+        let body = "Partition GUID code: 0FC63DAF-8483-4772-8E79-3D69D8477DE4 (Linux filesystem)\n\
                     Partition unique GUID: 00000000-0000-0000-0000-000000000000\n\
                     First sector: 1024 (at 512.0 KiB)\n\
                     Last sector: 2047 (at 1023.5 KiB)\n\
@@ -888,8 +901,16 @@ mod tests {
         let partition = parse_partition_info(body, 3).unwrap().unwrap();
         assert_eq!(partition.first_sector, 1024);
         assert_eq!(partition.last_sector, 2047);
-        assert_eq!(partition.type_code, "8300");
+        assert_eq!(partition.type_code, "0FC63DAF-8483-4772-8E79-3D69D8477DE4");
         assert_eq!(partition.name, "CYBEX_STATE");
+        partition
+            .validate(1024, 2047, "8300", "CYBEX_STATE")
+            .unwrap();
+        assert!(
+            partition
+                .validate(1024, 2047, "8200", "CYBEX_STATE")
+                .is_err()
+        );
     }
 
     #[test]
