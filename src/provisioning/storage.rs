@@ -335,6 +335,14 @@ async fn inspect_partition(disk: &str, index: u8) -> Result<Option<ExistingParti
         bail!("partition inspection output is too large")
     }
     let body = String::from_utf8(output.stdout).context("partition inspection is not UTF-8")?;
+    parse_partition_info(&body, index)
+}
+
+fn parse_partition_info(body: &str, index: u8) -> Result<Option<ExistingPartition>> {
+    let missing = format!("Partition #{index} does not exist.");
+    if body.lines().any(|line| line.trim() == missing) {
+        return Ok(None);
+    }
     let field = |prefix: &str| {
         body.lines()
             .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
@@ -857,6 +865,31 @@ mod tests {
             partition_path(Path::new("/dev/nvme0n1"), 3).unwrap(),
             Path::new("/dev/nvme0n1p3")
         );
+    }
+
+    #[test]
+    fn missing_sgdisk_partition_is_not_treated_as_malformed() {
+        assert!(
+            parse_partition_info("Partition #1 does not exist.\n", 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_sgdisk_partition_fields_are_parsed_exactly() {
+        let body = "Partition GUID code: 8300 (Linux filesystem)\n\
+                    Partition unique GUID: 00000000-0000-0000-0000-000000000000\n\
+                    First sector: 1024 (at 512.0 KiB)\n\
+                    Last sector: 2047 (at 1023.5 KiB)\n\
+                    Partition size: 1024 sectors (512.0 KiB)\n\
+                    Attribute flags: 0000000000000000\n\
+                    Partition name: 'CYBEX_STATE'\n";
+        let partition = parse_partition_info(body, 3).unwrap().unwrap();
+        assert_eq!(partition.first_sector, 1024);
+        assert_eq!(partition.last_sector, 2047);
+        assert_eq!(partition.type_code, "8300");
+        assert_eq!(partition.name, "CYBEX_STATE");
     }
 
     #[test]
