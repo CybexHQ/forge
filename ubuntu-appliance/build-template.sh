@@ -133,8 +133,9 @@ truncate -s 8192 "$iso_tree/CYBEX_PROVISIONING.BIN"
   --ubuntu-snapshot-id "$snapshot_id" \
   --release-public-key "$release_public_key"
 
-package_bundle="$output_dir/cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst"
-test ! -e "$package_bundle"
+package_bundle_name="cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst"
+package_bundle="$work_dir/$package_bundle_name"
+test ! -e "$output_dir/$package_bundle_name"
 tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 \
   --mode=u=rw,go=r --mtime='@0' -C "$iso_tree/cybex/apt" -cf - . \
   | zstd -19 --threads=1 --no-progress --no-dictID -o "$package_bundle"
@@ -153,7 +154,9 @@ for package_name in cybex-forge cybex-forge-bootstrap cybex-forge-appliance linu
   }
   required_versions="$(jq -c --arg package "$package_name" --arg version "$package_version" '. + {($package):$version}' <<<"$required_versions")"
 done
-package_metadata="$output_dir/cybex-forge-appliance-packages-$version-x86_64-linux.json"
+package_metadata_name="cybex-forge-appliance-packages-$version-x86_64-linux.json"
+package_metadata="$work_dir/$package_metadata_name"
+test ! -e "$output_dir/$package_metadata_name"
 jq -n \
   --arg schema 'cybex.forge.appliance-package-snapshot.v1' \
   --arg release_id "$version" \
@@ -218,6 +221,8 @@ jq -n \
   --argjson provisioning_public_keys "$(printf '%s\n' "${provisioning_keys[@]}" | jq -R . | jq -s .)" \
   '{schema:$schema,version:$version,architecture:"x86_64-linux",base_os:"ubuntu",base_os_version:"26.04",size_bytes:$size_bytes,template_sha256:$template_sha256,personalization_offset:$personalization_offset,personalization_size:$personalization_size,placeholder_sha256:$placeholder_sha256,ubuntu_snapshot_id:$ubuntu_snapshot_id,provisioning_public_keys:$provisioning_public_keys}' \
   > "$metadata"
+mv -- "$package_bundle" "$output_dir/$package_bundle_name"
+mv -- "$package_metadata" "$output_dir/$package_metadata_name"
 
 echo "built provisionable Ubuntu Forge ISO template: $output_iso"
 echo "personalization_offset=$personalization_offset"
