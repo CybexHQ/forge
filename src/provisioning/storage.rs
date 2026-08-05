@@ -485,7 +485,7 @@ fn offline_apt_config() -> Value {
 fn storage_config(disk: &str) -> Value {
     json!([
         {"type":"disk","id":"disk0","path":disk,"ptable":"gpt","preserve":true,"wipe":null},
-        {"type":"partition","id":"efi-partition","device":"disk0","number":1,"preserve":true},
+        {"type":"partition","id":"efi-partition","device":"disk0","number":1,"preserve":true,"flag":"boot","grub_device":true},
         {"type":"partition","id":"root-partition","device":"disk0","number":2,"preserve":true},
         {"type":"partition","id":"state-partition","device":"disk0","number":3,"preserve":true},
         {"type":"partition","id":"swap-partition","device":"disk0","number":4,"preserve":true},
@@ -929,6 +929,26 @@ mod tests {
             "deb [trusted=yes] file:///cdrom/cybex/apt ./"
         );
         assert!(config.get("sources").is_none());
+    }
+
+    #[test]
+    fn preserved_efi_partition_is_the_explicit_uefi_bootloader_target() {
+        let config = storage_config("/dev/sda");
+        let actions = config.as_array().unwrap();
+        let efi_partition = actions
+            .iter()
+            .find(|action| action["id"] == "efi-partition")
+            .unwrap();
+        assert_eq!(efi_partition["preserve"], true);
+        assert_eq!(efi_partition["flag"], "boot");
+        assert_eq!(efi_partition["grub_device"], true);
+
+        let efi_mount = actions
+            .iter()
+            .find(|action| action["id"] == "efi-mount")
+            .unwrap();
+        assert_eq!(efi_mount["device"], "efi-format");
+        assert_eq!(efi_mount["path"], "/boot/efi");
     }
 
     #[test]
