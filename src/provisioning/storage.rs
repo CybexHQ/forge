@@ -26,6 +26,7 @@ const SWAP_BYTES: u64 = 8 * GIB;
 pub(crate) struct PreparedStorage {
     pub disk_path: PathBuf,
     pub state_mount: PathBuf,
+    sector_size: u64,
     partition_starts: [u64; 5],
     partition_ends: [u64; 5],
 }
@@ -194,6 +195,7 @@ pub(crate) async fn create_state_partition_first(
     Ok(PreparedStorage {
         disk_path,
         state_mount: state_mount.to_path_buf(),
+        sector_size,
         partition_starts: starts,
         partition_ends: ends,
     })
@@ -233,6 +235,7 @@ pub(crate) async fn resume_prepared_storage(
     Ok(PreparedStorage {
         disk_path,
         state_mount: state_mount.to_path_buf(),
+        sector_size,
         partition_starts: starts,
         partition_ends: ends,
     })
@@ -418,10 +421,6 @@ pub(crate) fn write_autoinstall(
     prepared: &PreparedStorage,
     plan: &SignedInstallPlan,
 ) -> Result<()> {
-    let disk = prepared
-        .disk_path
-        .to_str()
-        .ok_or_else(|| anyhow!("target disk path is not UTF-8"))?;
     let hostname = format!("forge-{}", device_id_suffix(&plan.reserved_device_id));
     let config = json!({
         "autoinstall": {
@@ -431,7 +430,7 @@ pub(crate) fn write_autoinstall(
             "keyboard": {"layout": "us"},
             "refresh-installer": {"update": false},
             "apt": offline_apt_config(),
-            "storage": {"config": storage_config(disk)},
+            "storage": {"config": storage_config(prepared)?},
             "packages": [
                 "cybex-forge",
                 "cybex-forge-bootstrap",
@@ -482,14 +481,31 @@ fn offline_apt_config() -> Value {
     })
 }
 
-fn storage_config(disk: &str) -> Value {
-    json!([
+fn storage_config(prepared: &PreparedStorage) -> Result<Value> {
+    let disk = prepared
+        .disk_path
+        .to_str()
+        .ok_or_else(|| anyhow!("target disk path is not UTF-8"))?;
+    let mut partition_sizes = [0; 5];
+    for (index, (&start, &end)) in prepared
+        .partition_starts
+        .iter()
+        .zip(&prepared.partition_ends)
+        .enumerate()
+    {
+        partition_sizes[index] = end
+            .checked_sub(start)
+            .and_then(|sectors| sectors.checked_add(1))
+            .and_then(|sectors| sectors.checked_mul(prepared.sector_size))
+            .ok_or_else(|| anyhow!("approved partition size is invalid"))?;
+    }
+    Ok(json!([
         {"type":"disk","id":"disk0","path":disk,"ptable":"gpt","preserve":true,"wipe":null},
-        {"type":"partition","id":"efi-partition","device":"disk0","number":1,"preserve":true,"flag":"boot","grub_device":true},
-        {"type":"partition","id":"root-partition","device":"disk0","number":2,"preserve":true},
-        {"type":"partition","id":"state-partition","device":"disk0","number":3,"preserve":true},
-        {"type":"partition","id":"swap-partition","device":"disk0","number":4,"preserve":true},
-        {"type":"partition","id":"cache-partition","device":"disk0","number":5,"preserve":true},
+        {"type":"partition","id":"efi-partition","device":"disk0","number":1,"size":partition_sizes[0],"preserve":true,"flag":"boot","grub_device":true},
+        {"type":"partition","id":"root-partition","device":"disk0","number":2,"size":partition_sizes[1],"preserve":true},
+        {"type":"partition","id":"state-partition","device":"disk0","number":3,"size":partition_sizes[2],"preserve":true},
+        {"type":"partition","id":"swap-partition","device":"disk0","number":4,"size":partition_sizes[3],"preserve":true},
+        {"type":"partition","id":"cache-partition","device":"disk0","number":5,"size":partition_sizes[4],"preserve":true},
         {"type":"format","id":"efi-format","volume":"efi-partition","fstype":"fat32","label":"CYBEX_EFI"},
         {"type":"format","id":"root-format","volume":"root-partition","fstype":"btrfs","label":"CYBEX_ROOT"},
         {"type":"format","id":"state-format","volume":"state-partition","fstype":"ext4","label":"CYBEX_STATE","preserve":true},
@@ -500,7 +516,7 @@ fn storage_config(disk: &str) -> Value {
         {"type":"mount","id":"state-mount","device":"state-format","path":"/var/lib/cybex-forge/state","options":"nodev,nosuid"},
         {"type":"mount","id":"cache-mount","device":"cache-format","path":"/var/cache/cybex-forge","options":"nodev,nosuid,exec"},
         {"type":"mount","id":"swap-mount","device":"swap-format","path":"none"}
-    ])
+    ]))
 }
 
 pub(crate) fn materialize_target(
@@ -933,7 +949,15 @@ mod tests {
 
     #[test]
     fn preserved_efi_partition_is_the_explicit_uefi_bootloader_target() {
-        let config = storage_config("/dev/sda");
+        let (starts, ends) = calculate_layout(512, (160 * GIB) / 512).unwrap();
+        let prepared = PreparedStorage {
+            disk_path: PathBuf::from("/dev/sda"),
+            state_mount: PathBuf::from("/run/cybex-state"),
+            sector_size: 512,
+            partition_starts: starts,
+            partition_ends: ends,
+        };
+        let config = storage_config(&prepared).unwrap();
         let actions = config.as_array().unwrap();
         let efi_partition = actions
             .iter()
@@ -949,6 +973,31 @@ mod tests {
             .unwrap();
         assert_eq!(efi_mount["device"], "efi-format");
         assert_eq!(efi_mount["path"], "/boot/efi");
+    }
+
+    #[test]
+    fn preserved_partitions_declare_the_exact_approved_byte_sizes() {
+        let (starts, ends) = calculate_layout(512, (160 * GIB) / 512).unwrap();
+        let prepared = PreparedStorage {
+            disk_path: PathBuf::from("/dev/sda"),
+            state_mount: PathBuf::from("/run/cybex-state"),
+            sector_size: 512,
+            partition_starts: starts,
+            partition_ends: ends,
+        };
+        let config = storage_config(&prepared).unwrap();
+        let actions = config.as_array().unwrap();
+        let expected = [
+            ("efi-partition", EFI_BYTES),
+            ("root-partition", ROOT_BYTES),
+            ("state-partition", STATE_BYTES),
+            ("swap-partition", SWAP_BYTES),
+            ("cache-partition", 93_413_441_536),
+        ];
+        for (id, size) in expected {
+            let partition = actions.iter().find(|action| action["id"] == id).unwrap();
+            assert_eq!(partition["size"], size);
+        }
     }
 
     #[test]
