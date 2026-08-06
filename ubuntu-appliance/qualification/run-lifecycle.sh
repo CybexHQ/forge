@@ -113,18 +113,31 @@ code="${CYBEX_FORGE_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
 test -f "$vars_template" && test -f "$code"
 cp -- "$vars_template" "$work_dir/OVMF_VARS.fd"
 
-qemu-system-x86_64 \
-  -enable-kvm -machine q35,smm=on -cpu host -smp 4 -m 32768 \
-  -global driver=cfi.pflash01,property=secure,value=on \
-  -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
-  -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
-  -drive "if=none,id=system,format=raw,file=$disk,cache=none" \
-  -device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=system,serial=CYBEXQUALIFICATION \
-  -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$personalized" \
-  -device ide-cd,drive=installer \
-  -netdev "bridge,id=net0,br=$bridge" -device virtio-net-pci,netdev=net0,mac=52:54:00:c7:be:01 \
-  -boot once=d,menu=off -display none -serial "file:$work_dir/serial.log" &
-qemu_pid=$!
+start_qemu() {
+  local boot_mode="$1"
+  local -a boot_arguments
+  case "$boot_mode" in
+    installer) boot_arguments=(-boot "once=d,menu=off") ;;
+    installed) boot_arguments=(-boot "order=c,menu=off") ;;
+    *) echo "error: unsupported qualification boot mode: $boot_mode" >&2; exit 1 ;;
+  esac
+  qemu-system-x86_64 \
+    -enable-kvm -machine q35,smm=on -cpu host -smp 4 -m 32768 \
+    -global driver=cfi.pflash01,property=secure,value=on \
+    -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
+    -drive "if=pflash,format=raw,unit=1,file=$work_dir/OVMF_VARS.fd" \
+    -drive "if=none,id=system,format=raw,file=$disk,cache=none" \
+    -device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=system,serial=CYBEXQUALIFICATION \
+    -drive "if=none,id=installer,media=cdrom,readonly=on,format=raw,file=$personalized" \
+    -device ide-cd,drive=installer \
+    -netdev "bridge,id=net0,br=$bridge" -device virtio-net-pci,netdev=net0,mac=52:54:00:c7:be:01 \
+    "${boot_arguments[@]}" -display none -serial "file:$work_dir/serial.log" &
+  qemu_pid=$!
+}
+
+qemu_restart_count=0
+cold_restart_deadline=0
+start_qemu installer
 
 session="$work_dir/session.json"
 claimed=false
@@ -179,6 +192,28 @@ for _attempt in $(seq 1 1080); do
   then
     echo 'error: approved Forge candidate did not acknowledge its plan before the qualification deadline' >&2
     jq '{state,heartbeat_at,destructive_started_at,progress,failure_code,failure_message}' "$session" >&2
+    if [[ -s "$work_dir/serial.log" ]]; then
+      echo 'bounded qualification serial console follows:' >&2
+      tail -n 500 "$work_dir/serial.log" >&2
+    fi
+    exit 1
+  fi
+  if [[ "$state" = rebooting && "$qemu_restart_count" -eq 0 ]] \
+    && [[ -s "$work_dir/serial.log" ]] \
+    && (( $(date +%s) - $(stat -c %Y "$work_dir/serial.log") >= 180 ))
+  then
+    echo 'qualification: reboot console stalled; cold-starting the installed disk once' >&2
+    kill "$qemu_pid" 2>/dev/null || true
+    wait "$qemu_pid" 2>/dev/null || true
+    qemu_pid=""
+    start_qemu installed
+    qemu_restart_count=1
+    cold_restart_deadline=$((SECONDS + 300))
+  fi
+  if [[ "$state" = rebooting && "$qemu_restart_count" -eq 1 ]] \
+    && ((SECONDS >= cold_restart_deadline))
+  then
+    echo 'error: installed Forge disk did not activate after its bounded cold restart' >&2
     if [[ -s "$work_dir/serial.log" ]]; then
       echo 'bounded qualification serial console follows:' >&2
       tail -n 500 "$work_dir/serial.log" >&2
