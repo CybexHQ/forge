@@ -477,13 +477,19 @@ fn offline_package_install_commands() -> Value {
         "btrfs-progs",
         "watchdog",
     ];
+    let apt_options = "-o Dir::Etc::sourcelist=/tmp/cybex-offline.list \
+                       -o Dir::Etc::sourceparts=- \
+                       -o Acquire::Languages=none";
     let install = format!(
         "mkdir -p /target/cdrom; \
          mount --bind /cdrom /target/cdrom; \
-         trap 'umount /target/cdrom' EXIT; \
-         curtin in-target --target=/target -- apt-get update -o Acquire::Languages=none; \
+         printf '%s\\n' 'deb [trusted=yes] file:///cdrom/cybex/apt ./' \
+         > /target/tmp/cybex-offline.list; \
+         chmod 0644 /target/tmp/cybex-offline.list; \
+         trap 'rm -f /target/tmp/cybex-offline.list; umount /target/cdrom' EXIT; \
+         curtin in-target --target=/target -- apt-get {apt_options} update; \
          curtin in-target --target=/target -- env DEBIAN_FRONTEND=noninteractive \
-         apt-get install --yes --no-install-recommends {}",
+         apt-get {apt_options} install --yes --no-install-recommends {}",
         packages.join(" ")
     );
     json!([
@@ -971,10 +977,16 @@ mod tests {
         let install = install_command[2].as_str().unwrap();
         let mkdir = install.find("mkdir -p /target/cdrom").unwrap();
         let mount = install.find("mount --bind /cdrom /target/cdrom").unwrap();
-        let update = install.find("apt-get update").unwrap();
-        let packages = install.find("apt-get install").unwrap();
-        assert!(mkdir < mount && mount < update && update < packages);
-        assert!(install.contains("trap 'umount /target/cdrom' EXIT"));
+        let source = install.find("/target/tmp/cybex-offline.list").unwrap();
+        let update = install.find(" update;").unwrap();
+        let packages = install.find(" install --yes").unwrap();
+        assert!(mkdir < mount && mount < source && source < update && update < packages);
+        assert!(install.contains("deb [trusted=yes] file:///cdrom/cybex/apt ./"));
+        assert!(install.contains("chmod 0644 /target/tmp/cybex-offline.list"));
+        assert_eq!(install.matches("Dir::Etc::sourcelist").count(), 2);
+        assert_eq!(install.matches("Dir::Etc::sourceparts=-").count(), 2);
+        assert!(install.contains("rm -f /target/tmp/cybex-offline.list"));
+        assert!(install.contains("umount /target/cdrom"));
         assert!(install.contains("DEBIAN_FRONTEND=noninteractive"));
         assert!(
             StdCommand::new("sh")
