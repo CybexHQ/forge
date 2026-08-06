@@ -74,7 +74,7 @@ rm -f /etc/nginx/sites-enabled/default
 nginx -t
 sshd -t
 netplan generate
-systemctl enable --now nix-daemon nginx tftpd-hpa cybex-forge-firewall ssh
+systemctl enable nix-daemon nginx tftpd-hpa cybex-forge-firewall ssh
 systemctl enable cybex-forge.service cybex-forge-appliance-update.timer
 
 generation="$(jq -er '.root_generation' "$state_dir/appliance-release.json")"

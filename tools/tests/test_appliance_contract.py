@@ -43,6 +43,15 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
         self.assertIn("After=network-online.target nix-daemon.service "
                       "cybex-forge-first-boot.service\n", service)
 
+    def test_first_boot_does_not_wait_for_units_ordered_after_it(self) -> None:
+        script = FIRST_BOOT.read_text(encoding="utf-8")
+        self.assertNotIn("systemctl enable --now", script)
+        self.assertIn(
+            "systemctl enable nix-daemon nginx tftpd-hpa "
+            "cybex-forge-firewall ssh\n",
+            script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
