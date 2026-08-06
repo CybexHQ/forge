@@ -1,7 +1,8 @@
 [Unit]
 Description=Cybex Forge managed appliance service
-After=network-online.target nix-daemon.service
+After=network-online.target nix-daemon.service cybex-forge-first-boot.service
 Wants=network-online.target
+Requires=cybex-forge-first-boot.service
 RequiresMountsFor=/var/lib/cybex-forge/state /var/cache/cybex-forge /nix
 StartLimitIntervalSec=0
 

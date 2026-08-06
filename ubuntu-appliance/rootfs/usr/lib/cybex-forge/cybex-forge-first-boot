@@ -55,7 +55,8 @@ nix_mount_options=",$(findmnt -n -o OPTIONS /nix),"
 [[ "$nix_mount_options" != *,noexec,* ]]
 install -d -m 0755 -o root -g root /var/cache/cybex-forge /var/cache/cybex-forge/nix /nix
 nix-store --init
-test -d /nix/store /nix/var/nix/db
+test -d /nix/store
+test -d /nix/var/nix/db
 chown root:root /var/cache/cybex-forge /var/cache/cybex-forge/nix /nix
 
 install -d -m 0750 -o cybex-forge -g cybex-forge \
@@ -64,6 +65,8 @@ chown -R cybex-forge:cybex-forge \
   /var/lib/cybex-forge/state \
   /var/cache/cybex-forge/{www,tftp,build,build-outputs}
 chmod 0600 /var/lib/cybex-forge/state/manage-state.json
+chown root:cybex-forge /etc/cybex-forge/config.toml
+chmod 0640 /etc/cybex-forge/config.toml
 
 /usr/lib/cybex-forge/cybex-forge-network-guard
 ln -sfn /etc/nginx/sites-available/cybex-forge /etc/nginx/sites-enabled/cybex-forge
