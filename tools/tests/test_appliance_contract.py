@@ -24,6 +24,24 @@ SERVICE = (
 QUALIFICATION_LIFECYCLE = (
     REPOSITORY / "ubuntu-appliance" / "qualification" / "run-lifecycle.sh"
 )
+NETWORK_CHANGE = (
+    REPOSITORY
+    / "ubuntu-appliance"
+    / "rootfs"
+    / "usr"
+    / "lib"
+    / "cybex-forge"
+    / "cybex-forge-network-change"
+)
+NETPLAN_APPLY = (
+    REPOSITORY
+    / "ubuntu-appliance"
+    / "rootfs"
+    / "usr"
+    / "lib"
+    / "cybex-forge"
+    / "cybex-forge-netplan-apply"
+)
 
 
 class ApplianceFirstBootContractTests(unittest.TestCase):
@@ -67,6 +85,15 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
         self.assertIn("qemu_restart_count=1\n", script)
         self.assertIn("cold_restart_deadline=$((SECONDS + 300))\n", script)
         self.assertIn("-m 32768", script)
+
+    def test_root_network_helper_shares_handshake_files_with_forge(self) -> None:
+        change_script = NETWORK_CHANGE.read_text(encoding="utf-8")
+        self.assertIn('chown root:cybex-forge "$status.tmp"\n', change_script)
+        self.assertIn('chmod 0640 "$status.tmp"\n', change_script)
+
+        apply_script = NETPLAN_APPLY.read_text(encoding="utf-8")
+        self.assertIn('chown root:cybex-forge "$pending"\n', apply_script)
+        self.assertIn('chmod 0640 "$pending"\n', apply_script)
 
 
 if __name__ == "__main__":

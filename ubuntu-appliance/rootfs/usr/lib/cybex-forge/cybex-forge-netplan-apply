@@ -18,6 +18,8 @@ candidate_sha="$(sha256sum "$candidate" | awk '{print $1}')"
 install -m 0600 "$active" "$backup"
 install -m 0600 "$candidate" "$active"
 printf '%s\n' "$candidate_sha" > "$pending"
+chown root:cybex-forge "$pending"
+chmod 0640 "$pending"
 
 rollback() {
   install -m 0600 "$backup" "$active"
