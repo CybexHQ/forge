@@ -1805,7 +1805,7 @@ async fn preflight_source_build_check_in_store(
             args.extend(["--system".to_string(), system.clone()]);
         }
     }
-    let mut dry_run = Command::new(&command.program);
+    let mut dry_run = crate::nix_command::tokio_command(&command.program);
     dry_run
         .args(&args)
         .current_dir(&config.build.work_dir)
@@ -1844,7 +1844,7 @@ async fn preflight_source_build_check_in_store(
     let would_build_set = would_build.iter().cloned().collect::<HashSet<_>>();
     let mut derivations = BTreeMap::<String, Value>::new();
     for chunk in would_build.chunks(PREFLIGHT_DERIVATION_SHOW_CHUNK) {
-        let mut derivation_show = Command::new(&command.program);
+        let mut derivation_show = crate::nix_command::tokio_command(&command.program);
         derivation_show
             .arg("--store")
             .arg(&store_url)
@@ -4077,7 +4077,7 @@ where
 }
 
 async fn ensure_nix_daemon_available(config: &AppConfig) -> Result<()> {
-    let output = Command::new(&config.build.nix_binary)
+    let output = crate::nix_command::tokio_command(&config.build.nix_binary)
         .args(["store", "ping", "--store", "daemon"])
         .output()
         .await
@@ -4233,7 +4233,7 @@ async fn evaluate_software_inventory_with_limits(
             "github:NixOS/nixpkgs/{commit}#legacyPackages.{}.{}.version",
             spec.system, package_ref
         );
-        let mut command = Command::new(&config.build.nix_binary);
+        let mut command = crate::nix_command::tokio_command(&config.build.nix_binary);
         command.args(software_inventory_eval_args(
             &installable,
             spec.allow_source_builds,
@@ -4723,7 +4723,7 @@ async fn run_nix_build(
                 config.build.work_dir.display()
             )
         })?;
-    let mut child = Command::new(&command.program)
+    let mut child = crate::nix_command::tokio_command(&command.program)
         .args(&command.args)
         .current_dir(&config.build.work_dir)
         .stdout(Stdio::piped())
@@ -4864,7 +4864,7 @@ async fn inspect_build_output(
 }
 
 async fn run_nix_hash(config: &AppConfig, path: &str) -> Result<String> {
-    let output = Command::new(&config.build.nix_binary)
+    let output = crate::nix_command::tokio_command(&config.build.nix_binary)
         .arg("hash")
         .arg("path")
         .arg("--type")
@@ -4888,7 +4888,7 @@ async fn run_nix_hash(config: &AppConfig, path: &str) -> Result<String> {
 }
 
 async fn run_nix_path_info(config: &AppConfig, path: &str) -> Result<(i64, i64, Option<String>)> {
-    let output = Command::new(&config.build.nix_binary)
+    let output = crate::nix_command::tokio_command(&config.build.nix_binary)
         .arg("path-info")
         .arg("--json")
         .arg("--closure-size")
@@ -5218,6 +5218,43 @@ mod tests {
     use crate::config::{AppConfig, BuildTargetConfig};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nix_daemon_probe_enables_required_features() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cybex-forge-nix-daemon-feature-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_nix = root.join("nix");
+        std::fs::write(
+            &fake_nix,
+            r#"#!/bin/sh
+set -eu
+case "${NIX_CONFIG:-}" in
+  *"extra-experimental-features = nix-command flakes"*) ;;
+  *) printf '%s\n' 'required Nix features are missing' >&2; exit 64 ;;
+esac
+[ "$#" -eq 4 ]
+[ "$1" = store ]
+[ "$2" = ping ]
+[ "$3" = --store ]
+[ "$4" = daemon ]
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut config = AppConfig::default();
+        config.build.nix_binary = fake_nix.display().to_string();
+        let result = ensure_nix_daemon_available(&config).await;
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
 
     fn valid_installer_target_identity() -> Value {
         json!({

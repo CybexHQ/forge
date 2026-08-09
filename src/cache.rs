@@ -343,7 +343,7 @@ pub async fn export_output(
             cache_dir.display(),
             private_key_path.display()
         );
-        let mut command = Command::new(&nix_binary);
+        let mut command = crate::nix_command::std_command(&nix_binary);
         command
             .arg("copy")
             .arg("--to")
@@ -1795,7 +1795,7 @@ fn ensure_signing_key_blocking_with_command(
         .with_context(|| format!("create cache key directory {}", parent.display()))?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("harden cache key directory {}", parent.display()))?;
-    let mut command = Command::new(nix_store);
+    let mut command = crate::nix_command::std_command(nix_store);
     command
         .arg("--generate-binary-cache-key")
         .arg(key_name)

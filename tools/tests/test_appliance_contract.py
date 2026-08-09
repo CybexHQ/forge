@@ -1,5 +1,11 @@
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -42,9 +48,97 @@ NETPLAN_APPLY = (
     / "cybex-forge"
     / "cybex-forge-netplan-apply"
 )
+BUILD_TEMPLATE = REPOSITORY / "ubuntu-appliance" / "build-template.sh"
+BUILD_PACKAGE_SNAPSHOT = (
+    REPOSITORY / "ubuntu-appliance" / "build-package-snapshot.sh"
+)
+RELEASE_WORKFLOW = REPOSITORY / ".github" / "workflows" / "release.yml"
+PACKAGE_SERVER = (
+    REPOSITORY
+    / "ubuntu-appliance"
+    / "qualification"
+    / "serve-package-snapshot.py"
+)
 
 
 class ApplianceFirstBootContractTests(unittest.TestCase):
+    def test_qualification_package_server_exposes_only_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            snapshot = directory / "cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst"
+            snapshot.write_bytes(b"exact unpublished qualification snapshot\0\xff")
+            port_file = directory / "port"
+            server = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(PACKAGE_SERVER),
+                    "--bind",
+                    "127.0.0.1",
+                    "--file",
+                    str(snapshot),
+                    "--port-file",
+                    str(port_file),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _attempt in range(100):
+                    if port_file.exists():
+                        break
+                    if server.poll() is not None:
+                        self.fail(server.stderr.read().decode())
+                    time.sleep(0.01)
+                port = int(port_file.read_text(encoding="ascii"))
+                origin = f"http://127.0.0.1:{port}"
+                with urlopen(f"{origin}/{snapshot.name}", timeout=2) as response:
+                    self.assertEqual(response.read(), snapshot.read_bytes())
+                with self.assertRaises(HTTPError) as failure:
+                    urlopen(f"{origin}/not-the-snapshot", timeout=2)
+                self.assertEqual(failure.exception.code, 404)
+            finally:
+                server.terminate()
+                server.wait(timeout=2)
+                if server.stderr is not None:
+                    server.stderr.close()
+
+    def test_thin_iso_and_package_snapshot_are_built_separately(self) -> None:
+        template = BUILD_TEMPLATE.read_text(encoding="utf-8")
+        self.assertNotIn("build-offline-repo.sh", template)
+        self.assertNotIn("$iso_tree/cybex/apt", template)
+        self.assertIn('$iso_tree/cybex/release-public-key', template)
+        self.assertIn("network-snapshot-v1", template)
+        self.assertIn('rm -rf -- "$iso_tree/pool" "$iso_tree/dists"', template)
+        self.assertIn("casper/ubuntu-server-minimal.squashfs", template)
+        self.assertIn("casper/install-sources.yaml", template)
+        self.assertIn(
+            "casper/ubuntu-server-minimal.ubuntu-server.squashfs", template
+        )
+        self.assertIn(
+            "casper/ubuntu-server-minimal.ubuntu-server.installer.squashfs",
+            template,
+        )
+        self.assertIn("thin installer ISO retained a target package repository", template)
+        self.assertIn("hidden_efi_image_sha256", template)
+        self.assertIn(
+            "remastered ISO changed the hidden UEFI El Torito image bytes",
+            template,
+        )
+
+        snapshot = BUILD_PACKAGE_SNAPSHOT.read_text(encoding="utf-8")
+        self.assertIn("build-offline-repo.sh", snapshot)
+        self.assertIn("cybex.forge.appliance-package-snapshot.v1", snapshot)
+
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        snapshot_build = workflow.index("build-package-snapshot.sh")
+        template_build = workflow.index("build-template.sh")
+        self.assertLess(snapshot_build, template_build)
+        self.assertIn(
+            '--installer-iso-template-package-delivery "$package_delivery"',
+            workflow,
+        )
+
     def test_nix_store_directories_are_checked_individually(self) -> None:
         script = FIRST_BOOT.read_text(encoding="utf-8")
         self.assertIn("test -d /nix/store\n", script)

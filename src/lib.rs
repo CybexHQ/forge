@@ -12,10 +12,12 @@ pub mod maintenance;
 pub mod manage;
 pub mod models;
 pub mod netboot;
+pub(crate) mod nix_command;
 pub mod nix_log;
 pub(crate) mod protected_material;
 pub mod provisioning;
 pub(crate) mod redact;
+pub(crate) mod release_transport;
 pub mod routes;
 
 use std::sync::{Arc, RwLock};

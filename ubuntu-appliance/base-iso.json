@@ -1,11 +1,12 @@
 {
   "schema": "cybex.forge.ubuntu-base-iso.v1",
   "version": "26.04",
+  "build_id": "20260807",
   "architecture": "amd64",
-  "filename": "ubuntu-26.04-live-server-amd64.iso",
-  "url": "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso",
-  "size_bytes": 2918598656,
-  "sha256": "dec49008a71f6098d0bcfc822021f4d042d5f2db279e4d75bdd981304f1ca5d9",
-  "checksums_url": "https://releases.ubuntu.com/26.04/SHA256SUMS",
-  "checksums_signature_url": "https://releases.ubuntu.com/26.04/SHA256SUMS.gpg"
+  "filename": "resolute-live-server-amd64.iso",
+  "url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/resolute-live-server-amd64.iso",
+  "size_bytes": 2926247936,
+  "sha256": "74b56b1dcec6c6d10576ad6677c511e9b2f452a62125d59aaf86b8281167316e",
+  "checksums_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/SHA256SUMS",
+  "checksums_signature_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/SHA256SUMS.gpg"
 }

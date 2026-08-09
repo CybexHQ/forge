@@ -24,6 +24,8 @@ enum Command {
         envelope: PathBuf,
         #[arg(long, default_value = "/cdrom/cybex/provisioning-public-keys")]
         provisioning_keys: PathBuf,
+        #[arg(long, default_value = "/cdrom/cybex/release-public-key")]
+        release_public_key: PathBuf,
         #[arg(long, default_value = "/autoinstall.yaml")]
         autoinstall: PathBuf,
         #[arg(long, default_value = "/run/cybex-state")]
@@ -58,6 +60,7 @@ async fn main() -> Result<()> {
         Command::Prepare {
             envelope,
             provisioning_keys,
+            release_public_key,
             autoinstall,
             state_mount,
         } => {
@@ -65,6 +68,7 @@ async fn main() -> Result<()> {
             let options = PrepareOptions {
                 envelope_path: envelope,
                 provisioning_keys_path: provisioning_keys,
+                release_public_key_path: release_public_key,
                 autoinstall_path: autoinstall,
                 state_mount,
                 ..PrepareOptions::default()

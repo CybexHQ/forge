@@ -2,6 +2,7 @@ use super::inventory::{
     ForgeProvisioningDisk, ForgeProvisioningEthernetInterface, ForgeProvisioningInventory,
     hardware_digest, inventory_sha256,
 };
+use crate::appliance::SignedApplianceRelease;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{
     Engine as _,
@@ -22,8 +23,11 @@ const ENVELOPE_SCHEMA: &str = "cybex.forge.provisioning-envelope.v1";
 const ENVELOPE_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-PROVISIONING-ENVELOPE-V1";
 const KEY_DERIVATION_DOMAIN: &[u8] = b"CYBEX-FORGE-PROVISIONING-KEY-V1\0";
 const REQUEST_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-PROVISIONING-V1";
-const INSTALL_PLAN_SCHEMA: &str = "cybex.forge.install-plan.v1";
-const INSTALL_PLAN_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-INSTALL-PLAN-V1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "cybex.forge.install-plan.v1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "cybex.forge.install-plan.v2";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "CYBEX-FORGE-INSTALL-PLAN-V1";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "CYBEX-FORGE-INSTALL-PLAN-V2";
+pub(crate) const NETWORK_SNAPSHOT_DELIVERY: &str = "network-snapshot-v1";
 const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-IDENTITY-TRANSITION-V1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +97,12 @@ pub struct SignedInstallPlan {
     pub base_os_version: String,
     pub release_version: String,
     pub at_rest_protection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_delivery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appliance_release: Option<SignedApplianceRelease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_transport_url: Option<String>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub plan_sha256: String,
@@ -249,7 +259,7 @@ fn validate_envelope_fields(
         bail!("provisioning envelope schema is unsupported")
     }
     if envelope.manage_origin != required_manage_origin {
-        bail!("provisioning media is not bound to the production Management origin")
+        bail!("provisioning media is not bound to the required Management origin")
     }
     let origin = reqwest::Url::parse(&envelope.manage_origin)
         .context("provisioning Management origin is invalid")?;
@@ -321,8 +331,38 @@ fn verify_install_plan_inner(
             .verifying_key()
             .to_bytes(),
     );
-    if plan.schema != INSTALL_PLAN_SCHEMA
-        || plan.session_id != envelope.session_id
+    let plan_object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("install plan must be a JSON object"))?;
+    let package_fields = [
+        "package_delivery",
+        "appliance_release",
+        "package_transport_url",
+    ];
+    let package_field_count = package_fields
+        .iter()
+        .filter(|field| plan_object.contains_key(**field))
+        .count();
+    let signature_domain = match plan.schema.as_str() {
+        INSTALL_PLAN_SCHEMA_V1
+            if package_field_count == 0
+                && plan.package_delivery.is_none()
+                && plan.appliance_release.is_none()
+                && plan.package_transport_url.is_none() =>
+        {
+            INSTALL_PLAN_SIGNATURE_DOMAIN_V1
+        }
+        INSTALL_PLAN_SCHEMA_V2
+            if package_field_count == package_fields.len()
+                && plan.package_delivery.as_deref() == Some(NETWORK_SNAPSHOT_DELIVERY)
+                && plan.appliance_release.is_some()
+                && plan.package_transport_url.is_some() =>
+        {
+            INSTALL_PLAN_SIGNATURE_DOMAIN_V2
+        }
+        _ => bail!("install plan package-delivery contract is incompatible"),
+    };
+    if plan.session_id != envelope.session_id
         || plan.organization_id.is_nil()
         || plan.release_version != envelope.release_version
         || plan.inventory_sha256 != expected_inventory_sha256
@@ -384,7 +424,7 @@ fn verify_install_plan_inner(
             .try_into()
             .map_err(|_| anyhow!("install plan signature length is invalid"))?,
     );
-    let mut payload = INSTALL_PLAN_SIGNATURE_DOMAIN.as_bytes().to_vec();
+    let mut payload = signature_domain.as_bytes().to_vec();
     payload.push(b'\n');
     payload.extend_from_slice(&canonical);
     signing_key
@@ -728,6 +768,157 @@ fn canonical_json(value: Value) -> Value {
 mod tests {
     use super::*;
 
+    fn signed_plan_fixture(
+        schema: &str,
+        signature_domain: &str,
+    ) -> (
+        Value,
+        ProvisioningEnvelope,
+        ForgeProvisioningInventory,
+        SigningKey,
+    ) {
+        let now = Utc::now();
+        let media_secret = URL_SAFE_NO_PAD.encode([3; 32]);
+        let envelope = ProvisioningEnvelope {
+            schema: ENVELOPE_SCHEMA.to_string(),
+            session_id: Uuid::from_bytes([1; 16]),
+            media_secret: media_secret.clone(),
+            manage_origin: "https://manage.cybex.net".to_string(),
+            release_version: "1.2.3".to_string(),
+            template_sha256: "a".repeat(64),
+            issued_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            signature: URL_SAFE_NO_PAD.encode([0; 64]),
+            zero_padding: String::new(),
+        };
+        let disk = ForgeProvisioningDisk {
+            id: "disk-1".to_string(),
+            path: "/dev/sda".to_string(),
+            model: "Disk".to_string(),
+            serial: "serial-1".to_string(),
+            wwn: String::new(),
+            size_bytes: 160 * 1024 * 1024 * 1024,
+            removable: false,
+            mounted: false,
+            held: false,
+            eligible: true,
+            blocker_codes: Vec::new(),
+        };
+        let interface = ForgeProvisioningEthernetInterface {
+            id: "pci-0000:00:03.0".to_string(),
+            name: "enp0s3".to_string(),
+            mac: "52:54:00:12:34:56".to_string(),
+            link_up: true,
+            addresses: vec!["192.0.2.10/24".to_string()],
+            gateway: Some("192.0.2.1".to_string()),
+        };
+        let inventory = ForgeProvisioningInventory {
+            manufacturer: "Cybex".to_string(),
+            model: "Qualification VM".to_string(),
+            serial_number: "vm-1".to_string(),
+            asset_tag: "lab".to_string(),
+            cpu_model: "test".to_string(),
+            cpu_cores: 4,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+            firmware_version: "firmware".to_string(),
+            kernel_version: "kernel".to_string(),
+            boot_mode: "uefi".to_string(),
+            secure_boot: true,
+            virtualization: "kvm".to_string(),
+            ethernet_interfaces: vec![interface.clone()],
+            disks: vec![disk.clone()],
+        };
+        let provisioning_fingerprint = sha256_hex(
+            derive_provisioning_key(&media_secret)
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        let mut unsigned = json!({
+            "schema": schema,
+            "id": Uuid::from_bytes([2; 16]),
+            "organization_id": Uuid::from_bytes([4; 16]),
+            "plan_revision": 1,
+            "session_id": envelope.session_id,
+            "session_revision": 2,
+            "inventory_sha256": inventory_sha256(&inventory).unwrap(),
+            "hardware_digest": hardware_digest(&inventory).unwrap(),
+            "provisioning_public_key_fingerprint": provisioning_fingerprint,
+            "reserved_device_id": "dev_0123456789abcdef0123456789abcdef",
+            "display_name": "Qualification Forge",
+            "target_disk_id": disk.id,
+            "target_disk": disk,
+            "network_interface": interface,
+            "network": {
+                "mode": "dhcp",
+                "interface_id": "pci-0000:00:03.0",
+                "address_cidr": null,
+                "gateway": null,
+                "dns_servers": []
+            },
+            "maintenance_window": {
+                "timezone": "UTC",
+                "weekday": 0,
+                "start": "02:00",
+                "duration_minutes": 120
+            },
+            "management_cidrs": [],
+            "ssh_ca_public_keys": ["ssh-ed25519 AAAA qualification"],
+            "base_os": "ubuntu",
+            "base_os_version": "26.04",
+            "release_version": "1.2.3",
+            "at_rest_protection": "none",
+            "issued_at": now,
+            "expires_at": now + chrono::Duration::minutes(20)
+        });
+        if schema == INSTALL_PLAN_SCHEMA_V2 {
+            unsigned.as_object_mut().unwrap().extend([
+                (
+                    "package_delivery".to_string(),
+                    json!(NETWORK_SNAPSHOT_DELIVERY),
+                ),
+                (
+                    "appliance_release".to_string(),
+                    json!({
+                        "schema": "cybex.forge.appliance-release.v1",
+                        "release_id": "1.2.3",
+                        "ubuntu_snapshot_id": "20260801T120000Z",
+                        "cybex_repository_snapshot": {
+                            "url": "https://releases.cybex.net/cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst",
+                            "sha256": "b".repeat(64),
+                            "size_bytes": 1024
+                        },
+                        "required_package_versions": {},
+                        "expected_kernel": "kernel",
+                        "minimum_protocol": 4,
+                        "minimum_state_schema": 1,
+                        "rollback_compatible": true,
+                        "release_notes": "https://releases.cybex.net/1.2.3",
+                        "signature": STANDARD.encode([0; 64])
+                    }),
+                ),
+                (
+                    "package_transport_url".to_string(),
+                    json!("http://192.168.122.1:8080/cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
+                ),
+            ]);
+        }
+        let unsigned = canonical_json(unsigned);
+        let canonical = serde_json::to_vec(&unsigned).unwrap();
+        let plan_sha256 = sha256_hex(&canonical);
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let mut payload = signature_domain.as_bytes().to_vec();
+        payload.push(b'\n');
+        payload.extend_from_slice(&canonical);
+        let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        let mut plan = unsigned;
+        plan.as_object_mut().unwrap().extend([
+            ("plan_sha256".to_string(), json!(plan_sha256)),
+            ("signature".to_string(), json!(signature)),
+        ]);
+        (plan, envelope, inventory, signing_key)
+    }
+
     #[test]
     fn derived_media_key_is_domain_separated_and_stable() {
         let secret = URL_SAFE_NO_PAD.encode([9_u8; 32]);
@@ -749,5 +940,46 @@ mod tests {
             deterministic_event_id(session, plan, 7),
             deterministic_event_id(session, plan, 8)
         );
+    }
+
+    #[test]
+    fn legacy_and_network_install_plans_use_distinct_exact_signature_domains() {
+        let (legacy, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
+        let legacy =
+            verify_install_plan(legacy, &key.verifying_key(), &envelope, &inventory).unwrap();
+        assert_eq!(legacy.schema, INSTALL_PLAN_SCHEMA_V1);
+        assert!(legacy.appliance_release.is_none());
+
+        let (network, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        let network =
+            verify_install_plan(network, &key.verifying_key(), &envelope, &inventory).unwrap();
+        assert_eq!(network.schema, INSTALL_PLAN_SCHEMA_V2);
+        assert_eq!(
+            network.package_delivery.as_deref(),
+            Some(NETWORK_SNAPSHOT_DELIVERY)
+        );
+
+        let (wrong_domain, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
+        assert!(
+            verify_install_plan(wrong_domain, &key.verifying_key(), &envelope, &inventory).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_plan_rejects_even_null_network_delivery_fields() {
+        let (mut legacy, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
+        legacy.as_object_mut().unwrap().extend([
+            ("package_delivery".to_string(), Value::Null),
+            ("appliance_release".to_string(), Value::Null),
+            ("package_transport_url".to_string(), Value::Null),
+        ]);
+        let error = verify_install_plan(legacy, &key.verifying_key(), &envelope, &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("package-delivery contract"));
     }
 }

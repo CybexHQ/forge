@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -95,6 +95,8 @@ struct ComponentCompatibilityContract {
     maximum_forge_protocol: u32,
     manage_version: String,
     manage_release: String,
+    #[serde(default)]
+    workstation_runtime_epoch: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,12 +137,57 @@ struct AgentForgeConfigResponse {
     #[serde(default)]
     network_change: Option<crate::appliance::SignedApplianceNetworkChange>,
     #[serde(default)]
-    workstation_netboot: Option<crate::netboot::DesiredWorkstationNetboot>,
+    workstation_netboot: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ForgeReportResponse {
     status: String,
+    #[serde(default)]
+    workstation_netboot: Option<WorkstationNetbootReportReceipt>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkstationNetbootReportReceipt {
+    state: WorkstationNetbootReportReceiptState,
+    #[serde(default)]
+    error_code: Option<WorkstationNetbootReportReceiptErrorCode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WorkstationNetbootReportReceiptState {
+    Accepted,
+    Rejected,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum WorkstationNetbootReportReceiptErrorCode {
+    #[serde(rename = "runtime_report_missing")]
+    Missing,
+    #[serde(rename = "runtime_report_invalid")]
+    Invalid,
+    #[serde(rename = "runtime_report_stale")]
+    Stale,
+    #[serde(rename = "runtime_report_storage_unavailable")]
+    StorageUnavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkstationNetbootReportReceiptErrorCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "runtime_report_missing",
+            Self::Invalid => "runtime_report_invalid",
+            Self::Stale => "runtime_report_stale",
+            Self::StorageUnavailable => "runtime_report_storage_unavailable",
+            Self::Unknown => "runtime_report_receipt_invalid",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,8 +323,10 @@ struct ForgeAgentReportRequest {
     cache_artifacts_complete: bool,
     disk: Option<crate::disk::DiskStats>,
     host: Option<crate::host::HostStats>,
-    workstation_netboot: crate::netboot::WorkstationNetbootReport,
+    workstation_netboot: Option<crate::netboot::WorkstationNetbootReport>,
     appliance: Option<crate::appliance::ApplianceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appliance_report_error: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -493,17 +542,85 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     let mut managed = load_managed_state(state)?;
     require_activated_identity(&managed)?;
 
-    if has_unreported_known_profile_events(&state.db, managed.last_reported_event_id).await? {
-        report_boot_state(state, &mut managed).await?;
-        save_managed_state(state, &managed)?;
+    let mut first_failure = None;
+    if let Err(error) = acknowledge_pending_appliance_network_change(state, &managed).await {
+        retain_sync_failure(
+            &mut first_failure,
+            "appliance network acknowledgement",
+            error,
+        );
     }
-    acknowledge_pending_appliance_network_change(state, &managed).await?;
-    let config = fetch_boot_config(state, &managed).await?;
-    apply_boot_config(state, &config).await?;
-    report_boot_state(state, &mut managed).await?;
-    let forge_report = sync_forge_foundation(state, &managed).await?;
-    save_managed_state(state, &managed)?;
-    Ok(SyncOnceReport::synced(forge_report))
+    if let Err(error) = sync_boot_foundation(state, &mut managed).await {
+        retain_sync_failure(&mut first_failure, "boot configuration and report", error);
+    }
+    let forge_report = match sync_forge_foundation(state, &managed).await {
+        Ok(report) => Some(report),
+        Err(error) => {
+            retain_sync_failure(&mut first_failure, "Forge configuration and report", error);
+            None
+        }
+    };
+    if let Err(error) = save_managed_state(state, &managed) {
+        retain_sync_failure(&mut first_failure, "managed state persistence", error);
+    }
+    if let Some(error) = first_failure {
+        return Err(error);
+    }
+    Ok(SyncOnceReport::synced(forge_report.expect(
+        "successful Forge sync returns its report receipt",
+    )))
+}
+
+async fn sync_boot_foundation(state: &AppState, managed: &mut ManagedState) -> Result<()> {
+    let mut first_failure = None;
+    match has_unreported_known_profile_events(&state.db, managed.last_reported_event_id).await {
+        Ok(true) => match report_boot_state(state, managed).await {
+            Ok(()) => {
+                if let Err(error) = save_managed_state(state, managed) {
+                    retain_sync_failure(&mut first_failure, "boot event cursor save", error);
+                }
+            }
+            Err(error) => retain_sync_failure(&mut first_failure, "boot event pre-report", error),
+        },
+        Ok(false) => {}
+        Err(error) => retain_sync_failure(&mut first_failure, "boot event discovery", error),
+    }
+    match fetch_boot_config(state, managed).await {
+        Ok(config) => {
+            if let Err(error) = apply_boot_config(state, &config).await {
+                retain_sync_failure(&mut first_failure, "boot desired configuration", error);
+            }
+        }
+        Err(error) => retain_sync_failure(
+            &mut first_failure,
+            "boot desired configuration fetch",
+            error,
+        ),
+    }
+    match report_boot_state(state, managed).await {
+        Ok(()) => {
+            if let Err(error) = save_managed_state(state, managed) {
+                retain_sync_failure(&mut first_failure, "boot event cursor save", error);
+            }
+        }
+        Err(error) => retain_sync_failure(&mut first_failure, "boot state report", error),
+    }
+    first_failure.map_or(Ok(()), Err)
+}
+
+fn retain_sync_failure(
+    first_failure: &mut Option<anyhow::Error>,
+    subsystem: &'static str,
+    error: anyhow::Error,
+) {
+    warn!(
+        subsystem,
+        error = %safe_error(&error),
+        "managed subsystem sync failed; continuing independent reconciliation"
+    );
+    if first_failure.is_none() {
+        *first_failure = Some(error.context(format!("{subsystem} failed")));
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -646,107 +763,192 @@ async fn sync_forge_foundation(
     state: &AppState,
     managed: &ManagedState,
 ) -> Result<ForgeReportReceipt> {
-    let desired = fetch_forge_config(state, managed).await?;
-    if desired.build_jobs.len() > MAX_MANAGED_BUILD_JOBS {
-        bail!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs");
+    let mut first_failure = None;
+    let mut peer_runtime_epoch = None;
+    match fetch_forge_config(state, managed).await {
+        Ok(desired) => {
+            peer_runtime_epoch = desired
+                .compatibility
+                .as_ref()
+                .and_then(|contract| contract.workstation_runtime_epoch);
+            apply_forge_desired(state, desired, &mut first_failure).await;
+        }
+        Err(error) => retain_sync_failure(
+            &mut first_failure,
+            "Forge desired configuration fetch",
+            error,
+        ),
     }
+    let report = match report_forge_state(state, managed, peer_runtime_epoch.is_some()).await {
+        Ok(report) => Some(report),
+        Err(error) => {
+            retain_sync_failure(&mut first_failure, "Forge state report", error);
+            None
+        }
+    };
+    if let Some(error) = first_failure {
+        return Err(error);
+    }
+    Ok(report.expect("successful Forge report returns its receipt"))
+}
 
-    let workstation_netboot = desired.workstation_netboot.clone();
-    let appliance_update = desired.appliance_update.clone();
-    let network_change = desired.network_change.clone();
-    let mut retained_job_ids = Vec::with_capacity(desired.build_jobs.len());
-    for job in desired.build_jobs {
-        retained_job_ids.push(job.id.clone());
-        let sync = db::upsert_managed_build_job(
-            &state.db,
-            &job.id,
-            &job.requested_artifact_type,
-            job.build_spec,
-            job.target.as_deref(),
-            job.system.as_deref(),
-            &job.input_revision,
-            &job.input_config_hash,
-            job.cache_metadata,
-        )
-        .await;
-        // A job this Forge refuses must not take the sync cycle down with it.
-        // Everything below -- cancellations, cache deletions, retention, and
-        // the report itself -- used to be skipped whenever a single job failed
-        // to validate, so one bad Blueprint silently froze cache, disk, and
-        // host reporting for the whole node while its heartbeat stayed green.
-        match sync {
-            Ok(_) => {}
-            Err(AppError::Validation(reason)) => {
-                warn!(
-                    job_id = %job.id,
-                    %reason,
-                    "rejecting managed build job; reporting it to Manage as failed"
-                );
-                if let Err(error) = db::record_rejected_managed_build_job(
-                    &state.db,
-                    &job.id,
-                    &job.requested_artifact_type,
-                    job.target.as_deref(),
-                    job.system.as_deref(),
-                    &job.input_revision,
-                    &job.input_config_hash,
-                    &reason,
-                )
-                .await
-                {
-                    error!(
-                        job_id = %job.id,
-                        error = %error,
-                        "could not record rejected managed build job"
+async fn apply_forge_desired(
+    state: &AppState,
+    desired: AgentForgeConfigResponse,
+    first_failure: &mut Option<anyhow::Error>,
+) {
+    if let Some(workstation_netboot) = desired.workstation_netboot {
+        match crate::netboot::decode_desired(workstation_netboot.clone()) {
+            Ok(workstation_netboot) => {
+                if !crate::netboot::queue_reconcile_desired(state, workstation_netboot) {
+                    debug!(
+                        "coalesced the latest workstation runtime desired state behind the in-flight reconciliation"
                     );
                 }
             }
-            // Transient trouble (a busy database, IO) must keep retrying
-            // rather than burn the job down, so it still aborts the cycle.
             Err(error) => {
-                return Err(anyhow::Error::new(error))
-                    .with_context(|| format!("sync managed build job {}", job.id));
+                warn!(
+                    failure_kind = crate::netboot::safe_failure_kind(&error),
+                    safe_detail = %crate::netboot::safe_failure_message(&error),
+                    "isolated an unusable workstation netboot desired state"
+                );
+                if !crate::netboot::queue_desired_decode_failure(state, workstation_netboot, &error)
+                {
+                    debug!(
+                        "coalesced workstation runtime decoding failure behind the in-flight reconciliation"
+                    );
+                }
             }
         }
     }
-    if desired.build_jobs_complete {
-        db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await?;
+
+    if let Some(update) = desired.appliance_update {
+        if !crate::appliance::queue_update_request(update) {
+            debug!("coalesced the latest appliance update behind the in-flight download");
+        }
     }
-    db::cancel_managed_build_jobs(&state.db, &desired.deleted_build_job_ids).await?;
+    if let Err(error) = crate::appliance::store_network_change(desired.network_change) {
+        retain_sync_failure(first_failure, "appliance network desired state", error);
+    }
+
+    let build_count_valid = desired.build_jobs.len() <= MAX_MANAGED_BUILD_JOBS;
+    if !build_count_valid {
+        retain_sync_failure(
+            first_failure,
+            "managed build desired state",
+            anyhow!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs"),
+        );
+    }
+    let mut build_snapshot_applied = build_count_valid;
+    let mut retained_job_ids = Vec::with_capacity(desired.build_jobs.len());
+    if build_count_valid {
+        for job in desired.build_jobs {
+            retained_job_ids.push(job.id.clone());
+            let sync = db::upsert_managed_build_job(
+                &state.db,
+                &job.id,
+                &job.requested_artifact_type,
+                job.build_spec,
+                job.target.as_deref(),
+                job.system.as_deref(),
+                &job.input_revision,
+                &job.input_config_hash,
+                job.cache_metadata,
+            )
+            .await;
+            match sync {
+                Ok(_) => {}
+                Err(AppError::Validation(reason)) => {
+                    warn!(
+                        job_id = %job.id,
+                        %reason,
+                        "rejecting managed build job; reporting it to Manage as failed"
+                    );
+                    if let Err(error) = db::record_rejected_managed_build_job(
+                        &state.db,
+                        &job.id,
+                        &job.requested_artifact_type,
+                        job.target.as_deref(),
+                        job.system.as_deref(),
+                        &job.input_revision,
+                        &job.input_config_hash,
+                        &reason,
+                    )
+                    .await
+                    {
+                        build_snapshot_applied = false;
+                        retain_sync_failure(
+                            first_failure,
+                            "rejected managed build persistence",
+                            anyhow::Error::new(error),
+                        );
+                    }
+                }
+                Err(error) => {
+                    build_snapshot_applied = false;
+                    retain_sync_failure(
+                        first_failure,
+                        "managed build desired state",
+                        anyhow::Error::new(error)
+                            .context(format!("sync managed build job {}", job.id)),
+                    );
+                }
+            }
+        }
+    }
+    if desired.build_jobs_complete && build_snapshot_applied {
+        if let Err(error) = db::cancel_absent_managed_build_jobs(&state.db, &retained_job_ids).await
+        {
+            retain_sync_failure(
+                first_failure,
+                "managed build snapshot cancellation",
+                error.into(),
+            );
+        }
+    }
+    if let Err(error) =
+        db::cancel_managed_build_jobs(&state.db, &desired.deleted_build_job_ids).await
+    {
+        retain_sync_failure(first_failure, "managed build deletion", error.into());
+    }
+
     let deletion_keys = desired
         .deleted_cache_artifacts
         .into_iter()
         .map(|artifact| (artifact.artifact_type, artifact.hash))
         .collect::<Vec<_>>();
-    crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await?;
+    if let Err(error) =
+        crate::cache::remove_artifacts_by_key(&state.db, &state.config, &deletion_keys).await
+    {
+        retain_sync_failure(first_failure, "managed cache deletion", error);
+    }
     let protected_keys = desired
         .protected_cache_artifacts
         .into_iter()
         .map(|artifact| (artifact.artifact_type, artifact.hash))
         .collect::<Vec<_>>();
-    db::replace_managed_cache_protections(
+    let protections_applied = match db::replace_managed_cache_protections(
         &state.db,
         &protected_keys,
         desired.protected_cache_artifacts_complete,
     )
-    .await?;
-    if !crate::cache::try_enforce_retention(&state.db, &state.config).await? {
-        debug!("cache mutation is active; deferring retention until the next managed sync");
-    }
-    crate::appliance::store_update_request(appliance_update).await?;
-    crate::appliance::store_network_change(network_change)?;
-
-    if let Some(workstation_netboot) = workstation_netboot {
-        if let Err(error) = crate::netboot::reconcile_desired(state, &workstation_netboot).await {
-            warn!(
-                failure_kind = crate::netboot::safe_failure_kind(&error),
-                safe_detail = %crate::netboot::safe_failure_message(&error),
-                "workstation netboot reconciliation failed"
-            );
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            retain_sync_failure(first_failure, "managed cache protections", error.into());
+            false
+        }
+    };
+    if protections_applied {
+        match crate::cache::try_enforce_retention(&state.db, &state.config).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("cache mutation is active; deferring retention until the next managed sync")
+            }
+            Err(error) => retain_sync_failure(first_failure, "managed cache retention", error),
         }
     }
-
-    report_forge_state(state, managed).await
 }
 
 async fn acknowledge_pending_appliance_network_change(
@@ -795,23 +997,100 @@ async fn fetch_forge_config(
 async fn report_forge_state(
     state: &AppState,
     managed: &ManagedState,
+    peer_supports_runtime_fencing: bool,
 ) -> Result<ForgeReportReceipt> {
-    let build_jobs = db::list_build_jobs(&state.db).await?;
-    match crate::cache::try_scrub_cache_artifacts(&state.db, &state.config, 8).await {
-        Ok(Some(_)) => {}
+    let (build_jobs, build_listing_valid) = match db::list_build_jobs(&state.db).await {
+        Ok(jobs) => (jobs, true),
+        Err(_) => {
+            warn!(
+                error_code = "build_report_storage_unavailable",
+                "could not read build reports; continuing independent Forge report lanes"
+            );
+            (Vec::new(), false)
+        }
+    };
+    let cache_scrub_valid = match crate::cache::try_scrub_cache_artifacts(
+        &state.db,
+        &state.config,
+        8,
+    )
+    .await
+    {
+        Ok(Some(_)) => true,
         Ok(None) => {
             debug!(
                 "cache mutation is active; deferring integrity scrub until the next managed sync"
             );
+            true
         }
-        Err(err) => warn!(error = %err, "Forge cache integrity scrub failed"),
-    }
-    let cache_artifacts = db::list_cache_artifacts(&state.db).await?;
-    let cache_inventory = db::cache_inventory_state(&state.db).await?;
-    let cache_artifacts_complete = cache_artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
-    let cache = crate::cache::status_report(&state.config, &state.db).await;
-    let workstation_netboot = crate::netboot::report(state).await?;
-    let appliance = crate::appliance::report().await?;
+        Err(err) => {
+            warn!(error = %err, "Forge cache integrity scrub failed");
+            false
+        }
+    };
+    let (cache_artifacts, cache_listing_complete, cache_listing_valid) =
+        match db::list_cache_artifacts(&state.db).await {
+            Ok(artifacts) => {
+                let complete = artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
+                (artifacts, complete, true)
+            }
+            Err(_) => {
+                warn!(
+                    error_code = "cache_artifact_report_storage_unavailable",
+                    "could not read cache artifact reports; sending a non-authoritative cache lane"
+                );
+                (Vec::new(), false, false)
+            }
+        };
+    let (cache_inventory_instance_id, cache_inventory_generation, cache_inventory_valid) =
+        match db::cache_inventory_state(&state.db).await {
+            Ok(inventory) => (inventory.instance_id, inventory.generation, true),
+            Err(_) => {
+                warn!(
+                    error_code = "cache_inventory_report_storage_unavailable",
+                    "could not read cache inventory generation; isolating the cache lane"
+                );
+                (String::new(), 0, false)
+            }
+        };
+    let cache_inventory_generation = cache_inventory_generation_for_peer(
+        cache_inventory_generation,
+        cache_listing_valid,
+        cache_inventory_valid,
+        peer_supports_runtime_fencing,
+    );
+    let cache_artifacts_complete =
+        cache_listing_complete && cache_inventory_valid && cache_scrub_valid;
+    let local_cache_build_state_valid =
+        build_listing_valid && cache_scrub_valid && cache_listing_valid && cache_inventory_valid;
+    let cache = cache_status_for_local_state(
+        crate::cache::status_report(&state.config, &state.db).await,
+        local_cache_build_state_valid,
+    );
+    let workstation_netboot = match crate::netboot::report(state).await {
+        Ok(report) => Some(runtime_report_for_peer(
+            report,
+            peer_supports_runtime_fencing,
+        )),
+        Err(error) => {
+            warn!(
+                error_code = crate::netboot::ERROR_RUNTIME_REPORT_STORAGE_UNAVAILABLE,
+                safe_detail = %crate::netboot::safe_failure_message(&error),
+                "workstation runtime report generation failed; sending null without blocking the Forge report"
+            );
+            None
+        }
+    };
+    let (appliance, appliance_report_error) = match crate::appliance::report().await {
+        Ok(report) => (report, None),
+        Err(error) => {
+            warn!(
+                error = %safe_error(&error),
+                "appliance report generation failed; sending null without blocking independent Forge state"
+            );
+            (None, Some("local_state_unavailable"))
+        }
+    };
     let body = ForgeAgentReportRequest {
         protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
         capabilities: forge_capabilities(&state.config),
@@ -826,13 +1105,14 @@ async fn report_forge_state(
             .take(MAX_REPORT_CACHE_ARTIFACTS)
             .map(ForgeCacheArtifactReport::from)
             .collect(),
-        cache_inventory_instance_id: cache_inventory.instance_id,
-        cache_inventory_generation: cache_inventory.generation,
+        cache_inventory_instance_id,
+        cache_inventory_generation,
         cache_artifacts_complete,
         disk: crate::disk::stats(&state.config.cache.root_dir).ok(),
         host: crate::host::sample().await,
         workstation_netboot,
         appliance,
+        appliance_report_error,
     };
     let (_body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
     let device_id = managed_device_id(managed)?;
@@ -845,10 +1125,80 @@ async fn report_forge_state(
         .context("report managed forge state request failed")?;
     let response =
         parse_success_json::<ForgeReportResponse>(response, "report managed forge state").await?;
+    validate_forge_report_response(&response)?;
+    Ok(ForgeReportReceipt)
+}
+
+fn validate_forge_report_response(response: &ForgeReportResponse) -> Result<()> {
     if response.status != "ok" {
         bail!("Manage returned an invalid Forge report status");
     }
-    Ok(ForgeReportReceipt)
+    let Some(receipt) = response.workstation_netboot.as_ref() else {
+        // Older Manage releases predate isolated runtime receipts.
+        return Ok(());
+    };
+    match (receipt.state, receipt.error_code) {
+        (WorkstationNetbootReportReceiptState::Accepted, None) => Ok(()),
+        (
+            WorkstationNetbootReportReceiptState::Rejected
+            | WorkstationNetbootReportReceiptState::Unavailable,
+            Some(code),
+        ) if code != WorkstationNetbootReportReceiptErrorCode::Unknown => Err(anyhow!(
+            "Manage did not accept workstation runtime evidence ({})",
+            code.as_str()
+        )),
+        _ => bail!("Manage returned an invalid workstation runtime report receipt"),
+    }
+}
+
+fn runtime_report_for_peer(
+    mut report: crate::netboot::WorkstationNetbootReport,
+    peer_supports_runtime_fencing: bool,
+) -> crate::netboot::WorkstationNetbootReport {
+    if !peer_supports_runtime_fencing {
+        report.compatibility_epoch = None;
+        report.reconcile_generation = None;
+        // The legacy nested DTO rejects unknown fields and its invariant also
+        // rejects failure evidence on a ready runtime. Omit the additive
+        // warning during a Manage-first rolling upgrade; new peers receive it.
+        report.warning_kind = None;
+        report.warning_message = None;
+    }
+    report
+}
+
+fn cache_inventory_generation_for_peer(
+    generation: i64,
+    cache_listing_valid: bool,
+    cache_inventory_valid: bool,
+    peer_supports_lane_isolation: bool,
+) -> i64 {
+    if peer_supports_lane_isolation && (!cache_listing_valid || !cache_inventory_valid) {
+        // A negative generation is rejected by Manage's isolated cache lane.
+        // This prevents a best-effort empty snapshot (or an independently
+        // optimistic cache status report) from refreshing cache health when
+        // Forge could not read its authoritative local inventory.
+        -1
+    } else {
+        generation
+    }
+}
+
+fn cache_status_for_local_state(
+    mut report: crate::cache::CacheStatusReport,
+    local_state_valid: bool,
+) -> crate::cache::CacheStatusReport {
+    if !local_state_valid {
+        // `cache::status_report` deliberately stays best-effort and may mask
+        // a local database read failure while collecting diagnostics. At the
+        // managed report boundary, however, cache and build form one
+        // capability and every peer already understands this error shape.
+        // Preserve the cache trust identity and measurements while making the
+        // unavailable local state explicit.
+        report.status = "error".to_string();
+        report.error = "local_state_unavailable".to_string();
+    }
+    report
 }
 
 fn fit_forge_report_body(
@@ -1899,6 +2249,7 @@ fn validate_component_compatibility(
         .contains(&contract.protocol_version)
         || !(contract.minimum_forge_protocol..=contract.maximum_forge_protocol)
             .contains(&CYBEX_COMPONENT_PROTOCOL_VERSION)
+        || contract.workstation_runtime_epoch == Some(0)
     {
         bail!(
             "incompatible Manage protocol {} (Forge protocol {}, supported Forge range {} through {}, Manage version {}, release {})",
@@ -3331,6 +3682,7 @@ mod tests {
                 maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
                 manage_version: "0.1.0".to_string(),
                 manage_release: "test".to_string(),
+                workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
             }),
             settings: ManagedBootSettings {
                 public_base_url: "http://127.0.0.1".to_string(),
@@ -3361,6 +3713,19 @@ mod tests {
             manifest["forge"]["minimum_manage_protocol"].as_u64(),
             Some(u64::from(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION))
         );
+        #[cfg(not(feature = "resilience-qualification-epoch-2"))]
+        assert_eq!(
+            manifest["workstation_runtime"]["compatibility_epoch"].as_u64(),
+            Some(u64::from(crate::netboot::COMPATIBILITY_EPOCH))
+        );
+        #[cfg(feature = "resilience-qualification-epoch-2")]
+        {
+            assert_eq!(
+                manifest["workstation_runtime"]["compatibility_epoch"].as_u64(),
+                Some(1)
+            );
+            assert_eq!(crate::netboot::COMPATIBILITY_EPOCH, 2);
+        }
         let config = sample_boot_config();
         validate_component_compatibility(config.compatibility.as_ref()).unwrap();
         assert!(validate_component_compatibility(None).is_err());
@@ -3371,8 +3736,185 @@ mod tests {
             maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
             manage_version: "future".to_string(),
             manage_release: "future".to_string(),
+            workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
         };
         assert!(validate_component_compatibility(Some(&incompatible)).is_err());
+    }
+
+    #[test]
+    fn runtime_warning_shape_is_negotiated_without_breaking_legacy_manage() {
+        let current = crate::netboot::WorkstationNetbootReport {
+            compatibility_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
+            reconcile_generation: Some(7),
+            state: "ready".to_string(),
+            warning_kind: Some(crate::netboot::FAILURE_INTEGRITY_MISMATCH.to_string()),
+            warning_message: Some("previous rollback copy quarantined".to_string()),
+            ..Default::default()
+        };
+        let legacy = runtime_report_for_peer(current.clone(), false);
+        let legacy_value = serde_json::to_value(legacy).unwrap();
+        assert!(legacy_value.get("compatibility_epoch").is_none());
+        assert!(legacy_value.get("reconcile_generation").is_none());
+        assert!(legacy_value.get("warning_kind").is_none());
+        assert!(legacy_value.get("warning_message").is_none());
+        assert_eq!(legacy_value["state"], "ready");
+        assert_eq!(legacy_value["failure_kind"], "");
+        assert_eq!(legacy_value["failure_message"], "");
+
+        let current_value = serde_json::to_value(runtime_report_for_peer(current, true)).unwrap();
+        assert_eq!(
+            current_value["compatibility_epoch"],
+            crate::netboot::COMPATIBILITY_EPOCH
+        );
+        assert_eq!(current_value["reconcile_generation"], 7);
+        assert_eq!(
+            current_value["warning_kind"],
+            crate::netboot::FAILURE_INTEGRITY_MISMATCH
+        );
+        assert_eq!(current_value["failure_kind"], "");
+    }
+
+    #[test]
+    fn forge_report_receipt_accepts_old_manage_and_retries_isolated_rejections() {
+        let legacy: ForgeReportResponse = serde_json::from_value(json!({"status": "ok"})).unwrap();
+        validate_forge_report_response(&legacy).unwrap();
+
+        let rejected: ForgeReportResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "workstation_netboot": {
+                "state": "rejected",
+                "error_code": "runtime_report_stale"
+            }
+        }))
+        .unwrap();
+        let error = validate_forge_report_response(&rejected).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Manage did not accept workstation runtime evidence (runtime_report_stale)"
+        );
+    }
+
+    #[test]
+    fn boot_sync_defers_lane_errors_until_after_config_and_final_report() {
+        let source = include_str!("manage.rs");
+        let start = source.find("async fn sync_boot_foundation").unwrap();
+        let end = source[start..]
+            .find("\nfn retain_sync_failure")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        let first_report = body.find("report_boot_state").unwrap();
+        let config = body.find("fetch_boot_config").unwrap();
+        let final_report = body.rfind("report_boot_state").unwrap();
+        assert!(first_report < config && config < final_report);
+        assert_eq!(body.matches("report_boot_state").count(), 2);
+        assert!(body.contains("first_failure.map_or(Ok(()), Err)"));
+    }
+
+    #[test]
+    fn forge_report_inventory_failures_do_not_suppress_independent_lanes() {
+        let source = include_str!("manage.rs");
+        let start = source.find("async fn report_forge_state").unwrap();
+        let end = source[start..]
+            .find("\nfn validate_forge_report_response")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("let (build_jobs, build_listing_valid)"));
+        assert!(body.contains("match db::list_cache_artifacts"));
+        assert!(body.contains("match db::cache_inventory_state"));
+        assert!(body.contains("let cache_scrub_valid"));
+        assert!(body.contains("(Vec::new(), false, false)"));
+        assert!(body.contains("cache_inventory_generation_for_peer("));
+        assert!(body.contains("cache_status_for_local_state("));
+        assert!(
+            body.contains("cache_listing_complete && cache_inventory_valid && cache_scrub_valid")
+        );
+        assert!(body.contains(
+            "build_listing_valid && cache_scrub_valid && cache_listing_valid && cache_inventory_valid"
+        ));
+        assert!(body.contains("crate::netboot::report(state).await"));
+        assert!(body.contains("crate::appliance::report().await"));
+    }
+
+    #[test]
+    fn cache_inventory_read_failures_invalidate_only_fencing_capable_peer_lane() {
+        assert_eq!(
+            cache_inventory_generation_for_peer(41, true, true, true),
+            41
+        );
+        assert_eq!(
+            cache_inventory_generation_for_peer(41, false, true, true),
+            -1,
+            "an unreadable artifact list must not refresh cache health"
+        );
+        assert_eq!(
+            cache_inventory_generation_for_peer(41, true, false, true),
+            -1,
+            "an unreadable inventory watermark must not refresh cache health"
+        );
+
+        assert_eq!(
+            cache_inventory_generation_for_peer(41, false, true, false),
+            41,
+            "legacy Manage receives its existing non-authoritative incomplete shape"
+        );
+        assert_eq!(
+            cache_inventory_generation_for_peer(0, true, false, false),
+            0,
+            "legacy Manage does not receive the isolated-lane sentinel"
+        );
+    }
+
+    #[test]
+    fn legacy_cache_report_marks_local_cache_or_build_state_unavailable_without_losing_identity() {
+        let report = crate::cache::CacheStatusReport {
+            enabled: true,
+            status: "ready".to_string(),
+            public_key: "cache.example-1:public-key".to_string(),
+            public_key_fingerprint: "sha256:fingerprint".to_string(),
+            base_url: "https://forge.example/cache".to_string(),
+            total_size_bytes: 1234,
+            artifact_count: 3,
+            error: String::new(),
+        };
+
+        let degraded = cache_status_for_local_state(report.clone(), false);
+        assert_eq!(degraded.enabled, report.enabled);
+        assert_eq!(degraded.status, "error");
+        assert_eq!(degraded.error, "local_state_unavailable");
+        assert_eq!(degraded.public_key, report.public_key);
+        assert_eq!(
+            degraded.public_key_fingerprint,
+            report.public_key_fingerprint
+        );
+        assert_eq!(degraded.base_url, report.base_url);
+        assert_eq!(degraded.total_size_bytes, report.total_size_bytes);
+        assert_eq!(degraded.artifact_count, report.artifact_count);
+        assert_eq!(
+            cache_inventory_generation_for_peer(41, false, true, false),
+            41,
+            "legacy peers rely on the cache error instead of the isolated-lane sentinel"
+        );
+
+        let unchanged = cache_status_for_local_state(report.clone(), true);
+        assert_eq!(unchanged.status, report.status);
+        assert_eq!(unchanged.error, report.error);
+    }
+
+    #[test]
+    fn workstation_runtime_shape_is_isolated_from_the_forge_config_envelope() {
+        let config: AgentForgeConfigResponse = serde_json::from_value(json!({
+            "workstation_netboot": {
+                "future_runtime_contract": true
+            }
+        }))
+        .unwrap();
+
+        let runtime = config
+            .workstation_netboot
+            .expect("raw runtime desired state");
+        assert!(crate::netboot::decode_desired(runtime).is_err());
     }
 
     async fn managed_test_pool() -> sqlx::SqlitePool {

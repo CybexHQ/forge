@@ -95,7 +95,7 @@ Section: admin
 Priority: optional
 Architecture: amd64
 Maintainer: Cybex <support@cybex.net>
-Depends: cybex-forge (= ${version}-1), cybex-forge-bootstrap (= ${version}-1), systemd, nginx-core, tftpd-hpa, ipxe, openssh-server, nftables, netplan.io, btrfs-progs, watchdog, nix-bin, nix-setup-systemd, curl, dnsutils, jq, mokutil, sbsigntool, linux-generic, linux-firmware, intel-microcode, amd64-microcode
+Depends: cybex-forge (= ${version}-1), cybex-forge-bootstrap (= ${version}-1), systemd, nginx-core, tftpd-hpa, ipxe, openssh-server, nftables, netplan.io, btrfs-progs, watchdog, nix-bin, nix-setup-systemd, curl, dnsutils, jq, mokutil, sbsigntool, shim-signed, grub-efi-amd64-signed, secureboot-db, linux-generic, linux-firmware, intel-microcode, amd64-microcode
 Description: Managed Ubuntu host integration for Cybex Forge
 EOF
 build_package "$appliance_root" cybex-forge-appliance
