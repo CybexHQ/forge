@@ -3,13 +3,13 @@ set -Eeuo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 --output DIR --forge-binary FILE --bootstrap-binary FILE --version SEMVER --ubuntu-snapshot-id ID --release-public-key BASE64" >&2
+  echo "usage: $0 --output DIR --pulse-binary FILE --bootstrap-binary FILE --version SEMVER --ubuntu-snapshot-id ID --release-public-key BASE64" >&2
   exit 2
 }
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 output=""
-forge_binary=""
+pulse_binary=""
 bootstrap_binary=""
 version=""
 snapshot_id=""
@@ -17,7 +17,7 @@ release_public_key=""
 while (($#)); do
   case "$1" in
     --output) output="${2:-}"; shift 2 ;;
-    --forge-binary) forge_binary="${2:-}"; shift 2 ;;
+    --pulse-binary) pulse_binary="${2:-}"; shift 2 ;;
     --bootstrap-binary) bootstrap_binary="${2:-}"; shift 2 ;;
     --version) version="${2:-}"; shift 2 ;;
     --ubuntu-snapshot-id) snapshot_id="${2:-}"; shift 2 ;;
@@ -25,10 +25,10 @@ while (($#)); do
     *) usage ;;
   esac
 done
-test -n "$output" && test -n "$forge_binary" && test -n "$bootstrap_binary"
+test -n "$output" && test -n "$pulse_binary" && test -n "$bootstrap_binary"
 test -n "$version" && test -n "$release_public_key"
 [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-python3 -B "$repository_root/tools/forge-release.py" validate-public-key \
+python3 -B "$repository_root/tools/pulse-release.py" validate-public-key \
   --trusted-public-key "$release_public_key" >/dev/null
 mkdir -p -- "$output"
 output="$(cd -- "$output" && pwd -P)"
@@ -44,7 +44,7 @@ local_packages="$work_dir/local"
 mkdir -p -- "$local_packages"
 "$repository_root/ubuntu-appliance/build-packages.sh" \
   --output "$local_packages" \
-  --forge-binary "$forge_binary" \
+  --pulse-binary "$pulse_binary" \
   --bootstrap-binary "$bootstrap_binary" \
   --version "$version" \
   --ubuntu-snapshot-id "$snapshot_id" \
@@ -138,7 +138,7 @@ done < <(find "$output" -maxdepth 1 -type f -name '*.deb' -print0)
   gzip -n -9 -c Packages > Packages.gz
   apt-ftparchive \
     -o APT::FTPArchive::Release::Origin='Cybex' \
-    -o APT::FTPArchive::Release::Label='Cybex Forge Offline' \
+    -o APT::FTPArchive::Release::Label='Cybex Pulse Offline' \
     -o APT::FTPArchive::Release::Suite='resolute' \
     -o APT::FTPArchive::Release::Codename='resolute' \
     -o APT::FTPArchive::Release::Architectures='amd64' \

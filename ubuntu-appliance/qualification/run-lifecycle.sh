@@ -28,8 +28,8 @@ test -f "$template" && test -f "$manifest" && test -f "$token_file" && test -n "
 for command_name in curl ip jq python3 qemu-system-x86_64 truncate sha256sum openssl ssh-keygen; do
   command -v "$command_name" >/dev/null || { echo "error: missing $command_name" >&2; exit 1; }
 done
-bridge="${CYBEX_FORGE_QUALIFICATION_BRIDGE:?set the isolated qualification bridge}"
-management_cidr="${CYBEX_FORGE_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
+bridge="${CYBEX_PULSE_QUALIFICATION_BRIDGE:?set the isolated qualification bridge}"
+management_cidr="${CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
 token="$(tr -d '\r\n' < "$token_file")"
 test -n "$token"
 release_version="$(jq -er '.version' "$manifest")"
@@ -51,11 +51,11 @@ cleanup() {
   fi
   if [[ -n "$session_id" && "$lifecycle_succeeded" != true ]]; then
     cleanup_session="$work_dir/cleanup-session.json"
-    if api GET "/v1/forge/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
+    if api GET "/v1/pulse/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
       && [[ "$(jq -r '.destructive_started_at // ""' "$cleanup_session")" = "" ]] \
       && [[ "$(jq -r '.state' "$cleanup_session")" =~ ^(created|claimed|awaiting_approval|approved|failed)$ ]]
     then
-      api POST "/v1/forge/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
+      api POST "/v1/pulse/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
     fi
   fi
   if [[ -f "$personalized" ]]; then
@@ -85,8 +85,8 @@ case "$package_delivery" in
   embedded) ;;
   network-snapshot-v1)
     test "$(jq -er '.appliance_release_v1.schema' "$manifest")" = \
-      cybex.forge.appliance-release.v1
-    package_filename="cybex-forge-appliance-packages-$release_version-x86_64-linux.tar.zst"
+      cybex.pulse.appliance-release.v1
+    package_filename="cybex-pulse-appliance-packages-$release_version-x86_64-linux.tar.zst"
     signed_package_url="$(jq -er '.appliance_release_v1.cybex_repository_snapshot.url' "$manifest")"
     [[ "$signed_package_url" = */"$package_filename" ]]
     manifest_directory="$(cd -- "$(dirname -- "$manifest")" && pwd -P)"
@@ -101,7 +101,7 @@ case "$package_delivery" in
       ip -4 -o address show dev "$bridge" scope global \
         | awk '{sub(/\/.*/, "", $4); print $4}'
     )
-    bridge_ipv4="${CYBEX_FORGE_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
+    bridge_ipv4="${CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
     if [[ -n "$bridge_ipv4" ]]; then
       printf '%s\n' "${bridge_addresses[@]}" | grep -Fx "$bridge_ipv4" >/dev/null
     else
@@ -160,19 +160,19 @@ else
       else .
       end' "$manifest")"
 fi
-api POST /v1/forge/provisioning-sessions "$create_body" > "$create_response"
+api POST /v1/pulse/provisioning-sessions "$create_body" > "$create_response"
 session_id="$(jq -er '.session.id' "$create_response")"
 media_secret="$(jq -er '.media_secret' "$create_response")"
 download_path="$(jq -er '.download_path' "$create_response")"
-[[ "$download_path" = "/v1/forge/provisioning-sessions/$session_id/appliance-iso" ]]
+[[ "$download_path" = "/v1/pulse/provisioning-sessions/$session_id/appliance-iso" ]]
 personalization_path="$(jq -er '.personalization_path' "$create_response")"
-[[ "$personalization_path" = "/v1/forge/provisioning-sessions/$session_id/personalization-envelope" ]]
+[[ "$personalization_path" = "/v1/pulse/provisioning-sessions/$session_id/personalization-envelope" ]]
 
 headers="$work_dir/download.headers"
 envelope="$work_dir/personalization-envelope.bin"
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
   --header "Authorization: Bearer $token" \
-  --header "X-Cybex-Forge-Provisioning-Secret: $media_secret" \
+  --header "X-Cybex-Pulse-Provisioning-Secret: $media_secret" \
   --dump-header "$headers" --output "$envelope" "$manage_origin$personalization_path"
 test "$(stat -c '%s' "$envelope")" -eq 8192
 cp --reflink=auto -- "$template" "$personalized"
@@ -180,7 +180,7 @@ personalization_offset="$(jq -er '.installer_iso_template_v2.personalization_off
 dd if="$envelope" of="$personalized" bs=1 seek="$personalization_offset" conv=notrunc status=none
 rm -f -- "$envelope"
 verification="$work_dir/media-verification.json"
-CYBEX_FORGE_MEDIA_SECRET="$media_secret" \
+CYBEX_PULSE_MEDIA_SECRET="$media_secret" \
   python3 -B "$repository_root/ubuntu-appliance/qualification/verify-personalized-media.py" \
     --iso "$personalized" --manifest "$manifest" --headers "$headers" \
     --session-id "$session_id" > "$verification"
@@ -190,8 +190,8 @@ rm -f "$create_response"
 disk="$work_dir/appliance.raw"
 truncate -s 160G "$disk"
 preapproval_digest="$(dd if="$disk" bs=1M count=16 status=none | sha256sum | awk '{print $1}')"
-vars_template="${CYBEX_FORGE_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}"
-code="${CYBEX_FORGE_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
+vars_template="${CYBEX_PULSE_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}"
+code="${CYBEX_PULSE_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
 test -f "$vars_template" && test -f "$code"
 cp -- "$vars_template" "$work_dir/OVMF_VARS.fd"
 
@@ -224,7 +224,7 @@ start_qemu installer
 session="$work_dir/session.json"
 claimed=false
 for _attempt in $(seq 1 180); do
-  api GET "/v1/forge/provisioning-sessions/$session_id" > "$session"
+  api GET "/v1/pulse/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = awaiting_approval ]]; then claimed=true; break; fi
   [[ "$state" != failed && "$state" != revoked && "$state" != expired ]]
@@ -246,14 +246,14 @@ session_suffix="${session_id%%-*}"
 approve_body="$(jq -cn \
   --argjson revision "$revision" --arg inventory "$inventory_sha" \
   --arg disk "$disk_id" --arg interface "$interface_id" --arg cidr "$management_cidr" \
-  --arg display_name "Forge release qualification $release_version $session_suffix" \
+  --arg display_name "Pulse release qualification $release_version $session_suffix" \
   '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:0,start:"02:00",duration_minutes:120},management_cidrs:[$cidr]}')"
-api POST "/v1/forge/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
+api POST "/v1/pulse/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
 
 ready=false
 pre_destructive_deadline=$((SECONDS + 300))
 for _attempt in $(seq 1 1080); do
-  api GET "/v1/forge/provisioning-sessions/$session_id" > "$session"
+  api GET "/v1/pulse/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = ready ]]; then ready=true; break; fi
   if [[ -s "$work_dir/serial.log" ]] \
@@ -272,7 +272,7 @@ for _attempt in $(seq 1 1080); do
     && [[ "$(jq -r '.destructive_started_at // ""' "$session")" = "" ]] \
     && ((SECONDS >= pre_destructive_deadline))
   then
-    echo 'error: approved Forge candidate did not acknowledge its plan before the qualification deadline' >&2
+    echo 'error: approved Pulse candidate did not acknowledge its plan before the qualification deadline' >&2
     jq '{state,heartbeat_at,destructive_started_at,progress,failure_code,failure_message}' "$session" >&2
     if [[ -s "$work_dir/serial.log" ]]; then
       echo 'bounded qualification serial console follows:' >&2
@@ -295,7 +295,7 @@ for _attempt in $(seq 1 1080); do
   if [[ "$state" = rebooting && "$qemu_restart_count" -eq 1 ]] \
     && ((SECONDS >= cold_restart_deadline))
   then
-    echo 'error: installed Forge disk did not activate after its bounded cold restart' >&2
+    echo 'error: installed Pulse disk did not activate after its bounded cold restart' >&2
     if [[ -s "$work_dir/serial.log" ]]; then
       echo 'bounded qualification serial console follows:' >&2
       tail -n 500 "$work_dir/serial.log" >&2
@@ -312,7 +312,7 @@ nodes="$work_dir/nodes.json"
 node="$work_dir/node.json"
 appliance_projection_ready=false
 for _attempt in $(seq 1 120); do
-  api GET '/v1/forge/nodes?limit=100&offset=0' > "$nodes"
+  api GET '/v1/pulse/nodes?limit=100&offset=0' > "$nodes"
   jq -e --arg device "$device_id" '.nodes[] | select(.device_id == $device)' "$nodes" > "$node" || true
   if [[ -s "$node" ]] \
     && [[ "$(jq -er '.appliance_base_os' "$node")" = ubuntu ]] \
@@ -335,12 +335,12 @@ test "$appliance_projection_ready" = true
 network_change="$work_dir/network-change.json"
 network_body="$(jq -cn --arg interface "$interface_id" \
   '{network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]}}')"
-api POST "/v1/forge/nodes/$device_id/network-changes" "$network_body" > "$network_change"
+api POST "/v1/pulse/nodes/$device_id/network-changes" "$network_body" > "$network_change"
 network_change_id="$(jq -er '.id' "$network_change")"
 test "$(jq -er '.state' "$network_change")" = requested
 network_acknowledged=false
 for _attempt in $(seq 1 120); do
-  api GET '/v1/forge/nodes?limit=100&offset=0' > "$nodes"
+  api GET '/v1/pulse/nodes?limit=100&offset=0' > "$nodes"
   jq -e --arg device "$device_id" '.nodes[] | select(.device_id == $device)' "$nodes" > "$node"
   reported_change_id="$(jq -r '.appliance_network.network_change.change_id // ""' "$node")"
   reported_change_status="$(jq -r '.appliance_network.network_change.status // "idle"' "$node")"
@@ -359,7 +359,7 @@ certificate_response="$work_dir/ssh-certificate.json"
 certificate_request="$(jq -cn \
   --arg public_key "$(cat "$work_dir/operator-key.pub")" \
   '{public_key:$public_key,reason:"exact candidate release qualification",validity_minutes:5,allow_forwarding:false}')"
-api POST "/v1/forge/nodes/$device_id/ssh-certificates" "$certificate_request" > "$certificate_response"
+api POST "/v1/pulse/nodes/$device_id/ssh-certificates" "$certificate_request" > "$certificate_response"
 test "$(jq -er '.principal' "$certificate_response")" = "$device_id"
 valid_after="$(date -u -d "$(jq -er '.valid_after' "$certificate_response")" +%s)"
 valid_before="$(date -u -d "$(jq -er '.valid_before' "$certificate_response")" +%s)"
@@ -379,7 +379,7 @@ rm -f -- "$work_dir/operator-key" "$work_dir/operator-key.pub" \
 template_sha="$(jq -er '.template_sha256' "$verification")"
 personalized_sha="$(jq -er '.personalized_sha256' "$verification")"
 jq -n \
-  --arg schema 'cybex.forge.ubuntu-appliance-qualification.v1' \
+  --arg schema 'cybex.pulse.ubuntu-appliance-qualification.v1' \
   --arg session_id "$session_id" --arg template_sha256 "$template_sha" \
   --arg personalized_sha256 "$personalized_sha" \
   --arg completed_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \

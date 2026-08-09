@@ -1,11 +1,11 @@
 [package]
-name = "cybex-forge"
-version = "0.1.4"
+name = "cybex-pulse"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "UEFI-only PXE/iPXE boot control service for Cybex-managed infrastructure"
 license-file = "LICENSE"
-repository = "https://github.com/CybexHQ/forge"
+repository = "https://github.com/CybexHQ/pulse"
 readme = "README.md"
 publish = false
 

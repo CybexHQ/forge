@@ -1,9 +1,0 @@
-[Unit]
-Description=Watch for signed Cybex Forge Netplan changes
-
-[Path]
-PathExists=/var/lib/cybex-forge/state/appliance-network-change-request.json
-Unit=cybex-forge-network-change.service
-
-[Install]
-WantedBy=multi-user.target

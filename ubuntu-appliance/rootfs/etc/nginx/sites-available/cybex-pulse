@@ -11,7 +11,7 @@ server {
     }
 
     location /assets/ {
-        alias /var/cache/cybex-forge/www/assets/;
+        alias /var/cache/cybex-pulse/www/assets/;
         autoindex off;
     }
 }

@@ -1,13 +1,13 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use cybex_forge::provisioning::{
+use cybex_pulse::provisioning::{
     FinalizeOptions, PrepareOptions, finalize_target, prepare, report_install_stage,
 };
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "cybex-forge-bootstrap",
+    name = "cybex-pulse-bootstrap",
     about = "Fail-closed provisioned Ubuntu appliance bootstrap",
     version
 )]

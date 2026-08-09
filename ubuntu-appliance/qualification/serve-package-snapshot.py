@@ -28,7 +28,7 @@ def main() -> None:
 
     class SnapshotHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "CybexForgeQualification/1"
+        server_version = "CybexPulseQualification/1"
 
         def send_snapshot_headers(self) -> None:
             self.send_response(HTTPStatus.OK)

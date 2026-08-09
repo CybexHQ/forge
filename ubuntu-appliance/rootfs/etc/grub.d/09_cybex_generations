@@ -19,7 +19,7 @@ case "$fsroot" in
     generations="$root_top/.cybex-root-generations"
     ;;
   *)
-    echo "Cybex Forge root is not a managed Btrfs generation" >&2
+    echo "Cybex Pulse root is not a managed Btrfs generation" >&2
     exit 1
     ;;
 esac
@@ -30,7 +30,7 @@ for generation in $(find "$generations" -mindepth 1 -maxdepth 1 -type d -printf 
   version="${kernel##*/vmlinuz-}"
   initrd="/.cybex-root-generations/$generation/boot/initrd.img-$version"
   cat <<EOF
-menuentry 'Cybex Forge generation $generation' --id 'cybex-forge-generation-$generation' {
+menuentry 'Cybex Pulse generation $generation' --id 'cybex-pulse-generation-$generation' {
     insmod gzio
     insmod part_gpt
     insmod btrfs

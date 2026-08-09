@@ -47,7 +47,7 @@ const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_BLUEPRINT_BUILDER_V2: &str = "blueprint_builder_v2";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
-const CAPABILITY_FORGE_BOOT_GRANT_V1: &str = "forge_boot_grant_v1";
+const CAPABILITY_PULSE_BOOT_GRANT_V1: &str = "pulse_boot_grant_v1";
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
 const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 4;
 const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 4;
@@ -67,7 +67,7 @@ const MAX_BOOT_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
 // room for the remainder of the authenticated node report so a verified
 // manifest is never silently dropped solely because the transport cap is
 // smaller than the persistence contract.
-const MAX_FORGE_REPORT_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PULSE_REPORT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEVICE_HOSTNAME_CHARS: usize = 253;
 const MAX_DEVICE_SERIAL_CHARS: usize = 128;
 const MAX_DEVICE_NOTES_CHARS: usize = 2_000;
@@ -75,7 +75,7 @@ const MAX_DEVICE_TAGS: usize = 50;
 const MAX_DEVICE_TAG_CHARS: usize = 64;
 const MAX_PROFILE_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_PROFILE_RAW_SCRIPT_BYTES: usize = 64 * 1024;
-const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-forge/reliability-state.json";
+const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-pulse/reliability-state.json";
 const MAX_RELIABILITY_STATE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -91,8 +91,8 @@ struct ManagedState {
 #[derive(Debug, Deserialize)]
 struct ComponentCompatibilityContract {
     protocol_version: u32,
-    minimum_forge_protocol: u32,
-    maximum_forge_protocol: u32,
+    minimum_pulse_protocol: u32,
+    maximum_pulse_protocol: u32,
     manage_version: String,
     manage_release: String,
     #[serde(default)]
@@ -117,7 +117,7 @@ struct AgentBootConfigResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentForgeConfigResponse {
+struct AgentPulseConfigResponse {
     #[serde(default)]
     compatibility: Option<ComponentCompatibilityContract>,
     #[serde(default)]
@@ -141,7 +141,7 @@ struct AgentForgeConfigResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ForgeReportResponse {
+struct PulseReportResponse {
     status: String,
     #[serde(default)]
     workstation_netboot: Option<WorkstationNetbootReportReceipt>,
@@ -312,12 +312,12 @@ struct BootAgentEventReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ForgeAgentReportRequest {
+struct PulseAgentReportRequest {
     protocol_version: u32,
     capabilities: Vec<&'static str>,
     cache: crate::cache::CacheStatusReport,
-    build_jobs: Vec<ForgeBuildJobReport>,
-    cache_artifacts: Vec<ForgeCacheArtifactReport>,
+    build_jobs: Vec<PulseBuildJobReport>,
+    cache_artifacts: Vec<PulseCacheArtifactReport>,
     cache_inventory_instance_id: String,
     cache_inventory_generation: i64,
     cache_artifacts_complete: bool,
@@ -330,7 +330,7 @@ struct ForgeAgentReportRequest {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ForgeBuildJobReport {
+struct PulseBuildJobReport {
     local_id: i64,
     managed_job_id: Option<String>,
     requested_artifact_type: String,
@@ -363,7 +363,7 @@ struct ForgeBuildJobReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ForgeCacheArtifactReport {
+struct PulseCacheArtifactReport {
     local_id: i64,
     managed_artifact_id: Option<String>,
     artifact_type: String,
@@ -387,7 +387,7 @@ struct ForgeCacheArtifactReport {
     updated_at: String,
 }
 
-impl From<BuildJob> for ForgeBuildJobReport {
+impl From<BuildJob> for PulseBuildJobReport {
     fn from(job: BuildJob) -> Self {
         Self {
             local_id: job.id,
@@ -419,7 +419,7 @@ impl From<BuildJob> for ForgeBuildJobReport {
     }
 }
 
-impl From<CacheArtifact> for ForgeCacheArtifactReport {
+impl From<CacheArtifact> for PulseCacheArtifactReport {
     fn from(artifact: CacheArtifact) -> Self {
         Self {
             local_id: artifact.id,
@@ -470,15 +470,15 @@ pub enum SyncOnceDisposition {
 pub struct SyncOnceReport {
     pub schema: &'static str,
     pub outcome: SyncOnceDisposition,
-    /// True only after Manage accepted and returned JSON for the signed Forge
+    /// True only after Manage accepted and returned JSON for the signed Pulse
     /// report. Boot reports are intentionally not counted here.
     pub report_posted: bool,
 }
 
 impl SyncOnceReport {
-    fn synced(_receipt: ForgeReportReceipt) -> Self {
+    fn synced(_receipt: PulseReportReceipt) -> Self {
         Self {
-            schema: "cybex.forge.sync-once.v1",
+            schema: "cybex.pulse.sync-once.v1",
             outcome: SyncOnceDisposition::Synced,
             report_posted: true,
         }
@@ -486,7 +486,7 @@ impl SyncOnceReport {
 }
 
 #[derive(Debug)]
-struct ForgeReportReceipt;
+struct PulseReportReceipt;
 
 #[derive(Clone, Debug)]
 struct NormalizedManagedSettings {
@@ -509,7 +509,7 @@ pub fn spawn(state: AppState) {
                             active_managed_sync_interval_seconds(normal_interval, active_builds > 0)
                         }
                         Err(err) => {
-                            warn!(error = %err, "failed to inspect active Forge builds for managed sync cadence");
+                            warn!(error = %err, "failed to inspect active Pulse builds for managed sync cadence");
                             normal_interval
                         }
                     }
@@ -553,10 +553,10 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     if let Err(error) = sync_boot_foundation(state, &mut managed).await {
         retain_sync_failure(&mut first_failure, "boot configuration and report", error);
     }
-    let forge_report = match sync_forge_foundation(state, &managed).await {
+    let pulse_report = match sync_pulse_foundation(state, &managed).await {
         Ok(report) => Some(report),
         Err(error) => {
-            retain_sync_failure(&mut first_failure, "Forge configuration and report", error);
+            retain_sync_failure(&mut first_failure, "Pulse configuration and report", error);
             None
         }
     };
@@ -566,8 +566,8 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     if let Some(error) = first_failure {
         return Err(error);
     }
-    Ok(SyncOnceReport::synced(forge_report.expect(
-        "successful Forge sync returns its report receipt",
+    Ok(SyncOnceReport::synced(pulse_report.expect(
+        "successful Pulse sync returns its report receipt",
     )))
 }
 
@@ -661,9 +661,9 @@ async fn current_boot_client_reports(pool: &SqlitePool) -> Result<Vec<BootAgentC
 
 fn require_activated_identity(managed: &ManagedState) -> Result<()> {
     managed_device_id(managed).context(
-        "Forge has no V2-activated appliance identity; reinstall from personalized media",
+        "Pulse has no V2-activated appliance identity; reinstall from personalized media",
     )?;
-    signing_key(managed).context("Forge V2 appliance signing identity is incomplete")?;
+    signing_key(managed).context("Pulse V2 appliance signing identity is incomplete")?;
     Ok(())
 }
 
@@ -759,42 +759,42 @@ async fn report_boot_state(state: &AppState, managed: &mut ManagedState) -> Resu
     Ok(())
 }
 
-async fn sync_forge_foundation(
+async fn sync_pulse_foundation(
     state: &AppState,
     managed: &ManagedState,
-) -> Result<ForgeReportReceipt> {
+) -> Result<PulseReportReceipt> {
     let mut first_failure = None;
     let mut peer_runtime_epoch = None;
-    match fetch_forge_config(state, managed).await {
+    match fetch_pulse_config(state, managed).await {
         Ok(desired) => {
             peer_runtime_epoch = desired
                 .compatibility
                 .as_ref()
                 .and_then(|contract| contract.workstation_runtime_epoch);
-            apply_forge_desired(state, desired, &mut first_failure).await;
+            apply_pulse_desired(state, desired, &mut first_failure).await;
         }
         Err(error) => retain_sync_failure(
             &mut first_failure,
-            "Forge desired configuration fetch",
+            "Pulse desired configuration fetch",
             error,
         ),
     }
-    let report = match report_forge_state(state, managed, peer_runtime_epoch.is_some()).await {
+    let report = match report_pulse_state(state, managed, peer_runtime_epoch.is_some()).await {
         Ok(report) => Some(report),
         Err(error) => {
-            retain_sync_failure(&mut first_failure, "Forge state report", error);
+            retain_sync_failure(&mut first_failure, "Pulse state report", error);
             None
         }
     };
     if let Some(error) = first_failure {
         return Err(error);
     }
-    Ok(report.expect("successful Forge report returns its receipt"))
+    Ok(report.expect("successful Pulse report returns its receipt"))
 }
 
-async fn apply_forge_desired(
+async fn apply_pulse_desired(
     state: &AppState,
-    desired: AgentForgeConfigResponse,
+    desired: AgentPulseConfigResponse,
     first_failure: &mut Option<anyhow::Error>,
 ) {
     if let Some(workstation_netboot) = desired.workstation_netboot {
@@ -836,7 +836,7 @@ async fn apply_forge_desired(
         retain_sync_failure(
             first_failure,
             "managed build desired state",
-            anyhow!("managed forge config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs"),
+            anyhow!("managed pulse config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs"),
         );
     }
     let mut build_snapshot_applied = build_count_valid;
@@ -960,7 +960,7 @@ async fn acknowledge_pending_appliance_network_change(
     };
     let device_id = managed_device_id(managed)?;
     let path = format!(
-        "/v1/agent/devices/{device_id}/forge/network-changes/{}/acknowledge",
+        "/v1/agent/devices/{device_id}/pulse/network-changes/{}/acknowledge",
         pending.change_id
     );
     let body = serde_json::to_vec(&json!({
@@ -977,34 +977,34 @@ async fn acknowledge_pending_appliance_network_change(
     crate::appliance::accept_network_acknowledgement(&acknowledgement)
 }
 
-async fn fetch_forge_config(
+async fn fetch_pulse_config(
     state: &AppState,
     managed: &ManagedState,
-) -> Result<AgentForgeConfigResponse> {
+) -> Result<AgentPulseConfigResponse> {
     let device_id = managed_device_id(managed)?;
-    let path = format!("/v1/agent/devices/{device_id}/forge/config");
+    let path = format!("/v1/agent/devices/{device_id}/pulse/config");
     let response = signed_request(state, managed, Method::GET, &path, Vec::new())
         .await?
         .send()
         .await
-        .context("fetch managed forge config request failed")?;
-    let config: AgentForgeConfigResponse =
-        parse_success_json(response, "fetch managed forge config").await?;
+        .context("fetch managed pulse config request failed")?;
+    let config: AgentPulseConfigResponse =
+        parse_success_json(response, "fetch managed pulse config").await?;
     validate_component_compatibility(config.compatibility.as_ref())?;
     Ok(config)
 }
 
-async fn report_forge_state(
+async fn report_pulse_state(
     state: &AppState,
     managed: &ManagedState,
     peer_supports_runtime_fencing: bool,
-) -> Result<ForgeReportReceipt> {
+) -> Result<PulseReportReceipt> {
     let (build_jobs, build_listing_valid) = match db::list_build_jobs(&state.db).await {
         Ok(jobs) => (jobs, true),
         Err(_) => {
             warn!(
                 error_code = "build_report_storage_unavailable",
-                "could not read build reports; continuing independent Forge report lanes"
+                "could not read build reports; continuing independent Pulse report lanes"
             );
             (Vec::new(), false)
         }
@@ -1024,7 +1024,7 @@ async fn report_forge_state(
             true
         }
         Err(err) => {
-            warn!(error = %err, "Forge cache integrity scrub failed");
+            warn!(error = %err, "Pulse cache integrity scrub failed");
             false
         }
     };
@@ -1076,7 +1076,7 @@ async fn report_forge_state(
             warn!(
                 error_code = crate::netboot::ERROR_RUNTIME_REPORT_STORAGE_UNAVAILABLE,
                 safe_detail = %crate::netboot::safe_failure_message(&error),
-                "workstation runtime report generation failed; sending null without blocking the Forge report"
+                "workstation runtime report generation failed; sending null without blocking the Pulse report"
             );
             None
         }
@@ -1086,24 +1086,24 @@ async fn report_forge_state(
         Err(error) => {
             warn!(
                 error = %safe_error(&error),
-                "appliance report generation failed; sending null without blocking independent Forge state"
+                "appliance report generation failed; sending null without blocking independent Pulse state"
             );
             (None, Some("local_state_unavailable"))
         }
     };
-    let body = ForgeAgentReportRequest {
+    let body = PulseAgentReportRequest {
         protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
-        capabilities: forge_capabilities(&state.config),
+        capabilities: pulse_capabilities(&state.config),
         cache,
         build_jobs: build_jobs
             .into_iter()
             .take(MAX_REPORT_BUILD_JOBS)
-            .map(ForgeBuildJobReport::from)
+            .map(PulseBuildJobReport::from)
             .collect(),
         cache_artifacts: cache_artifacts
             .into_iter()
             .take(MAX_REPORT_CACHE_ARTIFACTS)
-            .map(ForgeCacheArtifactReport::from)
+            .map(PulseCacheArtifactReport::from)
             .collect(),
         cache_inventory_instance_id,
         cache_inventory_generation,
@@ -1114,24 +1114,24 @@ async fn report_forge_state(
         appliance,
         appliance_report_error,
     };
-    let (_body, body_bytes) = fit_forge_report_body(body, MAX_FORGE_REPORT_BODY_BYTES)?;
+    let (_body, body_bytes) = fit_pulse_report_body(body, MAX_PULSE_REPORT_BODY_BYTES)?;
     let device_id = managed_device_id(managed)?;
-    let path = format!("/v1/agent/devices/{device_id}/forge/report");
+    let path = format!("/v1/agent/devices/{device_id}/pulse/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)
         .await?
         .header(CONTENT_TYPE, "application/json")
         .send()
         .await
-        .context("report managed forge state request failed")?;
+        .context("report managed pulse state request failed")?;
     let response =
-        parse_success_json::<ForgeReportResponse>(response, "report managed forge state").await?;
-    validate_forge_report_response(&response)?;
-    Ok(ForgeReportReceipt)
+        parse_success_json::<PulseReportResponse>(response, "report managed pulse state").await?;
+    validate_pulse_report_response(&response)?;
+    Ok(PulseReportReceipt)
 }
 
-fn validate_forge_report_response(response: &ForgeReportResponse) -> Result<()> {
+fn validate_pulse_report_response(response: &PulseReportResponse) -> Result<()> {
     if response.status != "ok" {
-        bail!("Manage returned an invalid Forge report status");
+        bail!("Manage returned an invalid Pulse report status");
     }
     let Some(receipt) = response.workstation_netboot.as_ref() else {
         // Older Manage releases predate isolated runtime receipts.
@@ -1177,7 +1177,7 @@ fn cache_inventory_generation_for_peer(
         // A negative generation is rejected by Manage's isolated cache lane.
         // This prevents a best-effort empty snapshot (or an independently
         // optimistic cache status report) from refreshing cache health when
-        // Forge could not read its authoritative local inventory.
+        // Pulse could not read its authoritative local inventory.
         -1
     } else {
         generation
@@ -1201,13 +1201,13 @@ fn cache_status_for_local_state(
     report
 }
 
-fn fit_forge_report_body(
-    mut body: ForgeAgentReportRequest,
+fn fit_pulse_report_body(
+    mut body: PulseAgentReportRequest,
     max_bytes: usize,
-) -> Result<(ForgeAgentReportRequest, Vec<u8>)> {
+) -> Result<(PulseAgentReportRequest, Vec<u8>)> {
     let original_jobs = body.build_jobs.len();
     let original_artifacts = body.cache_artifacts.len();
-    let mut body_bytes = serialize_forge_report_body(&body)?;
+    let mut body_bytes = serialize_pulse_report_body(&body)?;
     if body_bytes.len() <= max_bytes {
         return Ok((body, body_bytes));
     }
@@ -1218,7 +1218,7 @@ fn fit_forge_report_body(
     for job in &mut body.build_jobs {
         job.logs.clear();
     }
-    body_bytes = serialize_forge_report_body(&body)?;
+    body_bytes = serialize_pulse_report_body(&body)?;
     while body_bytes.len() > max_bytes {
         let Some(index) = body
             .build_jobs
@@ -1231,7 +1231,7 @@ fn fit_forge_report_body(
         // oldest terminal evidence while preserving current work and the
         // latest completed Blueprint inventory.
         body.build_jobs.remove(index);
-        body_bytes = serialize_forge_report_body(&body)?;
+        body_bytes = serialize_pulse_report_body(&body)?;
     }
 
     if body_bytes.len() > max_bytes && !body.cache_artifacts.is_empty() {
@@ -1239,15 +1239,15 @@ fn fit_forge_report_body(
             let mut candidate = body.clone();
             candidate.cache_artifacts.truncate(count);
             candidate.cache_artifacts_complete = false;
-            serialize_forge_report_body(&candidate).is_ok_and(|bytes| bytes.len() <= max_bytes)
+            serialize_pulse_report_body(&candidate).is_ok_and(|bytes| bytes.len() <= max_bytes)
         });
         body.cache_artifacts.truncate(fitting);
         body.cache_artifacts_complete = false;
-        body_bytes = serialize_forge_report_body(&body)?;
+        body_bytes = serialize_pulse_report_body(&body)?;
     }
 
     if body_bytes.len() > max_bytes {
-        bail!("managed forge report base body exceeded {max_bytes} bytes");
+        bail!("managed pulse report base body exceeded {max_bytes} bytes");
     }
     warn!(
         jobs_sent = body.build_jobs.len(),
@@ -1255,13 +1255,13 @@ fn fit_forge_report_body(
         cache_artifacts_sent = body.cache_artifacts.len(),
         cache_artifacts_total = original_artifacts,
         max_bytes,
-        "managed forge report trimmed to fit request budget"
+        "managed pulse report trimmed to fit request budget"
     );
     Ok((body, body_bytes))
 }
 
-fn serialize_forge_report_body(body: &ForgeAgentReportRequest) -> Result<Vec<u8>> {
-    serde_json::to_vec(body).context("serialize managed forge report")
+fn serialize_pulse_report_body(body: &PulseAgentReportRequest) -> Result<Vec<u8>> {
+    serde_json::to_vec(body).context("serialize managed pulse report")
 }
 
 fn fit_boot_report_body(
@@ -1699,14 +1699,14 @@ async fn signed_request_for_config(
     })
 }
 
-fn forge_capabilities(_config: &AppConfig) -> Vec<&'static str> {
+fn pulse_capabilities(_config: &AppConfig) -> Vec<&'static str> {
     let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
         CAPABILITY_BLUEPRINT_BUILDER_V2,
         CAPABILITY_CACHE_V1,
         CAPABILITY_WORKSTATION_NETBOOT_V1,
-        CAPABILITY_FORGE_BOOT_GRANT_V1,
+        CAPABILITY_PULSE_BOOT_GRANT_V1,
     ];
     capabilities.push(CAPABILITY_APPLIANCE_UPDATE_V1);
     capabilities
@@ -1739,7 +1739,7 @@ fn signing_key_from_b64(value: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
-pub(crate) struct ForgeBootIdentity {
+pub(crate) struct PulseBootIdentity {
     pub device_id: String,
     pub signing_key: SigningKey,
 }
@@ -1747,11 +1747,11 @@ pub(crate) struct ForgeBootIdentity {
 /// Load the already-adopted node identity for short-lived boot-grant signing.
 /// This never creates or rotates key material: PXE must fail closed until the
 /// same identity Manage has adopted is durable on disk.
-pub(crate) fn forge_boot_identity(config: &AppConfig) -> Result<ForgeBootIdentity> {
+pub(crate) fn pulse_boot_identity(config: &AppConfig) -> Result<PulseBootIdentity> {
     let managed = load_managed_state_from_config(config)?;
     let device_id = managed_device_id(&managed)?.to_string();
     let signing_key = signing_key(&managed)?;
-    Ok(ForgeBootIdentity {
+    Ok(PulseBootIdentity {
         device_id,
         signing_key,
     })
@@ -2247,16 +2247,16 @@ fn validate_component_compatibility(
         contract.ok_or_else(|| anyhow!("managed protocol-4 compatibility is required"))?;
     if !(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION..=CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION)
         .contains(&contract.protocol_version)
-        || !(contract.minimum_forge_protocol..=contract.maximum_forge_protocol)
+        || !(contract.minimum_pulse_protocol..=contract.maximum_pulse_protocol)
             .contains(&CYBEX_COMPONENT_PROTOCOL_VERSION)
         || contract.workstation_runtime_epoch == Some(0)
     {
         bail!(
-            "incompatible Manage protocol {} (Forge protocol {}, supported Forge range {} through {}, Manage version {}, release {})",
+            "incompatible Manage protocol {} (Pulse protocol {}, supported Pulse range {} through {}, Manage version {}, release {})",
             contract.protocol_version,
             CYBEX_COMPONENT_PROTOCOL_VERSION,
-            contract.minimum_forge_protocol,
-            contract.maximum_forge_protocol,
+            contract.minimum_pulse_protocol,
+            contract.maximum_pulse_protocol,
             clean_string(&contract.manage_version),
             clean_string(&contract.manage_release),
         );
@@ -2393,7 +2393,7 @@ fn validate_assignable_profile(profile: &ManagedBootProfile, field: &str) -> Res
 
 fn managed_profile_has_boot_action(profile: &ManagedBootProfile) -> bool {
     match profile.profile_type.as_str() {
-        "local_disk" | "forge_installer" => true,
+        "local_disk" | "pulse_installer" => true,
         "custom_ipxe" => profile
             .raw_script
             .as_deref()
@@ -2462,7 +2462,7 @@ fn load_reliability_state() -> Option<Value> {
         warn!(
             path = RELIABILITY_STATE_PATH,
             bytes = bytes.len(),
-            "ignoring oversized Forge reliability state"
+            "ignoring oversized Pulse reliability state"
         );
         return None;
     }
@@ -2471,12 +2471,12 @@ fn load_reliability_state() -> Option<Value> {
         Ok(_) => {
             warn!(
                 path = RELIABILITY_STATE_PATH,
-                "ignoring non-object Forge reliability state"
+                "ignoring non-object Pulse reliability state"
             );
             None
         }
         Err(err) => {
-            warn!(path = RELIABILITY_STATE_PATH, error = %err, "ignoring invalid Forge reliability state");
+            warn!(path = RELIABILITY_STATE_PATH, error = %err, "ignoring invalid Pulse reliability state");
             None
         }
     }
@@ -2575,14 +2575,14 @@ mod tests {
     async fn signed_requests_canonicalize_the_final_prefixed_path_and_query() {
         let signing = SigningKey::from_bytes(&[11_u8; 32]);
         let managed = ManagedState {
-            device_id: Some("forge-123".to_string()),
+            device_id: Some("pulse-123".to_string()),
             private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
             ..ManagedState::default()
         };
         let mut config = AppConfig::default();
         config.manage.api_url = "https://manage.example.invalid/api".to_string();
         config.manage.organization_id = "org-123".to_string();
-        let relative = "/v1/agent/devices/forge-123/config?cursor=a%2Fb";
+        let relative = "/v1/agent/devices/pulse-123/config?cursor=a%2Fb";
         let body = br#"{"status":"ready"}"#.to_vec();
         let request =
             signed_request_for_config(&config, &managed, Method::POST, relative, body.clone())
@@ -2593,7 +2593,7 @@ mod tests {
         let signed_path = request_path_and_query(request.url().as_str()).unwrap();
         assert_eq!(
             signed_path,
-            "/api/v1/agent/devices/forge-123/config?cursor=a%2Fb"
+            "/api/v1/agent/devices/pulse-123/config?cursor=a%2Fb"
         );
         let timestamp = request.headers()["x-cybex-timestamp"].to_str().unwrap();
         let request_id = request.headers()["x-cybex-request-id"].to_str().unwrap();
@@ -2858,8 +2858,8 @@ mod tests {
         let settings = ManagedBootSettings {
             public_base_url: " http://boot.example/// ".to_string(),
             listen_addr: "127.0.0.1:9080".to_string(),
-            tftp_root: "/srv/cybex-forge/tftp-managed".to_string(),
-            http_root: "/srv/cybex-forge/www-managed".to_string(),
+            tftp_root: "/srv/cybex-pulse/tftp-managed".to_string(),
+            http_root: "/srv/cybex-pulse/www-managed".to_string(),
             bootloader_filename: " ipxe.efi ".to_string(),
             menu_timeout_ms: 1_000,
         };
@@ -2900,16 +2900,16 @@ mod tests {
         let invalid_url = ManagedBootSettings {
             public_base_url: "http://boot.example/path?debug=true".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-forge/tftp".to_string(),
-            http_root: "/srv/cybex-forge/www".to_string(),
+            tftp_root: "/srv/cybex-pulse/tftp".to_string(),
+            http_root: "/srv/cybex-pulse/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
         let invalid_loader = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-forge/tftp".to_string(),
-            http_root: "/srv/cybex-forge/www".to_string(),
+            tftp_root: "/srv/cybex-pulse/tftp".to_string(),
+            http_root: "/srv/cybex-pulse/www".to_string(),
             bootloader_filename: "../snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -3594,17 +3594,17 @@ mod tests {
     }
 
     #[test]
-    fn forge_capabilities_report_build_and_cache() {
+    fn pulse_capabilities_report_build_and_cache() {
         let config = AppConfig::default();
         assert_eq!(
-            forge_capabilities(&config),
+            pulse_capabilities(&config),
             vec![
                 "boot_v1",
                 "builder_v1",
                 "blueprint_builder_v2",
                 "cache_v1",
                 "workstation_netboot_v1",
-                "forge_boot_grant_v1",
+                "pulse_boot_grant_v1",
                 "appliance_update_v1"
             ]
         );
@@ -3678,8 +3678,8 @@ mod tests {
         AgentBootConfigResponse {
             compatibility: Some(ComponentCompatibilityContract {
                 protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
-                minimum_forge_protocol: 1,
-                maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
+                minimum_pulse_protocol: 1,
+                maximum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
                 manage_version: "0.1.0".to_string(),
                 manage_release: "test".to_string(),
                 workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
@@ -3687,8 +3687,8 @@ mod tests {
             settings: ManagedBootSettings {
                 public_base_url: "http://127.0.0.1".to_string(),
                 listen_addr: "127.0.0.1:8080".to_string(),
-                tftp_root: "/srv/cybex-forge/tftp".to_string(),
-                http_root: "/srv/cybex-forge/www".to_string(),
+                tftp_root: "/srv/cybex-pulse/tftp".to_string(),
+                http_root: "/srv/cybex-pulse/www".to_string(),
                 bootloader_filename: "ipxe.efi".to_string(),
                 menu_timeout_ms: 10_000,
             },
@@ -3710,7 +3710,7 @@ mod tests {
             Some(u64::from(CYBEX_COMPONENT_PROTOCOL_VERSION))
         );
         assert_eq!(
-            manifest["forge"]["minimum_manage_protocol"].as_u64(),
+            manifest["pulse"]["minimum_manage_protocol"].as_u64(),
             Some(u64::from(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION))
         );
         #[cfg(not(feature = "resilience-qualification-epoch-2"))]
@@ -3732,8 +3732,8 @@ mod tests {
 
         let incompatible = ComponentCompatibilityContract {
             protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
-            minimum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
-            maximum_forge_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            minimum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            maximum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
             manage_version: "future".to_string(),
             manage_release: "future".to_string(),
             workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
@@ -3775,11 +3775,11 @@ mod tests {
     }
 
     #[test]
-    fn forge_report_receipt_accepts_old_manage_and_retries_isolated_rejections() {
-        let legacy: ForgeReportResponse = serde_json::from_value(json!({"status": "ok"})).unwrap();
-        validate_forge_report_response(&legacy).unwrap();
+    fn pulse_report_receipt_accepts_old_manage_and_retries_isolated_rejections() {
+        let legacy: PulseReportResponse = serde_json::from_value(json!({"status": "ok"})).unwrap();
+        validate_pulse_report_response(&legacy).unwrap();
 
-        let rejected: ForgeReportResponse = serde_json::from_value(json!({
+        let rejected: PulseReportResponse = serde_json::from_value(json!({
             "status": "ok",
             "workstation_netboot": {
                 "state": "rejected",
@@ -3787,7 +3787,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = validate_forge_report_response(&rejected).unwrap_err();
+        let error = validate_pulse_report_response(&rejected).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Manage did not accept workstation runtime evidence (runtime_report_stale)"
@@ -3812,11 +3812,11 @@ mod tests {
     }
 
     #[test]
-    fn forge_report_inventory_failures_do_not_suppress_independent_lanes() {
+    fn pulse_report_inventory_failures_do_not_suppress_independent_lanes() {
         let source = include_str!("manage.rs");
-        let start = source.find("async fn report_forge_state").unwrap();
+        let start = source.find("async fn report_pulse_state").unwrap();
         let end = source[start..]
-            .find("\nfn validate_forge_report_response")
+            .find("\nfn validate_pulse_report_response")
             .map(|offset| start + offset)
             .unwrap();
         let body = &source[start..end];
@@ -3873,7 +3873,7 @@ mod tests {
             status: "ready".to_string(),
             public_key: "cache.example-1:public-key".to_string(),
             public_key_fingerprint: "sha256:fingerprint".to_string(),
-            base_url: "https://forge.example/cache".to_string(),
+            base_url: "https://pulse.example/cache".to_string(),
             total_size_bytes: 1234,
             artifact_count: 3,
             error: String::new(),
@@ -3903,8 +3903,8 @@ mod tests {
     }
 
     #[test]
-    fn workstation_runtime_shape_is_isolated_from_the_forge_config_envelope() {
-        let config: AgentForgeConfigResponse = serde_json::from_value(json!({
+    fn workstation_runtime_shape_is_isolated_from_the_pulse_config_envelope() {
+        let config: AgentPulseConfigResponse = serde_json::from_value(json!({
             "workstation_netboot": {
                 "future_runtime_contract": true
             }
@@ -3927,7 +3927,7 @@ mod tests {
         let mut random = [0u8; 8];
         OsRng.fill_bytes(&mut random);
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-managed-state-{}-{}",
+            "cybex-pulse-managed-state-{}-{}",
             std::process::id(),
             hex::encode(random)
         ));
@@ -3940,7 +3940,7 @@ mod tests {
             id: id.to_string(),
             name: "Installer".to_string(),
             description: String::new(),
-            profile_type: "forge_installer".to_string(),
+            profile_type: "pulse_installer".to_string(),
             enabled: true,
             is_default: false,
             one_time: false,

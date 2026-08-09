@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS managed_build_job_report_acks (
     managed_job_id TEXT PRIMARY KEY,
     acknowledged_at TEXT NOT NULL,
-    FOREIGN KEY (managed_job_id) REFERENCES forge_build_jobs(managed_job_id) ON DELETE CASCADE
+    FOREIGN KEY (managed_job_id) REFERENCES pulse_build_jobs(managed_job_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS managed_cache_protection_state (

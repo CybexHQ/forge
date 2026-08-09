@@ -84,7 +84,7 @@ pub fn ensure_directories(config: &AppConfig) -> std::io::Result<()> {
 
 pub async fn active_build_job_count(pool: &SqlitePool) -> AppResult<i64> {
     let count = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM forge_build_jobs WHERE status IN ('queued', 'running')",
+        "SELECT COUNT(*) FROM pulse_build_jobs WHERE status IN ('queued', 'running')",
     )
     .fetch_one(pool)
     .await?;
@@ -144,7 +144,7 @@ pub async fn migrate(pool: &SqlitePool) -> AppResult<()> {
 pub async fn quarantine_protected_build_jobs(pool: &SqlitePool) -> AppResult<usize> {
     let rows = sqlx::query_as::<_, LegacyProtectedBuildJobRow>(
         "SELECT id, managed_job_id, status, build_spec, cache_metadata, logs, error
-         FROM forge_build_jobs ORDER BY id",
+         FROM pulse_build_jobs ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -168,13 +168,13 @@ pub async fn quarantine_protected_build_jobs(pool: &SqlitePool) -> AppResult<usi
             let build_spec_sha256 = hex::encode(Sha256::digest(row.build_spec.as_bytes()));
             let safe_spec = serde_json::to_string(&json!({
                 "schema_version": 1,
-                "security_quarantine": "protected reusable input removed during Forge upgrade"
+                "security_quarantine": "protected reusable input removed during Pulse upgrade"
             }))
             .map_err(|err| AppError::Config(err.to_string()))?;
             let safe_metadata = serde_json::to_string(&json!({
                 "security_quarantine": {
                     "status": "pending_purge",
-                    "reason": "protected reusable input removed during Forge upgrade",
+                    "reason": "protected reusable input removed during Pulse upgrade",
                     "scope": "static_binary_cache",
                     "store_gc": "operator_managed"
                 }
@@ -199,10 +199,10 @@ pub async fn quarantine_protected_build_jobs(pool: &SqlitePool) -> AppResult<usi
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE forge_build_jobs
+                "UPDATE pulse_build_jobs
                  SET build_spec = ?, cache_metadata = ?, status = 'failed',
                      progress_percent = 100, progress_stage = 'failed',
-                     progress_message = 'Build quarantined during Forge security upgrade',
+                     progress_message = 'Build quarantined during Pulse security upgrade',
                      logs = '', error = 'Build quarantined because reusable input failed the protected-material boundary',
                      completed_at = COALESCE(completed_at, ?), updated_at = ?
                  WHERE id = ?",
@@ -218,7 +218,7 @@ pub async fn quarantine_protected_build_jobs(pool: &SqlitePool) -> AppResult<usi
             quarantined += 1;
         } else if redacted_logs != row.logs || redacted_error != row.error {
             sqlx::query(
-                "UPDATE forge_build_jobs SET logs = ?, error = ?, updated_at = ? WHERE id = ?",
+                "UPDATE pulse_build_jobs SET logs = ?, error = ?, updated_at = ? WHERE id = ?",
             )
             .bind(redacted_logs)
             .bind(redacted_error)
@@ -237,7 +237,7 @@ pub(crate) async fn pending_protected_build_job_remediations(
     sqlx::query_as::<_, ProtectedBuildJobRemediation>(
         "SELECT remediation.job_id, remediation.managed_job_id, job.output_path
          FROM protected_build_job_remediations remediation
-         JOIN forge_build_jobs job ON job.id = remediation.job_id
+         JOIN pulse_build_jobs job ON job.id = remediation.job_id
          WHERE remediation.cache_purge_status = 'pending_purge'
          ORDER BY remediation.job_id",
     )
@@ -262,7 +262,7 @@ pub(crate) async fn protected_build_job_remediation_exists(
 /// Complete the SQLite half of a protected-artifact purge after the cache
 /// mutation lock holder has unpublished and swept the filesystem. A `purged`
 /// status covers withdrawal of the exported root plus sweeping members not
-/// shared by retained roots; Forge deliberately leaves `/nix/store` garbage
+/// shared by retained roots; Pulse deliberately leaves `/nix/store` garbage
 /// collection to its separately governed policy.
 pub(crate) async fn complete_protected_build_job_cache_purge(
     pool: &SqlitePool,
@@ -271,7 +271,7 @@ pub(crate) async fn complete_protected_build_job_cache_purge(
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
     for artifact_id in artifact_ids {
-        sqlx::query("DELETE FROM forge_cache_artifacts WHERE id = ?")
+        sqlx::query("DELETE FROM pulse_cache_artifacts WHERE id = ?")
             .bind(artifact_id)
             .execute(&mut *tx)
             .await?;
@@ -279,7 +279,7 @@ pub(crate) async fn complete_protected_build_job_cache_purge(
 
     for artifact_id in artifact_ids {
         let remaining_by_id: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM forge_cache_artifacts WHERE id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM pulse_cache_artifacts WHERE id = ?")
                 .bind(artifact_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -291,7 +291,7 @@ pub(crate) async fn complete_protected_build_job_cache_purge(
     }
 
     let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM forge_cache_artifacts
+        "SELECT COUNT(*) FROM pulse_cache_artifacts
          WHERE (? IS NOT NULL AND source_build_job_id = ?)
             OR (? <> '' AND store_path = ?)",
     )
@@ -311,13 +311,13 @@ pub(crate) async fn complete_protected_build_job_cache_purge(
     let safe_metadata = serde_json::to_string(&json!({
         "security_quarantine": {
             "status": "purged",
-            "reason": "protected reusable input removed during Forge upgrade",
+            "reason": "protected reusable input removed during Pulse upgrade",
             "scope": "static_binary_cache",
             "store_gc": "operator_managed"
         }
     }))
     .map_err(|err| AppError::Config(err.to_string()))?;
-    sqlx::query("UPDATE forge_build_jobs SET cache_metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE pulse_build_jobs SET cache_metadata = ?, updated_at = ? WHERE id = ?")
         .bind(safe_metadata)
         .bind(&now)
         .bind(remediation.job_id)
@@ -1104,7 +1104,7 @@ async fn get_boot_event(pool: &SqlitePool, id: i64) -> AppResult<BootEvent> {
 
 pub async fn list_build_jobs(pool: &SqlitePool) -> AppResult<Vec<BuildJob>> {
     let rows = sqlx::query_as::<_, BuildJobRow>(
-        "SELECT * FROM forge_build_jobs ORDER BY created_at DESC, id DESC",
+        "SELECT * FROM pulse_build_jobs ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -1132,10 +1132,10 @@ pub async fn create_build_job(
     let cache_metadata = metadata_to_string(input.cache_metadata, "cache_metadata")?;
     let now = now_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO forge_build_jobs
+        "INSERT INTO pulse_build_jobs
          (requested_artifact_type, build_spec, target, system, input_revision, input_config_hash,
           status, progress_percent, progress_stage, progress_message, cache_metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Forge to claim the build', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Pulse to claim the build', ?, ?, ?)",
     )
     .bind(requested_artifact_type)
     .bind(build_spec)
@@ -1182,51 +1182,51 @@ pub async fn upsert_managed_build_job(
     let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
     let now = now_rfc3339();
     sqlx::query(
-        "INSERT INTO forge_build_jobs
+        "INSERT INTO pulse_build_jobs
          (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision,
           input_config_hash, status, progress_percent, progress_stage, progress_message,
           cache_metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Forge to claim the build', ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'queued', 'Waiting for Pulse to claim the build', ?, ?, ?)
          ON CONFLICT(managed_job_id) DO UPDATE SET
              requested_artifact_type = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.requested_artifact_type
-                 ELSE forge_build_jobs.requested_artifact_type
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.requested_artifact_type
+                 ELSE pulse_build_jobs.requested_artifact_type
              END,
              build_spec = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.build_spec
-                 ELSE forge_build_jobs.build_spec
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.build_spec
+                 ELSE pulse_build_jobs.build_spec
              END,
              target = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.target
-                 ELSE forge_build_jobs.target
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.target
+                 ELSE pulse_build_jobs.target
              END,
              system = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.system
-                 ELSE forge_build_jobs.system
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.system
+                 ELSE pulse_build_jobs.system
              END,
              input_revision = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.input_revision
-                 ELSE forge_build_jobs.input_revision
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.input_revision
+                 ELSE pulse_build_jobs.input_revision
              END,
              input_config_hash = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.input_config_hash
-                 ELSE forge_build_jobs.input_config_hash
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.input_config_hash
+                 ELSE pulse_build_jobs.input_config_hash
              END,
              progress_percent = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_percent
-                 ELSE forge_build_jobs.progress_percent
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.progress_percent
+                 ELSE pulse_build_jobs.progress_percent
              END,
              progress_stage = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_stage
-                 ELSE forge_build_jobs.progress_stage
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.progress_stage
+                 ELSE pulse_build_jobs.progress_stage
              END,
              progress_message = CASE
-                 WHEN forge_build_jobs.status = 'queued' THEN excluded.progress_message
-                 ELSE forge_build_jobs.progress_message
+                 WHEN pulse_build_jobs.status = 'queued' THEN excluded.progress_message
+                 ELSE pulse_build_jobs.progress_message
              END,
              cache_metadata = CASE
-                 WHEN forge_build_jobs.status IN ('queued', 'running') THEN excluded.cache_metadata
-                 ELSE forge_build_jobs.cache_metadata
+                 WHEN pulse_build_jobs.status IN ('queued', 'running') THEN excluded.cache_metadata
+                 ELSE pulse_build_jobs.cache_metadata
              END,
              updated_at = excluded.updated_at",
     )
@@ -1246,12 +1246,12 @@ pub async fn upsert_managed_build_job(
     get_build_job_by_managed_id(pool, &managed_job_id).await
 }
 
-/// Persist a managed job that this Forge can never build as a terminal local
+/// Persist a managed job that this Pulse can never build as a terminal local
 /// failure, so the reason reaches Manage on the next report.
 ///
 /// [`upsert_managed_build_job`] validates before it writes, so a job Manage
-/// considers valid but this Forge rejects leaves *no local row at all* -- and
-/// the Forge report is assembled from local rows, so the job stayed `queued`
+/// considers valid but this Pulse rejects leaves *no local row at all* -- and
+/// the Pulse report is assembled from local rows, so the job stayed `queued`
 /// in Manage forever with no way to see why. Recording the rejection turns an
 /// invisible stall into a visible failure an operator can act on.
 ///
@@ -1277,10 +1277,10 @@ pub async fn record_rejected_managed_build_job(
     // be well formed. A malformed id is a Manage-side bug we cannot record
     // against any job; the caller logs and moves on.
     let managed_job_id = normalize_managed_id(managed_job_id, "managed_job_id")?;
-    let error = format!("Forge rejected this build job: {reason}");
+    let error = format!("Pulse rejected this build job: {reason}");
     let now = now_rfc3339();
     sqlx::query(
-        "INSERT INTO forge_build_jobs
+        "INSERT INTO pulse_build_jobs
          (managed_job_id, requested_artifact_type, build_spec, target, system, input_revision,
           input_config_hash, status, progress_percent, progress_stage, progress_message,
           error, rejection_code, cache_metadata, completed_at, created_at, updated_at)
@@ -1292,9 +1292,9 @@ pub async fn record_rejected_managed_build_job(
              progress_message = excluded.progress_message,
              error = excluded.error,
              rejection_code = excluded.rejection_code,
-             completed_at = COALESCE(forge_build_jobs.completed_at, excluded.updated_at),
+             completed_at = COALESCE(pulse_build_jobs.completed_at, excluded.updated_at),
              updated_at = excluded.updated_at
-         WHERE forge_build_jobs.status = 'queued'",
+         WHERE pulse_build_jobs.status = 'queued'",
     )
     .bind(&managed_job_id)
     .bind(sanitize_report_field(
@@ -1310,7 +1310,7 @@ pub async fn record_rejected_managed_build_job(
     ))
     .bind(sanitize_report_field(input_revision, 256, ""))
     .bind(sanitize_report_field(input_config_hash, 64, ""))
-    .bind(truncate_chars("Rejected by Forge validation", 256))
+    .bind(truncate_chars("Rejected by Pulse validation", 256))
     .bind(truncate_chars(&error, 2048))
     .bind(classify_validation_rejection(reason))
     .bind(&now)
@@ -1389,13 +1389,13 @@ pub async fn cancel_absent_managed_build_jobs(
             continue;
         }
         sqlx::query(
-            "UPDATE forge_build_jobs
+            "UPDATE pulse_build_jobs
              SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
                  progress_percent = CASE WHEN status = 'queued' THEN 100 ELSE COALESCE(progress_percent, 5) END,
                  progress_stage = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
                  progress_message = CASE
                      WHEN status = 'queued' THEN 'Build cancelled before start'
-                     ELSE 'Cancellation requested; waiting for Forge to stop the build'
+                     ELSE 'Cancellation requested; waiting for Pulse to stop the build'
                  END,
                  cancel_requested_at = CASE WHEN status = 'running' THEN ? ELSE cancel_requested_at END,
                  completed_at = CASE WHEN status = 'queued' THEN ? ELSE completed_at END,
@@ -1422,13 +1422,13 @@ pub async fn cancel_managed_build_jobs(
     for managed_job_id in managed_job_ids {
         let managed_job_id = normalize_managed_id(managed_job_id, "managed_job_id")?;
         let affected = sqlx::query(
-            "UPDATE forge_build_jobs
+            "UPDATE pulse_build_jobs
              SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
                  progress_percent = CASE WHEN status = 'queued' THEN 100 ELSE COALESCE(progress_percent, 5) END,
                  progress_stage = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
                  progress_message = CASE
                      WHEN status = 'queued' THEN 'Build cancelled before start'
-                     ELSE 'Cancellation requested; waiting for Forge to stop the build'
+                     ELSE 'Cancellation requested; waiting for Pulse to stop the build'
                  END,
                  cancel_requested_at = CASE WHEN status = 'running' THEN ? ELSE cancel_requested_at END,
                  completed_at = CASE WHEN status = 'queued' THEN ? ELSE completed_at END,
@@ -1451,11 +1451,11 @@ pub async fn recover_running_build_jobs(pool: &SqlitePool, reason: &str) -> AppR
     let now = now_rfc3339();
     let error = bounded_error_text(reason);
     let affected = sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET status = 'failed',
              progress_percent = 100,
              progress_stage = 'failed',
-             progress_message = 'Build interrupted by Forge restart recovery',
+             progress_message = 'Build interrupted by Pulse restart recovery',
              error = ?,
              completed_at = ?,
              updated_at = ?
@@ -1478,7 +1478,7 @@ pub async fn fail_running_build_job_after_worker_error(
     let now = now_rfc3339();
     let error = bounded_error_text(reason);
     let affected = sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET status = 'failed',
              progress_percent = 100,
              progress_stage = 'failed',
@@ -1501,18 +1501,18 @@ pub async fn fail_running_build_job_after_worker_error(
 pub async fn claim_next_build_job(pool: &SqlitePool) -> AppResult<Option<BuildJob>> {
     let now = now_rfc3339();
     let row = sqlx::query_as::<_, BuildJobRow>(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET status = 'running',
              progress_percent = 5,
              progress_stage = 'claimed',
-             progress_message = 'Build claimed by Forge',
+             progress_message = 'Build claimed by Pulse',
              started_at = COALESCE(started_at, ?),
              cancel_requested_at = NULL,
              logs = '',
              error = '',
              updated_at = ?
          WHERE id = (
-             SELECT id FROM forge_build_jobs
+             SELECT id FROM pulse_build_jobs
              WHERE status = 'queued'
              ORDER BY created_at ASC, id ASC
              LIMIT 1
@@ -1528,7 +1528,7 @@ pub async fn claim_next_build_job(pool: &SqlitePool) -> AppResult<Option<BuildJo
 
 pub async fn build_job_cancel_requested(pool: &SqlitePool, id: i64) -> AppResult<bool> {
     let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT status, cancel_requested_at FROM forge_build_jobs WHERE id = ?")
+        sqlx::query_as("SELECT status, cancel_requested_at FROM pulse_build_jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(pool)
             .await?;
@@ -1545,7 +1545,7 @@ pub async fn build_job_cancel_requested(pool: &SqlitePool, id: i64) -> AppResult
 pub async fn update_build_job_logs(pool: &SqlitePool, id: i64, logs: &str) -> AppResult<()> {
     let now = now_rfc3339();
     sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET logs = ?, updated_at = ?
          WHERE id = ? AND status = 'running'",
     )
@@ -1566,7 +1566,7 @@ pub async fn update_build_job_progress(
 ) -> AppResult<()> {
     let now = now_rfc3339();
     sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET progress_percent = ?,
              progress_stage = ?,
              progress_message = ?,
@@ -1613,7 +1613,7 @@ pub async fn finish_build_job(
     let progress_stage = terminal_build_progress_stage(status);
     let now = now_rfc3339();
     sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET status = CASE
                  WHEN cancel_requested_at IS NOT NULL AND ? = 1 THEN 'cancelled'
                  ELSE ?
@@ -1657,7 +1657,7 @@ pub async fn finish_build_job(
          WHERE id = ?
            AND NOT EXISTS (
                SELECT 1 FROM protected_build_job_remediations remediation
-               WHERE remediation.job_id = forge_build_jobs.id
+               WHERE remediation.job_id = pulse_build_jobs.id
            )",
     )
     .bind(cancel_override)
@@ -1720,7 +1720,7 @@ pub async fn update_build_job_report(
     let cache_metadata = metadata_to_string(cache_metadata, "cache_metadata")?;
     let now = now_rfc3339();
     sqlx::query(
-        "UPDATE forge_build_jobs
+        "UPDATE pulse_build_jobs
          SET status = ?,
              progress_percent = ?,
              progress_stage = ?,
@@ -1737,7 +1737,7 @@ pub async fn update_build_job_report(
          WHERE managed_job_id = ?
            AND NOT EXISTS (
                SELECT 1 FROM protected_build_job_remediations remediation
-               WHERE remediation.job_id = forge_build_jobs.id
+               WHERE remediation.job_id = pulse_build_jobs.id
            )",
     )
     .bind(status)
@@ -1762,7 +1762,7 @@ pub async fn update_build_job_report(
 
 pub async fn list_cache_artifacts(pool: &SqlitePool) -> AppResult<Vec<CacheArtifact>> {
     let rows = sqlx::query_as::<_, CacheArtifactRow>(
-        "SELECT * FROM forge_cache_artifacts ORDER BY created_at DESC, id DESC",
+        "SELECT * FROM pulse_cache_artifacts ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -1831,7 +1831,7 @@ pub async fn cache_artifacts_due_for_verification(
     limit: i64,
 ) -> AppResult<Vec<CacheArtifact>> {
     let rows = sqlx::query_as::<_, CacheArtifactRow>(
-        "SELECT * FROM forge_cache_artifacts
+        "SELECT * FROM pulse_cache_artifacts
          WHERE last_verified_at IS NULL
             OR julianday(last_verified_at) IS NULL
             OR julianday(last_verified_at) <= julianday('now', '-1 day')
@@ -1847,7 +1847,7 @@ pub async fn cache_artifacts_due_for_verification(
 
 pub async fn mark_cache_artifact_verified(pool: &SqlitePool, id: i64) -> AppResult<()> {
     sqlx::query(
-        "UPDATE forge_cache_artifacts
+        "UPDATE pulse_cache_artifacts
          SET verification_status = 'ready', last_verified_at = ?, updated_at = updated_at
          WHERE id = ?",
     )
@@ -1859,7 +1859,7 @@ pub async fn mark_cache_artifact_verified(pool: &SqlitePool, id: i64) -> AppResu
 }
 
 pub async fn delete_cache_artifact(pool: &SqlitePool, id: i64) -> AppResult<()> {
-    sqlx::query("DELETE FROM forge_cache_artifacts WHERE id = ?")
+    sqlx::query("DELETE FROM pulse_cache_artifacts WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await?;
@@ -1944,7 +1944,7 @@ pub async fn upsert_cache_artifact(
     )?;
     let now = now_rfc3339();
     sqlx::query(
-        "INSERT INTO forge_cache_artifacts
+        "INSERT INTO pulse_cache_artifacts
          (managed_artifact_id, artifact_type, hash, size_bytes, path, store_path, narinfo_path, nar_url, file_hash, nar_hash, nar_size_bytes, closure_size_bytes, closure_file_size_bytes, compression, references_json, serving_url, source_build_job_id, cache_metadata, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(artifact_type, hash) DO UPDATE SET
@@ -1993,7 +1993,7 @@ pub async fn upsert_cache_artifact(
 }
 
 pub async fn get_build_job(pool: &SqlitePool, id: i64) -> AppResult<BuildJob> {
-    let row = sqlx::query_as::<_, BuildJobRow>("SELECT * FROM forge_build_jobs WHERE id = ?")
+    let row = sqlx::query_as::<_, BuildJobRow>("SELECT * FROM pulse_build_jobs WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await?
@@ -2006,7 +2006,7 @@ pub async fn get_build_job_by_managed_id(
     managed_job_id: &str,
 ) -> AppResult<BuildJob> {
     let row =
-        sqlx::query_as::<_, BuildJobRow>("SELECT * FROM forge_build_jobs WHERE managed_job_id = ?")
+        sqlx::query_as::<_, BuildJobRow>("SELECT * FROM pulse_build_jobs WHERE managed_job_id = ?")
             .bind(managed_job_id)
             .fetch_optional(pool)
             .await?
@@ -2020,7 +2020,7 @@ async fn get_cache_artifact_by_key(
     hash: &str,
 ) -> AppResult<CacheArtifact> {
     let row = sqlx::query_as::<_, CacheArtifactRow>(
-        "SELECT * FROM forge_cache_artifacts WHERE artifact_type = ? AND hash = ?",
+        "SELECT * FROM pulse_cache_artifacts WHERE artifact_type = ? AND hash = ?",
     )
     .bind(artifact_type)
     .bind(hash)
@@ -2101,7 +2101,7 @@ fn profile_fields_have_boot_action(
     raw_script: Option<&str>,
 ) -> bool {
     match profile_type {
-        BootProfileType::LocalDisk | BootProfileType::ForgeInstaller => true,
+        BootProfileType::LocalDisk | BootProfileType::PulseInstaller => true,
         BootProfileType::CustomIpxe => raw_script
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
@@ -2491,9 +2491,9 @@ fn terminal_build_progress_message(status: &str, metadata: Option<&Value>) -> St
             .and_then(Value::as_str)
         {
             Some("out_of_memory") => "Build ran out of memory".to_string(),
-            Some("insufficient_memory") => "Forge memory is below the required minimum".to_string(),
-            Some("insufficient_swap") => "Forge swap is below the required minimum".to_string(),
-            Some("insufficient_disk_space") => "Forge disk space is insufficient".to_string(),
+            Some("insufficient_memory") => "Pulse memory is below the required minimum".to_string(),
+            Some("insufficient_swap") => "Pulse swap is below the required minimum".to_string(),
+            Some("insufficient_disk_space") => "Pulse disk space is insufficient".to_string(),
             Some("package_build_failed") => "A package failed to build".to_string(),
             Some("source_build_blocked") => {
                 "Blocked: requires building from source (not allowed for this Blueprint)"
@@ -2790,7 +2790,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-sqlite-busy-test-{}-{unique}.sqlite",
+            "cybex-pulse-sqlite-busy-test-{}-{unique}.sqlite",
             std::process::id()
         ));
         let url = format!("sqlite://{}", path.display());
@@ -2837,7 +2837,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-private-dir-{}-{unique}",
+            "cybex-pulse-private-dir-{}-{unique}",
             std::process::id()
         ));
 
@@ -2857,7 +2857,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
@@ -2910,7 +2910,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Stale installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
@@ -2924,7 +2924,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Current installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(true),
@@ -2966,7 +2966,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
@@ -3244,7 +3244,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer\nshell".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
@@ -3265,7 +3265,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Installer".to_string(),
                 description: Some("x".repeat(MAX_PROFILE_DESCRIPTION_CHARS + 1)),
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
@@ -3380,7 +3380,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Disabled installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(false),
                 is_default: Some(false),
                 one_time: Some(false),
@@ -3435,7 +3435,7 @@ mod tests {
             CreateBootProfileRequest {
                 name: "Assigned installer".to_string(),
                 description: None,
-                profile_type: BootProfileType::ForgeInstaller,
+                profile_type: BootProfileType::PulseInstaller,
                 enabled: Some(true),
                 is_default: Some(false),
                 one_time: Some(false),
@@ -3472,7 +3472,7 @@ mod tests {
         let unchanged = get_profile(&pool, profile.id).await.unwrap();
 
         assert!(err.to_string().contains("assigned profile"));
-        assert_eq!(unchanged.profile_type, BootProfileType::ForgeInstaller);
+        assert_eq!(unchanged.profile_type, BootProfileType::PulseInstaller);
     }
 
     #[tokio::test]
@@ -3569,7 +3569,7 @@ mod tests {
         let recovered = fail_running_build_job_after_worker_error(
             &pool,
             job.id,
-            "Forge stopped the build safely after an internal worker error; retry the build.",
+            "Pulse stopped the build safely after an internal worker error; retry the build.",
         )
         .await
         .unwrap();
@@ -3596,7 +3596,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_managed_build_job_is_recorded_so_manage_can_see_it() {
         let pool = test_pool().await;
-        // A spec this Forge refuses: upsert leaves no row, so before the
+        // A spec this Pulse refuses: upsert leaves no row, so before the
         // rejection is recorded there is nothing to report and Manage sees the
         // job sit in `queued` forever.
         let rejected_spec = json!({
@@ -3948,7 +3948,7 @@ mod tests {
             Some(100)
         );
 
-        sqlx::query("UPDATE forge_build_jobs SET managed_job_id = ? WHERE id = ?")
+        sqlx::query("UPDATE pulse_build_jobs SET managed_job_id = ? WHERE id = ?")
             .bind("managed-job-2")
             .bind(second.id)
             .execute(&pool)
@@ -4001,7 +4001,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_build_material_is_rejected_before_database_persistence() {
-        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
         let password_hash = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
         let pool = test_pool().await;
         let error = create_build_job(
@@ -4032,7 +4032,7 @@ mod tests {
 
         assert!(!error.contains(password_hash));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pulse_build_jobs")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -4059,7 +4059,7 @@ mod tests {
         .to_string();
         assert!(!error.contains(sentinel));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pulse_build_jobs")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -4084,7 +4084,7 @@ mod tests {
 
         assert!(!error.contains(sentinel));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forge_build_jobs")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pulse_build_jobs")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -4149,7 +4149,7 @@ mod tests {
         });
         let encoded_unsafe_spec = serde_json::to_string(&unsafe_spec).unwrap();
         sqlx::query(
-            "UPDATE forge_build_jobs
+            "UPDATE pulse_build_jobs
              SET build_spec = ?, status = 'succeeded', logs = ?, error = ? WHERE id = ?",
         )
         .bind(&encoded_unsafe_spec)
@@ -4175,7 +4175,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE forge_build_jobs
+            "UPDATE pulse_build_jobs
              SET status = 'running', cache_metadata = ?, logs = ?, error = ? WHERE id = ?",
         )
         .bind(serde_json::to_string(&json!({"api_token": sentinel})).unwrap())
@@ -4189,7 +4189,7 @@ mod tests {
         assert_eq!(quarantine_protected_build_jobs(&pool).await.unwrap(), 2);
         let stored: (String, String, String, String, String) = sqlx::query_as(
             "SELECT build_spec, cache_metadata, status, logs, error
-             FROM forge_build_jobs WHERE id = ?",
+             FROM pulse_build_jobs WHERE id = ?",
         )
         .bind(job.id)
         .fetch_one(&pool)
@@ -4201,7 +4201,7 @@ mod tests {
         assert!(stored.3.is_empty());
         assert!(!stored.4.contains(sentinel));
         let running_stored: (String, String, String, String) = sqlx::query_as(
-            "SELECT cache_metadata, status, logs, error FROM forge_build_jobs WHERE id = ?",
+            "SELECT cache_metadata, status, logs, error FROM pulse_build_jobs WHERE id = ?",
         )
         .bind(running.id)
         .fetch_one(&pool)
@@ -4284,7 +4284,7 @@ mod tests {
                 artifact_type: "nixos_closure".to_string(),
                 hash: "not-a-sha".to_string(),
                 size_bytes: 1,
-                path: "/srv/cybex-forge/cache/artifact".to_string(),
+                path: "/srv/cybex-pulse/cache/artifact".to_string(),
                 store_path: None,
                 narinfo_path: None,
                 nar_url: None,
@@ -4295,7 +4295,7 @@ mod tests {
                 closure_file_size_bytes: None,
                 compression: None,
                 references: None,
-                serving_url: Some("http://forge.example/cache/artifact".to_string()),
+                serving_url: Some("http://pulse.example/cache/artifact".to_string()),
                 source_build_job_id: None,
                 cache_metadata: None,
             },
@@ -4322,7 +4322,7 @@ mod tests {
                 closure_file_size_bytes: None,
                 compression: None,
                 references: None,
-                serving_url: Some("http://forge.example/cache/artifact".to_string()),
+                serving_url: Some("http://pulse.example/cache/artifact".to_string()),
                 source_build_job_id: None,
                 cache_metadata: None,
             },
@@ -4338,10 +4338,10 @@ mod tests {
                 artifact_type: "nixos_closure".to_string(),
                 hash: "c".repeat(64),
                 size_bytes: 4096,
-                path: "/srv/cybex-forge/cache/artifact".to_string(),
+                path: "/srv/cybex-pulse/cache/artifact".to_string(),
                 store_path: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-output".to_string()),
                 narinfo_path: Some(
-                    "/srv/cybex-forge/www/cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo"
+                    "/srv/cybex-pulse/www/cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo"
                         .to_string(),
                 ),
                 nar_url: Some("nar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.xz".to_string()),
@@ -4354,7 +4354,7 @@ mod tests {
                 references: Some(json!([
                     "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-output"
                 ])),
-                serving_url: Some("http://forge.example/cache/artifact".to_string()),
+                serving_url: Some("http://pulse.example/cache/artifact".to_string()),
                 source_build_job_id: Some("job-1".to_string()),
                 cache_metadata: Some(json!({"nix_cache_signing": "pending"})),
             },
@@ -4383,7 +4383,7 @@ mod tests {
                 artifact_type: "nixos_closure".to_string(),
                 hash: shared_hash.clone(),
                 size_bytes: 1024,
-                path: "/srv/cybex-forge/cache/closure.nar".to_string(),
+                path: "/srv/cybex-pulse/cache/closure.nar".to_string(),
                 store_path: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-closure".to_string()),
                 narinfo_path: None,
                 nar_url: None,
@@ -4394,7 +4394,7 @@ mod tests {
                 closure_file_size_bytes: None,
                 compression: None,
                 references: None,
-                serving_url: Some("http://forge.example/cache/closure.nar".to_string()),
+                serving_url: Some("http://pulse.example/cache/closure.nar".to_string()),
                 source_build_job_id: None,
                 cache_metadata: Some(json!({"kind": "closure"})),
             },
@@ -4407,7 +4407,7 @@ mod tests {
                 artifact_type: "netboot_artifact".to_string(),
                 hash: shared_hash.clone(),
                 size_bytes: 2048,
-                path: "/srv/cybex-forge/cache/netboot.nar".to_string(),
+                path: "/srv/cybex-pulse/cache/netboot.nar".to_string(),
                 store_path: Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-netboot".to_string()),
                 narinfo_path: None,
                 nar_url: None,
@@ -4418,7 +4418,7 @@ mod tests {
                 closure_file_size_bytes: None,
                 compression: None,
                 references: None,
-                serving_url: Some("http://forge.example/cache/netboot.nar".to_string()),
+                serving_url: Some("http://pulse.example/cache/netboot.nar".to_string()),
                 source_build_job_id: None,
                 cache_metadata: Some(json!({"kind": "netboot"})),
             },
@@ -4428,7 +4428,7 @@ mod tests {
 
         assert_ne!(closure.id, netboot.id);
         assert_eq!(netboot.artifact_type, "netboot_artifact");
-        assert_eq!(netboot.path, "/srv/cybex-forge/cache/netboot.nar");
+        assert_eq!(netboot.path, "/srv/cybex-pulse/cache/netboot.nar");
         assert_eq!(netboot.cache_metadata["kind"], "netboot");
 
         let artifacts = list_cache_artifacts(&pool).await.unwrap();
@@ -4562,7 +4562,7 @@ mod tests {
             1,
             "zstd",
             Some(json!([])),
-            "https://forge.test/cache/nar/a.nar.zst",
+            "https://pulse.test/cache/nar/a.nar.zst",
             None,
             None,
         )
@@ -4588,7 +4588,7 @@ mod tests {
                 .is_empty()
         );
         sqlx::query(
-            "UPDATE forge_cache_artifacts SET last_verified_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            "UPDATE pulse_cache_artifacts SET last_verified_at = '2000-01-01T00:00:00Z' WHERE id = ?",
         )
         .bind(artifact.id)
         .execute(&pool)

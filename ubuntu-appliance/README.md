@@ -1,9 +1,9 @@
-# Ubuntu Forge appliance
+# Ubuntu Pulse appliance
 
-This directory builds the provisionable Ubuntu 26.04 LTS Forge thin USB
+This directory builds the provisionable Ubuntu 26.04 LTS Pulse thin USB
 installer, its separately delivered package snapshot, the installed appliance
 payload, and the release qualification harness. This is the sole supported
-Forge appliance and installation implementation.
+Pulse appliance and installation implementation.
 
 ## Build inputs and outputs
 
@@ -19,8 +19,8 @@ Boot chain; no MOK enrollment is required.
 The ISO build adds only:
 
 - unattended NoCloud/Autoinstall configuration;
-- `cybex-forge-bootstrap`, accepted online provisioning public keys, and the
-  offline Forge release trust key;
+- `cybex-pulse-bootstrap`, accepted online provisioning public keys, and the
+  offline Pulse release trust key;
 - a fixed zero-filled 8192-byte `/CYBEX_PROVISIONING.BIN` slot.
 
 The package dependency closure is built and published as a separate signed
@@ -38,19 +38,19 @@ Typical invocation:
 ```bash
 ubuntu-appliance/build-package-snapshot.sh \
   --output-dir dist \
-  --forge-binary target/x86_64-unknown-linux-gnu/release/cybex-forge \
-  --bootstrap-binary target/x86_64-unknown-linux-gnu/release/cybex-forge-bootstrap \
+  --pulse-binary target/x86_64-unknown-linux-gnu/release/cybex-pulse \
+  --bootstrap-binary target/x86_64-unknown-linux-gnu/release/cybex-pulse-bootstrap \
   --version 1.2.3 \
   --ubuntu-snapshot-id 20260804T000000Z \
-  --release-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+  --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
 
 ubuntu-appliance/build-template.sh \
   --output-dir dist \
-  --bootstrap-binary target/x86_64-unknown-linux-gnu/release/cybex-forge-bootstrap \
+  --bootstrap-binary target/x86_64-unknown-linux-gnu/release/cybex-pulse-bootstrap \
   --version 1.2.3 \
   --ubuntu-snapshot-id 20260804T000000Z \
-  --release-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY" \
-  --provisioning-public-key "$CYBEX_FORGE_PROVISIONING_PUBLIC_KEY"
+  --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY" \
+  --provisioning-public-key "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEY"
 ```
 
 Provisioning keys must be canonical standard-Base64 raw Ed25519 public keys,
@@ -60,10 +60,10 @@ trust root. Private signing keys are never inputs to this build.
 Both builders create their outputs once and never overwrite an existing
 candidate:
 
-- `cybex-forge-appliance-template-<version>-x86_64-linux.iso`
+- `cybex-pulse-appliance-template-<version>-x86_64-linux.iso`
 - matching template metadata with the exact slot offset/size/digests and
   `package_delivery: network-snapshot-v1`
-- `cybex-forge-appliance-packages-<version>-x86_64-linux.tar.zst`
+- `cybex-pulse-appliance-packages-<version>-x86_64-linux.tar.zst`
 - matching package-snapshot metadata
 
 Release automation signs the v2 installer descriptor and package descriptor,
@@ -72,8 +72,8 @@ qualification is forbidden.
 
 ## Network-delivered package snapshot
 
-`build-packages.sh` produces `cybex-forge`, `cybex-forge-bootstrap`, and
-`cybex-forge-appliance` Debian packages. The appliance dependency closure
+`build-packages.sh` produces `cybex-pulse`, `cybex-pulse-bootstrap`, and
+`cybex-pulse-appliance` Debian packages. The appliance dependency closure
 includes systemd, nginx, TFTP/iPXE, OpenSSH, nftables, Netplan, Btrfs/watchdog,
 Nix, `linux-generic`, `linux-firmware`, `intel-microcode`, and
 `amd64-microcode`. The snapshot also carries `grub-efi-amd64`, Canonical's
@@ -83,7 +83,7 @@ The pinned Subiquity/Curtin runtime bind-mounts `/run` into the chrootable
 target, so the authenticated repository staged beneath
 `/run/cybex-appliance-repo/packages` is available to Curtin's UEFI curthooks
 before late commands run.
-It installs the pinned Forge release public key and all root-owned helpers.
+It installs the pinned Pulse release public key and all root-owned helpers.
 `build-offline-repo.sh` resolves and downloads the exact
 Ubuntu snapshot dependency closure and emits deterministic APT metadata;
 `build-package-snapshot.sh` archives that repository and emits the bounded
@@ -96,7 +96,7 @@ installation.
 The NoCloud seed has no interactive sections. Its early command runs:
 
 ```text
-cybex-forge-bootstrap prepare
+cybex-pulse-bootstrap prepare
 ```
 
 The Rust bootstrap verifies canonical envelope padding/body/signature and the
@@ -111,7 +111,7 @@ interrupted fetch leaves the target disk untouched.
 
 Official bootstrap binaries keep that production origin compiled in. A
 development-only appliance may be pinned to another canonical HTTPS origin at
-compile time with `CYBEX_FORGE_BUILD_MANAGE_ORIGIN`; that binary and ISO must
+compile time with `CYBEX_PULSE_BUILD_MANAGE_ORIGIN`; that binary and ISO must
 use separate development provisioning and release trust keys.
 
 Before partitioning it re-collects inventory, checks Secure Boot/UEFI/wired
@@ -138,14 +138,14 @@ UEFI entry as `BootNext` and reboots rather than replaying installation.
 
 ## Installed services
 
-- `cybex-forge.service`: unprivileged Forge service
-- `cybex-forge-first-boot.service`: network guard, first permanent-key report,
+- `cybex-pulse.service`: unprivileged Pulse service
+- `cybex-pulse-first-boot.service`: network guard, first permanent-key report,
   and readiness transition
-- `cybex-forge-firewall.service`: management-CIDR SSH nftables boundary
-- `cybex-forge-appliance-update.timer/service`: maintenance-window root
+- `cybex-pulse-firewall.service`: management-CIDR SSH nftables boundary
+- `cybex-pulse-appliance-update.timer/service`: maintenance-window root
   generation updater
-- `cybex-forge-generation-commit.service`: candidate health/commit or rollback
-- `cybex-forge-network-change.path/service`: signed two-phase Netplan changes
+- `cybex-pulse-generation-commit.service`: candidate health/commit or rollback
+- `cybex-pulse-network-change.path/service`: signed two-phase Netplan changes
 
 `cybex-support` has a locked password. SSH disables password/keyboard/root
 login, permits only that user and the exact device principal, and trusts active
@@ -157,20 +157,20 @@ from outside the plan's management CIDRs.
 `CYBEX_CACHE`. Installer-seeded Nix content is copied there before the
 bind is activated; first boot verifies the mount identity/options and initializes
 the store before `nix-daemon`. The store remains root-owned while
-`cybex-forge` receives daemon access through `nix-users`.
+`cybex-pulse` receives daemon access through `nix-users`.
 
 ## Root generations and package updates
 
-The Forge service accepts only a Management request whose
-`cybex.forge.appliance-release.v1` validates against the installed offline
+The Pulse service accepts only a Management request whose
+`cybex.pulse.appliance-release.v1` validates against the installed offline
 release key. It downloads the exact archive without redirects. Root then runs
-`cybex-forge verify-appliance-update` against the original descriptor/archive,
+`cybex-pulse verify-appliance-update` against the original descriptor/archive,
 checks safe archive entries/checksum coverage/Packages versions, and builds a
 writable Btrfs generation. Installation uses only that extracted repository.
 The candidate must pass package, signed-kernel, systemd, Nix, release, and
 boot-file validation before one-shot GRUB selection.
 
-On candidate boot, `cybex-forge-generation-commit` checks Forge, Nix, nginx,
+On candidate boot, `cybex-pulse-generation-commit` checks Pulse, Nix, nginx,
 TFTP, disk, and network. Success sets the default generation and retains two
 prior known-good generations. Failure records bounded rollback evidence and
 leaves the prior default in force. A hardware watchdog protects a candidate
@@ -200,7 +200,7 @@ expired, changed, or rebuilt.
 
 The bridge address is discovered automatically. A runner with more than one
 private bridge address can select an address already assigned to that bridge
-with `CYBEX_FORGE_QUALIFICATION_PACKAGE_BIND_ADDRESS`; loopback and public
+with `CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS`; loopback and public
 addresses are rejected.
 
 The automated boot entry mirrors Ubuntu to the first serial port so early

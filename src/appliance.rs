@@ -25,25 +25,25 @@ use tokio::process::Command;
 use crate::release_transport;
 
 pub const APPLIANCE_UPDATE_CAPABILITY: &str = "appliance_update_v1";
-const RELEASE_PATH: &str = "/usr/share/cybex-forge/appliance-release.json";
-const INSTALLED_STATE_PATH: &str = "/var/lib/cybex-forge/state/appliance-release.json";
-const UPDATE_STATUS_PATH: &str = "/var/lib/cybex-forge/state/appliance-update-status.json";
-const UPDATE_REQUEST_PATH: &str = "/var/lib/cybex-forge/state/appliance-update-request.json";
-const UPDATE_BUNDLE_ROOT: &str = "/var/lib/cybex-forge/state/appliance-update-bundles";
-const UPDATE_ROOT: &str = "/var/lib/cybex-forge/state/appliance-updates";
-const RELEASE_PUBLIC_KEY_PATH: &str = "/usr/share/cybex-forge/release-public-key";
-const PROVISIONING_STATE_PATH: &str = "/var/lib/cybex-forge/state/provisioning-state.json";
-const INSTALL_PLAN_PATH: &str = "/var/lib/cybex-forge/state/install-plan.json";
+const RELEASE_PATH: &str = "/usr/share/cybex-pulse/appliance-release.json";
+const INSTALLED_STATE_PATH: &str = "/var/lib/cybex-pulse/state/appliance-release.json";
+const UPDATE_STATUS_PATH: &str = "/var/lib/cybex-pulse/state/appliance-update-status.json";
+const UPDATE_REQUEST_PATH: &str = "/var/lib/cybex-pulse/state/appliance-update-request.json";
+const UPDATE_BUNDLE_ROOT: &str = "/var/lib/cybex-pulse/state/appliance-update-bundles";
+const UPDATE_ROOT: &str = "/var/lib/cybex-pulse/state/appliance-updates";
+const RELEASE_PUBLIC_KEY_PATH: &str = "/usr/share/cybex-pulse/release-public-key";
+const PROVISIONING_STATE_PATH: &str = "/var/lib/cybex-pulse/state/provisioning-state.json";
+const INSTALL_PLAN_PATH: &str = "/var/lib/cybex-pulse/state/install-plan.json";
 const NETWORK_CHANGE_REQUEST_PATH: &str =
-    "/var/lib/cybex-forge/state/appliance-network-change-request.json";
+    "/var/lib/cybex-pulse/state/appliance-network-change-request.json";
 const NETWORK_CHANGE_STATUS_PATH: &str =
-    "/var/lib/cybex-forge/state/appliance-network-change-status.json";
-const NETWORK_PENDING_PATH: &str = "/var/lib/cybex-forge/state/netplan-pending.sha256";
-const NETWORK_ACK_PATH: &str = "/var/lib/cybex-forge/state/netplan-ack.sha256";
-const APPLIANCE_RELEASE_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-APPLIANCE-RELEASE-V1";
-const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.forge.appliance-release.v1";
-const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-NETWORK-CHANGE-V1";
-const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-NETWORK-ACK-V1";
+    "/var/lib/cybex-pulse/state/appliance-network-change-status.json";
+const NETWORK_PENDING_PATH: &str = "/var/lib/cybex-pulse/state/netplan-pending.sha256";
+const NETWORK_ACK_PATH: &str = "/var/lib/cybex-pulse/state/netplan-ack.sha256";
+const APPLIANCE_RELEASE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-APPLIANCE-RELEASE-V1";
+const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.pulse.appliance-release.v1";
+const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-NETWORK-CHANGE-V1";
+const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-NETWORK-ACK-V1";
 const MAX_UPDATE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const SNAPSHOT_ID_MAX_BYTES: u64 = 64;
 const SNAPSHOT_CHECKSUMS_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -235,7 +235,7 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
         return Ok(());
     };
     if !is_managed_ubuntu() {
-        bail!("received an Ubuntu appliance update on a non-appliance Forge host")
+        bail!("received an Ubuntu appliance update on a non-appliance Pulse host")
     }
     // Manage continues advertising the desired attempt until it receives the
     // terminal report. Authenticate that replay, then accept the exact
@@ -266,7 +266,7 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
     let bundle_path = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", update.attempt_id));
     download_snapshot(&update.release.cybex_repository_snapshot, &bundle_path).await?;
     let stored = StoredApplianceUpdate {
-        schema: "cybex.forge.appliance-update-request.v1".to_string(),
+        schema: "cybex.pulse.appliance-update-request.v1".to_string(),
         attempt_id: update.attempt_id,
         requested_at: update.requested_at,
         release: update.release,
@@ -299,7 +299,7 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
 pub fn verify_and_extract_stored_update() -> Result<PathBuf> {
     let request: StoredApplianceUpdate =
         read_bounded_json(Path::new(UPDATE_REQUEST_PATH), 256 * 1024)?;
-    if request.schema != "cybex.forge.appliance-update-request.v1" {
+    if request.schema != "cybex.pulse.appliance-update-request.v1" {
         bail!("stored appliance update request schema is unsupported")
     }
     validate_managed_update(&ManagedApplianceUpdate {
@@ -484,7 +484,7 @@ fn validate_signed_release_with_policy(
     let snapshot = &release.cybex_repository_snapshot;
     let url = Url::parse(&snapshot.url).context("parse appliance package snapshot URL")?;
     let expected_filename = format!(
-        "cybex-forge-appliance-packages-{}-x86_64-linux.tar.zst",
+        "cybex-pulse-appliance-packages-{}-x86_64-linux.tar.zst",
         release.release_id
     );
     if url.scheme() != "https"
@@ -505,9 +505,9 @@ fn validate_signed_release_with_policy(
         bail!("appliance package snapshot size is invalid")
     }
     let expected_packages = BTreeSet::from([
-        "cybex-forge".to_string(),
-        "cybex-forge-appliance".to_string(),
-        "cybex-forge-bootstrap".to_string(),
+        "cybex-pulse".to_string(),
+        "cybex-pulse-appliance".to_string(),
+        "cybex-pulse-bootstrap".to_string(),
         "linux-firmware".to_string(),
         "linux-generic".to_string(),
         "nix-bin".to_string(),
@@ -1159,7 +1159,7 @@ pub fn store_network_change(change: Option<SignedApplianceNetworkChange>) -> Res
         return Ok(());
     };
     if !is_managed_ubuntu() {
-        bail!("received an appliance network change on a non-appliance Forge host")
+        bail!("received an appliance network change on a non-appliance Pulse host")
     }
     validate_network_change(&change, false)?;
     if read_optional_bounded_json::<Value>(Path::new(NETWORK_CHANGE_STATUS_PATH), 64 * 1024)
@@ -1250,10 +1250,10 @@ pub fn verify_and_materialize_network_change() -> Result<PathBuf> {
         "network": {
             "version": 2,
             "renderer": "networkd",
-            "ethernets": {"cybex-forge": Value::Object(device)},
+            "ethernets": {"cybex-pulse": Value::Object(device)},
         }
     }));
-    let output_root = Path::new("/run/cybex-forge-network-change");
+    let output_root = Path::new("/run/cybex-pulse-network-change");
     fs::create_dir_all(output_root)?;
     fs::set_permissions(output_root, fs::Permissions::from_mode(0o700))?;
     let output = output_root.join(format!("{}.yaml", change.id));
@@ -1291,7 +1291,7 @@ pub fn accept_network_acknowledgement(
     let state = load_provisioning_state()?;
     let pending = pending_network_acknowledgement()?
         .ok_or_else(|| anyhow!("no Netplan candidate is awaiting acknowledgement"))?;
-    if acknowledgement.schema != "cybex.forge.network-ack.v1"
+    if acknowledgement.schema != "cybex.pulse.network-ack.v1"
         || acknowledgement.change_id != change.id
         || acknowledgement.change_id != pending.change_id
         || acknowledgement.device_id != state.plan.reserved_device_id
@@ -1322,7 +1322,7 @@ fn validate_network_change(
     allow_expired: bool,
 ) -> Result<()> {
     let state = load_provisioning_state()?;
-    if change.schema != "cybex.forge.network-change.v1"
+    if change.schema != "cybex.pulse.network-change.v1"
         || change.id.is_nil()
         || change.device_incarnation_id.is_nil()
         || change.device_id != state.plan.reserved_device_id
@@ -1396,7 +1396,7 @@ fn canonical_url_base64(value: &str, expected_length: usize) -> Result<Vec<u8>> 
 fn load_provisioning_state() -> Result<crate::provisioning::DurableProvisioningState> {
     let state: crate::provisioning::DurableProvisioningState =
         read_bounded_json(Path::new(PROVISIONING_STATE_PATH), 512 * 1024)?;
-    if state.schema != "cybex.forge.provisioning-state.v1"
+    if state.schema != "cybex.pulse.provisioning-state.v1"
         || state.management_signing_public_key_b64.is_empty()
         || !state.identity_active
     {
@@ -1533,7 +1533,7 @@ pub async fn report() -> Result<Option<ApplianceReport>> {
         return Ok(None);
     }
     let release: ApplianceRelease = read_bounded_json(Path::new(RELEASE_PATH), 64 * 1024)?;
-    if release.schema != "cybex.forge.appliance-release.v1"
+    if release.schema != "cybex.pulse.appliance-release.v1"
         || release.release_id.is_empty()
         || release.ubuntu_snapshot_id.is_empty()
     {
@@ -1561,7 +1561,7 @@ pub async fn report() -> Result<Option<ApplianceReport>> {
         "managed_interface_id": managed_interface_id,
         "interfaces": command_json("ip", &["-j", "address", "show"]).await,
         "network_fallback_active": Path::new(
-            "/var/lib/cybex-forge/state/network-fallback-active"
+            "/var/lib/cybex-pulse/state/network-fallback-active"
         ).exists(),
         "network_change": read_optional_bounded_json::<Value>(
             Path::new(NETWORK_CHANGE_STATUS_PATH),
@@ -1688,9 +1688,9 @@ mod tests {
     fn signed_release_fixture() -> (SignedApplianceRelease, SigningKey) {
         let key = SigningKey::from_bytes(&[7; 32]);
         let required_package_versions = BTreeMap::from([
-            ("cybex-forge".to_string(), "0.1.2-1".to_string()),
-            ("cybex-forge-appliance".to_string(), "0.1.2-1".to_string()),
-            ("cybex-forge-bootstrap".to_string(), "0.1.2-1".to_string()),
+            ("cybex-pulse".to_string(), "0.1.2-1".to_string()),
+            ("cybex-pulse-appliance".to_string(), "0.1.2-1".to_string()),
+            ("cybex-pulse-bootstrap".to_string(), "0.1.2-1".to_string()),
             (
                 "linux-firmware".to_string(),
                 "20260319.git217ca6e4.1ubuntu".to_string(),
@@ -1703,7 +1703,7 @@ mod tests {
             release_id: "0.1.2".to_string(),
             ubuntu_snapshot_id: "20260805T000000Z".to_string(),
             cybex_repository_snapshot: ApplianceRepositorySnapshot {
-                url: "https://github.com/CybexHQ/forge/releases/download/v0.1.2/cybex-forge-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
+                url: "https://github.com/CybexHQ/pulse/releases/download/v0.1.2/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
                 sha256: "a".repeat(64),
                 size_bytes: 1024 * 1024 * 1024,
             },
@@ -1712,7 +1712,7 @@ mod tests {
             minimum_protocol: 4,
             minimum_state_schema: 1,
             rollback_compatible: true,
-            release_notes: "https://github.com/CybexHQ/forge/releases/tag/v0.1.2".to_string(),
+            release_notes: "https://github.com/CybexHQ/pulse/releases/tag/v0.1.2".to_string(),
             signature: String::new(),
         };
         let mut unsigned = serde_json::to_value(&release).unwrap();
@@ -1727,7 +1727,7 @@ mod tests {
 
     fn test_directory(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("cybex-forge-{label}-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cybex-pulse-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
     }
@@ -1905,9 +1905,9 @@ mod tests {
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                "cybex-forge",
-                "cybex-forge-appliance",
-                "cybex-forge-bootstrap",
+                "cybex-pulse",
+                "cybex-pulse-appliance",
+                "cybex-pulse-bootstrap",
                 "linux-firmware",
                 "linux-generic",
                 "nix-bin",

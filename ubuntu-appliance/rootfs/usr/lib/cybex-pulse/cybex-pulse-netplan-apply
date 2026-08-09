@@ -8,8 +8,8 @@ if (($# != 2)); then
 fi
 candidate="$1"
 ack_file="$2"
-active=/etc/netplan/90-cybex-forge.yaml
-state_dir=/var/lib/cybex-forge/state
+active=/etc/netplan/90-cybex-pulse.yaml
+state_dir=/var/lib/cybex-pulse/state
 backup="$state_dir/netplan-before-change.yaml"
 pending="$state_dir/netplan-pending.sha256"
 test -f "$candidate" && test ! -L "$candidate"
@@ -18,7 +18,7 @@ candidate_sha="$(sha256sum "$candidate" | awk '{print $1}')"
 install -m 0600 "$active" "$backup"
 install -m 0600 "$candidate" "$active"
 printf '%s\n' "$candidate_sha" > "$pending"
-chown root:cybex-forge "$pending"
+chown root:cybex-pulse "$pending"
 chmod 0640 "$pending"
 
 rollback() {

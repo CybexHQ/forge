@@ -46,7 +46,7 @@ const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 const BUILDING_PROGRESS_START: i32 = 25;
 const BUILDING_PROGRESS_END: i32 = 79;
 // These files are part of the pinned nixpkgs materialization machinery used
-// by Forge's current source lock. A nixpkgs update must deliberately refresh
+// by Pulse's current source lock. A nixpkgs update must deliberately refresh
 // the hashes after reviewing the new scripts. Derivation attributes and names
 // alone are explicitly not treated as provenance.
 const TRUSTED_STDENV_SOURCE_SHA256: &str =
@@ -225,15 +225,15 @@ pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         match db::recover_running_build_jobs(
             &state.db,
-            "Forge restarted while this build was running; mark failed for explicit retry.",
+            "Pulse restarted while this build was running; mark failed for explicit retry.",
         )
         .await
         {
             Ok(count) if count > 0 => {
-                warn!(count, "recovered stale running Forge build jobs");
+                warn!(count, "recovered stale running Pulse build jobs");
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to recover running Forge build jobs"),
+            Err(err) => warn!(error = %err, "failed to recover running Pulse build jobs"),
         }
         sweep_stale_job_dirs(&state.config).await;
 
@@ -251,9 +251,9 @@ async fn worker_loop(state: AppState, worker_index: usize) {
             Ok(Some(job)) => {
                 claim_failures = 0;
                 let job_id = job.id;
-                info!(job_id, worker_index, "claimed Forge build job");
+                info!(job_id, worker_index, "claimed Pulse build job");
                 if let Err(err) = execute_claimed_job(&state, job).await {
-                    warn!(error = %safe_error(&err), worker_index, "Forge build job execution failed");
+                    warn!(error = %safe_error(&err), worker_index, "Pulse build job execution failed");
                     recover_failed_job_execution(&state, job_id, worker_index).await;
                 }
                 cleanup_job_dirs(&state.config, job_id).await;
@@ -265,7 +265,7 @@ async fn worker_loop(state: AppState, worker_index: usize) {
             Err(err) => {
                 claim_failures = claim_failures.saturating_add(1);
                 let delay = (5u64 << claim_failures.saturating_sub(1).min(5)).min(120);
-                warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim Forge build job");
+                warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim Pulse build job");
                 sleep(Duration::from_secs(delay)).await;
             }
         }
@@ -274,14 +274,14 @@ async fn worker_loop(state: AppState, worker_index: usize) {
 
 async fn recover_failed_job_execution(state: &AppState, job_id: i64, worker_index: usize) {
     const RECOVERY_REASON: &str =
-        "Forge stopped the build safely after an internal worker error; retry the build.";
+        "Pulse stopped the build safely after an internal worker error; retry the build.";
     let mut failures: u32 = 0;
     loop {
         match db::fail_running_build_job_after_worker_error(&state.db, job_id, RECOVERY_REASON)
             .await
         {
             Ok(true) => {
-                warn!(job_id, worker_index, "recovered failed Forge build worker");
+                warn!(job_id, worker_index, "recovered failed Pulse build worker");
                 return;
             }
             Ok(false) => return,
@@ -294,7 +294,7 @@ async fn recover_failed_job_execution(state: &AppState, job_id: i64, worker_inde
                     job_id,
                     worker_index,
                     retry_in_seconds = delay,
-                    "failed to persist Forge build worker recovery"
+                    "failed to persist Pulse build worker recovery"
                 );
                 sleep(Duration::from_secs(delay)).await;
             }
@@ -315,13 +315,13 @@ async fn cleanup_job_dirs(config: &AppConfig, job_id: i64) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                warn!(error = %err, path = %dir.display(), "failed to remove Forge build job directory");
+                warn!(error = %err, path = %dir.display(), "failed to remove Pulse build job directory");
             }
         }
     }
 }
 
-/// Remove job dirs left behind by earlier Forge runs. Runs once at startup,
+/// Remove job dirs left behind by earlier Pulse runs. Runs once at startup,
 /// after stale running jobs have been marked failed and before workers start,
 /// so nothing under these names can be live.
 async fn sweep_stale_job_dirs(config: &AppConfig) {
@@ -334,7 +334,7 @@ async fn sweep_stale_job_dirs(config: &AppConfig) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                warn!(error = %err, path = %root.display(), "failed to scan Forge build directory");
+                warn!(error = %err, path = %root.display(), "failed to scan Pulse build directory");
                 continue;
             }
         };
@@ -353,13 +353,13 @@ async fn sweep_stale_job_dirs(config: &AppConfig) {
             match tokio::fs::remove_dir_all(entry.path()).await {
                 Ok(()) => removed += 1,
                 Err(err) => {
-                    warn!(error = %err, path = %entry.path().display(), "failed to remove stale Forge build job directory");
+                    warn!(error = %err, path = %entry.path().display(), "failed to remove stale Pulse build job directory");
                 }
             }
         }
     }
     if removed > 0 {
-        info!(removed, "removed stale Forge build job directories");
+        info!(removed, "removed stale Pulse build job directories");
     }
 }
 
@@ -432,7 +432,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     if let Err(err) = crate::disk::ensure_headroom(
         Path::new("/nix/store"),
         state.config.build.max_artifact_size_bytes,
-        "Forge build",
+        "Pulse build",
     ) {
         db::finish_build_job(
             &state.db,
@@ -463,7 +463,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "failed",
                 "",
                 &format!(
-                    "could not inspect Forge memory capacity: {}",
+                    "could not inspect Pulse memory capacity: {}",
                     safe_error(&err)
                 ),
                 "",
@@ -488,7 +488,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         Some((
             "insufficient_memory",
             format!(
-                "Forge requires at least {} bytes of memory for Build/Cache; detected {} bytes",
+                "Pulse requires at least {} bytes of memory for Build/Cache; detected {} bytes",
                 state.config.build.minimum_memory_bytes, capacity.memory_bytes
             ),
         ))
@@ -496,7 +496,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         Some((
             "insufficient_swap",
             format!(
-                "Forge requires at least {} bytes of emergency swap for Build/Cache; detected {} bytes",
+                "Pulse requires at least {} bytes of emergency swap for Build/Cache; detected {} bytes",
                 state.config.build.minimum_swap_bytes, capacity.swap_bytes
             ),
         ))
@@ -585,7 +585,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             Ok(_) => {}
             Err(err) => {
                 let error = format!(
-                    "Forge could not verify binary cache coverage, so this source-disabled build was stopped safely: {}",
+                    "Pulse could not verify binary cache coverage, so this source-disabled build was stopped safely: {}",
                     safe_error(&err)
                 );
                 db::finish_build_job(
@@ -684,7 +684,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 job.id,
                 Some(90),
                 "exporting",
-                "Exporting closure to Forge cache",
+                "Exporting closure to Pulse cache",
             )
             .await?;
             let mut cached = match cache::export_output(
@@ -847,7 +847,7 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         .iter()
         .any(|value| value == &system)
     {
-        bail!("system is not allowed on this Forge node");
+        bail!("system is not allowed on this Pulse node");
     }
     let input_revision = normalize_revision(&spec.input_revision)?;
     let input_config_hash = normalize_sha256(&spec.input_config_hash)?;
@@ -1056,7 +1056,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
         "hardware_facts_sha256",
         "hardware_driver_policy",
         "disk_layout_sha256",
-        "forge_device_id",
+        "pulse_device_id",
         "bundle_sha256",
         "profile_id",
         "managed_device_id",
@@ -1107,7 +1107,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
     {
         bail!("installer_target reinstall bindings must both be present or both be null");
     }
-    for field in ["device_id", "forge_device_id"] {
+    for field in ["device_id", "pulse_device_id"] {
         normalize_public_identifier(
             field,
             object
@@ -1190,7 +1190,7 @@ fn build_target<'a>(
             .context("validate configured Blueprint nixpkgs pin")?;
         if spec.nixpkgs_commit.as_deref() != Some(configured_revision) {
             bail!(
-                "Blueprint nixpkgs_commit does not match this Forge target's reviewed source pin"
+                "Blueprint nixpkgs_commit does not match this Pulse target's reviewed source pin"
             );
         }
     }
@@ -1310,14 +1310,14 @@ fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, St
     if oom_killed || lower.contains("out of memory") || lower.contains("oom-kill") {
         return (
             "out_of_memory",
-            "Forge exhausted its build memory; increase memory/swap or reduce max_build_cores"
+            "Pulse exhausted its build memory; increase memory/swap or reduce max_build_cores"
                 .to_string(),
         );
     }
     if lower.contains("no space left on device") || lower.contains("disk full") {
         return (
             "insufficient_disk_space",
-            "Forge ran out of disk space while building the Nix closure".to_string(),
+            "Pulse ran out of disk space while building the Nix closure".to_string(),
         );
     }
     if lower.contains("unable to start any build") {
@@ -1366,7 +1366,7 @@ const REJECT_FLAKE_CONFIG_NIX_OPTION: [&str; 3] = ["--option", "accept-flake-con
 const REQUIRE_BUILD_SANDBOX_NIX_OPTION: [&str; 3] = ["--option", "sandbox", "true"];
 
 fn append_source_policy_nix_options(args: &mut Vec<String>, allow_source_builds: bool) {
-    // Forge is a trusted Nix client because it exports and signs closures.
+    // Pulse is a trusted Nix client because it exports and signs closures.
     // Pin the daemon-side sandbox and refuse flake-supplied client settings on
     // every path so a Blueprint cannot use that trust to relax isolation.
     args.extend(
@@ -2208,7 +2208,7 @@ fn script_sha256_with_store_path_policy(script: &str, preserve_executables: bool
 /// Nix 2.26 serializes `__structuredAttrs` inside `env.__json`, while newer
 /// releases expose `structuredAttrs` directly. Merge both shapes with the
 /// ordinary string environment so policy decisions do not depend on the Nix
-/// client version installed on Forge.
+/// client version installed on Pulse.
 fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
     let mut merged = serde_json::Map::new();
     let mut conflict = false;
@@ -4103,7 +4103,7 @@ fn build_result_metadata(
     let mut metadata = job.cache_metadata.as_object().cloned().unwrap_or_default();
     metadata.insert(
         "result_schema".to_string(),
-        json!("cybex.forge.build.result.v1"),
+        json!("cybex.pulse.build.result.v1"),
     );
     metadata.insert(
         "max_build_cores".to_string(),
@@ -4374,11 +4374,11 @@ fn blueprint_nix_build_command(
     )?;
     write_job_input_file(
         input_dir.join("configuration.nix"),
-        &forge_nixos_configuration(build_input),
+        &pulse_nixos_configuration(build_input),
     )?;
     write_job_input_file(
         input_dir.join("flake.nix"),
-        &forge_nixos_flake(
+        &pulse_nixos_flake(
             &format!(
                 "github:NixOS/nixpkgs/{}",
                 spec.nixpkgs_commit
@@ -4458,7 +4458,7 @@ fn set_private_job_input_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn forge_nixos_flake(
+fn pulse_nixos_flake(
     nixpkgs_flake: &str,
     system: &str,
     build_input: &ValidatedBlueprintBuildInput,
@@ -4470,9 +4470,9 @@ fn forge_nixos_flake(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let description = serde_json::to_string(&format!(
-        "Cybex Forge Blueprint build: {name} rev {revision}"
+        "Cybex Pulse Blueprint build: {name} rev {revision}"
     ))
-    .unwrap_or_else(|_| "\"Cybex Forge Blueprint build\"".to_string());
+    .unwrap_or_else(|_| "\"Cybex Pulse Blueprint build\"".to_string());
     let nixpkgs_flake =
         serde_json::to_string(nixpkgs_flake).unwrap_or_else(|_| "\"nixpkgs\"".to_string());
     if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
@@ -4543,7 +4543,7 @@ fn forge_nixos_flake(
     )
 }
 
-fn forge_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> String {
+fn pulse_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> String {
     let include_desktop_module = build_input.desktop_module_nix.is_some();
     if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
         return r#"{ ... }:
@@ -4575,7 +4575,7 @@ fn forge_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> Stri
   ];
 
   system.stateVersion = lib.mkDefault lib.trivial.release;
-  networking.hostName = lib.mkDefault "cybex-forge-build";
+  networking.hostName = lib.mkDefault "cybex-pulse-build";
   networking.useDHCP = lib.mkDefault true;
 
   fileSystems."/" = {
@@ -4607,13 +4607,13 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
   options.cybex = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Blueprint metadata accepted while Forge prebuilds a generic NixOS closure.";
+    description = "Cybex Blueprint metadata accepted while Pulse prebuilds a generic NixOS closure.";
   };
 
   options.services.cybex-agent = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Agent policy accepted while Forge prebuilds a generic NixOS closure.";
+    description = "Cybex Agent policy accepted while Pulse prebuilds a generic NixOS closure.";
   };
 }
 "#;
@@ -4657,7 +4657,7 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
   options.services.cybex-agent = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Agent policy accepted while Forge prebuilds a generic NixOS closure.";
+    description = "Cybex Agent policy accepted while Pulse prebuilds a generic NixOS closure.";
   };
 }
 "#
@@ -4767,7 +4767,7 @@ async fn run_nix_build(
                 warn!(
                     error = %safe_error(&err.into()),
                     job_id = job.id,
-                    "could not check Forge build cancellation; build supervision will retry"
+                    "could not check Pulse build cancellation; build supervision will retry"
                 );
             }
         }
@@ -4794,7 +4794,7 @@ async fn run_nix_build(
                 warn!(
                     error = %safe_error(&err.into()),
                     job_id = job.id,
-                    "could not persist Forge build logs; build supervision will retry"
+                    "could not persist Pulse build logs; build supervision will retry"
                 );
             }
             let update = progress
@@ -4822,7 +4822,7 @@ async fn run_nix_build(
                         Err(err) => warn!(
                             error = %safe_error(&err.into()),
                             job_id = job.id,
-                            "could not persist Forge build progress; build supervision will retry"
+                            "could not persist Pulse build progress; build supervision will retry"
                         ),
                     }
                 }
@@ -5225,7 +5225,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-nix-daemon-feature-test-{}",
+            "cybex-pulse-nix-daemon-feature-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5267,7 +5267,7 @@ esac
             "hardware_facts_sha256": "11".repeat(32),
             "hardware_driver_policy": "auto",
             "disk_layout_sha256": "22".repeat(32),
-            "forge_device_id": "forge_1",
+            "pulse_device_id": "pulse_1",
             "bundle_sha256": "33".repeat(32),
             "profile_id": "00000000-0000-4000-8000-000000000005",
             "managed_device_id": null,
@@ -5382,7 +5382,7 @@ esac
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-software-inventory-policy-test-{}",
+            "cybex-pulse-software-inventory-policy-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5437,7 +5437,7 @@ printf '123.4\n'
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-software-inventory-timeout-test-{}",
+            "cybex-pulse-software-inventory-timeout-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5495,7 +5495,7 @@ sleep 5
     #[tokio::test]
     async fn cleanup_and_sweep_remove_job_dirs() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-build-cleanup-test-{}",
+            "cybex-pulse-build-cleanup-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5657,13 +5657,13 @@ sleep 5
     #[test]
     fn nix_build_command_uses_allowlisted_attr() {
         let mut config = AppConfig::default();
-        config.build.output_dir = PathBuf::from("/tmp/cybex-forge-test-builds");
+        config.build.output_dir = PathBuf::from("/tmp/cybex-pulse-test-builds");
         config.build.nix_binary = "nix".to_string();
         let target = BuildTargetConfig {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let mut spec = ValidatedBuildSpec {
@@ -5688,7 +5688,7 @@ sleep 5
         assert_eq!(command.args[0], "build");
         assert!(
             command.args.contains(
-                &"/srv/cybex-forge/build-inputs/cybex#packages.x86_64-linux.desktop-experience"
+                &"/srv/cybex-pulse/build-inputs/cybex#packages.x86_64-linux.desktop-experience"
                     .to_string()
             )
         );
@@ -6394,7 +6394,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         let write_text = synthetic_materializer(
             json!({
                 "buildCommand": STOCK_WRITE_TEXT_COMMAND,
-                "text": "forge-host\n",
+                "text": "pulse-host\n",
                 "checkPhase": ""
             }),
             vec![],
@@ -6440,7 +6440,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         // materializer exemption; complex stock generators use reviewed
         // fingerprints instead of a permissive shell parser.
         assert!(!derivation_is_exempt_from_source_policy_with_verifier(
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-forge-26.05.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-pulse-26.05.drv",
             Some(&structured),
             &synthetic_pinned_source,
         ));
@@ -6933,7 +6933,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         let mut nonce = [0_u8; 8];
         OsRng.fill_bytes(&mut nonce);
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-bounded-spawn-test-{}-{}",
+            "cybex-pulse-bounded-spawn-test-{}-{}",
             std::process::id(),
             hex::encode(nonce)
         ));
@@ -6972,7 +6972,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-test-{}",
+            "cybex-pulse-source-policy-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7044,7 +7044,7 @@ esac
             return;
         }
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-ifd-test-{}",
+            "cybex-pulse-source-policy-ifd-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7172,7 +7172,7 @@ esac
     #[tokio::test]
     async fn source_policy_bounds_dry_run_pipes_and_cleans_isolated_store() {
         let overflow_root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-overflow-test-{}",
+            "cybex-pulse-source-policy-overflow-test-{}",
             std::process::id()
         ));
         let (config, command) = source_policy_test_command(
@@ -7189,7 +7189,7 @@ esac
         let _ = std::fs::remove_dir_all(&overflow_root);
 
         let timeout_root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-timeout-test-{}",
+            "cybex-pulse-source-policy-timeout-test-{}",
             std::process::id()
         ));
         let (config, command) =
@@ -7208,7 +7208,7 @@ esac
     #[tokio::test]
     async fn source_policy_timeout_kills_helpers_that_inherit_capture_pipes() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-process-group-test-{}",
+            "cybex-pulse-source-policy-process-group-test-{}",
             std::process::id()
         ));
         let helper_pid = root.join("helper.pid");
@@ -7249,7 +7249,7 @@ esac
     #[tokio::test]
     async fn source_policy_bounds_derivation_show_while_reading_and_cleans_store() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-source-policy-show-overflow-test-{}",
+            "cybex-pulse-source-policy-show-overflow-test-{}",
             std::process::id()
         ));
         let (config, command) = source_policy_test_command(
@@ -7361,7 +7361,7 @@ esac
     #[test]
     fn nix_build_command_writes_blueprint_flake_input() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-build-input-test-{}",
+            "cybex-pulse-build-input-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7373,7 +7373,7 @@ esac
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let mut spec = ValidatedBuildSpec {
@@ -7468,7 +7468,7 @@ esac
             r#"inputs.nixpkgs.url = "github:NixOS/nixpkgs/{}";"#,
             "c".repeat(40)
         )));
-        assert!(!flake.contains("/srv/cybex-forge/build-inputs/cybex"));
+        assert!(!flake.contains("/srv/cybex-pulse/build-inputs/cybex"));
 
         spec.allow_source_builds = true;
         let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
@@ -7480,9 +7480,9 @@ esac
 
     #[test]
     fn nix_build_command_rejects_protected_material_before_writing_inputs() {
-        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
         let root = std::env::temp_dir().join(format!(
-            "cybex-forge-protected-build-input-test-{}",
+            "cybex-pulse-protected-build-input-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7493,7 +7493,7 @@ esac
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-forge/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let spec = ValidatedBuildSpec {
@@ -7574,7 +7574,7 @@ esac
 
     #[tokio::test]
     async fn log_capture_redacts_spaced_nix_assignments_and_modular_hashes() {
-        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
         let password_hash = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
         let log = SharedLog::new(4096);
         log.append(&format!(
@@ -7590,11 +7590,11 @@ esac
 
     #[tokio::test]
     async fn log_capture_redacts_assignments_split_across_stream_chunks() {
-        let sentinel = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
         let log = SharedLog::new(4096);
-        log.append("users.users.alice.hashedPassword = \"CYBEX_FORGE_")
+        log.append("users.users.alice.hashedPassword = \"CYBEX_PULSE_")
             .await;
-        assert!(!log.snapshot().await.contains("CYBEX_FORGE_"));
+        assert!(!log.snapshot().await.contains("CYBEX_PULSE_"));
 
         log.append("PROTECTED_SENTINEL_7f922a\"; done\n").await;
         let snapshot = log.snapshot().await;
@@ -7666,7 +7666,7 @@ esac
     #[test]
     fn managed_metadata_cannot_replace_verified_cache_export_fields() {
         let mut destination = json!({
-            "cache_schema": "cybex.forge.cache.v1",
+            "cache_schema": "cybex.pulse.cache.v1",
             "closure_manifest": {"verified": true},
             "closure_manifest_sha256": "a".repeat(64)
         });
@@ -7679,7 +7679,7 @@ esac
 
         merge_build_metadata(&mut destination, &source);
 
-        assert_eq!(destination["cache_schema"], "cybex.forge.cache.v1");
+        assert_eq!(destination["cache_schema"], "cybex.pulse.cache.v1");
         assert_eq!(destination["closure_manifest"], json!({"verified": true}));
         assert_eq!(destination["closure_manifest_sha256"], "a".repeat(64));
         assert_eq!(destination["target"], "blueprint");

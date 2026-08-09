@@ -20,7 +20,7 @@ const STATIC_PREFLIGHT_OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ForgeProvisioningEthernetInterface {
+pub struct PulseProvisioningEthernetInterface {
     pub id: String,
     pub name: String,
     pub mac: String,
@@ -31,7 +31,7 @@ pub struct ForgeProvisioningEthernetInterface {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ForgeProvisioningDisk {
+pub struct PulseProvisioningDisk {
     pub id: String,
     pub path: String,
     pub model: String,
@@ -48,7 +48,7 @@ pub struct ForgeProvisioningDisk {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ForgeProvisioningInventory {
+pub struct PulseProvisioningInventory {
     pub manufacturer: String,
     pub model: String,
     pub serial_number: String,
@@ -62,17 +62,17 @@ pub struct ForgeProvisioningInventory {
     pub secure_boot: bool,
     pub virtualization: String,
     #[serde(default)]
-    pub ethernet_interfaces: Vec<ForgeProvisioningEthernetInterface>,
+    pub ethernet_interfaces: Vec<PulseProvisioningEthernetInterface>,
     #[serde(default)]
-    pub disks: Vec<ForgeProvisioningDisk>,
+    pub disks: Vec<PulseProvisioningDisk>,
 }
 
-pub(crate) async fn collect_inventory() -> Result<ForgeProvisioningInventory> {
+pub(crate) async fn collect_inventory() -> Result<PulseProvisioningInventory> {
     let mut ethernet_interfaces = collect_ethernet_interfaces().await?;
     ethernet_interfaces.sort_by(|left, right| left.id.cmp(&right.id));
     let mut disks = collect_disks().await?;
     disks.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(ForgeProvisioningInventory {
+    Ok(PulseProvisioningInventory {
         manufacturer: clean(&read_trimmed("/sys/class/dmi/id/sys_vendor"), 256),
         model: clean(&read_trimmed("/sys/class/dmi/id/product_name"), 256),
         serial_number: clean(&read_trimmed("/sys/class/dmi/id/product_serial"), 256),
@@ -96,12 +96,12 @@ pub(crate) async fn collect_inventory() -> Result<ForgeProvisioningInventory> {
     })
 }
 
-pub(crate) fn inventory_sha256(inventory: &ForgeProvisioningInventory) -> Result<String> {
+pub(crate) fn inventory_sha256(inventory: &PulseProvisioningInventory) -> Result<String> {
     let bytes = serde_json::to_vec(inventory).context("serialize hardware inventory")?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-pub(crate) fn hardware_digest(inventory: &ForgeProvisioningInventory) -> Result<String> {
+pub(crate) fn hardware_digest(inventory: &PulseProvisioningInventory) -> Result<String> {
     let value = canonical_json(json!({
         "manufacturer": inventory.manufacturer,
         "model": inventory.model,
@@ -127,7 +127,7 @@ pub(crate) fn hardware_digest(inventory: &ForgeProvisioningInventory) -> Result<
 
 pub(crate) fn revalidate_plan_hardware(
     plan: &SignedInstallPlan,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
 ) -> Result<()> {
     if hardware_digest(inventory)? != plan.hardware_digest {
         bail!("stable hardware identity changed after approval")
@@ -159,7 +159,7 @@ pub(crate) fn revalidate_plan_hardware(
 
 pub(crate) fn revalidate_durable_plan_hardware(
     plan: &SignedInstallPlan,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
 ) -> Result<()> {
     if hardware_digest(inventory)? != plan.hardware_digest
         || inventory.boot_mode != "uefi"
@@ -188,7 +188,7 @@ pub(crate) fn revalidate_durable_plan_hardware(
 
 pub(crate) async fn preflight_network(
     plan: &SignedInstallPlan,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
     manage_origin: &str,
 ) -> Result<()> {
     let interface = inventory
@@ -601,7 +601,7 @@ fn ipv4_network(address: Ipv4Addr, prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(address) & mask)
 }
 
-async fn collect_ethernet_interfaces() -> Result<Vec<ForgeProvisioningEthernetInterface>> {
+async fn collect_ethernet_interfaces() -> Result<Vec<PulseProvisioningEthernetInterface>> {
     let mut interfaces = Vec::new();
     for entry in fs::read_dir("/sys/class/net").context("enumerate network interfaces")? {
         let entry = entry.context("read network interface")?;
@@ -660,7 +660,7 @@ async fn collect_ethernet_interfaces() -> Result<Vec<ForgeProvisioningEthernetIn
             .and_then(|route| route.get("gateway"))
             .and_then(Value::as_str)
             .map(|value| clean(value, 128));
-        interfaces.push(ForgeProvisioningEthernetInterface {
+        interfaces.push(PulseProvisioningEthernetInterface {
             id,
             name: clean(&name, 64),
             mac,
@@ -672,7 +672,7 @@ async fn collect_ethernet_interfaces() -> Result<Vec<ForgeProvisioningEthernetIn
     Ok(interfaces)
 }
 
-async fn collect_disks() -> Result<Vec<ForgeProvisioningDisk>> {
+async fn collect_disks() -> Result<Vec<PulseProvisioningDisk>> {
     let output = Command::new("lsblk")
         .args([
             "--json",
@@ -722,7 +722,7 @@ async fn collect_disks() -> Result<Vec<ForgeProvisioningDisk>> {
             blocker_codes.push("disk_too_small".to_string());
         }
         let id = stable_disk_id(Path::new(path))?;
-        disks.push(ForgeProvisioningDisk {
+        disks.push(PulseProvisioningDisk {
             id,
             path: clean(path, 256),
             model: clean(value_string(row.get("model")), 128),
@@ -933,8 +933,8 @@ fn canonical_json(value: Value) -> Value {
 mod tests {
     use super::*;
 
-    fn stable_inventory_fixture() -> ForgeProvisioningInventory {
-        ForgeProvisioningInventory {
+    fn stable_inventory_fixture() -> PulseProvisioningInventory {
+        PulseProvisioningInventory {
             manufacturer: "Cybex".into(),
             model: "Qualification VM".into(),
             serial_number: "vm-1".into(),
@@ -947,7 +947,7 @@ mod tests {
             boot_mode: "uefi".into(),
             secure_boot: true,
             virtualization: "kvm".into(),
-            ethernet_interfaces: vec![ForgeProvisioningEthernetInterface {
+            ethernet_interfaces: vec![PulseProvisioningEthernetInterface {
                 id: "pci-0000:00:03.0".into(),
                 name: "enp0s3".into(),
                 mac: "52:54:00:12:34:56".into(),
@@ -955,7 +955,7 @@ mod tests {
                 addresses: vec!["10.62.52.76/24".into()],
                 gateway: Some("10.62.52.1".into()),
             }],
-            disks: vec![ForgeProvisioningDisk {
+            disks: vec![PulseProvisioningDisk {
                 id: "scsi-qualification".into(),
                 path: "/dev/sda".into(),
                 model: "QEMU disk".into(),
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn removable_or_small_disks_cannot_be_eligible() {
-        let disk = ForgeProvisioningDisk {
+        let disk = PulseProvisioningDisk {
             id: "ata-test".into(),
             path: "/dev/sda".into(),
             model: String::new(),

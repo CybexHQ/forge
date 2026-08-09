@@ -1,4 +1,4 @@
-//! Host utilization sampling (/proc, /sys) for the periodic Forge report.
+//! Host utilization sampling (/proc, /sys) for the periodic Pulse report.
 //!
 //! Manage validates the reported bounds strictly and rejects the whole report
 //! on violation, so every value is clamped into the accepted ranges here.

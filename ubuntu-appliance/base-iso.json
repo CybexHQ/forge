@@ -1,5 +1,5 @@
 {
-  "schema": "cybex.forge.ubuntu-base-iso.v1",
+  "schema": "cybex.pulse.ubuntu-base-iso.v1",
   "version": "26.04",
   "build_id": "20260807",
   "architecture": "amd64",

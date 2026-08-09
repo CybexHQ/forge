@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-cidr_file=/var/lib/cybex-forge/state/management-cidrs.txt
-rules=/run/cybex-forge-firewall.nft
+cidr_file=/var/lib/cybex-pulse/state/management-cidrs.txt
+rules=/run/cybex-pulse-firewall.nft
 declare -a ipv4=() ipv6=()
 while IFS= read -r cidr; do
   [[ -z "$cidr" ]] && continue
@@ -15,7 +15,7 @@ while IFS= read -r cidr; do
 done < "$cidr_file"
 
 {
-  echo 'table inet cybex_forge {'
+  echo 'table inet cybex_pulse {'
   echo ' chain input {'
   echo '  type filter hook input priority -10; policy accept;'
   if ((${#ipv4[@]})); then
@@ -32,5 +32,5 @@ done < "$cidr_file"
   echo ' }'
   echo '}'
 } > "$rules"
-nft delete table inet cybex_forge 2>/dev/null || true
+nft delete table inet cybex_pulse 2>/dev/null || true
 nft -f "$rules"

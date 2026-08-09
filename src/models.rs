@@ -41,7 +41,7 @@ pub struct BootProfile {
 #[serde(rename_all = "snake_case")]
 pub enum BootProfileType {
     LocalDisk,
-    ForgeInstaller,
+    PulseInstaller,
     CustomIpxe,
 }
 
@@ -49,7 +49,7 @@ impl BootProfileType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalDisk => "local_disk",
-            Self::ForgeInstaller => "forge_installer",
+            Self::PulseInstaller => "pulse_installer",
             Self::CustomIpxe => "custom_ipxe",
         }
     }
@@ -67,7 +67,7 @@ impl FromStr for BootProfileType {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "local_disk" => Ok(Self::LocalDisk),
-            "forge_installer" => Ok(Self::ForgeInstaller),
+            "pulse_installer" => Ok(Self::PulseInstaller),
             "custom_ipxe" => Ok(Self::CustomIpxe),
             other => Err(AppError::Validation(format!(
                 "unsupported boot profile type '{other}'"
@@ -92,7 +92,7 @@ pub struct BuildJob {
     pub progress_message: Option<String>,
     pub logs: String,
     pub error: String,
-    /// Enumerated reason this Forge refused the job, empty when it did not.
+    /// Enumerated reason this Pulse refused the job, empty when it did not.
     /// Manage renders operator text from this code; the prose in `error` is
     /// for local logs and may be redacted in transit.
     #[serde(default)]

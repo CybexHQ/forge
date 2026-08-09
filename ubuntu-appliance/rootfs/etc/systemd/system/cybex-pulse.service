@@ -1,23 +1,23 @@
 [Unit]
-Description=Cybex Forge managed appliance service
-After=network-online.target nix-daemon.service cybex-forge-first-boot.service
+Description=Cybex Pulse managed appliance service
+After=network-online.target nix-daemon.service cybex-pulse-first-boot.service
 Wants=network-online.target
-Requires=cybex-forge-first-boot.service
-RequiresMountsFor=/var/lib/cybex-forge/state /var/cache/cybex-forge /nix
+Requires=cybex-pulse-first-boot.service
+RequiresMountsFor=/var/lib/cybex-pulse/state /var/cache/cybex-pulse /nix
 StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 NotifyAccess=all
 WatchdogSec=30s
-User=cybex-forge
-Group=cybex-forge
-ExecStart=/usr/bin/cybex-forge --config /etc/cybex-forge/config.toml serve
-WorkingDirectory=/var/lib/cybex-forge
+User=cybex-pulse
+Group=cybex-pulse
+ExecStart=/usr/bin/cybex-pulse --config /etc/cybex-pulse/config.toml serve
+WorkingDirectory=/var/lib/cybex-pulse
 Restart=always
 RestartSec=3s
 UMask=0077
-ReadWritePaths=/var/lib/cybex-forge /var/cache/cybex-forge
+ReadWritePaths=/var/lib/cybex-pulse /var/cache/cybex-pulse
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true

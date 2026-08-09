@@ -7,7 +7,7 @@ use std::{fs, io, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-const APPLIANCE_UPDATE_LOCK: &str = "/var/lib/cybex-forge/state/appliance-update.lock";
+const APPLIANCE_UPDATE_LOCK: &str = "/var/lib/cybex-pulse/state/appliance-update.lock";
 
 /// Return whether appliance maintenance currently holds the shared mutation
 /// lease. Netboot publication uses this as a promotion barrier while an

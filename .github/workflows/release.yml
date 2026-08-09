@@ -1,4 +1,4 @@
-name: Forge Release
+name: Pulse Release
 
 on:
   pull_request:
@@ -21,14 +21,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential shellcheck
 
       - name: Bash syntax
-        run: bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-forge/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        run: bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-pulse/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
 
       - name: Shellcheck
-        run: shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-forge/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        run: shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-pulse/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
 
       - name: Ubuntu appliance pinned-base contract
         run: |
-          test "$(jq -er '.schema' ubuntu-appliance/base-iso.json)" = cybex.forge.ubuntu-base-iso.v1
+          test "$(jq -er '.schema' ubuntu-appliance/base-iso.json)" = cybex.pulse.ubuntu-base-iso.v1
           test "$(jq -er '.version' ubuntu-appliance/base-iso.json)" = 26.04
           test "$(jq -er '.architecture' ubuntu-appliance/base-iso.json)" = amd64
           test "$(jq -er '.sha256 | test("^[0-9a-f]{64}$")' ubuntu-appliance/base-iso.json)" = true
@@ -90,10 +90,10 @@ jobs:
       contents: read
       actions: read
     env:
-      CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY }}
-      CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS: ${{ vars.CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS }}
-      CYBEX_FORGE_UBUNTU_SNAPSHOT_ID: ${{ vars.CYBEX_FORGE_UBUNTU_SNAPSHOT_ID }}
-      CYBEX_FORGE_RELEASE_ARTIFACT: cybex-forge-release-candidate-${{ github.run_id }}
+      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS: ${{ vars.CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS }}
+      CYBEX_PULSE_UBUNTU_SNAPSHOT_ID: ${{ vars.CYBEX_PULSE_UBUNTU_SNAPSHOT_ID }}
+      CYBEX_PULSE_RELEASE_ARTIFACT: cybex-pulse-release-candidate-${{ github.run_id }}
     steps:
       - name: Checkout exact tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -107,12 +107,12 @@ jobs:
           set -euo pipefail
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           test "v$version" = "$GITHUB_REF_NAME"
-          test -n "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
-          test -n "$CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS"
-          [[ "$CYBEX_FORGE_UBUNTU_SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-          python3 tools/forge-release.py validate-public-key \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          test -n "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+          test -n "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS"
+          [[ "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+          python3 tools/pulse-release.py validate-public-key \
+            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           test "${#provisioning_keys[@]}" -ge 1
           test "${#provisioning_keys[@]}" -le 8
           test "$(printf '%s\n' "${provisioning_keys[@]}" | LC_ALL=C sort -u | wc -l)" -eq "${#provisioning_keys[@]}"
@@ -120,7 +120,7 @@ jobs:
             <(printf '%s\n' "${provisioning_keys[@]}") \
             <(printf '%s\n' "${provisioning_keys[@]}" | LC_ALL=C sort)
           for key in "${provisioning_keys[@]}"; do
-            python3 tools/forge-release.py validate-public-key --trusted-public-key "$key"
+            python3 tools/pulse-release.py validate-public-key --trusted-public-key "$key"
           done
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
@@ -145,10 +145,10 @@ jobs:
       - name: Require repository immutable-release policy
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.CYBEX_FORGE_RELEASE_POLICY_TOKEN }}
+          GH_TOKEN: ${{ secrets.CYBEX_PULSE_RELEASE_POLICY_TOKEN }}
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?configure CYBEX_FORGE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
+          : "${GH_TOKEN:?configure CYBEX_PULSE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
           immutable_enabled="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -166,11 +166,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          response="$RUNNER_TEMP/cybex-forge-run-artifacts.json"
+          response="$RUNNER_TEMP/cybex-pulse-run-artifacts.json"
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$CYBEX_FORGE_RELEASE_ARTIFACT&per_page=100" \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$CYBEX_PULSE_RELEASE_ARTIFACT&per_page=100" \
             > "$response"
           count="$(jq '[.artifacts[] | select(.expired == false)] | length' "$response")"
           case "$count" in
@@ -186,7 +186,7 @@ jobs:
               artifact="$(jq -c '.artifacts[] | select(.expired == false)' "$response")"
               artifact_id="$(jq -r '.id' <<<"$artifact")"
               digest="$(jq -r '.digest' <<<"$artifact")"
-              test "$(jq -r '.name' <<<"$artifact")" = "$CYBEX_FORGE_RELEASE_ARTIFACT"
+              test "$(jq -r '.name' <<<"$artifact")" = "$CYBEX_PULSE_RELEASE_ARTIFACT"
               test "$(jq -r '.workflow_run.id' <<<"$artifact")" = "$GITHUB_RUN_ID"
               test "$(jq -r '.workflow_run.head_sha' <<<"$artifact")" = "${GITHUB_SHA,,}"
               [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
@@ -199,7 +199,7 @@ jobs:
               exit 1
               ;;
           esac
-          printf 'artifact_name=%s\n' "$CYBEX_FORGE_RELEASE_ARTIFACT" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$CYBEX_PULSE_RELEASE_ARTIFACT" >> "$GITHUB_OUTPUT"
 
       - name: Install Nix for a new candidate
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -214,7 +214,7 @@ jobs:
           path: manage-source
           fetch-depth: 0
           persist-credentials: false
-          ssh-key: ${{ secrets.CYBEX_FORGE_MANAGE_SOURCE_SSH_KEY }}
+          ssh-key: ${{ secrets.CYBEX_PULSE_MANAGE_SOURCE_SSH_KEY }}
 
       - name: Verify pinned Manage source and runtime version
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -224,8 +224,8 @@ jobs:
           test "$(git -C manage-source rev-parse HEAD)" = "${{ steps.workstation-source.outputs.revision }}"
           test -z "$(git -C manage-source status --porcelain)"
           test "$(tr -d '\n' < manage-source/deploy/nixos/workstation-netboot-version)" = "${{ steps.workstation-source.outputs.runtime_version }}"
-          python3 tools/forge-release.py verify-component-compatibility \
-            --forge-compatibility protocol/compatibility.json \
+          python3 tools/pulse-release.py verify-component-compatibility \
+            --pulse-compatibility protocol/compatibility.json \
             --manage-compatibility manage-source/protocol/compatibility.json
           test "$(jq -er '.workstation_runtime.compatibility_epoch' protocol/compatibility.json)" = 1
 
@@ -233,10 +233,10 @@ jobs:
         if: steps.release-candidate.outputs.reuse != 'true'
         shell: bash
         env:
-          CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64 }}
+          CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
-          test -n "$CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64"
+          test -n "$CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64"
 
       - name: Install Ubuntu appliance build tools for a new candidate
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -251,7 +251,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.release-version.outputs.version }}"
-          cargo build --release --locked --bin cybex-forge --bin cybex-forge-bootstrap
+          cargo build --release --locked --bin cybex-pulse --bin cybex-pulse-bootstrap
           source_epoch="$(git -C manage-source show -s --format=%ct HEAD)"
           [[ "$source_epoch" =~ ^[1-9][0-9]*$ ]]
           nix-build release/workstation-netboot.nix \
@@ -259,8 +259,8 @@ jobs:
             --arg sourceDateEpoch "$source_epoch" \
             --out-link result-workstation-netboot
           install -d -m 0755 dist
-          install -m 0755 target/release/cybex-forge dist/cybex-forge-x86_64-linux
-          install -m 0755 target/release/cybex-forge-bootstrap "$RUNNER_TEMP/cybex-forge-bootstrap"
+          install -m 0755 target/release/cybex-pulse dist/cybex-pulse-x86_64-linux
+          install -m 0755 target/release/cybex-pulse-bootstrap "$RUNNER_TEMP/cybex-pulse-bootstrap"
           staging="$RUNNER_TEMP/cybex-workstation-netboot-tree"
           install -d -m 0755 "$staging"
           for component in manifest.json bzImage initrd nix-store.squashfs; do
@@ -272,40 +272,40 @@ jobs:
           bundle="dist/${{ steps.workstation-source.outputs.bundle_name }}"
           nix-shell release/release-tools.nix --run \
             "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -19 --threads=1 --no-progress --no-dictID -o '$bundle'"
-          python3 tools/forge-release.py inspect-workstation-netboot \
+          python3 tools/pulse-release.py inspect-workstation-netboot \
             --workstation-netboot-bundle "$bundle" \
             --workstation-netboot-tree "$staging" \
             --workstation-netboot-url "https://github.invalid/$GITHUB_REF_NAME/${{ steps.workstation-source.outputs.bundle_name }}" \
             --workstation-netboot-runtime-version "${{ steps.workstation-source.outputs.runtime_version }}" \
             --workstation-netboot-manage-revision "${{ steps.workstation-source.outputs.revision }}" \
             --workstation-netboot-nixpkgs-revision "${{ steps.workstation-source.outputs.nixpkgs_revision }}"
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           template_args=()
           for key in "${provisioning_keys[@]}"; do
             template_args+=(--provisioning-public-key "$key")
           done
           ubuntu-appliance/build-package-snapshot.sh \
             --output-dir dist \
-            --forge-binary dist/cybex-forge-x86_64-linux \
-            --bootstrap-binary "$RUNNER_TEMP/cybex-forge-bootstrap" \
+            --pulse-binary dist/cybex-pulse-x86_64-linux \
+            --bootstrap-binary "$RUNNER_TEMP/cybex-pulse-bootstrap" \
             --version "$version" \
-            --ubuntu-snapshot-id "$CYBEX_FORGE_UBUNTU_SNAPSHOT_ID" \
-            --release-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --ubuntu-snapshot-id "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" \
+            --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
           ubuntu-appliance/build-template.sh \
             --output-dir dist \
             --cache-dir "$RUNNER_TEMP/ubuntu-base-cache" \
-            --bootstrap-binary "$RUNNER_TEMP/cybex-forge-bootstrap" \
+            --bootstrap-binary "$RUNNER_TEMP/cybex-pulse-bootstrap" \
             --version "$version" \
-            --ubuntu-snapshot-id "$CYBEX_FORGE_UBUNTU_SNAPSHOT_ID" \
-            --release-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY" \
+            --ubuntu-snapshot-id "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" \
+            --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY" \
             "${template_args[@]}"
           mv \
-            "dist/cybex-forge-appliance-template-$version-x86_64-linux.json" \
-            "$RUNNER_TEMP/cybex-forge-appliance-template-metadata.json"
+            "dist/cybex-pulse-appliance-template-$version-x86_64-linux.json" \
+            "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json"
           mv \
-            "dist/cybex-forge-appliance-packages-$version-x86_64-linux.json" \
-            "$RUNNER_TEMP/cybex-forge-appliance-packages-metadata.json"
-          test "$(dist/cybex-forge-x86_64-linux --version)" = "cybex-forge $version"
+            "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.json" \
+            "$RUNNER_TEMP/cybex-pulse-appliance-packages-metadata.json"
+          test "$(dist/cybex-pulse-x86_64-linux --version)" = "cybex-pulse $version"
 
       - name: Fetch latest previously published compatibility asset
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -314,7 +314,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          releases="$RUNNER_TEMP/cybex-forge-published-releases.json"
+          releases="$RUNNER_TEMP/cybex-pulse-published-releases.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -328,24 +328,24 @@ jobs:
           fi
           release_id="$(jq -er '.id' <<<"$previous")"
           [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          assets="$RUNNER_TEMP/cybex-forge-previous-release-assets.json"
+          assets="$RUNNER_TEMP/cybex-pulse-previous-release-assets.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
             > "$assets"
           asset_count="$(jq \
-            '[.[][] | select(.name == "cybex-forge-release-compatibility.json")] | length' \
+            '[.[][] | select(.name == "cybex-pulse-release-compatibility.json")] | length' \
             "$assets")"
           if [ "$asset_count" -ne 1 ]; then
             echo "::error::The latest previous release must contain exactly one signed compatibility asset"
             exit 1
           fi
           asset_id="$(jq -er \
-            '.[][] | select(.name == "cybex-forge-release-compatibility.json") | .id' \
+            '.[][] | select(.name == "cybex-pulse-release-compatibility.json") | .id' \
             "$assets")"
           [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
-          previous_asset="$RUNNER_TEMP/cybex-forge-previous-release-compatibility.json"
+          previous_asset="$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json"
           gh api \
             -H 'Accept: application/octet-stream' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -358,11 +358,11 @@ jobs:
         if: steps.release-candidate.outputs.reuse != 'true'
         shell: bash
         env:
-          CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64 }}
+          CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
           version="${{ steps.release-version.outputs.version }}"
-          key_path="$RUNNER_TEMP/cybex-forge-release-key.pem"
+          key_path="$RUNNER_TEMP/cybex-pulse-release-key.pem"
           cleanup_key() {
             if [ -f "$key_path" ]; then
               shred -u -n 1 -z -- "$key_path" || rm -f -- "$key_path"
@@ -370,44 +370,44 @@ jobs:
           }
           trap cleanup_key EXIT
           umask 077
-          printf '%s' "$CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
+          printf '%s' "$CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
           chmod 0600 "$key_path"
-          derived_public_key="$(python3 tools/forge-release.py public-key --private-key "$key_path")"
-          test "$derived_public_key" = "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+          derived_public_key="$(python3 tools/pulse-release.py public-key --private-key "$key_path")"
+          test "$derived_public_key" = "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
           release_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases"
           artifact_base="$release_base/download/$GITHUB_REF_NAME"
           published_at="$(date -u -d "@$(git show -s --format=%ct HEAD)" +'%Y-%m-%dT%H:%M:%SZ')"
-          personalization_offset="$(jq -er '.personalization_offset' "$RUNNER_TEMP/cybex-forge-appliance-template-metadata.json")"
-          package_delivery="$(jq -er '.package_delivery' "$RUNNER_TEMP/cybex-forge-appliance-template-metadata.json")"
+          personalization_offset="$(jq -er '.personalization_offset' "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json")"
+          package_delivery="$(jq -er '.package_delivery' "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json")"
           test "$package_delivery" = network-snapshot-v1
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_FORGE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           previous_compatibility_args=()
-          if [ -s "$RUNNER_TEMP/cybex-forge-previous-release-compatibility.json" ]; then
+          if [ -s "$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json" ]; then
             previous_compatibility_args=(
-              --previous-compatibility "$RUNNER_TEMP/cybex-forge-previous-release-compatibility.json"
+              --previous-compatibility "$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json"
             )
           fi
           template_args=(
-            --installer-iso-template "dist/cybex-forge-appliance-template-$version-x86_64-linux.iso"
-            --installer-iso-template-url "$artifact_base/cybex-forge-appliance-template-$version-x86_64-linux.iso"
+            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso"
+            --installer-iso-template-url "$artifact_base/cybex-pulse-appliance-template-$version-x86_64-linux.iso"
             --installer-iso-template-personalization-offset "$personalization_offset"
             --installer-iso-template-package-delivery "$package_delivery"
           )
           for key in "${provisioning_keys[@]}"; do
             template_args+=(--provisioning-public-key "$key")
           done
-          python3 tools/forge-release.py manifest \
-            --artifact dist/cybex-forge-x86_64-linux \
-            --artifact-url "$artifact_base/cybex-forge-x86_64-linux" \
+          python3 tools/pulse-release.py manifest \
+            --artifact dist/cybex-pulse-x86_64-linux \
+            --artifact-url "$artifact_base/cybex-pulse-x86_64-linux" \
             --version "$version" \
             --private-key "$key_path" \
-            --output dist/cybex-forge-release.json \
+            --output dist/cybex-pulse-release.json \
             --release-url "$release_base/tag/$GITHUB_REF_NAME" \
             --notes-url "$release_base/tag/$GITHUB_REF_NAME" \
             "${template_args[@]}" \
-            --appliance-package-snapshot "dist/cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --appliance-package-snapshot-metadata "$RUNNER_TEMP/cybex-forge-appliance-packages-metadata.json" \
-            --appliance-package-snapshot-url "$artifact_base/cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --appliance-package-snapshot-metadata "$RUNNER_TEMP/cybex-pulse-appliance-packages-metadata.json" \
+            --appliance-package-snapshot-url "$artifact_base/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
             --workstation-netboot-bundle "dist/${{ steps.workstation-source.outputs.bundle_name }}" \
             --workstation-netboot-tree "$RUNNER_TEMP/cybex-workstation-netboot-tree" \
             --workstation-netboot-url "$artifact_base/${{ steps.workstation-source.outputs.bundle_name }}" \
@@ -415,17 +415,17 @@ jobs:
             --workstation-netboot-manage-revision "${{ steps.workstation-source.outputs.revision }}" \
             --workstation-netboot-nixpkgs-revision "${{ steps.workstation-source.outputs.nixpkgs_revision }}" \
             --published-at "$published_at"
-          python3 tools/forge-release.py compatibility \
-            --manifest dist/cybex-forge-release.json \
-            --manifest-url "$artifact_base/cybex-forge-release.json" \
+          python3 tools/pulse-release.py compatibility \
+            --manifest dist/cybex-pulse-release.json \
+            --manifest-url "$artifact_base/cybex-pulse-release.json" \
             --compatibility protocol/compatibility.json \
             --private-key "$key_path" \
             "${previous_compatibility_args[@]}" \
-            --output dist/cybex-forge-release-compatibility.json
-          python3 tools/forge-release.py verify-compatibility \
-            --asset dist/cybex-forge-release-compatibility.json \
-            --manifest dist/cybex-forge-release.json \
-            --manifest-url "$artifact_base/cybex-forge-release.json" \
+            --output dist/cybex-pulse-release-compatibility.json
+          python3 tools/pulse-release.py verify-compatibility \
+            --asset dist/cybex-pulse-release-compatibility.json \
+            --manifest dist/cybex-pulse-release.json \
+            --manifest-url "$artifact_base/cybex-pulse-release.json" \
             --compatibility protocol/compatibility.json \
             --trusted-public-key "$derived_public_key"
           cleanup_key
@@ -433,12 +433,12 @@ jobs:
           (
             cd dist
             sha256sum -b \
-              cybex-forge-x86_64-linux \
-              "cybex-forge-appliance-template-$version-x86_64-linux.iso" \
-              "cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
+              cybex-pulse-x86_64-linux \
+              "cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
+              "cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
               "${{ steps.workstation-source.outputs.bundle_name }}" \
-              cybex-forge-release.json \
-              cybex-forge-release-compatibility.json > SHA256SUMS
+              cybex-pulse-release.json \
+              cybex-pulse-release-compatibility.json > SHA256SUMS
           )
 
       - name: Upload the one release candidate artifact
@@ -447,7 +447,7 @@ jobs:
         # actions/upload-artifact v4.6.2; rotate only after reviewing the official tag.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT }}
+          name: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT }}
           path: dist/
           if-no-files-found: error
           compression-level: 0
@@ -469,12 +469,12 @@ jobs:
           action_digest="${action_digest#sha256:}"
           [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
           [[ "$action_digest" =~ ^[0-9a-f]{64}$ ]]
-          metadata="$RUNNER_TEMP/cybex-forge-candidate-artifact.json"
+          metadata="$RUNNER_TEMP/cybex-pulse-candidate-artifact.json"
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$metadata"
-          test "$(jq -r '.name' "$metadata")" = "$CYBEX_FORGE_RELEASE_ARTIFACT"
+          test "$(jq -r '.name' "$metadata")" = "$CYBEX_PULSE_RELEASE_ARTIFACT"
           test "$(jq -r '.expired' "$metadata")" = "false"
           test "$(jq -r '.workflow_run.id' "$metadata")" = "$GITHUB_RUN_ID"
           test "$(jq -r '.workflow_run.head_sha' "$metadata")" = "${GITHUB_SHA,,}"
@@ -482,14 +482,14 @@ jobs:
           [[ "$api_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "${api_digest#sha256:}" = "$action_digest"
           printf 'artifact_id=%s\nartifact_digest=%s\nartifact_name=%s\n' \
-            "$artifact_id" "$action_digest" "$CYBEX_FORGE_RELEASE_ARTIFACT" \
+            "$artifact_id" "$action_digest" "$CYBEX_PULSE_RELEASE_ARTIFACT" \
             >> "$GITHUB_OUTPUT"
 
   release_qualify:
     name: Boot, install, adopt, and reboot exact candidate
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release_build
-    runs-on: [self-hosted, linux, x64, cybex-forge-lab]
+    runs-on: [self-hosted, linux, x64, cybex-pulse-lab]
     environment: production-release-qualification
     outputs:
       artifact_id: ${{ steps.upload-qualification.outputs.artifact-id }}
@@ -498,13 +498,13 @@ jobs:
       contents: read
       actions: read
     env:
-      CYBEX_FORGE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
-      CYBEX_FORGE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
-      CYBEX_FORGE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
-      CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY }}
-      CYBEX_FORGE_QUALIFICATION_BRIDGE: ${{ vars.CYBEX_FORGE_QUALIFICATION_BRIDGE }}
-      CYBEX_FORGE_QUALIFICATION_PACKAGE_BIND_ADDRESS: ${{ vars.CYBEX_FORGE_QUALIFICATION_PACKAGE_BIND_ADDRESS }}
-      CYBEX_FORGE_QUALIFICATION_MANAGEMENT_CIDR: ${{ vars.CYBEX_FORGE_QUALIFICATION_MANAGEMENT_CIDR }}
+      CYBEX_PULSE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
+      CYBEX_PULSE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
+      CYBEX_PULSE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
+      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_PULSE_QUALIFICATION_BRIDGE: ${{ vars.CYBEX_PULSE_QUALIFICATION_BRIDGE }}
+      CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS: ${{ vars.CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS }}
+      CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR: ${{ vars.CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR }}
     steps:
       - name: Checkout exact qualification source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -515,7 +515,7 @@ jobs:
       - name: Download build-once candidate by immutable artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT_ID }}
           path: dist
           merge-multiple: true
 
@@ -523,48 +523,48 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$CYBEX_FORGE_RELEASE_VERSION"
+          version="$CYBEX_PULSE_RELEASE_VERSION"
           (cd dist && sha256sum --check --strict SHA256SUMS)
           tree="$RUNNER_TEMP/workstation-netboot-qualification"
           install -d -m 0700 "$tree"
           tar --use-compress-program=unzstd \
-            -xf "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" -C "$tree"
-          python3 -B tools/forge-release.py verify \
-            --manifest dist/cybex-forge-release.json \
-            --artifact dist/cybex-forge-x86_64-linux \
-            --installer-iso-template "dist/cybex-forge-appliance-template-$version-x86_64-linux.iso" \
-            --appliance-package-snapshot "dist/cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --workstation-netboot-bundle "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
+            -xf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" -C "$tree"
+          python3 -B tools/pulse-release.py verify \
+            --manifest dist/cybex-pulse-release.json \
+            --artifact dist/cybex-pulse-x86_64-linux \
+            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
+            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --workstation-netboot-bundle "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$tree" \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME"
-          python3 -B tools/forge-release.py verify-compatibility \
-            --asset dist/cybex-forge-release-compatibility.json \
-            --manifest dist/cybex-forge-release.json \
-            --manifest-url "$artifact_base/cybex-forge-release.json" \
+          python3 -B tools/pulse-release.py verify-compatibility \
+            --asset dist/cybex-pulse-release-compatibility.json \
+            --manifest dist/cybex-pulse-release.json \
+            --manifest-url "$artifact_base/cybex-pulse-release.json" \
             --compatibility protocol/compatibility.json \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
 
       - name: Exercise Secure Boot provisioned-media lifecycle
         shell: bash
         env:
-          CYBEX_FORGE_QUALIFICATION_TOKEN: ${{ secrets.CYBEX_FORGE_QUALIFICATION_TOKEN }}
-          CYBEX_FORGE_QUALIFICATION_MANAGE_ORIGIN: ${{ vars.CYBEX_FORGE_QUALIFICATION_MANAGE_ORIGIN }}
+          CYBEX_PULSE_QUALIFICATION_TOKEN: ${{ secrets.CYBEX_PULSE_QUALIFICATION_TOKEN }}
+          CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN: ${{ vars.CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN }}
         run: |
           set -Eeuo pipefail
-          test -n "$CYBEX_FORGE_QUALIFICATION_TOKEN"
-          [[ "$CYBEX_FORGE_QUALIFICATION_MANAGE_ORIGIN" =~ ^https://[^/]+$ ]]
-          token_file="$RUNNER_TEMP/forge-qualification-token"
+          test -n "$CYBEX_PULSE_QUALIFICATION_TOKEN"
+          [[ "$CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN" =~ ^https://[^/]+$ ]]
+          token_file="$RUNNER_TEMP/pulse-qualification-token"
           cleanup_token() { shred -u -n 1 -z -- "$token_file" 2>/dev/null || rm -f -- "$token_file"; }
           trap cleanup_token EXIT
           umask 077
-          printf '%s' "$CYBEX_FORGE_QUALIFICATION_TOKEN" > "$token_file"
+          printf '%s' "$CYBEX_PULSE_QUALIFICATION_TOKEN" > "$token_file"
           ubuntu-appliance/qualification/run-lifecycle.sh \
-            --template "dist/cybex-forge-appliance-template-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-            --manifest dist/cybex-forge-release.json \
-            --manage-origin "$CYBEX_FORGE_QUALIFICATION_MANAGE_ORIGIN" \
+            --template "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
+            --manifest dist/cybex-pulse-release.json \
+            --manage-origin "$CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN" \
             --token-file "$token_file" \
-            --output "$RUNNER_TEMP/cybex-forge-ubuntu-qualification.json"
+            --output "$RUNNER_TEMP/cybex-pulse-ubuntu-qualification.json"
           cleanup_token
           trap - EXIT
 
@@ -572,8 +572,8 @@ jobs:
         id: upload-qualification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cybex-forge-qualified-${{ github.run_id }}
-          path: ${{ runner.temp }}/cybex-forge-ubuntu-qualification.json
+          name: cybex-pulse-qualified-${{ github.run_id }}
+          path: ${{ runner.temp }}/cybex-pulse-ubuntu-qualification.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
@@ -588,7 +588,7 @@ jobs:
       # Predecessor verification and immutable publication are one
       # repository-wide critical section. Per-tag locking permits two tags to
       # sign from the same predecessor and publish in reverse order.
-      group: forge-release-publish
+      group: pulse-release-publish
       cancel-in-progress: false
     permissions:
       contents: write
@@ -597,14 +597,14 @@ jobs:
       attestations: write
       artifact-metadata: write
     env:
-      CYBEX_FORGE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
-      CYBEX_FORGE_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
-      CYBEX_FORGE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
-      CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
-      CYBEX_FORGE_QUALIFICATION_ARTIFACT_ID: ${{ needs.release_qualify.outputs.artifact_id }}
-      CYBEX_FORGE_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.release_qualify.outputs.artifact_digest }}
-      CYBEX_FORGE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
-      CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_PULSE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
+      CYBEX_PULSE_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
+      CYBEX_PULSE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
+      CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
+      CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID: ${{ needs.release_qualify.outputs.artifact_id }}
+      CYBEX_PULSE_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.release_qualify.outputs.artifact_digest }}
+      CYBEX_PULSE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
+      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
     steps:
       - name: Checkout exact tag for independent verification
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -618,7 +618,7 @@ jobs:
           set -Eeuo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA,,}"
           test -z "$(git status --porcelain)"
-          test "v$CYBEX_FORGE_RELEASE_VERSION" = "$GITHUB_REF_NAME"
+          test "v$CYBEX_PULSE_RELEASE_VERSION" = "$GITHUB_REF_NAME"
 
       - name: Install independent archive verifier
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
@@ -648,27 +648,27 @@ jobs:
             test "$(jq -r '.digest' "$metadata")" = "sha256:$expected_digest"
           }
           validate_artifact \
-            "$CYBEX_FORGE_RELEASE_ARTIFACT_ID" \
-            "$CYBEX_FORGE_RELEASE_ARTIFACT" \
-            "$CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST" \
-            "$RUNNER_TEMP/cybex-forge-candidate-artifact.json"
+            "$CYBEX_PULSE_RELEASE_ARTIFACT_ID" \
+            "$CYBEX_PULSE_RELEASE_ARTIFACT" \
+            "$CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST" \
+            "$RUNNER_TEMP/cybex-pulse-candidate-artifact.json"
           validate_artifact \
-            "$CYBEX_FORGE_QUALIFICATION_ARTIFACT_ID" \
-            "cybex-forge-qualified-$GITHUB_RUN_ID" \
-            "$CYBEX_FORGE_QUALIFICATION_ARTIFACT_DIGEST" \
-            "$RUNNER_TEMP/cybex-forge-qualification-artifact.json"
+            "$CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID" \
+            "cybex-pulse-qualified-$GITHUB_RUN_ID" \
+            "$CYBEX_PULSE_QUALIFICATION_ARTIFACT_DIGEST" \
+            "$RUNNER_TEMP/cybex-pulse-qualification-artifact.json"
 
       - name: Download original release candidate independently by artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_FORGE_RELEASE_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT_ID }}
           path: dist
           merge-multiple: true
 
       - name: Download exact-candidate qualification evidence by artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_FORGE_QUALIFICATION_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID }}
           path: qualification
           merge-multiple: true
 
@@ -676,17 +676,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$CYBEX_FORGE_RELEASE_VERSION"
-          expected="$RUNNER_TEMP/cybex-forge-publish-expected"
-          actual="$RUNNER_TEMP/cybex-forge-publish-actual"
+          version="$CYBEX_PULSE_RELEASE_VERSION"
+          expected="$RUNNER_TEMP/cybex-pulse-publish-expected"
+          actual="$RUNNER_TEMP/cybex-pulse-publish-actual"
           printf '%s\n' \
             SHA256SUMS \
-            cybex-forge-release-compatibility.json \
-            cybex-forge-release.json \
-            cybex-forge-x86_64-linux \
-            "cybex-forge-appliance-template-$version-x86_64-linux.iso" \
-            "cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
-            "$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
+            cybex-pulse-release-compatibility.json \
+            cybex-pulse-release.json \
+            cybex-pulse-x86_64-linux \
+            "cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
+            "cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
+            "$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
             | LC_ALL=C sort > "$expected"
           find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$actual"
           diff -u "$expected" "$actual"
@@ -699,35 +699,35 @@ jobs:
           printf '%s\n' bzImage initrd manifest.json nix-store.squashfs \
             > "$RUNNER_TEMP/cybex-workstation-archive-expected"
           tar --use-compress-program=unzstd \
-            -tf "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
+            -tf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
             > "$RUNNER_TEMP/cybex-workstation-archive-actual"
           diff -u \
             "$RUNNER_TEMP/cybex-workstation-archive-expected" \
             "$RUNNER_TEMP/cybex-workstation-archive-actual"
           test "$(tar --use-compress-program=unzstd -tvf \
-            "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" | awk '$1 !~ /^-rw-r--r--$/ {bad=1} END {print bad+0}')" = 0
+            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" | awk '$1 !~ /^-rw-r--r--$/ {bad=1} END {print bad+0}')" = 0
           install -d -m 0700 "$RUNNER_TEMP/cybex-workstation-netboot-verify"
           tar --use-compress-program=unzstd \
-            -xf "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
+            -xf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
             -C "$RUNNER_TEMP/cybex-workstation-netboot-verify"
-          python3 -B tools/forge-release.py verify \
-            --manifest dist/cybex-forge-release.json \
-            --artifact dist/cybex-forge-x86_64-linux \
-            --installer-iso-template "dist/cybex-forge-appliance-template-$version-x86_64-linux.iso" \
-            --appliance-package-snapshot "dist/cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --workstation-netboot-bundle "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
+          python3 -B tools/pulse-release.py verify \
+            --manifest dist/cybex-pulse-release.json \
+            --artifact dist/cybex-pulse-x86_64-linux \
+            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
+            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --workstation-netboot-bundle "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$RUNNER_TEMP/cybex-workstation-netboot-verify" \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME"
-          python3 -B tools/forge-release.py verify-compatibility \
-            --asset dist/cybex-forge-release-compatibility.json \
-            --manifest dist/cybex-forge-release.json \
-            --manifest-url "$artifact_base/cybex-forge-release.json" \
+          python3 -B tools/pulse-release.py verify-compatibility \
+            --asset dist/cybex-pulse-release-compatibility.json \
+            --manifest dist/cybex-pulse-release.json \
+            --manifest-url "$artifact_base/cybex-pulse-release.json" \
             --compatibility protocol/compatibility.json \
-            --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
-          evidence=qualification/cybex-forge-ubuntu-qualification.json
+            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+          evidence=qualification/cybex-pulse-ubuntu-qualification.json
           test -f "$evidence" && test ! -L "$evidence"
-          test "$(jq -er '.schema' "$evidence")" = cybex.forge.ubuntu-appliance-qualification.v1
+          test "$(jq -er '.schema' "$evidence")" = cybex.pulse.ubuntu-appliance-qualification.v1
           test "$(jq -er '.ok' "$evidence")" = true
           test "$(jq -er '.final_state' "$evidence")" = ready
           test "$(jq -er '.secure_boot' "$evidence")" = true
@@ -738,18 +738,18 @@ jobs:
           test "$(jq -er '.two_phase_network_acknowledged' "$evidence")" = true
           test "$(jq -er '.exact_principal_ssh_certificate' "$evidence")" = true
           test "$(jq -er '.template_sha256' "$evidence")" = \
-            "$(jq -er '.installer_iso_template_v2.template_sha256' dist/cybex-forge-release.json)"
-          install -m 0700 dist/cybex-forge-x86_64-linux "$RUNNER_TEMP/cybex-forge-release-verify"
-          test "$("$RUNNER_TEMP/cybex-forge-release-verify" --version)" = "cybex-forge $version"
-          rm -f -- "$RUNNER_TEMP/cybex-forge-release-verify"
+            "$(jq -er '.installer_iso_template_v2.template_sha256' dist/cybex-pulse-release.json)"
+          install -m 0700 dist/cybex-pulse-x86_64-linux "$RUNNER_TEMP/cybex-pulse-release-verify"
+          test "$("$RUNNER_TEMP/cybex-pulse-release-verify" --version)" = "cybex-pulse $version"
+          rm -f -- "$RUNNER_TEMP/cybex-pulse-release-verify"
 
       - name: Require repository immutable-release policy
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.CYBEX_FORGE_RELEASE_POLICY_TOKEN }}
+          GH_TOKEN: ${{ secrets.CYBEX_PULSE_RELEASE_POLICY_TOKEN }}
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?configure CYBEX_FORGE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
+          : "${GH_TOKEN:?configure CYBEX_PULSE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
           immutable_enabled="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -761,14 +761,14 @@ jobs:
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: |
-            dist/cybex-forge-x86_64-linux
-            dist/cybex-forge-appliance-template-${{ env.CYBEX_FORGE_RELEASE_VERSION }}-x86_64-linux.iso
-            dist/cybex-forge-appliance-packages-${{ env.CYBEX_FORGE_RELEASE_VERSION }}-x86_64-linux.tar.zst
-            dist/${{ env.CYBEX_FORGE_WORKSTATION_BUNDLE_NAME }}
-            dist/cybex-forge-release.json
-            dist/cybex-forge-release-compatibility.json
+            dist/cybex-pulse-x86_64-linux
+            dist/cybex-pulse-appliance-template-${{ env.CYBEX_PULSE_RELEASE_VERSION }}-x86_64-linux.iso
+            dist/cybex-pulse-appliance-packages-${{ env.CYBEX_PULSE_RELEASE_VERSION }}-x86_64-linux.tar.zst
+            dist/${{ env.CYBEX_PULSE_WORKSTATION_BUNDLE_NAME }}
+            dist/cybex-pulse-release.json
+            dist/cybex-pulse-release-compatibility.json
             dist/SHA256SUMS
-            qualification/cybex-forge-ubuntu-qualification.json
+            qualification/cybex-pulse-ubuntu-qualification.json
 
       - name: Remove only a stale draft for this exact tag
         env:
@@ -784,13 +784,13 @@ jobs:
           test "${remote_tag_commit,,}" = "${GITHUB_SHA,,}"
           owner_run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           owner_run_marker="Cybex-Release-Workflow: $owner_run"
-          owner_artifact_marker="Cybex-Candidate-Artifact-ID: $CYBEX_FORGE_RELEASE_ARTIFACT_ID"
-          owner_digest_marker="Cybex-Candidate-Artifact-SHA256: $CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST"
+          owner_artifact_marker="Cybex-Candidate-Artifact-ID: $CYBEX_PULSE_RELEASE_ARTIFACT_ID"
+          owner_digest_marker="Cybex-Candidate-Artifact-SHA256: $CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST"
           expected_body="$(printf '%s\n%s\n%s' \
             "$owner_run_marker" \
             "$owner_artifact_marker" \
             "$owner_digest_marker")"
-          existing="$RUNNER_TEMP/cybex-forge-existing-release.json"
+          existing="$RUNNER_TEMP/cybex-pulse-existing-release.json"
           if gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -800,25 +800,25 @@ jobs:
             test "$(jq -r '.tag_name' "$existing")" = "$GITHUB_REF_NAME"
             test "$(jq -r '.draft' "$existing")" = "true"
             test "$(jq -r '.immutable' "$existing")" = "false"
-            test "$(jq -r '.name // ""' "$existing")" = "Cybex Forge $GITHUB_REF_NAME"
+            test "$(jq -r '.name // ""' "$existing")" = "Cybex Pulse $GITHUB_REF_NAME"
             test "$(jq -r '.body // ""' "$existing")" = "$expected_body"
             stale_id="$(jq -r '.id' "$existing")"
             [[ "$stale_id" =~ ^[1-9][0-9]*$ ]]
-            stale_assets="$RUNNER_TEMP/cybex-forge-existing-release-assets.json"
+            stale_assets="$RUNNER_TEMP/cybex-pulse-existing-release-assets.json"
             gh api \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/$GITHUB_REPOSITORY/releases/$stale_id/assets?per_page=100" \
               > "$stale_assets"
             jq -e \
-              --arg binary "cybex-forge-x86_64-linux" \
-              --arg template "cybex-forge-appliance-template-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-              --arg packages "cybex-forge-appliance-packages-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-              --arg netboot "$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
-              --arg manifest "cybex-forge-release.json" \
-              --arg compatibility "cybex-forge-release-compatibility.json" \
+              --arg binary "cybex-pulse-x86_64-linux" \
+              --arg template "cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
+              --arg packages "cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
+              --arg netboot "$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+              --arg manifest "cybex-pulse-release.json" \
+              --arg compatibility "cybex-pulse-release-compatibility.json" \
               --arg checksums "SHA256SUMS" \
-              --arg qualification "cybex-forge-ubuntu-qualification.json" \
+              --arg qualification "cybex-pulse-ubuntu-qualification.json" \
               'type == "array"
                and length <= 8
                and ((map(.name) | length) == (map(.name) | unique | length))
@@ -843,21 +843,21 @@ jobs:
           owner_run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           release_markers="$(printf '%s\n%s\n%s' \
             "Cybex-Release-Workflow: $owner_run" \
-            "Cybex-Candidate-Artifact-ID: $CYBEX_FORGE_RELEASE_ARTIFACT_ID" \
-            "Cybex-Candidate-Artifact-SHA256: $CYBEX_FORGE_RELEASE_ARTIFACT_DIGEST")"
+            "Cybex-Candidate-Artifact-ID: $CYBEX_PULSE_RELEASE_ARTIFACT_ID" \
+            "Cybex-Candidate-Artifact-SHA256: $CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST")"
           gh release create "$GITHUB_REF_NAME" \
             --draft --verify-tag --target "$GITHUB_SHA" \
             --notes "$release_markers" \
-            --title "Cybex Forge $GITHUB_REF_NAME"
+            --title "Cybex Pulse $GITHUB_REF_NAME"
           gh release upload "$GITHUB_REF_NAME" \
-            dist/cybex-forge-x86_64-linux \
-            "dist/cybex-forge-appliance-template-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-            "dist/cybex-forge-appliance-packages-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-            "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
-            dist/cybex-forge-release.json \
-            dist/cybex-forge-release-compatibility.json \
+            dist/cybex-pulse-x86_64-linux \
+            "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
+            "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
+            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+            dist/cybex-pulse-release.json \
+            dist/cybex-pulse-release-compatibility.json \
             dist/SHA256SUMS \
-            qualification/cybex-forge-ubuntu-qualification.json
+            qualification/cybex-pulse-ubuntu-qualification.json
 
       - name: Verify remote draft assets and publish immutably
         env:
@@ -870,18 +870,18 @@ jobs:
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
             --jq '.id')"
-          remote_assets="$RUNNER_TEMP/cybex-forge-release-assets.json"
+          remote_assets="$RUNNER_TEMP/cybex-pulse-release-assets.json"
           remote_assets_match() {
             jq -e 'length == 8' "$remote_assets" >/dev/null || return 1
             for path in \
-              dist/cybex-forge-x86_64-linux \
-              "dist/cybex-forge-appliance-template-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-              "dist/cybex-forge-appliance-packages-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-              "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
-              dist/cybex-forge-release.json \
-              dist/cybex-forge-release-compatibility.json \
+              dist/cybex-pulse-x86_64-linux \
+              "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
+              "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
+              "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+              dist/cybex-pulse-release.json \
+              dist/cybex-pulse-release-compatibility.json \
               dist/SHA256SUMS \
-              qualification/cybex-forge-ubuntu-qualification.json
+              qualification/cybex-pulse-ubuntu-qualification.json
               do
               name="$(basename "$path")"
               digest="sha256:$(sha256sum "$path" | cut -d ' ' -f 1)"
@@ -909,7 +909,7 @@ jobs:
           done
           test "$matched" = "true"
           test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = "true"
-          releases="$RUNNER_TEMP/cybex-forge-publish-predecessors.json"
+          releases="$RUNNER_TEMP/cybex-pulse-publish-predecessors.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -921,20 +921,20 @@ jobs:
           if [ -n "$previous" ]; then
             previous_release_id="$(jq -er '.id' <<<"$previous")"
             [[ "$previous_release_id" =~ ^[1-9][0-9]*$ ]]
-            previous_assets="$RUNNER_TEMP/cybex-forge-publish-predecessor-assets.json"
+            previous_assets="$RUNNER_TEMP/cybex-pulse-publish-predecessor-assets.json"
             gh api --paginate --slurp \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/$GITHUB_REPOSITORY/releases/$previous_release_id/assets?per_page=100" \
               > "$previous_assets"
             test "$(jq \
-              '[.[][] | select(.name == "cybex-forge-release-compatibility.json")] | length' \
+              '[.[][] | select(.name == "cybex-pulse-release-compatibility.json")] | length' \
               "$previous_assets")" -eq 1
             previous_asset_id="$(jq -er \
-              '.[][] | select(.name == "cybex-forge-release-compatibility.json") | .id' \
+              '.[][] | select(.name == "cybex-pulse-release-compatibility.json") | .id' \
               "$previous_assets")"
             [[ "$previous_asset_id" =~ ^[1-9][0-9]*$ ]]
-            previous_compatibility="$RUNNER_TEMP/cybex-forge-publish-predecessor.json"
+            previous_compatibility="$RUNNER_TEMP/cybex-pulse-publish-predecessor.json"
             gh api \
               -H 'Accept: application/octet-stream' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -943,10 +943,10 @@ jobs:
             test -f "$previous_compatibility" && test ! -L "$previous_compatibility"
             test "$(stat -c %s "$previous_compatibility")" -gt 0
             test "$(stat -c %s "$previous_compatibility")" -le 1048576
-            python3 -B tools/forge-release.py verify-successor \
+            python3 -B tools/pulse-release.py verify-successor \
               --previous-compatibility "$previous_compatibility" \
-              --current-compatibility dist/cybex-forge-release-compatibility.json \
-              --trusted-public-key "$CYBEX_FORGE_UPDATE_TRUSTED_PUBLIC_KEY"
+              --current-compatibility dist/cybex-pulse-release-compatibility.json \
+              --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
           fi
           gh release edit "$GITHUB_REF_NAME" --draft=false
           immutable=false
@@ -968,14 +968,14 @@ jobs:
           test "$(jq -r '.tag_name' <<<"$published")" = "$GITHUB_REF_NAME"
           gh release verify "$GITHUB_REF_NAME"
           for path in \
-            dist/cybex-forge-x86_64-linux \
-            "dist/cybex-forge-appliance-template-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.iso" \
-            "dist/cybex-forge-appliance-packages-$CYBEX_FORGE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-            "dist/$CYBEX_FORGE_WORKSTATION_BUNDLE_NAME" \
-            dist/cybex-forge-release.json \
-            dist/cybex-forge-release-compatibility.json \
+            dist/cybex-pulse-x86_64-linux \
+            "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
+            "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
+            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+            dist/cybex-pulse-release.json \
+            dist/cybex-pulse-release-compatibility.json \
             dist/SHA256SUMS \
-            qualification/cybex-forge-ubuntu-qualification.json
+            qualification/cybex-pulse-ubuntu-qualification.json
           do
             gh release verify-asset "$GITHUB_REF_NAME" "$path"
           done

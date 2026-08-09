@@ -34,12 +34,12 @@ use crate::{
     release_transport,
 };
 
-pub const DESCRIPTOR_SCHEMA: &str = "cybex.forge.workstation-netboot.v1";
-pub const MANIFEST_SCHEMA: &str = "cybex.forge.workstation-netboot-manifest.v1";
-pub const SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-WORKSTATION-NETBOOT-V1";
+pub const DESCRIPTOR_SCHEMA: &str = "cybex.pulse.workstation-netboot.v1";
+pub const MANIFEST_SCHEMA: &str = "cybex.pulse.workstation-netboot-manifest.v1";
+pub const SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-WORKSTATION-NETBOOT-V1";
 pub const ARCHITECTURE: &str = "x86_64-linux";
 pub const FORMAT: &str = "split-squashfs-v1";
-pub const REQUIRED_FORGE_PROTOCOL: u32 = 4;
+pub const REQUIRED_PULSE_PROTOCOL: u32 = 4;
 #[cfg(not(feature = "resilience-qualification-epoch-2"))]
 pub const COMPATIBILITY_EPOCH: u32 = 1;
 #[cfg(feature = "resilience-qualification-epoch-2")]
@@ -64,7 +64,7 @@ const MAINTENANCE_INTERVAL_SECONDS: u64 = 60 * 60;
 const RECONCILE_RETRY_BASE_SECONDS: i64 = 30;
 const RECONCILE_RETRY_MAX_SECONDS: i64 = 30 * 60;
 const MAX_RECONCILE_ATTEMPT_ROWS: i64 = 128;
-const BOOT_GRANT_DOMAIN: &str = "CYBEX-FORGE-BOOT-GRANT-V1";
+const BOOT_GRANT_DOMAIN: &str = "CYBEX-PULSE-BOOT-GRANT-V1";
 const COMPONENT_NAMES: [&str; 3] = ["bzImage", "initrd", "nix-store.squashfs"];
 static RECONCILE_QUEUE: Mutex<RuntimeReconcileQueue> = Mutex::new(RuntimeReconcileQueue::new());
 
@@ -105,7 +105,7 @@ pub struct WorkstationNetbootDescriptor {
     pub nixpkgs_revision: String,
     pub architecture: String,
     pub format: String,
-    pub required_forge_protocol: u32,
+    pub required_pulse_protocol: u32,
     pub url: String,
     pub sha256: String,
     pub size_bytes: u64,
@@ -121,7 +121,7 @@ struct WorkstationNetbootManifest {
     runtime_version: String,
     architecture: String,
     format: String,
-    required_forge_protocol: u32,
+    required_pulse_protocol: u32,
     manage_source_revision: String,
     nixpkgs_revision: String,
     source_date_epoch: u64,
@@ -134,7 +134,7 @@ struct WorkstationNetbootManifest {
 #[derive(Clone, Debug, Serialize)]
 pub struct BootGrantClaims {
     pub schema: &'static str,
-    pub forge_device_id: String,
+    pub pulse_device_id: String,
     pub organization_id: String,
     pub organization_slug: String,
     pub manage_api_url: String,
@@ -149,7 +149,7 @@ pub struct BootGrantClaims {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ForgeBootGrant {
+struct PulseBootGrant {
     claims: BootGrantClaims,
     signature: String,
 }
@@ -161,7 +161,7 @@ struct BootContext {
     organization_slug: String,
     bundle_sha256: String,
     profile_id: Option<String>,
-    forge_boot_grant: ForgeBootGrant,
+    pulse_boot_grant: PulseBootGrant,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -278,7 +278,7 @@ fn validate_compatibility_epoch(compatibility_epoch: u32) -> Result<()> {
         return Err(coded_runtime_failure(
             FAILURE_COMPATIBILITY_EPOCH_UNSUPPORTED,
             format!(
-                "workstation runtime compatibility epoch {compatibility_epoch} is unsupported; this Forge supports epoch {COMPATIBILITY_EPOCH}"
+                "workstation runtime compatibility epoch {compatibility_epoch} is unsupported; this Pulse supports epoch {COMPATIBILITY_EPOCH}"
             ),
         ));
     }
@@ -318,7 +318,7 @@ pub fn signature_message(descriptor: &WorkstationNetbootDescriptor) -> String {
         descriptor.nixpkgs_revision,
         descriptor.architecture,
         descriptor.format,
-        descriptor.required_forge_protocol,
+        descriptor.required_pulse_protocol,
         descriptor.components.bz_image.size_bytes,
         descriptor.components.bz_image.sha256,
         descriptor.components.initrd.size_bytes,
@@ -353,7 +353,7 @@ fn validate_descriptor_with_policy(
     validate_revision(&descriptor.nixpkgs_revision, "nixpkgs revision")?;
     if descriptor.architecture != ARCHITECTURE
         || descriptor.format != FORMAT
-        || descriptor.required_forge_protocol != REQUIRED_FORGE_PROTOCOL
+        || descriptor.required_pulse_protocol != REQUIRED_PULSE_PROTOCOL
     {
         bail!("workstation netboot descriptor target contract is incompatible");
     }
@@ -1507,7 +1507,7 @@ fn validate_manifest(
         || manifest.runtime_version != descriptor.runtime_version
         || manifest.architecture != descriptor.architecture
         || manifest.format != descriptor.format
-        || manifest.required_forge_protocol != descriptor.required_forge_protocol
+        || manifest.required_pulse_protocol != descriptor.required_pulse_protocol
         || manifest.manage_source_revision != descriptor.manage_source_revision
         || manifest.nixpkgs_revision != descriptor.nixpkgs_revision
         || manifest.components != descriptor.components
@@ -1743,7 +1743,7 @@ fn enforce_watermark_precedence(
 pub fn boot_grant_message(claims: &BootGrantClaims) -> String {
     format!(
         "{BOOT_GRANT_DOMAIN}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        claims.forge_device_id,
+        claims.pulse_device_id,
         claims.organization_id,
         claims.organization_slug,
         claims.manage_api_url,
@@ -1813,9 +1813,9 @@ pub async fn create_boot_session(
     let manifest = parse_canonical_manifest(&manifest_body)?;
     validate_manifest(&manifest, &descriptor)?;
 
-    let identity = crate::manage::forge_boot_identity(&state.config)?;
+    let identity = crate::manage::pulse_boot_identity(&state.config)?;
     if !is_safe_control_plane_id(&identity.device_id) {
-        bail!("adopted Forge device identity is invalid");
+        bail!("adopted Pulse device identity is invalid");
     }
     let issued_at = Utc::now().timestamp();
     let expires_at = issued_at + BOOT_GRANT_LIFETIME_SECONDS;
@@ -1827,8 +1827,8 @@ pub async fn create_boot_session(
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
     let session_id = URL_SAFE_NO_PAD.encode(session_bytes);
     let claims = BootGrantClaims {
-        schema: "cybex.forge.boot-grant.v1",
-        forge_device_id: identity.device_id,
+        schema: "cybex.pulse.boot-grant.v1",
+        pulse_device_id: identity.device_id,
         organization_id: state.config.manage.organization_id.clone(),
         organization_slug: state.config.manage.organization_slug.clone(),
         manage_api_url: state.config.manage.api_url.clone(),
@@ -1845,27 +1845,27 @@ pub async fn create_boot_session(
         .signing_key
         .sign(boot_grant_message(&claims).as_bytes());
     let context = BootContext {
-        schema: "cybex.forge.boot-context.v1",
+        schema: "cybex.pulse.boot-context.v1",
         api_url: claims.manage_api_url.clone(),
         organization_slug: claims.organization_slug.clone(),
         bundle_sha256: bundle_sha256.clone(),
         profile_id: claims.profile_id.clone(),
-        forge_boot_grant: ForgeBootGrant {
+        pulse_boot_grant: PulseBootGrant {
             claims,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         },
     };
-    let context_body = serde_json::to_vec(&context).context("serialize Forge boot context")?;
+    let context_body = serde_json::to_vec(&context).context("serialize Pulse boot context")?;
     let context_archive = newc_context_archive(&context_body, issued_at)?;
     if context_archive.len() > BOOT_CONTEXT_MAX_BYTES {
-        bail!("Forge boot context archive exceeded 64 KiB");
+        bail!("Pulse boot context archive exceeded 64 KiB");
     }
 
     let sessions_root = state.config.paths.data_dir.join("netboot/sessions");
     let session_root = sessions_root.join(&session_id);
-    fs::create_dir_all(&sessions_root).context("create Forge boot sessions root")?;
+    fs::create_dir_all(&sessions_root).context("create Pulse boot sessions root")?;
     fs::set_permissions(&sessions_root, fs::Permissions::from_mode(0o700))?;
-    fs::create_dir(&session_root).context("create Forge boot session directory")?;
+    fs::create_dir(&session_root).context("create Pulse boot session directory")?;
     fs::set_permissions(&session_root, fs::Permissions::from_mode(0o700))?;
     let context_path = session_root.join("context.cpio");
     // iPXE's magic-initrd support wraps this bounded JSON body in the cpio
@@ -1878,7 +1878,7 @@ pub async fn create_boot_session(
     }
 
     let insert_result = sqlx::query(
-        "INSERT INTO forge_boot_sessions
+        "INSERT INTO pulse_boot_sessions
          (session_id, nonce_sha256, normalized_mac, profile_id, managed_device_id,
           reinstall_request_id, bundle_sha256, context_path, issued_at, expires_at,
           cleanup_after)
@@ -1912,7 +1912,7 @@ pub async fn create_boot_session(
         .kernel_cmdline_template
         .replace("{squashfs_url}", &squashfs_url);
     Ok(BootSessionLaunch {
-        schema: "cybex.forge.kexec.v1",
+        schema: "cybex.pulse.kexec.v1",
         bundle_sha256,
         kernel_url,
         initrd_url,
@@ -1934,7 +1934,7 @@ fn is_safe_control_plane_id(value: &str) -> bool {
 
 pub fn render_ipxe_launch(launch: &BootSessionLaunch) -> String {
     format!(
-        "#!ipxe\necho Cybex Forge: loading signed workstation installer runtime\nkernel {} {} || goto failed\ninitrd {} || goto failed\ninitrd --name context.json {} /etc/cybex-installer/boot-context.json mode=600 mkdir=1 || goto failed\nboot || goto failed\n:failed\necho Cybex Forge could not stage the installer runtime\nsleep 5\nexit 1\n",
+        "#!ipxe\necho Cybex Pulse: loading signed workstation installer runtime\nkernel {} {} || goto failed\ninitrd {} || goto failed\ninitrd --name context.json {} /etc/cybex-installer/boot-context.json mode=600 mkdir=1 || goto failed\nboot || goto failed\n:failed\necho Cybex Pulse could not stage the installer runtime\nsleep 5\nexit 1\n",
         launch.kernel_url, launch.command_line, launch.initrd_url, launch.context_url,
     )
 }
@@ -1948,7 +1948,7 @@ pub async fn serve_context(
         return Err(AppError::NotFound);
     }
     let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT context_path, expires_at FROM forge_boot_sessions WHERE session_id = ?",
+        "SELECT context_path, expires_at FROM pulse_boot_sessions WHERE session_id = ?",
     )
     .bind(&session_id)
     .fetch_optional(&state.db)
@@ -1987,7 +1987,7 @@ pub async fn serve_context(
 pub async fn cleanup_expired_sessions(state: &AppState) -> Result<usize> {
     let now_unix = Utc::now().timestamp();
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT session_id, context_path FROM forge_boot_sessions
+        "SELECT session_id, context_path FROM pulse_boot_sessions
          WHERE cleanup_after < ? ORDER BY cleanup_after LIMIT 256",
     )
     .bind(now_unix)
@@ -2005,13 +2005,13 @@ pub async fn cleanup_expired_sessions(state: &AppState) -> Result<usize> {
         }
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                fs::remove_dir_all(&root).context("remove expired Forge boot session")?;
+                fs::remove_dir_all(&root).context("remove expired Pulse boot session")?;
             }
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        sqlx::query("DELETE FROM forge_boot_sessions WHERE session_id = ? AND cleanup_after < ?")
+        sqlx::query("DELETE FROM pulse_boot_sessions WHERE session_id = ? AND cleanup_after < ?")
             .bind(&session_id)
             .bind(now_unix)
             .execute(&state.db)
@@ -2319,7 +2319,7 @@ async fn prune_expired_bundles(state: &AppState) -> Result<usize> {
            AND bundle.bundle_sha256 <> runtime.active_bundle_sha256
            AND bundle.bundle_sha256 <> runtime.previous_bundle_sha256
            AND NOT EXISTS (
-             SELECT 1 FROM forge_boot_sessions session
+             SELECT 1 FROM pulse_boot_sessions session
              WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
            )
          ORDER BY bundle.retained_until LIMIT 8",
@@ -2424,7 +2424,7 @@ fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
 
 fn newc_context_archive(body: &[u8], mtime: i64) -> Result<Vec<u8>> {
     if mtime < 0 || body.is_empty() {
-        bail!("Forge boot context archive inputs are invalid");
+        bail!("Pulse boot context archive inputs are invalid");
     }
     let mut archive = Vec::with_capacity(body.len() + 512);
     append_newc_entry(
@@ -2654,7 +2654,7 @@ pub async fn serve_component(
                    AND (bundle.bundle_sha256 = active_bundle_sha256
                         OR bundle.bundle_sha256 = previous_bundle_sha256)
                ) OR EXISTS(
-                 SELECT 1 FROM forge_boot_sessions session
+                 SELECT 1 FROM pulse_boot_sessions session
                  WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
                )
              )
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[test]
     fn boot_context_overlay_is_a_bounded_newc_member() {
-        let body = br#"{"schema":"cybex.forge.boot-context.v1"}"#;
+        let body = br#"{"schema":"cybex.pulse.boot-context.v1"}"#;
         let cpio = newc_context_archive(body, 1_700_000_000).unwrap();
         assert!(cpio.len() <= BOOT_CONTEXT_MAX_BYTES);
         assert!(
@@ -2857,19 +2857,19 @@ mod tests {
     #[test]
     fn ipxe_launch_uses_magic_initrd_context_injection() {
         let launch = BootSessionLaunch {
-            schema: "cybex.forge.kexec.v1",
+            schema: "cybex.pulse.kexec.v1",
             bundle_sha256: "a".repeat(64),
-            kernel_url: "http://forge.test/kernel".to_string(),
-            initrd_url: "http://forge.test/initrd".to_string(),
-            context_url: "http://forge.test/context.cpio".to_string(),
-            squashfs_url: "http://forge.test/rootfs".to_string(),
+            kernel_url: "http://pulse.test/kernel".to_string(),
+            initrd_url: "http://pulse.test/initrd".to_string(),
+            context_url: "http://pulse.test/context.cpio".to_string(),
+            squashfs_url: "http://pulse.test/rootfs".to_string(),
             command_line: "init=/nix/store/system/init".to_string(),
             expires_at: 1_700_000_600,
         };
         let script = render_ipxe_launch(&launch);
-        assert!(script.contains("initrd http://forge.test/initrd"));
+        assert!(script.contains("initrd http://pulse.test/initrd"));
         assert!(script.contains(
-            "http://forge.test/context.cpio /etc/cybex-installer/boot-context.json mode=600 mkdir=1"
+            "http://pulse.test/context.cpio /etc/cybex-installer/boot-context.json mode=600 mkdir=1"
         ));
     }
 
@@ -2877,7 +2877,7 @@ mod tests {
     fn signature_message_contract_is_exact() {
         let descriptor = fixture_descriptor();
         let message = signature_message(&descriptor);
-        assert!(message.starts_with("CYBEX-FORGE-WORKSTATION-NETBOOT-V1\n1.0.0\n"));
+        assert!(message.starts_with("CYBEX-PULSE-WORKSTATION-NETBOOT-V1\n1.0.0\n"));
         assert!(message.ends_with("https://releases.example.test/cybex-workstation-netboot-1.0.0-aaaaaaaaaaaa-x86_64-linux.tar.zst\n"));
         assert_eq!(message.lines().count(), 17);
     }
@@ -3734,15 +3734,15 @@ mod tests {
     impl RuntimeFilesystemFixture {
         async fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "cybex-forge-netboot-runtime-test-{}",
+                "cybex-pulse-netboot-runtime-test-{}",
                 uuid::Uuid::new_v4().simple()
             ));
             fs::create_dir_all(&root).unwrap();
             let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
             let mut config = crate::config::AppConfig::default();
-            config.server.public_base_url = "http://forge.test".to_string();
+            config.server.public_base_url = "http://pulse.test".to_string();
             config.paths.data_dir = root.join("data");
-            config.paths.database_path = root.join("cybex-forge.sqlite");
+            config.paths.database_path = root.join("cybex-pulse.sqlite");
             config.paths.boot_assets_dir = root.join("www");
             config.paths.static_dir = root.join("static");
             config.paths.tftp_dir = root.join("tftp");
@@ -3758,7 +3758,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "private_key_b64": STANDARD.encode(signing_key.to_bytes()),
                     "public_key_b64": STANDARD.encode(signing_key.verifying_key().to_bytes()),
-                    "device_id": "forge-runtime-test"
+                    "device_id": "pulse-runtime-test"
                 }))
                 .unwrap(),
             )
@@ -3805,7 +3805,7 @@ mod tests {
                 nixpkgs_revision: "c".repeat(40),
                 architecture: ARCHITECTURE.to_string(),
                 format: FORMAT.to_string(),
-                required_forge_protocol: REQUIRED_FORGE_PROTOCOL,
+                required_pulse_protocol: REQUIRED_PULSE_PROTOCOL,
                 url: format!(
                     "http://127.0.0.1:9/cybex-workstation-netboot-{runtime_version}-aaaaaaaaaaaa-{ARCHITECTURE}.tar.zst"
                 ),
@@ -4008,7 +4008,7 @@ mod tests {
             runtime_version: descriptor.runtime_version.clone(),
             architecture: descriptor.architecture.clone(),
             format: descriptor.format.clone(),
-            required_forge_protocol: descriptor.required_forge_protocol,
+            required_pulse_protocol: descriptor.required_pulse_protocol,
             manage_source_revision: descriptor.manage_source_revision.clone(),
             nixpkgs_revision: descriptor.nixpkgs_revision.clone(),
             source_date_epoch: 1,
@@ -4039,7 +4039,7 @@ mod tests {
             nixpkgs_revision: "c".repeat(40),
             architecture: ARCHITECTURE.to_string(),
             format: FORMAT.to_string(),
-            required_forge_protocol: REQUIRED_FORGE_PROTOCOL,
+            required_pulse_protocol: REQUIRED_PULSE_PROTOCOL,
             url: "https://releases.example.test/cybex-workstation-netboot-1.0.0-aaaaaaaaaaaa-x86_64-linux.tar.zst".to_string(),
             sha256: "d".repeat(64),
             size_bytes: 4,

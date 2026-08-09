@@ -16,11 +16,11 @@ import unittest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-TOOL = REPOSITORY / "tools" / "forge-release.py"
+TOOL = REPOSITORY / "tools" / "pulse-release.py"
 WEAK_PUBLIC_KEYS = REPOSITORY / "trust" / "ed25519-weak-public-keys.txt"
 
 
-class ForgeReleaseToolTests(unittest.TestCase):
+class PulseReleaseToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary.name)
@@ -32,10 +32,10 @@ class ForgeReleaseToolTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.private_key.chmod(0o600)
-        self.artifact = self.directory / "cybex-forge-x86_64-linux"
-        self.artifact.write_bytes(b"deterministic Forge artifact\0\xff\n")
+        self.artifact = self.directory / "cybex-pulse-x86_64-linux"
+        self.artifact.write_bytes(b"deterministic Pulse artifact\0\xff\n")
         self.template = self.directory / (
-            "cybex-forge-appliance-template-0.1.1-x86_64-linux.iso"
+            "cybex-pulse-appliance-template-0.1.1-x86_64-linux.iso"
         )
         self.personalization_offset = 4096
         media = bytearray(b"Cybex Ubuntu template\n" * 900)
@@ -71,7 +71,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
             "--artifact",
             str(self.artifact),
             "--artifact-url",
-            "https://releases.example.test/v0.1.1/cybex-forge-x86_64-linux",
+            "https://releases.example.test/v0.1.1/cybex-pulse-x86_64-linux",
             "--version",
             "0.1.1",
             "--private-key",
@@ -86,7 +86,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
             str(self.template),
             "--installer-iso-template-url",
             "https://releases.example.test/v0.1.1/"
-            "cybex-forge-appliance-template-0.1.1-x86_64-linux.iso",
+            "cybex-pulse-appliance-template-0.1.1-x86_64-linux.iso",
             "--installer-iso-template-personalization-offset",
             str(self.personalization_offset),
             "--provisioning-public-key",
@@ -110,13 +110,13 @@ class ForgeReleaseToolTests(unittest.TestCase):
 
     def network_package_arguments(self) -> tuple[list[str], Path]:
         snapshot = self.directory / (
-            "cybex-forge-appliance-packages-0.1.1-x86_64-linux.tar.zst"
+            "cybex-pulse-appliance-packages-0.1.1-x86_64-linux.tar.zst"
         )
         snapshot.write_bytes(b"deterministic package snapshot\0\xff\n")
         versions = {
-            "cybex-forge": "0.1.1",
-            "cybex-forge-bootstrap": "0.1.1",
-            "cybex-forge-appliance": "0.1.1",
+            "cybex-pulse": "0.1.1",
+            "cybex-pulse-bootstrap": "0.1.1",
+            "cybex-pulse-appliance": "0.1.1",
             "linux-generic": "6.17.0.1.1",
             "linux-firmware": "20260715.git123-0ubuntu1",
             "nix-bin": "2.30.1+dfsg-1",
@@ -125,7 +125,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
         metadata.write_text(
             json.dumps(
                 {
-                    "schema": "cybex.forge.appliance-package-snapshot.v1",
+                    "schema": "cybex.pulse.appliance-package-snapshot.v1",
                     "release_id": "0.1.1",
                     "ubuntu_snapshot_id": "20260804T000000Z",
                     "filename": snapshot.name,
@@ -175,11 +175,11 @@ class ForgeReleaseToolTests(unittest.TestCase):
                 "size_bytes": len(body),
             }
         manifest = {
-            "schema": "cybex.forge.workstation-netboot-manifest.v1",
+            "schema": "cybex.pulse.workstation-netboot-manifest.v1",
             "runtime_version": runtime_version,
             "architecture": "x86_64-linux",
             "format": "split-squashfs-v1",
-            "required_forge_protocol": 4,
+            "required_pulse_protocol": 4,
             "manage_source_revision": manage_revision,
             "nixpkgs_revision": nixpkgs_revision,
             "source_date_epoch": source_date_epoch,
@@ -251,7 +251,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
             "--manifest",
             str(manifest),
             "--manifest-url",
-            "https://releases.example.test/v0.1.1/cybex-forge-release.json",
+            "https://releases.example.test/v0.1.1/cybex-pulse-release.json",
             "--compatibility",
             str(self.compatibility),
         ]
@@ -283,50 +283,50 @@ class ForgeReleaseToolTests(unittest.TestCase):
         )
 
     def test_component_compatibility_is_semantic_not_byte_or_revision_equality(self) -> None:
-        forge = json.loads(self.compatibility.read_text(encoding="utf-8"))
+        pulse = json.loads(self.compatibility.read_text(encoding="utf-8"))
         manage = json.loads(self.compatibility.read_text(encoding="utf-8"))
-        forge["forge"]["maximum_manage_protocol"] = 5
+        pulse["pulse"]["maximum_manage_protocol"] = 5
         manage["protocol_version"] = 5
-        manage["manage"]["maximum_forge_protocol"] = 5
-        manage["forge"]["maximum_manage_protocol"] = 5
+        manage["manage"]["maximum_pulse_protocol"] = 5
+        manage["pulse"]["maximum_manage_protocol"] = 5
         manage["workstation_runtime"]["resolution_states"].append("future_resolution")
-        forge_path = self.directory / "forge-compatibility.json"
+        pulse_path = self.directory / "pulse-compatibility.json"
         manage_path = self.directory / "manage-compatibility.json"
-        self.write_canonical_json(forge_path, forge)
+        self.write_canonical_json(pulse_path, pulse)
         self.write_canonical_json(manage_path, manage)
 
         compatible = self.run_tool(
             "verify-component-compatibility",
-            "--forge-compatibility",
-            str(forge_path),
+            "--pulse-compatibility",
+            str(pulse_path),
             "--manage-compatibility",
             str(manage_path),
         )
         self.assertEqual(compatible.returncode, 0, compatible.stderr.decode())
-        self.assertIn(b"forge_protocol=4 manage_protocol=5", compatible.stdout)
+        self.assertIn(b"pulse_protocol=4 manage_protocol=5", compatible.stdout)
 
         manage["manage"] = {
-            "minimum_forge_protocol": 5,
-            "maximum_forge_protocol": 5,
+            "minimum_pulse_protocol": 5,
+            "maximum_pulse_protocol": 5,
         }
         self.write_canonical_json(manage_path, manage)
         rejected_protocol = self.run_tool(
             "verify-component-compatibility",
-            "--forge-compatibility",
-            str(forge_path),
+            "--pulse-compatibility",
+            str(pulse_path),
             "--manage-compatibility",
             str(manage_path),
         )
         self.assertEqual(rejected_protocol.returncode, 2)
-        self.assertIn(b"does not accept selected Forge protocol 4", rejected_protocol.stderr)
+        self.assertIn(b"does not accept selected Pulse protocol 4", rejected_protocol.stderr)
 
-        manage["manage"]["minimum_forge_protocol"] = 4
+        manage["manage"]["minimum_pulse_protocol"] = 4
         manage["workstation_runtime"]["compatibility_epoch"] += 1
         self.write_canonical_json(manage_path, manage)
         rejected_runtime = self.run_tool(
             "verify-component-compatibility",
-            "--forge-compatibility",
-            str(forge_path),
+            "--pulse-compatibility",
+            str(pulse_path),
             "--manage-compatibility",
             str(manage_path),
         )
@@ -429,7 +429,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
             set(asset),
             {
                 "schema",
-                "forge_release_version",
+                "pulse_release_version",
                 "release_manifest",
                 "compatibility",
                 "compatibility_sha256",
@@ -438,8 +438,8 @@ class ForgeReleaseToolTests(unittest.TestCase):
                 "signature",
             },
         )
-        self.assertEqual(asset["schema"], "cybex.forge.release-compatibility.v1")
-        self.assertEqual(asset["forge_release_version"], "0.1.1")
+        self.assertEqual(asset["schema"], "cybex.pulse.release-compatibility.v1")
+        self.assertEqual(asset["pulse_release_version"], "0.1.1")
         self.assertEqual(asset["compatibility"], contract)
         canonical_contract = (
             json.dumps(
@@ -455,14 +455,14 @@ class ForgeReleaseToolTests(unittest.TestCase):
             asset["release_manifest"],
             {
                 "url": "https://releases.example.test/v0.1.1/"
-                "cybex-forge-release.json",
+                "cybex-pulse-release.json",
                 "sha256": hashlib.sha256(original_manifest).hexdigest(),
             },
         )
         manifest = json.loads(original_manifest)
         self.assertNotIn("release_compatibility", manifest)
         self.assertEqual(
-            asset["artifacts"]["forge_binary"], manifest["artifact"]
+            asset["artifacts"]["pulse_binary"], manifest["artifact"]
         )
         self.assertEqual(
             asset["artifacts"]["appliance_iso_template"],
@@ -502,7 +502,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
         release_tool["_self_verify"](
             public_der,
             compatibility_signature,
-            b"CYBEX-FORGE-RELEASE-COMPATIBILITY-V1\n"
+            b"CYBEX-PULSE-RELEASE-COMPATIBILITY-V1\n"
             + canonical_unsigned_asset,
         )
         with self.assertRaises(release_tool["ReleaseError"]):
@@ -537,7 +537,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         asset = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(asset["artifacts"]["forge_binary"], manifest["artifact"])
+        self.assertEqual(asset["artifacts"]["pulse_binary"], manifest["artifact"])
         self.assertEqual(
             asset["artifacts"]["appliance_package_snapshot"],
             manifest["appliance_release_v1"]["cybex_repository_snapshot"],
@@ -635,7 +635,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
             output, manifest_path, command="verify-compatibility"
         )
         arguments[arguments.index("--manifest-url") + 1] = (
-            "https://releases.example.test/v0.1.2/cybex-forge-release.json"
+            "https://releases.example.test/v0.1.2/cybex-pulse-release.json"
         )
         rejected = self.run_tool(*arguments)
         self.assertEqual(rejected.returncode, 2)
@@ -697,7 +697,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
         def signed_version(version: str, output: Path) -> Path:
             payload = dict(previous_asset)
             payload.pop("signature")
-            payload["forge_release_version"] = version
+            payload["pulse_release_version"] = version
             message = release_tool["_release_compatibility_message"](payload)
             private_fd = os.open(self.private_key, os.O_RDONLY)
             try:
@@ -763,7 +763,7 @@ class ForgeReleaseToolTests(unittest.TestCase):
         workflow = (REPOSITORY / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("group: forge-release-publish", workflow)
+        self.assertIn("group: pulse-release-publish", workflow)
         predecessor_check = workflow.rfind("verify-successor")
         immutable_publish = workflow.rfind(
             'gh release edit "$GITHUB_REF_NAME" --draft=false'

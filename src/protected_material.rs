@@ -694,7 +694,7 @@ mod tests {
 
     use super::*;
 
-    const SENTINEL: &str = "CYBEX_FORGE_PROTECTED_SENTINEL_7f922a";
+    const SENTINEL: &str = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
     const PASSWORD_HASH: &str = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
 
     fn build_spec(generated_nix: &str, desktop_module_nix: &str, expected_state: Value) -> Value {

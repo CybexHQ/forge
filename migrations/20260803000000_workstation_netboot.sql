@@ -30,7 +30,7 @@ CREATE TABLE boot_profiles_v4 (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    profile_type TEXT NOT NULL CHECK (profile_type IN ('local_disk', 'forge_installer', 'custom_ipxe')),
+    profile_type TEXT NOT NULL CHECK (profile_type IN ('local_disk', 'pulse_installer', 'custom_ipxe')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
     one_time INTEGER NOT NULL DEFAULT 0 CHECK (one_time IN (0, 1)),
@@ -45,7 +45,7 @@ INSERT INTO boot_profiles_v4
      raw_script, created_at, updated_at, managed_profile_id)
 SELECT id, name, description,
        CASE WHEN profile_type = 'linux_installer' AND managed_profile_id IS NOT NULL
-            THEN 'forge_installer' ELSE profile_type END,
+            THEN 'pulse_installer' ELSE profile_type END,
        enabled, is_default, one_time, raw_script, created_at, updated_at,
        managed_profile_id
 FROM boot_profiles
@@ -93,7 +93,7 @@ CREATE TABLE workstation_netboot_bundles (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE forge_boot_sessions (
+CREATE TABLE pulse_boot_sessions (
     session_id TEXT PRIMARY KEY,
     nonce_sha256 TEXT NOT NULL UNIQUE,
     normalized_mac TEXT NOT NULL,
@@ -108,4 +108,4 @@ CREATE TABLE forge_boot_sessions (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_forge_boot_sessions_cleanup ON forge_boot_sessions(cleanup_after);
+CREATE INDEX idx_pulse_boot_sessions_cleanup ON pulse_boot_sessions(cleanup_after);

@@ -27,17 +27,17 @@ use crate::{
 };
 
 const CACHE_MUTATION_LOCK_FILENAME: &str = ".cybex-cache-mutation.lock";
-const CLOSURE_MANIFEST_SCHEMA: &str = "cybex.forge.closure-manifest.v1";
+const CLOSURE_MANIFEST_SCHEMA: &str = "cybex.pulse.closure-manifest.v1";
 const CLOSURE_MANIFEST_VALIDATION_LEVEL: &str = "compressed_file_hash";
 const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// Cross-process lease for the cache filesystem and its artifact inventory.
 ///
-/// A process-local mutex would still let an overlapping Forge process (for
+/// A process-local mutex would still let an overlapping Pulse process (for
 /// example during a service restart) sweep files that `nix copy` is publishing.
 /// Keep this descriptor open for the complete filesystem + SQLite mutation so
-/// all Forge processes agree on the same serialization boundary.
+/// all Pulse processes agree on the same serialization boundary.
 #[derive(Debug)]
 struct CacheMutationLock(fs::File);
 
@@ -311,7 +311,7 @@ pub async fn export_output(
     evaluated_derivation: Option<&str>,
 ) -> Result<CachedNixArtifact> {
     if !config.cache.enabled {
-        bail!("Forge Cache is disabled");
+        bail!("Pulse Cache is disabled");
     }
     let mutation_lock = acquire_cache_mutation_lock(config).await?;
     if db::protected_build_job_remediation_exists(pool, job.id).await? {
@@ -320,7 +320,7 @@ pub async fn export_output(
     crate::disk::ensure_headroom(
         &config.cache.root_dir,
         closure_size_bytes.max(0) as u64,
-        "Forge cache export",
+        "Pulse cache export",
     )?;
     let public_key = ensure_signing_key(config).await?;
     let cache_dir = config.cache.root_dir.clone();
@@ -377,7 +377,7 @@ pub async fn export_output(
             .to_string();
         let narinfo = verified.root_narinfo;
         let metadata = json!({
-            "cache_schema": "cybex.forge.cache.v1",
+            "cache_schema": "cybex.pulse.cache.v1",
             "public_key_fingerprint": public_key_fingerprint(&public_key),
             "nix_cache_info": cache_info,
             "narinfo": narinfo_name,
@@ -797,7 +797,7 @@ fn verify_narinfo_signature(narinfo: &ParsedNarInfo, public_key: &str) -> Result
             .is_ok()
     });
     if !verified {
-        bail!("NARInfo did not carry a valid signature from the active Forge cache key");
+        bail!("NARInfo did not carry a valid signature from the active Pulse cache key");
     }
     Ok(())
 }
@@ -806,17 +806,17 @@ fn parse_cache_public_key(public_key: &str) -> Result<(&str, VerifyingKey)> {
     let (key_name, encoded_key) = public_key
         .split_once(':')
         .filter(|(name, encoded)| !name.is_empty() && !encoded.is_empty())
-        .ok_or_else(|| anyhow!("Forge cache public key had an invalid shape"))?;
+        .ok_or_else(|| anyhow!("Pulse cache public key had an invalid shape"))?;
     let key_bytes = BASE64_STANDARD
         .decode(encoded_key)
-        .context("decode Forge cache public key")?;
+        .context("decode Pulse cache public key")?;
     let key_bytes: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| anyhow!("Forge cache public key was not 256-bit"))?;
+        .map_err(|_| anyhow!("Pulse cache public key was not 256-bit"))?;
     let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).context("parse Forge cache public key")?;
+        VerifyingKey::from_bytes(&key_bytes).context("parse Pulse cache public key")?;
     if verifying_key.is_weak() {
-        bail!("Forge cache public key must not be a weak Ed25519 key");
+        bail!("Pulse cache public key must not be a weak Ed25519 key");
     }
     Ok((key_name, verifying_key))
 }
@@ -1070,7 +1070,7 @@ pub async fn remediate_protected_build_jobs(
     }
     tracing::warn!(
         remediated_jobs = completed,
-        "withdrew legacy protected build roots and swept unreferenced members from the Forge static cache; /nix/store GC remains operator-managed"
+        "withdrew legacy protected build roots and swept unreferenced members from the Pulse static cache; /nix/store GC remains operator-managed"
     );
     Ok(completed)
 }
@@ -1240,7 +1240,7 @@ pub async fn try_enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Res
 async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
         tracing::warn!(
-            "cache.max_bytes is 0: Forge Cache retention is disabled and the cache root can grow without bound"
+            "cache.max_bytes is 0: Pulse Cache retention is disabled and the cache root can grow without bound"
         );
         return Ok(());
     }
@@ -1355,7 +1355,7 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
         tracing::warn!(
             total_size_bytes = total,
             max_size_bytes = config.cache.max_bytes,
-            "Forge Cache remains above max_bytes after evicting every eligible artifact"
+            "Pulse Cache remains above max_bytes after evicting every eligible artifact"
         );
     }
     Ok(())
@@ -1456,7 +1456,7 @@ async fn scrub_cache_artifact(
         artifact_type = %artifact.artifact_type,
         hash = %artifact.hash,
         reason = %verification_error,
-        "removing missing or corrupt Forge cache artifact for automatic repair"
+        "removing missing or corrupt Pulse cache artifact for automatic repair"
     );
     db::delete_cache_artifact(pool, artifact.id).await?;
     Ok(true)
@@ -2006,7 +2006,7 @@ fn narinfo_filename_for_store_path(store_path: &str) -> Result<String> {
 fn public_key_fingerprint(public_key: &str) -> String {
     // Cybex Manage validates this as the full 64-char sha256 hex of the
     // decoded ed25519 key material ("name:base64" -> sha256 of the decoded
-    // 32 bytes), and rejects the whole forge report when it differs.
+    // 32 bytes), and rejects the whole pulse report when it differs.
     public_key
         .split_once(':')
         .and_then(|(_, material)| BASE64_STANDARD.decode(material).ok())
@@ -2054,7 +2054,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-cache-{label}-{}-{nanos}",
+            "cybex-pulse-cache-{label}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -2361,7 +2361,7 @@ mod tests {
         );
         protected_material::validate_cache_metadata(&first.manifest).unwrap();
         let encoded = serde_json::to_string(&first.manifest).unwrap();
-        assert!(!encoded.contains("CYBEX_FORGE_PROTECTED_SENTINEL"));
+        assert!(!encoded.contains("CYBEX_PULSE_PROTECTED_SENTINEL"));
         assert!(!encoded.contains("$6$rounds="));
 
         // Reference ordering in NARInfo must not affect the manifest or its
@@ -2897,13 +2897,13 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         let public = ensure_signing_key_blocking_with_command(
             &private_key,
             &public_key,
-            "cybex-forge-cache",
+            "cybex-pulse-cache",
             &fake_nix_store,
         )
         .unwrap();
         release_writer.join().unwrap();
 
-        assert!(public.starts_with("cybex-forge-cache:"));
+        assert!(public.starts_with("cybex-pulse-cache:"));
         let fingerprint = public_key_fingerprint(&public);
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -2962,7 +2962,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         fs::write(&config.cache.private_key_path, "private").unwrap();
         fs::write(
             &config.cache.public_key_path,
-            "cybex-forge-cache:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            "cybex-pulse-cache:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         )
         .unwrap();
         fs::set_permissions(
@@ -2975,7 +2975,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
 
         assert_eq!(report.status, "ready");
         assert_eq!(report.total_size_bytes, 4136);
-        assert!(report.public_key.starts_with("cybex-forge-cache:"));
+        assert!(report.public_key.starts_with("cybex-pulse-cache:"));
         assert_eq!(report.public_key_fingerprint.len(), 64);
         assert_eq!(
             fs::metadata(&config.cache.private_key_path)
@@ -3076,7 +3076,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: source,
                     cache_metadata: None,
                 },
@@ -3161,7 +3161,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                 references: Some(json!([
                     "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-protected"
                 ])),
-                serving_url: Some("http://forge.example/cache/nar/protected.nar.xz".to_string()),
+                serving_url: Some("http://pulse.example/cache/nar/protected.nar.xz".to_string()),
                 source_build_job_id: Some("active-job".to_string()),
                 cache_metadata: None,
             },
@@ -3189,7 +3189,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                 references: Some(json!([
                     "/nix/store/cccccccccccccccccccccccccccccccc-unprotected"
                 ])),
-                serving_url: Some("http://forge.example/cache/nar/unprotected.nar.xz".to_string()),
+                serving_url: Some("http://pulse.example/cache/nar/unprotected.nar.xz".to_string()),
                 source_build_job_id: None,
                 cache_metadata: None,
             },
@@ -3306,7 +3306,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: Some(footprint as i64),
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: source,
                     cache_metadata: None,
                 },
@@ -3384,7 +3384,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://forge.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: None,
                     cache_metadata: None,
                 },
@@ -3488,12 +3488,12 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     compression: Some(root_narinfo.compression),
                     references: Some(json!(root_narinfo.references)),
                     serving_url: Some(format!(
-                        "http://forge.example/cache/{}",
+                        "http://pulse.example/cache/{}",
                         root_narinfo.store_path
                     )),
                     source_build_job_id: None,
                     cache_metadata: Some(json!({
-                        "cache_schema": "cybex.forge.cache.v1",
+                        "cache_schema": "cybex.pulse.cache.v1",
                         "public_key_fingerprint": public_key_fingerprint(&public_key),
                         "closure_manifest": verified.manifest,
                         "closure_manifest_sha256": verified.manifest_sha256,
@@ -3650,7 +3650,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         .unwrap();
 
         sqlx::query(
-            "UPDATE forge_build_jobs
+            "UPDATE pulse_build_jobs
              SET build_spec = ?, status = 'succeeded', output_path = ?, logs = ?, error = ?
              WHERE id = ?",
         )
@@ -3678,7 +3678,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         assert_eq!(ledger.3, "pending_purge");
         let scrubbed: (String, String, String, String, String) = sqlx::query_as(
             "SELECT build_spec, cache_metadata, status, logs, error
-             FROM forge_build_jobs WHERE id = ?",
+             FROM pulse_build_jobs WHERE id = ?",
         )
         .bind(job.id)
         .fetch_one(&pool)
@@ -3754,7 +3754,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         assert_eq!(purge_status.0, "purged");
         assert!(purge_status.1.is_some());
         let metadata: String =
-            sqlx::query_scalar("SELECT cache_metadata FROM forge_build_jobs WHERE id = ?")
+            sqlx::query_scalar("SELECT cache_metadata FROM pulse_build_jobs WHERE id = ?")
                 .bind(job.id)
                 .fetch_one(&pool)
                 .await

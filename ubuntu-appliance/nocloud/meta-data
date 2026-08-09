@@ -1,2 +1,2 @@
-instance-id: cybex-forge-provisioned-installer
-local-hostname: cybex-forge-installer
+instance-id: cybex-pulse-provisioned-installer
+local-hostname: cybex-pulse-installer

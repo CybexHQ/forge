@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, bail};
 use axum::serve as axum_serve;
 use clap::Parser;
-use cybex_forge::{
+use cybex_pulse::{
     AppState,
     config::{Cli, Command},
     db, router,
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         if effective_uid() != 0 {
             anyhow::bail!("appliance package verification must run as root");
         }
-        let packages = cybex_forge::appliance::verify_and_extract_stored_update()?;
+        let packages = cybex_pulse::appliance::verify_and_extract_stored_update()?;
         println!("{}", packages.display());
         return Ok(());
     }
@@ -34,12 +34,12 @@ async fn main() -> anyhow::Result<()> {
         if effective_uid() != 0 {
             anyhow::bail!("appliance network verification must run as root");
         }
-        let candidate = cybex_forge::appliance::verify_and_materialize_network_change()?;
+        let candidate = cybex_pulse::appliance::verify_and_materialize_network_change()?;
         println!("{}", candidate.display());
         return Ok(());
     }
 
-    let config = cybex_forge::config::AppConfig::load(&cli.config)
+    let config = cybex_pulse::config::AppConfig::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     if matches!(command, Command::ValidateApplianceConfig) {
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool)
         .await
         .context("database migration failed")?;
-    cybex_forge::cache::remediate_protected_build_jobs(&pool, &config)
+    cybex_pulse::cache::remediate_protected_build_jobs(&pool, &config)
         .await
         .context("protected build cache remediation failed")?;
 
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::SyncOnce => {
             let state = AppState::new(config, pool);
-            let outcome = cybex_forge::manage::sync_once(&state).await?;
+            let outcome = cybex_pulse::manage::sync_once(&state).await?;
             println!("{}", serde_json::to_string(&outcome)?);
             Ok(())
         }
@@ -98,14 +98,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn ensure_managed_command_is_not_root(
-    config: &cybex_forge::config::AppConfig,
+    config: &cybex_pulse::config::AppConfig,
     command: &Command,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if managed_command_requires_service_user(config, command) && effective_uid() == 0 {
             bail!(
-                "managed Cybex Forge stateful commands must not run as root; use systemctl for the service"
+                "managed Cybex Pulse stateful commands must not run as root; use systemctl for the service"
             );
         }
     }
@@ -114,7 +114,7 @@ fn ensure_managed_command_is_not_root(
 }
 
 fn managed_command_requires_service_user(
-    config: &cybex_forge::config::AppConfig,
+    config: &cybex_pulse::config::AppConfig,
     command: &Command,
 ) -> bool {
     config.manage.enabled
@@ -133,7 +133,7 @@ fn effective_uid() -> u32 {
 }
 
 async fn run_server(
-    config: cybex_forge::config::AppConfig,
+    config: cybex_pulse::config::AppConfig,
     pool: sqlx::SqlitePool,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config
@@ -142,22 +142,22 @@ async fn run_server(
         .parse()
         .with_context(|| format!("invalid listen address {}", config.server.listen_addr))?;
     let state = AppState::new(config, pool);
-    if let Err(err) = cybex_forge::cache::initialize(&state.config).await {
+    if let Err(err) = cybex_pulse::cache::initialize(&state.config).await {
         // Degraded, not fatal: exports re-run key setup and `nix copy`
         // rewrites nix-cache-info, so the cache can still heal later.
-        warn!(error = %err, "Forge Cache initialization failed; substituters will reject this cache until resolved");
+        warn!(error = %err, "Pulse Cache initialization failed; substituters will reject this cache until resolved");
     }
-    cybex_forge::build::spawn(state.clone());
-    cybex_forge::netboot::spawn_maintenance(state.clone());
+    cybex_pulse::build::spawn(state.clone());
+    cybex_pulse::netboot::spawn_maintenance(state.clone());
     if state.config.manage.enabled {
-        cybex_forge::manage::spawn(state.clone());
+        cybex_pulse::manage::spawn(state.clone());
     }
     let app = router(state);
 
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
-    info!(%listen_addr, "cybex-forge listening");
+    info!(%listen_addr, "cybex-pulse listening");
     spawn_systemd_watchdog();
 
     axum_serve(
@@ -218,7 +218,7 @@ async fn shutdown_signal() {
 
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("cybex_forge=info,tower_http=info"));
+        .unwrap_or_else(|_| EnvFilter::new("cybex_pulse=info,tower_http=info"));
     tracing_subscriber::registry()
         .with(env_filter)
         // Operational logs belong on stderr so one-shot commands can reserve
@@ -229,7 +229,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use cybex_forge::config::AppConfig;
+    use cybex_pulse::config::AppConfig;
 
     use super::{Command, managed_command_requires_service_user};
 

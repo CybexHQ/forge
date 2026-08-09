@@ -62,7 +62,7 @@ test "${#provisioning_keys[@]}" -ge 1
 [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
 test -f "$bootstrap_binary" && test -x "$bootstrap_binary"
 test -f "$lock_file"
-python3 -B "$repository_root/tools/forge-release.py" validate-public-key \
+python3 -B "$repository_root/tools/pulse-release.py" validate-public-key \
   --trusted-public-key "$release_public_key" >/dev/null
 
 for command_name in curl gpgv jq sha256sum stat xorriso sed cmp awk; do
@@ -82,7 +82,7 @@ for index in "${!sorted_keys[@]}"; do
     echo "error: provisioning public keys must be supplied in sorted order" >&2
     exit 1
   }
-  python3 -B "$repository_root/tools/forge-release.py" validate-public-key \
+  python3 -B "$repository_root/tools/pulse-release.py" validate-public-key \
     --trusted-public-key "${sorted_keys[$index]}" >/dev/null
 done
 
@@ -100,7 +100,7 @@ base_sha256="$(jq -er '.sha256' "$lock_file")"
 base_size="$(jq -er '.size_bytes' "$lock_file")"
 checksums_url="$(jq -er '.checksums_url' "$lock_file")"
 signature_url="$(jq -er '.checksums_signature_url' "$lock_file")"
-test "$(jq -er '.schema' "$lock_file")" = "cybex.forge.ubuntu-base-iso.v1"
+test "$(jq -er '.schema' "$lock_file")" = "cybex.pulse.ubuntu-base-iso.v1"
 test "$(jq -er '.version' "$lock_file")" = "26.04"
 test "$(jq -er '.architecture' "$lock_file")" = "amd64"
 [[ "$base_sha256" =~ ^[0-9a-f]{64}$ ]]
@@ -109,22 +109,26 @@ test "$(jq -er '.architecture' "$lock_file")" = "amd64"
 base_iso="$cache_dir/$base_filename"
 checksums="$cache_dir/SHA256SUMS"
 checksums_signature="$cache_dir/SHA256SUMS.gpg"
+ubuntu_keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+test -f "$ubuntu_keyring" || {
+  echo "error: ubuntu-keyring is required to authenticate the Canonical ISO" >&2
+  exit 1
+}
 if [[ ! -f "$base_iso" ]] \
   || [[ "$(stat -c '%s' "$base_iso")" != "$base_size" ]] \
   || [[ "$(sha256sum "$base_iso" | awk '{print $1}')" != "$base_sha256" ]]; then
   curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$base_iso.part" "$base_url"
   mv -- "$base_iso.part" "$base_iso"
 fi
-curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums.part" "$checksums_url"
-mv -- "$checksums.part" "$checksums"
-curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums_signature.part" "$signature_url"
-mv -- "$checksums_signature.part" "$checksums_signature"
-
-ubuntu_keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
-test -f "$ubuntu_keyring" || {
-  echo "error: ubuntu-keyring is required to authenticate the Canonical ISO" >&2
-  exit 1
-}
+if [[ ! -s "$checksums" ]] \
+  || [[ ! -s "$checksums_signature" ]] \
+  || ! gpgv --keyring "$ubuntu_keyring" "$checksums_signature" "$checksums" >/dev/null 2>&1 \
+  || ! grep -Fx "$base_sha256 *$base_filename" "$checksums" >/dev/null; then
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums.part" "$checksums_url"
+  mv -- "$checksums.part" "$checksums"
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --output "$checksums_signature.part" "$signature_url"
+  mv -- "$checksums_signature.part" "$checksums_signature"
+fi
 gpgv --keyring "$ubuntu_keyring" "$checksums_signature" "$checksums"
 grep -Fx "$base_sha256 *$base_filename" "$checksums" >/dev/null
 test "$(sha256sum "$base_iso" | awk '{print $1}')" = "$base_sha256"
@@ -171,7 +175,7 @@ test ! -e "$iso_tree/pool" && test ! -e "$iso_tree/dists"
 mkdir -p -- "$iso_tree/nocloud" "$iso_tree/cybex/bootstrap"
 install -m 0644 "$repository_root/ubuntu-appliance/nocloud/user-data" "$iso_tree/nocloud/user-data"
 install -m 0644 "$repository_root/ubuntu-appliance/nocloud/meta-data" "$iso_tree/nocloud/meta-data"
-install -m 0755 "$bootstrap_binary" "$iso_tree/cybex/bootstrap/cybex-forge-bootstrap"
+install -m 0755 "$bootstrap_binary" "$iso_tree/cybex/bootstrap/cybex-pulse-bootstrap"
 printf '%s\n' "${provisioning_keys[@]}" > "$iso_tree/cybex/provisioning-public-keys"
 printf '%s\n' "$release_public_key" > "$iso_tree/cybex/release-public-key"
 chmod 0644 "$iso_tree/cybex/provisioning-public-keys" "$iso_tree/cybex/release-public-key"
@@ -189,7 +193,7 @@ find "$iso_tree" -type f -iname '*.efi' -print0 \
   | xargs -0 -r sha256sum > "$work_dir/efi-after.sha256"
 cmp "$work_dir/efi-before.sha256" "$work_dir/efi-after.sha256"
 
-output_iso="$output_dir/cybex-forge-appliance-template-$version-x86_64-linux.iso"
+output_iso="$output_dir/cybex-pulse-appliance-template-$version-x86_64-linux.iso"
 test ! -e "$output_iso" || {
   echo "error: refusing to overwrite existing release candidate $output_iso" >&2
   exit 1
@@ -237,9 +241,9 @@ test "$placeholder_sha256" = "$expected_placeholder_sha256"
 template_sha256="$(sha256sum "$output_iso" | awk '{print $1}')"
 template_size="$(stat -c '%s' "$output_iso")"
 
-metadata="$output_dir/cybex-forge-appliance-template-$version-x86_64-linux.json"
+metadata="$output_dir/cybex-pulse-appliance-template-$version-x86_64-linux.json"
 jq -n \
-  --arg schema 'cybex.forge.installer-template-build.v1' \
+  --arg schema 'cybex.pulse.installer-template-build.v1' \
   --arg version "$version" \
   --arg package_delivery 'network-snapshot-v1' \
   --arg template_sha256 "$template_sha256" \
@@ -251,5 +255,5 @@ jq -n \
   --argjson provisioning_public_keys "$(printf '%s\n' "${provisioning_keys[@]}" | jq -R . | jq -s .)" \
   '{schema:$schema,version:$version,architecture:"x86_64-linux",base_os:"ubuntu",base_os_version:"26.04",package_delivery:$package_delivery,size_bytes:$size_bytes,template_sha256:$template_sha256,personalization_offset:$personalization_offset,personalization_size:$personalization_size,placeholder_sha256:$placeholder_sha256,ubuntu_snapshot_id:$ubuntu_snapshot_id,provisioning_public_keys:$provisioning_public_keys}' \
   > "$metadata"
-echo "built provisionable Ubuntu Forge ISO template: $output_iso"
+echo "built provisionable Ubuntu Pulse ISO template: $output_iso"
 echo "personalization_offset=$personalization_offset"

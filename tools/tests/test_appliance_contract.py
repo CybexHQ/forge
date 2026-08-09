@@ -15,8 +15,8 @@ FIRST_BOOT = (
     / "rootfs"
     / "usr"
     / "lib"
-    / "cybex-forge"
-    / "cybex-forge-first-boot"
+    / "cybex-pulse"
+    / "cybex-pulse-first-boot"
 )
 SERVICE = (
     REPOSITORY
@@ -25,7 +25,7 @@ SERVICE = (
     / "etc"
     / "systemd"
     / "system"
-    / "cybex-forge.service"
+    / "cybex-pulse.service"
 )
 QUALIFICATION_LIFECYCLE = (
     REPOSITORY / "ubuntu-appliance" / "qualification" / "run-lifecycle.sh"
@@ -36,8 +36,8 @@ NETWORK_CHANGE = (
     / "rootfs"
     / "usr"
     / "lib"
-    / "cybex-forge"
-    / "cybex-forge-network-change"
+    / "cybex-pulse"
+    / "cybex-pulse-network-change"
 )
 NETPLAN_APPLY = (
     REPOSITORY
@@ -45,8 +45,8 @@ NETPLAN_APPLY = (
     / "rootfs"
     / "usr"
     / "lib"
-    / "cybex-forge"
-    / "cybex-forge-netplan-apply"
+    / "cybex-pulse"
+    / "cybex-pulse-netplan-apply"
 )
 BUILD_TEMPLATE = REPOSITORY / "ubuntu-appliance" / "build-template.sh"
 BUILD_PACKAGE_SNAPSHOT = (
@@ -65,7 +65,7 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
     def test_qualification_package_server_exposes_only_the_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            snapshot = directory / "cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst"
+            snapshot = directory / "cybex-pulse-appliance-packages-1.2.3-x86_64-linux.tar.zst"
             snapshot.write_bytes(b"exact unpublished qualification snapshot\0\xff")
             port_file = directory / "port"
             server = subprocess.Popen(
@@ -128,7 +128,7 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
 
         snapshot = BUILD_PACKAGE_SNAPSHOT.read_text(encoding="utf-8")
         self.assertIn("build-offline-repo.sh", snapshot)
-        self.assertIn("cybex.forge.appliance-package-snapshot.v1", snapshot)
+        self.assertIn("cybex.pulse.appliance-package-snapshot.v1", snapshot)
 
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         snapshot_build = workflow.index("build-package-snapshot.sh")
@@ -148,22 +148,22 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
     def test_service_can_read_config_only_after_first_boot_succeeds(self) -> None:
         script = FIRST_BOOT.read_text(encoding="utf-8")
         self.assertIn(
-            "chown root:cybex-forge /etc/cybex-forge/config.toml\n"
-            "chmod 0640 /etc/cybex-forge/config.toml\n",
+            "chown root:cybex-pulse /etc/cybex-pulse/config.toml\n"
+            "chmod 0640 /etc/cybex-pulse/config.toml\n",
             script,
         )
 
         service = SERVICE.read_text(encoding="utf-8")
-        self.assertIn("Requires=cybex-forge-first-boot.service\n", service)
+        self.assertIn("Requires=cybex-pulse-first-boot.service\n", service)
         self.assertIn("After=network-online.target nix-daemon.service "
-                      "cybex-forge-first-boot.service\n", service)
+                      "cybex-pulse-first-boot.service\n", service)
 
     def test_first_boot_does_not_wait_for_units_ordered_after_it(self) -> None:
         script = FIRST_BOOT.read_text(encoding="utf-8")
         self.assertNotIn("systemctl enable --now", script)
         self.assertIn(
             "systemctl enable nix-daemon nginx tftpd-hpa "
-            "cybex-forge-firewall ssh\n",
+            "cybex-pulse-firewall ssh\n",
             script,
         )
 
@@ -180,13 +180,13 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
         self.assertIn("cold_restart_deadline=$((SECONDS + 300))\n", script)
         self.assertIn("-m 32768", script)
 
-    def test_root_network_helper_shares_handshake_files_with_forge(self) -> None:
+    def test_root_network_helper_shares_handshake_files_with_pulse(self) -> None:
         change_script = NETWORK_CHANGE.read_text(encoding="utf-8")
-        self.assertIn('chown root:cybex-forge "$status.tmp"\n', change_script)
+        self.assertIn('chown root:cybex-pulse "$status.tmp"\n', change_script)
         self.assertIn('chmod 0640 "$status.tmp"\n', change_script)
 
         apply_script = NETPLAN_APPLY.read_text(encoding="utf-8")
-        self.assertIn('chown root:cybex-forge "$pending"\n', apply_script)
+        self.assertIn('chown root:cybex-pulse "$pending"\n', apply_script)
         self.assertIn('chmod 0640 "$pending"\n', apply_script)
 
 

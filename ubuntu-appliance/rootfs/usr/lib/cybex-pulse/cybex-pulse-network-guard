@@ -2,10 +2,10 @@
 set -Eeuo pipefail
 umask 077
 
-state_dir=/var/lib/cybex-forge/state
+state_dir=/var/lib/cybex-pulse/state
 approved="$state_dir/netplan-approved.json"
 fallback="$state_dir/netplan-dhcp-fallback.json"
-active=/etc/netplan/90-cybex-forge.yaml
+active=/etc/netplan/90-cybex-pulse.yaml
 plan="$state_dir/install-plan.json"
 test -s "$approved" && test -s "$fallback" && test -s "$plan"
 

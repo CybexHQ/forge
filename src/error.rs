@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn internal_error_responses_are_generic() {
-        let err = AppError::Config("database_path = /var/lib/cybex-forge/private".to_string());
+        let err = AppError::Config("database_path = /var/lib/cybex-pulse/private".to_string());
 
         assert_eq!(err.code(), "configuration_error");
         assert_eq!(err.response_message(), "internal server error");

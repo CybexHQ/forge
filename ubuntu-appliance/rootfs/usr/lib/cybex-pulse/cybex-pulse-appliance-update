@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-state_dir=/var/lib/cybex-forge/state
+state_dir=/var/lib/cybex-pulse/state
 request="$state_dir/appliance-update-request.json"
 status="$state_dir/appliance-update-status.json"
 lock="$state_dir/appliance-update.lock"
@@ -80,10 +80,10 @@ trap fail_update ERR
 
 write_status preparing preflight 10
 test "$(findmnt -n -o FSTYPE /)" = btrfs
-test "$(jq -er '.schema' "$request")" = cybex.forge.appliance-update-request.v1
-test "$(jq -er '.release.schema' "$request")" = cybex.forge.appliance-release.v1
+test "$(jq -er '.schema' "$request")" = cybex.pulse.appliance-update-request.v1
+test "$(jq -er '.release.schema' "$request")" = cybex.pulse.appliance-release.v1
 test "$(jq -er '.release.rollback_compatible' "$request")" = true
-test ! -e /var/lib/cybex-forge/state/maintenance-lease
+test ! -e /var/lib/cybex-pulse/state/maintenance-lease
 
 timezone="$(jq -er '.maintenance_window.timezone' "$state_dir/install-plan.json")"
 weekday="$(jq -er '.maintenance_window.weekday' "$state_dir/install-plan.json")"
@@ -130,7 +130,7 @@ test ! -e "$candidate_path"
 # exact archive digest and size, safe archive paths, checksum coverage, and
 # every signed required package version.
 failure_stage=verifying
-packages="$(/usr/bin/cybex-forge verify-appliance-update)"
+packages="$(/usr/bin/cybex-pulse verify-appliance-update)"
 test "$packages" = "$state_dir/appliance-updates/$target_release/packages"
 test -d "$packages"
 
@@ -150,7 +150,7 @@ kernel="$(find "$candidate_path/boot" -maxdepth 1 -type f -name 'vmlinuz-*' -pri
   | LC_ALL=C sort -V | tail -n 1)"
 test -s "$kernel"
 sbverify --list "$kernel" >/dev/null
-for unit in cybex-forge nginx tftpd-hpa nix-daemon; do
+for unit in cybex-pulse nginx tftpd-hpa nix-daemon; do
   test -f "$candidate_path/etc/systemd/system/$unit.service" \
     || test -f "$candidate_path/lib/systemd/system/$unit.service" \
     || test -f "$candidate_path/usr/lib/systemd/system/$unit.service"
@@ -160,7 +160,7 @@ cleanup_mounts
 
 printf '%s\n' "$candidate" > "$state_dir/pending-root-generation"
 update-grub
-grub-reboot "cybex-forge-generation-$candidate"
+grub-reboot "cybex-pulse-generation-$candidate"
 write_status rebooting reboot_pending 80 "$candidate"
 trap - ERR
 systemctl reboot

@@ -1,14 +1,14 @@
 [server]
 listen_addr = "127.0.0.1:8080"
-public_base_url = "http://CYBEX_FORGE_IP"
+public_base_url = "http://CYBEX_PULSE_IP"
 
 [paths]
-data_dir = "/var/lib/cybex-forge"
-database_path = "/var/lib/cybex-forge/cybex-forge.sqlite"
-boot_assets_dir = "/srv/cybex-forge/www"
-iso_dir = "/srv/cybex-forge/www/isos"
-static_dir = "/srv/cybex-forge/www/assets"
-tftp_dir = "/srv/cybex-forge/tftp"
+data_dir = "/var/lib/cybex-pulse"
+database_path = "/var/lib/cybex-pulse/cybex-pulse.sqlite"
+boot_assets_dir = "/srv/cybex-pulse/www"
+iso_dir = "/srv/cybex-pulse/www/isos"
+static_dir = "/srv/cybex-pulse/www/assets"
+tftp_dir = "/srv/cybex-pulse/tftp"
 
 [auth]
 admin_token = "replace-with-a-long-random-token"
@@ -29,8 +29,8 @@ cancel_grace_seconds = 10
 max_log_bytes = 65536
 max_artifact_size_bytes = 21474836480
 allowed_systems = ["x86_64-linux"]
-work_dir = "/var/lib/cybex-forge/build"
-output_dir = "/var/lib/cybex-forge/build-outputs"
+work_dir = "/var/lib/cybex-pulse/build"
+output_dir = "/var/lib/cybex-pulse/build-outputs"
 nix_binary = "/nix/var/nix/profiles/default/bin/nix"
 manage_source_url_template = "github:CybexHQ/manage/{revision}"
 
@@ -46,10 +46,10 @@ manage_source_url_template = "github:CybexHQ/manage/{revision}"
 
 [cache]
 enabled = true
-root_dir = "/srv/cybex-forge/www/cache"
-signing_key_name = "cybex-forge-cache"
-private_key_path = "/var/lib/cybex-forge/cache/cache-priv-key.pem"
-public_key_path = "/var/lib/cybex-forge/cache/cache-pub-key.pem"
+root_dir = "/srv/cybex-pulse/www/cache"
+signing_key_name = "cybex-pulse-cache"
+private_key_path = "/var/lib/cybex-pulse/cache/cache-priv-key.pem"
+public_key_path = "/var/lib/cybex-pulse/cache/cache-pub-key.pem"
 max_bytes = 68719476736
 retain_recent_builds = 50
 
@@ -61,6 +61,6 @@ trusted_public_key = ""
 enabled = false
 api_url = "https://manage.example.com"
 organization_slug = "default"
-state_path = "/var/lib/cybex-forge/state/manage-state.json"
+state_path = "/var/lib/cybex-pulse/state/manage-state.json"
 sync_interval_seconds = 30
 http_timeout_seconds = 30

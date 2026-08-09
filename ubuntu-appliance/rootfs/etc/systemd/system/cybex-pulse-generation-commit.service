@@ -1,0 +1,14 @@
+[Unit]
+Description=Commit a healthy Cybex Pulse root generation
+After=network-online.target cybex-pulse.service nginx.service tftpd-hpa.service nix-daemon.service
+Wants=network-online.target cybex-pulse.service nginx.service tftpd-hpa.service nix-daemon.service
+ConditionPathExists=/var/lib/cybex-pulse/state/pending-root-generation
+ConditionPathExists=/var/lib/cybex-pulse/state/appliance-update-request.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-pulse/cybex-pulse-generation-commit
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-state_dir=/var/lib/cybex-forge/state
+state_dir=/var/lib/cybex-pulse/state
 pending_file="$state_dir/pending-root-generation"
 request="$state_dir/appliance-update-request.json"
 status="$state_dir/appliance-update-status.json"
@@ -58,7 +58,7 @@ rollback() {
 }
 trap rollback ERR
 
-for unit in cybex-forge nginx tftpd-hpa nix-daemon; do
+for unit in cybex-pulse nginx tftpd-hpa nix-daemon; do
   systemctl is-active --quiet "$unit"
 done
 curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8080/healthz >/dev/null
@@ -68,10 +68,10 @@ sbverify --list "$(readlink -f /boot/vmlinuz)" >/dev/null
 nix --version >/dev/null
 
 prune_root_generations
-grub-set-default "cybex-forge-generation-$pending"
+grub-set-default "cybex-pulse-generation-$pending"
 jq --arg generation "$pending" \
-  --arg release_id "$(jq -er '.release_id' /usr/share/cybex-forge/appliance-release.json)" \
-  --arg ubuntu_snapshot_id "$(jq -er '.ubuntu_snapshot_id' /usr/share/cybex-forge/appliance-release.json)" \
+  --arg release_id "$(jq -er '.release_id' /usr/share/cybex-pulse/appliance-release.json)" \
+  --arg ubuntu_snapshot_id "$(jq -er '.ubuntu_snapshot_id' /usr/share/cybex-pulse/appliance-release.json)" \
   '.root_generation=$generation | .appliance_release=$release_id |
    .ubuntu_snapshot_id=$ubuntu_snapshot_id' \
   "$state_dir/appliance-release.json" > "$state_dir/appliance-release.json.tmp"

@@ -157,7 +157,7 @@ pub async fn boot_kexec(
         .ok_or(AppError::NotFound)?;
     let profile_id = device.one_time_profile_id.ok_or(AppError::NotFound)?;
     let profile = db::get_profile(&state.db, profile_id).await?;
-    if !profile.enabled || profile.profile_type != BootProfileType::ForgeInstaller {
+    if !profile.enabled || profile.profile_type != BootProfileType::PulseInstaller {
         return Err(AppError::NotFound);
     }
     let launch = create_installer_launch(&state, &profile, &device.mac, Some(&device)).await?;
@@ -273,12 +273,12 @@ async fn render_selected_profile(
     mac: Option<&str>,
     device: Option<&Device>,
 ) -> AppResult<String> {
-    if profile.profile_type != BootProfileType::ForgeInstaller {
+    if profile.profile_type != BootProfileType::PulseInstaller {
         let runtime = state.runtime_settings();
         return boot_logic::render_profile_script(profile, &runtime.public_base_url);
     }
     let mac = mac.ok_or_else(|| {
-        AppError::Validation("a normalized MAC is required for Forge installer boot".to_string())
+        AppError::Validation("a normalized MAC is required for Pulse installer boot".to_string())
     })?;
     let launch = create_installer_launch(state, profile, mac, device).await?;
     Ok(crate::netboot::render_ipxe_launch(&launch))
@@ -291,7 +291,7 @@ async fn create_installer_launch(
     device: Option<&Device>,
 ) -> AppResult<crate::netboot::BootSessionLaunch> {
     let profile_id = profile.managed_profile_id.as_deref().ok_or_else(|| {
-        AppError::Config("Forge installer profile has no managed identity".to_string())
+        AppError::Config("Pulse installer profile has no managed identity".to_string())
     })?;
     let binding: Option<(Option<String>, Option<String>)> = if let Some(device) = device {
         sqlx::query_as("SELECT managed_device_id, reinstall_request_id FROM devices WHERE id = ?")
@@ -309,7 +309,7 @@ async fn create_installer_launch(
         binding.as_ref().and_then(|value| value.1.as_deref()),
     )
     .await
-    .map_err(|_| AppError::Config("could not create signed Forge boot session".to_string()))
+    .map_err(|_| AppError::Config("could not create signed Pulse boot session".to_string()))
 }
 
 fn normalized_optional_mac(mac: Option<String>) -> AppResult<Option<String>> {

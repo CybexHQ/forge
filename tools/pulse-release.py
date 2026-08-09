@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build deterministic, signed Cybex Forge release manifests.
+"""Build deterministic, signed Cybex Pulse release manifests.
 
 The private Ed25519 key is opened without following symlinks and is passed to
 OpenSSL through an inherited file descriptor. Its bytes and path are never
@@ -25,32 +25,32 @@ from typing import Any, NoReturn, Sequence
 from urllib.parse import urlsplit
 
 
-SCHEMA = "cybex.forge.release.v1"
-RELEASE_COMPATIBILITY_SCHEMA = "cybex.forge.release-compatibility.v1"
+SCHEMA = "cybex.pulse.release.v1"
+RELEASE_COMPATIBILITY_SCHEMA = "cybex.pulse.release-compatibility.v1"
 RELEASE_COMPATIBILITY_SIGNATURE_DOMAIN = (
-    "CYBEX-FORGE-RELEASE-COMPATIBILITY-V1"
+    "CYBEX-PULSE-RELEASE-COMPATIBILITY-V1"
 )
 COMPONENT_COMPATIBILITY_SCHEMA = "cybex.component-compatibility.v1"
-RELEASE_MANIFEST_FILENAME = "cybex-forge-release.json"
-RELEASE_COMPATIBILITY_FILENAME = "cybex-forge-release-compatibility.json"
+RELEASE_MANIFEST_FILENAME = "cybex-pulse-release.json"
+RELEASE_COMPATIBILITY_FILENAME = "cybex-pulse-release-compatibility.json"
 INSTALLER_ISO_ARCHITECTURE = "x86_64-linux"
 INSTALLER_ISO_MAX_BYTES = 16 * 1024 * 1024 * 1024
 INSTALLER_ISO_TEMPLATE_SIGNATURE_DOMAIN = (
-    "CYBEX-FORGE-INSTALLER-ISO-TEMPLATE-V2"
+    "CYBEX-PULSE-INSTALLER-ISO-TEMPLATE-V2"
 )
 INSTALLER_ISO_TEMPLATE_BASE_OS = "ubuntu"
 INSTALLER_ISO_TEMPLATE_BASE_OS_VERSION = "26.04"
 INSTALLER_ISO_TEMPLATE_PERSONALIZATION_SIZE = 8192
 INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY = "network-snapshot-v1"
 APPLIANCE_PACKAGE_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024 * 1024
-APPLIANCE_RELEASE_SIGNATURE_DOMAIN = "CYBEX-FORGE-APPLIANCE-RELEASE-V1"
-APPLIANCE_RELEASE_SCHEMA = "cybex.forge.appliance-release.v1"
-WORKSTATION_NETBOOT_SIGNATURE_DOMAIN = "CYBEX-FORGE-WORKSTATION-NETBOOT-V1"
-WORKSTATION_NETBOOT_SCHEMA = "cybex.forge.workstation-netboot.v1"
-WORKSTATION_NETBOOT_MANIFEST_SCHEMA = "cybex.forge.workstation-netboot-manifest.v1"
+APPLIANCE_RELEASE_SIGNATURE_DOMAIN = "CYBEX-PULSE-APPLIANCE-RELEASE-V1"
+APPLIANCE_RELEASE_SCHEMA = "cybex.pulse.appliance-release.v1"
+WORKSTATION_NETBOOT_SIGNATURE_DOMAIN = "CYBEX-PULSE-WORKSTATION-NETBOOT-V1"
+WORKSTATION_NETBOOT_SCHEMA = "cybex.pulse.workstation-netboot.v1"
+WORKSTATION_NETBOOT_MANIFEST_SCHEMA = "cybex.pulse.workstation-netboot-manifest.v1"
 WORKSTATION_NETBOOT_ARCHITECTURE = "x86_64-linux"
 WORKSTATION_NETBOOT_FORMAT = "split-squashfs-v1"
-WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL = 4
+WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL = 4
 WORKSTATION_NETBOOT_MAX_BYTES = 8 * 1024 * 1024 * 1024
 WORKSTATION_NETBOOT_COMPONENTS = (
     "bzImage",
@@ -188,7 +188,7 @@ def _public_der(private_fd: int) -> bytes:
 
 def _sign(private_fd: int, message: bytes) -> bytes:
     os.lseek(private_fd, 0, os.SEEK_SET)
-    with tempfile.TemporaryFile(prefix="cybex-forge-release-message-") as message_file:
+    with tempfile.TemporaryFile(prefix="cybex-pulse-release-message-") as message_file:
         message_file.write(message)
         message_file.flush()
         message_file.seek(0)
@@ -203,7 +203,7 @@ def _sign(private_fd: int, message: bytes) -> bytes:
                 _private_fd_path(message_file.fileno()),
             ],
             pass_fds=[private_fd, message_file.fileno()],
-            action="sign the Forge release manifest",
+            action="sign the Pulse release manifest",
         )
     if len(signature) != 64:
         _fail("OpenSSL returned an invalid Ed25519 signature")
@@ -211,7 +211,7 @@ def _sign(private_fd: int, message: bytes) -> bytes:
 
 
 def _self_verify(public_der: bytes, signature: bytes, message: bytes) -> None:
-    with tempfile.TemporaryDirectory(prefix="cybex-forge-release-verify-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cybex-pulse-release-verify-") as directory:
         directory_path = Path(directory)
         public_path = directory_path / "public.der"
         signature_path = directory_path / "signature.bin"
@@ -237,7 +237,7 @@ def _self_verify(public_der: bytes, signature: bytes, message: bytes) -> None:
                 "-in",
                 str(message_path),
             ],
-            action="self-verify the Forge release signature",
+            action="self-verify the Pulse release signature",
         )
 
 
@@ -571,7 +571,7 @@ def _installer_iso_template_inputs(
             "provisioning public key must be supplied together"
         )
     expected_name = (
-        f"cybex-forge-appliance-template-{version}-{INSTALLER_ISO_ARCHITECTURE}.iso"
+        f"cybex-pulse-appliance-template-{version}-{INSTALLER_ISO_ARCHITECTURE}.iso"
     )
     path = Path(path_value)
     if path.name != expected_name:
@@ -658,7 +658,7 @@ def _appliance_release_inputs(
         return None
     bundle = Path(arguments.appliance_package_snapshot)
     metadata_path = Path(arguments.appliance_package_snapshot_metadata)
-    expected_name = f"cybex-forge-appliance-packages-{version}-x86_64-linux.tar.zst"
+    expected_name = f"cybex-pulse-appliance-packages-{version}-x86_64-linux.tar.zst"
     if bundle.name != expected_name:
         _fail(f"appliance package snapshot must be named {expected_name}")
     url = _validate_url(
@@ -690,7 +690,7 @@ def _appliance_release_inputs(
         "appliance package snapshot metadata",
     )
     if (
-        metadata["schema"] != "cybex.forge.appliance-package-snapshot.v1"
+        metadata["schema"] != "cybex.pulse.appliance-package-snapshot.v1"
         or metadata["release_id"] != version
         or metadata["filename"] != expected_name
         or not isinstance(metadata["ubuntu_snapshot_id"], str)
@@ -709,9 +709,9 @@ def _appliance_release_inputs(
         _fail("appliance package snapshot metadata does not match the bundle")
     versions = metadata["required_package_versions"]
     required_names = {
-        "cybex-forge",
-        "cybex-forge-bootstrap",
-        "cybex-forge-appliance",
+        "cybex-pulse",
+        "cybex-pulse-bootstrap",
+        "cybex-pulse-appliance",
         "linux-generic",
         "linux-firmware",
         "nix-bin",
@@ -766,7 +766,7 @@ def _workstation_netboot_message(descriptor: dict[str, Any]) -> bytes:
         f"{descriptor['nixpkgs_revision']}\n"
         f"{descriptor['architecture']}\n"
         f"{descriptor['format']}\n"
-        f"{descriptor['required_forge_protocol']}\n"
+        f"{descriptor['required_pulse_protocol']}\n"
         f"{components['bzImage']['size_bytes']}\n"
         f"{components['bzImage']['sha256']}\n"
         f"{components['initrd']['size_bytes']}\n"
@@ -861,7 +861,7 @@ def _inspect_workstation_netboot(
             "runtime_version",
             "architecture",
             "format",
-            "required_forge_protocol",
+            "required_pulse_protocol",
             "manage_source_revision",
             "nixpkgs_revision",
             "source_date_epoch",
@@ -877,7 +877,7 @@ def _inspect_workstation_netboot(
         "runtime_version": runtime_version,
         "architecture": WORKSTATION_NETBOOT_ARCHITECTURE,
         "format": WORKSTATION_NETBOOT_FORMAT,
-        "required_forge_protocol": WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL,
+        "required_pulse_protocol": WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL,
         "manage_source_revision": manage_revision,
         "nixpkgs_revision": nixpkgs_revision,
     }
@@ -947,7 +947,7 @@ def _inspect_workstation_netboot(
         "nixpkgs_revision": nixpkgs_revision,
         "architecture": WORKSTATION_NETBOOT_ARCHITECTURE,
         "format": WORKSTATION_NETBOOT_FORMAT,
-        "required_forge_protocol": WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL,
+        "required_pulse_protocol": WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL,
         "url": url,
         "sha256": bundle_sha256,
         "size_bytes": bundle_size,
@@ -1105,7 +1105,7 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
     published_at = _validate_published_at(arguments.published_at)
     installer_iso_template_inputs = _installer_iso_template_inputs(arguments, version)
     if installer_iso_template_inputs is None:
-        _fail("installer_iso_template_v2 is required for every Forge release")
+        _fail("installer_iso_template_v2 is required for every Pulse release")
     installer_iso_template: dict[str, Any] | None = None
     appliance_release_inputs = _appliance_release_inputs(arguments, version, notes_url)
     appliance_release: dict[str, Any] | None = None
@@ -1212,7 +1212,7 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
         manifest["workstation_netboot"] = workstation_netboot
     body = (json.dumps(manifest, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
     _atomic_write(output, body)
-    print(f"wrote signed Forge release manifest: {output}")
+    print(f"wrote signed Pulse release manifest: {output}")
 
 
 def _public_key_command(arguments: argparse.Namespace) -> None:
@@ -1308,7 +1308,7 @@ def _validate_compatibility_contract(
 ) -> dict[str, Any]:
     contract = _require_exact_object_keys(
         value,
-        {"schema", "protocol_version", "manage", "forge", "workstation_runtime"},
+        {"schema", "protocol_version", "manage", "pulse", "workstation_runtime"},
         "component compatibility contract",
     )
     if contract["schema"] != COMPONENT_COMPATIBILITY_SCHEMA:
@@ -1323,35 +1323,35 @@ def _validate_compatibility_contract(
     )
     manage = _require_exact_object_keys(
         contract["manage"],
-        {"minimum_forge_protocol", "maximum_forge_protocol"},
+        {"minimum_pulse_protocol", "maximum_pulse_protocol"},
         "Manage compatibility range",
     )
-    forge = _require_exact_object_keys(
-        contract["forge"],
+    pulse = _require_exact_object_keys(
+        contract["pulse"],
         {"minimum_manage_protocol", "maximum_manage_protocol"},
-        "Forge compatibility range",
+        "Pulse compatibility range",
     )
     manage_minimum = _require_positive_int(
-        manage["minimum_forge_protocol"],
-        "Manage minimum Forge protocol",
+        manage["minimum_pulse_protocol"],
+        "Manage minimum Pulse protocol",
         maximum=2**31 - 1,
     )
     manage_maximum = _require_positive_int(
-        manage["maximum_forge_protocol"],
-        "Manage maximum Forge protocol",
+        manage["maximum_pulse_protocol"],
+        "Manage maximum Pulse protocol",
         maximum=2**31 - 1,
     )
-    forge_minimum = _require_positive_int(
-        forge["minimum_manage_protocol"],
-        "Forge minimum Manage protocol",
+    pulse_minimum = _require_positive_int(
+        pulse["minimum_manage_protocol"],
+        "Pulse minimum Manage protocol",
         maximum=2**31 - 1,
     )
-    forge_maximum = _require_positive_int(
-        forge["maximum_manage_protocol"],
-        "Forge maximum Manage protocol",
+    pulse_maximum = _require_positive_int(
+        pulse["maximum_manage_protocol"],
+        "Pulse maximum Manage protocol",
         maximum=2**31 - 1,
     )
-    if manage_minimum > manage_maximum or forge_minimum > forge_maximum:
+    if manage_minimum > manage_maximum or pulse_minimum > pulse_maximum:
         _fail("component compatibility protocol range is inverted")
 
     runtime = _require_exact_object_keys(
@@ -1362,7 +1362,7 @@ def _validate_compatibility_contract(
             "manifest_schema",
             "architecture",
             "format",
-            "required_forge_protocol",
+            "required_pulse_protocol",
             "import_states",
             "import_error_codes",
             "resolution_states",
@@ -1378,8 +1378,8 @@ def _validate_compatibility_contract(
         maximum=2**31 - 1,
     )
     _require_positive_int(
-        runtime["required_forge_protocol"],
-        "workstation runtime required Forge protocol",
+        runtime["required_pulse_protocol"],
+        "workstation runtime required Pulse protocol",
         maximum=2**31 - 1,
     )
     if require_current_runtime_contract:
@@ -1388,7 +1388,7 @@ def _validate_compatibility_contract(
             "manifest_schema": WORKSTATION_NETBOOT_MANIFEST_SCHEMA,
             "architecture": WORKSTATION_NETBOOT_ARCHITECTURE,
             "format": WORKSTATION_NETBOOT_FORMAT,
-            "required_forge_protocol": WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL,
+            "required_pulse_protocol": WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL,
         }
         for field, expected in expected_runtime_scalars.items():
             if runtime[field] != expected:
@@ -1430,15 +1430,15 @@ def _runtime_compatibility_tuple(contract: dict[str, Any]) -> dict[str, object]:
             "manifest_schema",
             "architecture",
             "format",
-            "required_forge_protocol",
+            "required_pulse_protocol",
         )
     }
 
 
 def _verify_component_compatibility_command(arguments: argparse.Namespace) -> None:
-    forge_value, _ = _load_bounded_json(
-        Path(arguments.forge_compatibility),
-        "Forge component compatibility contract",
+    pulse_value, _ = _load_bounded_json(
+        Path(arguments.pulse_compatibility),
+        "Pulse component compatibility contract",
         maximum_bytes=1024 * 1024,
     )
     manage_value, _ = _load_bounded_json(
@@ -1446,30 +1446,30 @@ def _verify_component_compatibility_command(arguments: argparse.Namespace) -> No
         "Manage component compatibility contract",
         maximum_bytes=1024 * 1024,
     )
-    forge = _validate_compatibility_contract(forge_value)
+    pulse = _validate_compatibility_contract(pulse_value)
     manage = _validate_compatibility_contract(
         manage_value, require_current_runtime_contract=False
     )
-    forge_protocol = forge["protocol_version"]
+    pulse_protocol = pulse["protocol_version"]
     manage_protocol = manage["protocol_version"]
     if not (
-        manage["manage"]["minimum_forge_protocol"]
-        <= forge_protocol
-        <= manage["manage"]["maximum_forge_protocol"]
+        manage["manage"]["minimum_pulse_protocol"]
+        <= pulse_protocol
+        <= manage["manage"]["maximum_pulse_protocol"]
     ):
-        _fail(f"Manage does not accept selected Forge protocol {forge_protocol}")
+        _fail(f"Manage does not accept selected Pulse protocol {pulse_protocol}")
     if not (
-        forge["forge"]["minimum_manage_protocol"]
+        pulse["pulse"]["minimum_manage_protocol"]
         <= manage_protocol
-        <= forge["forge"]["maximum_manage_protocol"]
+        <= pulse["pulse"]["maximum_manage_protocol"]
     ):
-        _fail(f"selected Forge does not accept Manage protocol {manage_protocol}")
-    if _runtime_compatibility_tuple(forge) != _runtime_compatibility_tuple(manage):
-        _fail("Forge and Manage workstation runtime compatibility tuples do not match")
+        _fail(f"selected Pulse does not accept Manage protocol {manage_protocol}")
+    if _runtime_compatibility_tuple(pulse) != _runtime_compatibility_tuple(manage):
+        _fail("Pulse and Manage workstation runtime compatibility tuples do not match")
     print(
-        "verified semantic Forge/Manage compatibility: "
-        f"forge_protocol={forge_protocol} manage_protocol={manage_protocol} "
-        f"runtime_epoch={forge['workstation_runtime']['compatibility_epoch']}"
+        "verified semantic Pulse/Manage compatibility: "
+        f"pulse_protocol={pulse_protocol} manage_protocol={manage_protocol} "
+        f"runtime_epoch={pulse['workstation_runtime']['compatibility_epoch']}"
     )
 
 
@@ -1514,8 +1514,8 @@ def _release_manifest_artifact_identities(
     if not isinstance(artifact["url"], str):
         _fail("artifact-url must be a string")
     artifact_url = _validate_url(artifact["url"], "artifact-url")
-    if urlsplit(artifact_url).path.rsplit("/", 1)[-1] != "cybex-forge-x86_64-linux":
-        _fail("artifact-url filename does not bind the Forge binary")
+    if urlsplit(artifact_url).path.rsplit("/", 1)[-1] != "cybex-pulse-x86_64-linux":
+        _fail("artifact-url filename does not bind the Pulse binary")
     artifact_sha256 = _require_sha256(artifact["sha256"], "artifact.sha256")
     binary_signature = _canonical_base64(
         value["signature"], "binary signature", expected_bytes=64
@@ -1560,7 +1560,7 @@ def _release_manifest_artifact_identities(
         _fail("installer ISO template URL must be a string")
     template_url = _validate_url(template["url"], "installer-iso-template-url")
     expected_template_name = (
-        f"cybex-forge-appliance-template-{version}-{INSTALLER_ISO_ARCHITECTURE}.iso"
+        f"cybex-pulse-appliance-template-{version}-{INSTALLER_ISO_ARCHITECTURE}.iso"
     )
     if urlsplit(template_url).path.rsplit("/", 1)[-1] != expected_template_name:
         _fail("installer ISO template URL does not bind its release filename")
@@ -1634,7 +1634,7 @@ def _release_manifest_artifact_identities(
         if (
             appliance["schema"] != APPLIANCE_RELEASE_SCHEMA
             or appliance["release_id"] != version
-            or appliance["minimum_protocol"] != WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL
+            or appliance["minimum_protocol"] != WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL
             or appliance["minimum_state_schema"] != 1
             or appliance["rollback_compatible"] is not True
         ):
@@ -1650,7 +1650,7 @@ def _release_manifest_artifact_identities(
             snapshot["url"], "appliance-package-snapshot-url"
         )
         expected_snapshot_name = (
-            f"cybex-forge-appliance-packages-{version}-x86_64-linux.tar.zst"
+            f"cybex-pulse-appliance-packages-{version}-x86_64-linux.tar.zst"
         )
         if urlsplit(snapshot_url).path.rsplit("/", 1)[-1] != expected_snapshot_name:
             _fail("appliance package snapshot URL does not bind its release filename")
@@ -1693,7 +1693,7 @@ def _release_manifest_artifact_identities(
                 "nixpkgs_revision",
                 "architecture",
                 "format",
-                "required_forge_protocol",
+                "required_pulse_protocol",
                 "url",
                 "sha256",
                 "size_bytes",
@@ -1707,8 +1707,8 @@ def _release_manifest_artifact_identities(
             workstation["schema"] != WORKSTATION_NETBOOT_SCHEMA
             or workstation["architecture"] != WORKSTATION_NETBOOT_ARCHITECTURE
             or workstation["format"] != WORKSTATION_NETBOOT_FORMAT
-            or workstation["required_forge_protocol"]
-            != WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL
+            or workstation["required_pulse_protocol"]
+            != WORKSTATION_NETBOOT_REQUIRED_PULSE_PROTOCOL
             or not isinstance(workstation["runtime_version"], str)
             or not isinstance(workstation["manage_source_revision"], str)
             or not isinstance(workstation["nixpkgs_revision"], str)
@@ -1779,7 +1779,7 @@ def _release_manifest_artifact_identities(
         workstation_identity = workstation_unsigned
 
     identities: dict[str, object] = {
-        "forge_binary": {"url": artifact_url, "sha256": artifact_sha256},
+        "pulse_binary": {"url": artifact_url, "sha256": artifact_sha256},
         "appliance_iso_template": {
             "url": template_url,
             "sha256": template_sha256,
@@ -1819,7 +1819,7 @@ def _release_compatibility_unsigned_payload(
             "descriptor_schema": runtime["schema"],
             "architecture": runtime["architecture"],
             "format": runtime["format"],
-            "required_forge_protocol": runtime["required_forge_protocol"],
+            "required_pulse_protocol": runtime["required_pulse_protocol"],
         }
         for field, expected in expected_runtime_contract.items():
             if runtime_contract[field] != expected:
@@ -1830,7 +1830,7 @@ def _release_compatibility_unsigned_payload(
     return (
         {
             "schema": RELEASE_COMPATIBILITY_SCHEMA,
-            "forge_release_version": version,
+            "pulse_release_version": version,
             "release_manifest": {
                 "url": manifest_url,
                 "sha256": hashlib.sha256(manifest_body).hexdigest(),
@@ -1863,7 +1863,7 @@ def _verified_release_compatibility_payload(
         _fail("release compatibility asset must be canonical compact sorted JSON")
     expected_asset_fields = {
         "schema",
-        "forge_release_version",
+        "pulse_release_version",
         "release_manifest",
         "compatibility",
         "compatibility_sha256",
@@ -1878,9 +1878,9 @@ def _verified_release_compatibility_payload(
         _fail(
             f"release compatibility asset schema must be {RELEASE_COMPATIBILITY_SCHEMA}"
         )
-    if not isinstance(asset["forge_release_version"], str):
-        _fail("release compatibility Forge version must be a string")
-    _validate_version(asset["forge_release_version"])
+    if not isinstance(asset["pulse_release_version"], str):
+        _fail("release compatibility Pulse version must be a string")
+    _validate_version(asset["pulse_release_version"])
     release_manifest = _require_exact_object_keys(
         asset["release_manifest"],
         {"url", "sha256"},
@@ -1901,7 +1901,7 @@ def _verified_release_compatibility_payload(
     _require_exact_object_keys(
         asset["artifacts"],
         {
-            "forge_binary",
+            "pulse_binary",
             "appliance_iso_template",
             "appliance_package_snapshot",
             "workstation_runtime",
@@ -2047,7 +2047,7 @@ def _release_compatibility_command(arguments: argparse.Namespace) -> None:
     _self_verify(public_der, signature, message)
     asset = {**payload, "signature": base64.b64encode(signature).decode("ascii")}
     _atomic_write(output, _canonical_json_body(asset))
-    print(f"wrote signed Forge release compatibility asset: {output}")
+    print(f"wrote signed Pulse release compatibility asset: {output}")
 
 
 def _verify_release_compatibility_command(arguments: argparse.Namespace) -> None:
@@ -2085,8 +2085,8 @@ def _verify_release_compatibility_command(arguments: argparse.Namespace) -> None
     )
     _verify_signed_messages(public_der, manifest_signed_messages)
     print(
-        "verified signed Forge release compatibility asset: "
-        f"version={actual_payload['forge_release_version']} "
+        "verified signed Pulse release compatibility asset: "
+        f"version={actual_payload['pulse_release_version']} "
         f"manifest_sha256={actual_payload['release_manifest']['sha256']} "
         f"compatibility_sha256={actual_payload['compatibility_sha256']}"
     )
@@ -2116,11 +2116,11 @@ def _verify_release_successor_command(arguments: argparse.Namespace) -> None:
         arguments.trusted_public_key,
         require_current_runtime_contract=False,
     )
-    current_version = current_payload["forge_release_version"]
-    previous_version = previous_payload["forge_release_version"]
+    current_version = current_payload["pulse_release_version"]
+    previous_version = previous_payload["pulse_release_version"]
     if _compare_semver(current_version, previous_version) <= 0:
         _fail(
-            "current Forge release version must have greater SemVer precedence "
+            "current Pulse release version must have greater SemVer precedence "
             "than the latest published predecessor"
         )
     _enforce_epoch_runtime_identity_transition(
@@ -2129,7 +2129,7 @@ def _verify_release_successor_command(arguments: argparse.Namespace) -> None:
         arguments.trusted_public_key,
     )
     print(
-        "verified Forge release successor: "
+        "verified Pulse release successor: "
         f"previous={previous_version} current={current_version}"
     )
 
@@ -2168,8 +2168,8 @@ def _verify_command(arguments: argparse.Namespace) -> None:
     if not isinstance(manifest["version"], str):
         _fail("release manifest version must be a string")
     version = _validate_version(manifest["version"])
-    if artifact_path.name != "cybex-forge-x86_64-linux":
-        _fail("binary artifact must be named cybex-forge-x86_64-linux")
+    if artifact_path.name != "cybex-pulse-x86_64-linux":
+        _fail("binary artifact must be named cybex-pulse-x86_64-linux")
     release_url = _validate_url(str(manifest["release_url"]), "release-url")
     notes_url = _validate_url(str(manifest["notes_url"]), "notes-url")
     if not isinstance(manifest["published_at"], str):
@@ -2315,7 +2315,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
         )
         snapshot_path = Path(arguments.appliance_package_snapshot)
         expected_snapshot_name = (
-            f"cybex-forge-appliance-packages-{version}-x86_64-linux.tar.zst"
+            f"cybex-pulse-appliance-packages-{version}-x86_64-linux.tar.zst"
         )
         if snapshot_path.name != expected_snapshot_name:
             _fail(f"appliance package snapshot must be named {expected_snapshot_name}")
@@ -2356,7 +2356,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
                 "nixpkgs_revision",
                 "architecture",
                 "format",
-                "required_forge_protocol",
+                "required_pulse_protocol",
                 "url",
                 "sha256",
                 "size_bytes",
@@ -2393,7 +2393,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
         )
         workstation_sha = descriptor["sha256"]
     print(
-        "verified signed Forge release manifest: "
+        "verified signed Pulse release manifest: "
         f"version={version} binary_sha256={actual_artifact_sha}"
         + (
             f" workstation_netboot_sha256={workstation_sha}"
@@ -2416,7 +2416,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build signed Cybex Forge release manifests without exposing private key bytes."
+        description="Build signed Cybex Pulse release manifests without exposing private key bytes."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -2425,7 +2425,7 @@ def _parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
         help="hash an artifact and atomically write a signed manifest",
     )
-    manifest.add_argument("--artifact", required=True, help="regular Forge binary artifact")
+    manifest.add_argument("--artifact", required=True, help="regular Pulse binary artifact")
     manifest.add_argument("--artifact-url", required=True, help="exact HTTP(S) download URL")
     manifest.add_argument("--version", required=True, help="canonical Cargo SemVer without a leading v")
     manifest.add_argument("--private-key", required=True, help="mode-0600 Ed25519 PEM private key")
@@ -2504,10 +2504,10 @@ def _parser() -> argparse.ArgumentParser:
     verify_components = commands.add_parser(
         "verify-component-compatibility",
         allow_abbrev=False,
-        help="verify semantic compatibility between selected Forge and Manage contracts",
+        help="verify semantic compatibility between selected Pulse and Manage contracts",
     )
     verify_components.add_argument(
-        "--forge-compatibility", required=True, help="Forge component compatibility contract"
+        "--pulse-compatibility", required=True, help="Pulse component compatibility contract"
     )
     verify_components.add_argument(
         "--manage-compatibility", required=True, help="Manage component compatibility contract"
@@ -2520,12 +2520,12 @@ def _parser() -> argparse.ArgumentParser:
         help="bind a release manifest and compatibility contract in a signed asset",
     )
     compatibility.add_argument(
-        "--manifest", required=True, help="exact signed Forge release manifest"
+        "--manifest", required=True, help="exact signed Pulse release manifest"
     )
     compatibility.add_argument(
         "--manifest-url",
         required=True,
-        help="exact immutable URL for cybex-forge-release.json",
+        help="exact immutable URL for cybex-pulse-release.json",
     )
     compatibility.add_argument(
         "--compatibility",
@@ -2545,7 +2545,7 @@ def _parser() -> argparse.ArgumentParser:
     compatibility.add_argument(
         "--output",
         required=True,
-        help="cybex-forge-release-compatibility.json output path",
+        help="cybex-pulse-release-compatibility.json output path",
     )
     compatibility.set_defaults(handler=_release_compatibility_command)
 
@@ -2558,7 +2558,7 @@ def _parser() -> argparse.ArgumentParser:
         "--asset", required=True, help="signed release compatibility asset"
     )
     verify_compatibility.add_argument(
-        "--manifest", required=True, help="exact referenced Forge release manifest"
+        "--manifest", required=True, help="exact referenced Pulse release manifest"
     )
     verify_compatibility.add_argument(
         "--manifest-url",

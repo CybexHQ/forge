@@ -16,15 +16,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "cybex-forge")]
+#[command(name = "cybex-pulse")]
 #[command(about = "UEFI-only PXE/iPXE boot control service")]
 #[command(version)]
 pub struct Cli {
     #[arg(
         short,
         long,
-        default_value = "/etc/cybex-forge/config.toml",
-        env = "CYBEX_FORGE_CONFIG"
+        default_value = "/etc/cybex-pulse/config.toml",
+        env = "CYBEX_PULSE_CONFIG"
     )]
     pub config: PathBuf,
 
@@ -194,17 +194,17 @@ impl AppConfig {
         require_appliance_path(
             "paths.data_dir",
             &self.paths.data_dir,
-            "/var/lib/cybex-forge",
+            "/var/lib/cybex-pulse",
         )?;
         require_appliance_path(
             "paths.database_path",
             &self.paths.database_path,
-            "/var/lib/cybex-forge/cybex-forge.sqlite",
+            "/var/lib/cybex-pulse/cybex-pulse.sqlite",
         )?;
         require_appliance_path(
             "paths.tftp_dir",
             &self.paths.tftp_dir,
-            "/srv/cybex-forge/tftp",
+            "/srv/cybex-pulse/tftp",
         )?;
         for (field, path) in [
             (
@@ -224,12 +224,12 @@ impl AppConfig {
         require_appliance_path(
             "cache.private_key_path",
             &self.cache.private_key_path,
-            "/var/lib/cybex-forge/cache/cache-priv-key.pem",
+            "/var/lib/cybex-pulse/cache/cache-priv-key.pem",
         )?;
         require_appliance_path(
             "cache.public_key_path",
             &self.cache.public_key_path,
-            "/var/lib/cybex-forge/cache/cache-pub-key.pem",
+            "/var/lib/cybex-pulse/cache/cache-pub-key.pem",
         )?;
 
         if self.update.trusted_public_key.is_empty() {
@@ -257,7 +257,7 @@ impl AppConfig {
         require_appliance_path(
             "manage.state_path",
             &self.manage.state_path,
-            "/var/lib/cybex-forge/state/manage-state.json",
+            "/var/lib/cybex-pulse/state/manage-state.json",
         )?;
         Ok(())
     }
@@ -396,9 +396,9 @@ fn require_appliance_path(field: &str, actual: &Path, expected: &str) -> anyhow:
 }
 
 fn require_appliance_srv_path(field: &str, path: &Path) -> anyhow::Result<()> {
-    let preserved_root = Path::new("/srv/cybex-forge");
+    let preserved_root = Path::new("/srv/cybex-pulse");
     if path == preserved_root || !path.starts_with(preserved_root) {
-        bail!("appliance {field} must be below /srv/cybex-forge");
+        bail!("appliance {field} must be below /srv/cybex-pulse");
     }
     Ok(())
 }
@@ -786,7 +786,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:8080".to_string(),
-            public_base_url: "http://CYBEX_FORGE_IP".to_string(),
+            public_base_url: "http://CYBEX_PULSE_IP".to_string(),
         }
     }
 }
@@ -794,11 +794,11 @@ impl Default for ServerConfig {
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from("/var/lib/cybex-forge"),
-            database_path: PathBuf::from("/var/lib/cybex-forge/cybex-forge.sqlite"),
-            boot_assets_dir: PathBuf::from("/srv/cybex-forge/www"),
-            static_dir: PathBuf::from("/srv/cybex-forge/www/assets"),
-            tftp_dir: PathBuf::from("/srv/cybex-forge/tftp"),
+            data_dir: PathBuf::from("/var/lib/cybex-pulse"),
+            database_path: PathBuf::from("/var/lib/cybex-pulse/cybex-pulse.sqlite"),
+            boot_assets_dir: PathBuf::from("/srv/cybex-pulse/www"),
+            static_dir: PathBuf::from("/srv/cybex-pulse/www/assets"),
+            tftp_dir: PathBuf::from("/srv/cybex-pulse/tftp"),
         }
     }
 }
@@ -834,8 +834,8 @@ impl Default for BuildConfig {
             max_log_bytes: 64 * 1024,
             max_artifact_size_bytes: 20 * 1024 * 1024 * 1024,
             allowed_systems: vec!["x86_64-linux".to_string()],
-            work_dir: PathBuf::from("/var/lib/cybex-forge/build"),
-            output_dir: PathBuf::from("/var/lib/cybex-forge/build-outputs"),
+            work_dir: PathBuf::from("/var/lib/cybex-pulse/build"),
+            output_dir: PathBuf::from("/var/lib/cybex-pulse/build-outputs"),
             nix_binary: "nix".to_string(),
             manage_source_url_template: "github:CybexHQ/manage/{revision}".to_string(),
             targets: Vec::new(),
@@ -847,10 +847,10 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            root_dir: PathBuf::from("/srv/cybex-forge/www/cache"),
-            signing_key_name: "cybex-forge-cache".to_string(),
-            private_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-priv-key.pem"),
-            public_key_path: PathBuf::from("/var/lib/cybex-forge/cache/cache-pub-key.pem"),
+            root_dir: PathBuf::from("/srv/cybex-pulse/www/cache"),
+            signing_key_name: "cybex-pulse-cache".to_string(),
+            private_key_path: PathBuf::from("/var/lib/cybex-pulse/cache/cache-priv-key.pem"),
+            public_key_path: PathBuf::from("/var/lib/cybex-pulse/cache/cache-pub-key.pem"),
             max_bytes: 64 * 1024 * 1024 * 1024,
             retain_recent_builds: 50,
         }
@@ -864,7 +864,7 @@ impl Default for ManageConfig {
             api_url: String::new(),
             organization_id: String::new(),
             organization_slug: String::new(),
-            state_path: PathBuf::from("/var/lib/cybex-forge/state/manage-state.json"),
+            state_path: PathBuf::from("/var/lib/cybex-pulse/state/manage-state.json"),
             sync_interval_seconds: 30,
             http_timeout_seconds: 30,
         }
@@ -878,8 +878,8 @@ mod tests {
 
     fn appliance_config() -> AppConfig {
         let mut config = AppConfig::default();
-        config.build.work_dir = PathBuf::from("/srv/cybex-forge/build-work");
-        config.build.output_dir = PathBuf::from("/srv/cybex-forge/build-outputs");
+        config.build.work_dir = PathBuf::from("/srv/cybex-pulse/build-work");
+        config.build.output_dir = PathBuf::from("/srv/cybex-pulse/build-outputs");
         config.build.nix_binary = "/run/current-system/sw/bin/nix".to_string();
         config.update.trusted_public_key = STANDARD.encode(
             SigningKey::from_bytes(&[7u8; 32])
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn cli_reports_the_exact_package_version() {
-        let result = Cli::try_parse_from(["cybex-forge", "--version"]).unwrap_err();
+        let result = Cli::try_parse_from(["cybex-pulse", "--version"]).unwrap_err();
 
         assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(result.to_string().contains(env!("CARGO_PKG_VERSION")));
@@ -964,18 +964,18 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.server.listen_addr, "127.0.0.1:8080");
-        assert_eq!(config.server.public_base_url, "http://CYBEX_FORGE_IP");
+        assert_eq!(config.server.public_base_url, "http://CYBEX_PULSE_IP");
         assert_eq!(
             config.paths.boot_assets_dir,
-            PathBuf::from("/srv/cybex-forge/www")
+            PathBuf::from("/srv/cybex-pulse/www")
         );
         assert_eq!(
             config.paths.static_dir,
-            PathBuf::from("/srv/cybex-forge/www/assets")
+            PathBuf::from("/srv/cybex-pulse/www/assets")
         );
         assert_eq!(
             config.paths.tftp_dir,
-            PathBuf::from("/srv/cybex-forge/tftp")
+            PathBuf::from("/srv/cybex-pulse/tftp")
         );
         assert_eq!(config.manage.http_timeout_seconds, 30);
         assert_eq!(config.build.max_build_cores, 4);
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn missing_config_loads_normalized_defaults() {
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-missing-config-test-{}-{}.toml",
+            "cybex-pulse-missing-config-test-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1044,10 +1044,10 @@ organization_slug = " Default "
     #[test]
     fn config_rejects_removed_install_code_and_executable_updater_fields() {
         for raw in [
-            "[manage]\nforge_install_code = \"removed\"\n",
-            "[manage]\nforge_install_code_file = \"/run/removed\"\n",
+            "[manage]\npulse_install_code = \"removed\"\n",
+            "[manage]\npulse_install_code_file = \"/run/removed\"\n",
             "[update]\nenabled = true\n",
-            "[update]\nwork_dir = \"/var/lib/cybex-forge/updates\"\n",
+            "[update]\nwork_dir = \"/var/lib/cybex-pulse/updates\"\n",
         ] {
             let path = write_temp_config(raw);
             let error = AppConfig::load(&path).unwrap_err();
@@ -1073,27 +1073,27 @@ organization_slug = " Default "
             "listen_addr",
         );
         rejected(
-            |config| config.paths.data_dir = PathBuf::from("/srv/cybex-forge/data"),
+            |config| config.paths.data_dir = PathBuf::from("/srv/cybex-pulse/data"),
             "paths.data_dir",
         );
         rejected(
-            |config| config.paths.database_path = PathBuf::from("/tmp/forge.sqlite"),
+            |config| config.paths.database_path = PathBuf::from("/tmp/pulse.sqlite"),
             "paths.database_path",
         );
         rejected(
-            |config| config.paths.tftp_dir = PathBuf::from("/srv/cybex-forge/other-tftp"),
+            |config| config.paths.tftp_dir = PathBuf::from("/srv/cybex-pulse/other-tftp"),
             "paths.tftp_dir",
         );
         rejected(
-            |config| config.paths.boot_assets_dir = PathBuf::from("/var/www/forge"),
+            |config| config.paths.boot_assets_dir = PathBuf::from("/var/www/pulse"),
             "paths.boot_assets_dir",
         );
         rejected(
-            |config| config.build.work_dir = PathBuf::from("/var/lib/cybex-forge/build"),
+            |config| config.build.work_dir = PathBuf::from("/var/lib/cybex-pulse/build"),
             "build.work_dir",
         );
         rejected(
-            |config| config.cache.root_dir = PathBuf::from("/var/lib/cybex-forge/cache-public"),
+            |config| config.cache.root_dir = PathBuf::from("/var/lib/cybex-pulse/cache-public"),
             "cache.root_dir",
         );
         rejected(
@@ -1143,7 +1143,7 @@ public_base_url = "https://"
         let path = write_temp_config(
             r#"
 [server]
-public_base_url = "http://boot.example/forge;chain"
+public_base_url = "http://boot.example/pulse;chain"
 "#,
         );
 
@@ -1283,7 +1283,7 @@ bootloader_filename = "{bootloader_filename}"
 public_base_url = "http://boot.example"
 
 [paths]
-data_dir = "../var/lib/cybex-forge"
+data_dir = "../var/lib/cybex-pulse"
 "#,
             ),
             (
@@ -1293,7 +1293,7 @@ data_dir = "../var/lib/cybex-forge"
 public_base_url = "http://boot.example"
 
 [paths]
-database_path = "/var/lib/../cybex-forge.sqlite"
+database_path = "/var/lib/../cybex-pulse.sqlite"
 "#,
             ),
             (
@@ -1303,7 +1303,7 @@ database_path = "/var/lib/../cybex-forge.sqlite"
 public_base_url = "http://boot.example"
 
 [paths]
-boot_assets_dir = "/srv/cybex-forge//www"
+boot_assets_dir = "/srv/cybex-pulse//www"
 "#,
             ),
             (
@@ -1323,7 +1323,7 @@ tftp_dir = "/"
 public_base_url = "http://boot.example"
 
 [manage]
-state_path = "/var/lib/cybex-forge/../manage-state.json"
+state_path = "/var/lib/cybex-pulse/../manage-state.json"
 "#,
             ),
         ] {
@@ -1460,7 +1460,7 @@ menu_timeout_ms = 42
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-config-test-{}-{unique}.toml",
+            "cybex-pulse-config-test-{}-{unique}.toml",
             std::process::id()
         ));
         fs::write(&path, contents).unwrap();
@@ -1473,7 +1473,7 @@ menu_timeout_ms = 42
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-forge-config-{label}-{}-{unique}",
+            "cybex-pulse-config-{label}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();

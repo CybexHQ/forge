@@ -464,7 +464,7 @@ mod tests {
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "cybex-forge-assets-test-{}-{unique}-{id}",
+                "cybex-pulse-assets-test-{}-{unique}-{id}",
                 std::process::id()
             ));
             match fs::create_dir(&root) {

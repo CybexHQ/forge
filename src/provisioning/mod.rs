@@ -16,11 +16,11 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub use inventory::{ForgeProvisioningDisk, ForgeProvisioningInventory};
+pub use inventory::{PulseProvisioningDisk, PulseProvisioningInventory};
 pub use protocol::{ProvisioningEnvelope, SignedInstallPlan};
 
 pub const PRODUCTION_MANAGE_ORIGIN: &str = "https://manage.cybex.net";
-pub const REQUIRED_MANAGE_ORIGIN: &str = match option_env!("CYBEX_FORGE_BUILD_MANAGE_ORIGIN") {
+pub const REQUIRED_MANAGE_ORIGIN: &str = match option_env!("CYBEX_PULSE_BUILD_MANAGE_ORIGIN") {
     Some(origin) => origin,
     None => PRODUCTION_MANAGE_ORIGIN,
 };
@@ -131,7 +131,7 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
         match session.state.as_str() {
             "created" | "awaiting_approval" => {}
             "revoked" | "expired" | "failed" => {
-                bail!("this provisioned Forge media can no longer install")
+                bail!("this provisioned Pulse media can no longer install")
             }
             state => bail!("provisioning session entered unsupported state {state}"),
         }
@@ -193,7 +193,7 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
             .await?;
     let device_key = SigningKey::generate(&mut OsRng);
     let mut durable = DurableProvisioningState {
-        schema: "cybex.forge.provisioning-state.v1".to_string(),
+        schema: "cybex.pulse.provisioning-state.v1".to_string(),
         session_id: verified.envelope.session_id,
         plan: signed_plan.clone(),
         manage_origin: verified.envelope.manage_origin.clone(),
@@ -412,7 +412,7 @@ pub fn finalize_target(options: FinalizeOptions) -> Result<()> {
         bail!("cannot finalize an appliance before identity activation")
     }
     storage::materialize_target(&options.target, &options.state_mount, &state)
-        .context("materialize installed Forge appliance")?;
+        .context("materialize installed Pulse appliance")?;
     state.installation_complete = true;
     storage::save_durable_state(&options.state_mount, &state)
 }

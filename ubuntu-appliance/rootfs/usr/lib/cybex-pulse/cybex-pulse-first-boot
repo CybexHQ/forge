@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-state_dir=/var/lib/cybex-forge/state
-release=/usr/share/cybex-forge/appliance-release.json
+state_dir=/var/lib/cybex-pulse/state
+release=/usr/share/cybex-pulse/appliance-release.json
 test -s "$state_dir/manage-state.json"
 test -s "$state_dir/install-plan.json"
 test -s "$release"
@@ -24,7 +24,7 @@ root_fsroot="$(findmnt -n -o FSROOT /)"
 generations=/.cybex-root-generations
 if [[ "$root_fsroot" = / ]]; then
   # Subiquity initially installs into Btrfs' top-level subvolume. Move the
-  # running system into generation zero before Forge is allowed to report
+  # running system into generation zero before Pulse is allowed to report
   # ready, so every later snapshot is a sibling addressed from subvolid 5.
   mkdir -p "$generations"
   if [[ -e "$generations/0" ]]; then
@@ -34,7 +34,7 @@ if [[ "$root_fsroot" = / ]]; then
   fi
   printf '%s\n' 0 > "$state_dir/root-generation"
   update-grub
-  grub-set-default cybex-forge-generation-0
+  grub-set-default cybex-pulse-generation-0
   sync
   systemctl reboot
   exit 0
@@ -42,40 +42,40 @@ fi
 [[ "$root_fsroot" =~ ^/\.cybex-root-generations/[0-9]+$ ]]
 
 # /nix must be the executable bind mount backed by CYBEX_CACHE. Initialize it
-# before nix-daemon or Forge starts, and never delegate store ownership to the
-# unprivileged Forge service account.
-mountpoint -q /var/cache/cybex-forge
+# before nix-daemon or Pulse starts, and never delegate store ownership to the
+# unprivileged Pulse service account.
+mountpoint -q /var/cache/cybex-pulse
 mountpoint -q /nix
-test "$(findmnt -n -o UUID /var/cache/cybex-forge)" = "$(findmnt -n -o UUID /nix)"
+test "$(findmnt -n -o UUID /var/cache/cybex-pulse)" = "$(findmnt -n -o UUID /nix)"
 test "$(findmnt -n -o FSROOT /nix)" = /nix
 nix_mount_options=",$(findmnt -n -o OPTIONS /nix),"
 [[ "$nix_mount_options" == *,rw,* ]]
 [[ "$nix_mount_options" == *,nodev,* ]]
 [[ "$nix_mount_options" == *,nosuid,* ]]
 [[ "$nix_mount_options" != *,noexec,* ]]
-install -d -m 0755 -o root -g root /var/cache/cybex-forge /var/cache/cybex-forge/nix /nix
+install -d -m 0755 -o root -g root /var/cache/cybex-pulse /var/cache/cybex-pulse/nix /nix
 nix-store --init
 test -d /nix/store
 test -d /nix/var/nix/db
-chown root:root /var/cache/cybex-forge /var/cache/cybex-forge/nix /nix
+chown root:root /var/cache/cybex-pulse /var/cache/cybex-pulse/nix /nix
 
-install -d -m 0750 -o cybex-forge -g cybex-forge \
-  /var/cache/cybex-forge/{www/assets,www/cache,tftp,build,build-outputs}
-chown -R cybex-forge:cybex-forge \
-  /var/lib/cybex-forge/state \
-  /var/cache/cybex-forge/{www,tftp,build,build-outputs}
-chmod 0600 /var/lib/cybex-forge/state/manage-state.json
-chown root:cybex-forge /etc/cybex-forge/config.toml
-chmod 0640 /etc/cybex-forge/config.toml
+install -d -m 0750 -o cybex-pulse -g cybex-pulse \
+  /var/cache/cybex-pulse/{www/assets,www/cache,tftp,build,build-outputs}
+chown -R cybex-pulse:cybex-pulse \
+  /var/lib/cybex-pulse/state \
+  /var/cache/cybex-pulse/{www,tftp,build,build-outputs}
+chmod 0600 /var/lib/cybex-pulse/state/manage-state.json
+chown root:cybex-pulse /etc/cybex-pulse/config.toml
+chmod 0640 /etc/cybex-pulse/config.toml
 
-/usr/lib/cybex-forge/cybex-forge-network-guard
-ln -sfn /etc/nginx/sites-available/cybex-forge /etc/nginx/sites-enabled/cybex-forge
+/usr/lib/cybex-pulse/cybex-pulse-network-guard
+ln -sfn /etc/nginx/sites-available/cybex-pulse /etc/nginx/sites-enabled/cybex-pulse
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
 sshd -t
 netplan generate
-systemctl enable nix-daemon nginx tftpd-hpa cybex-forge-firewall ssh
-systemctl enable cybex-forge.service cybex-forge-appliance-update.timer
+systemctl enable nix-daemon nginx tftpd-hpa cybex-pulse-firewall ssh
+systemctl enable cybex-pulse.service cybex-pulse-appliance-update.timer
 
 generation="$(jq -er '.root_generation' "$state_dir/appliance-release.json")"
 delete_root_generation() (

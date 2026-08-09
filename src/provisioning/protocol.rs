@@ -1,5 +1,5 @@
 use super::inventory::{
-    ForgeProvisioningDisk, ForgeProvisioningEthernetInterface, ForgeProvisioningInventory,
+    PulseProvisioningDisk, PulseProvisioningEthernetInterface, PulseProvisioningInventory,
     hardware_digest, inventory_sha256,
 };
 use crate::appliance::SignedApplianceRelease;
@@ -19,16 +19,16 @@ use std::{fs, path::Path, time::Duration};
 use uuid::Uuid;
 
 const ENVELOPE_SIZE: usize = 8192;
-const ENVELOPE_SCHEMA: &str = "cybex.forge.provisioning-envelope.v1";
-const ENVELOPE_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-PROVISIONING-ENVELOPE-V1";
-const KEY_DERIVATION_DOMAIN: &[u8] = b"CYBEX-FORGE-PROVISIONING-KEY-V1\0";
-const REQUEST_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-PROVISIONING-V1";
-pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "cybex.forge.install-plan.v1";
-pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "cybex.forge.install-plan.v2";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "CYBEX-FORGE-INSTALL-PLAN-V1";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "CYBEX-FORGE-INSTALL-PLAN-V2";
+const ENVELOPE_SCHEMA: &str = "cybex.pulse.provisioning-envelope.v1";
+const ENVELOPE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-PROVISIONING-ENVELOPE-V1";
+const KEY_DERIVATION_DOMAIN: &[u8] = b"CYBEX-PULSE-PROVISIONING-KEY-V1\0";
+const REQUEST_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-PROVISIONING-V1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "cybex.pulse.install-plan.v1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "cybex.pulse.install-plan.v2";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "CYBEX-PULSE-INSTALL-PLAN-V1";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "CYBEX-PULSE-INSTALL-PLAN-V2";
 pub(crate) const NETWORK_SNAPSHOT_DELIVERY: &str = "network-snapshot-v1";
-const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-IDENTITY-TRANSITION-V1";
+const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-IDENTITY-TRANSITION-V1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,7 @@ pub(crate) struct VerifiedEnvelope {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ForgeProvisioningNetworkPlan {
+pub struct PulseProvisioningNetworkPlan {
     pub mode: String,
     pub interface_id: String,
     pub address_cidr: Option<String>,
@@ -63,7 +63,7 @@ pub struct ForgeProvisioningNetworkPlan {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ForgeMaintenanceWindowPlan {
+pub struct PulseMaintenanceWindowPlan {
     pub timezone: String,
     pub weekday: u8,
     pub start: String,
@@ -85,10 +85,10 @@ pub struct SignedInstallPlan {
     pub reserved_device_id: String,
     pub display_name: String,
     pub target_disk_id: String,
-    pub target_disk: ForgeProvisioningDisk,
-    pub network_interface: ForgeProvisioningEthernetInterface,
-    pub network: ForgeProvisioningNetworkPlan,
-    pub maintenance_window: ForgeMaintenanceWindowPlan,
+    pub target_disk: PulseProvisioningDisk,
+    pub network_interface: PulseProvisioningEthernetInterface,
+    pub network: PulseProvisioningNetworkPlan,
+    pub maintenance_window: PulseMaintenanceWindowPlan,
     #[serde(default)]
     pub management_cidrs: Vec<String>,
     #[serde(default)]
@@ -115,7 +115,7 @@ struct ClaimRequest<'a> {
     provisioning_public_key: String,
     provisioning_public_key_fingerprint: String,
     hardware_digest: &'a str,
-    inventory: &'a ForgeProvisioningInventory,
+    inventory: &'a PulseProvisioningInventory,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +301,7 @@ pub(crate) fn verify_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
     verify_install_plan_inner(value, signing_key, envelope, inventory, false)
 }
@@ -310,7 +310,7 @@ pub(crate) fn verify_durable_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
     verify_install_plan_inner(value, signing_key, envelope, inventory, true)
 }
@@ -319,7 +319,7 @@ fn verify_install_plan_inner(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &ForgeProvisioningInventory,
+    inventory: &PulseProvisioningInventory,
     acknowledged_attempt: bool,
 ) -> Result<SignedInstallPlan> {
     let plan: SignedInstallPlan =
@@ -445,7 +445,7 @@ impl ProvisioningClient {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(30))
             .https_only(true)
-            .user_agent(concat!("cybex-forge-bootstrap/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("cybex-pulse-bootstrap/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build provisioning HTTP client")?;
         Ok(Self {
@@ -459,7 +459,7 @@ impl ProvisioningClient {
         &self,
         media_secret: &str,
         key: &SigningKey,
-        inventory: &ForgeProvisioningInventory,
+        inventory: &PulseProvisioningInventory,
         hardware_digest: &str,
     ) -> Result<AgentSessionResponse> {
         let public = key.verifying_key().to_bytes();
@@ -473,7 +473,7 @@ impl ProvisioningClient {
         let response = self
             .signed_json(
                 Method::POST,
-                "/v1/agent/forge/provisioning-sessions/claim",
+                "/v1/agent/pulse/provisioning-sessions/claim",
                 key,
                 Some(media_secret),
                 Some(&request),
@@ -484,7 +484,7 @@ impl ProvisioningClient {
 
     pub(crate) async fn poll_plan(&self, key: &SigningKey) -> Result<AgentSessionResponse> {
         let path = format!(
-            "/v1/agent/forge/provisioning-sessions/{}/plan",
+            "/v1/agent/pulse/provisioning-sessions/{}/plan",
             self.session_id
         );
         let response = self
@@ -524,7 +524,7 @@ impl ProvisioningClient {
             payload: json!({}),
         };
         let path = format!(
-            "/v1/agent/forge/provisioning-sessions/{}/events",
+            "/v1/agent/pulse/provisioning-sessions/{}/events",
             self.session_id
         );
         let response: EventResponse = self
@@ -566,7 +566,7 @@ impl ProvisioningClient {
                 .encode(device_key.sign(transition.as_bytes()).to_bytes()),
         };
         let path = format!(
-            "/v1/agent/forge/provisioning-sessions/{}/activate-identity",
+            "/v1/agent/pulse/provisioning-sessions/{}/activate-identity",
             self.session_id
         );
         let first = self
@@ -632,7 +632,7 @@ impl ProvisioningClient {
             .header("x-cybex-timestamp", timestamp)
             .header("x-cybex-signature", signature);
         if let Some(secret) = media_secret {
-            request = request.header("x-cybex-forge-provisioning-secret", secret);
+            request = request.header("x-cybex-pulse-provisioning-secret", secret);
         }
         if !body.is_empty() {
             request = request
@@ -677,7 +677,7 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
 
 fn deterministic_event_id(session_id: Uuid, plan_id: Uuid, sequence: i64) -> Uuid {
     let mut digest = Sha256::new();
-    digest.update(b"CYBEX-FORGE-PROVISIONING-EVENT-ID-V1\0");
+    digest.update(b"CYBEX-PULSE-PROVISIONING-EVENT-ID-V1\0");
     digest.update(session_id.as_bytes());
     digest.update(plan_id.as_bytes());
     digest.update(sequence.to_be_bytes());
@@ -774,7 +774,7 @@ mod tests {
     ) -> (
         Value,
         ProvisioningEnvelope,
-        ForgeProvisioningInventory,
+        PulseProvisioningInventory,
         SigningKey,
     ) {
         let now = Utc::now();
@@ -791,7 +791,7 @@ mod tests {
             signature: URL_SAFE_NO_PAD.encode([0; 64]),
             zero_padding: String::new(),
         };
-        let disk = ForgeProvisioningDisk {
+        let disk = PulseProvisioningDisk {
             id: "disk-1".to_string(),
             path: "/dev/sda".to_string(),
             model: "Disk".to_string(),
@@ -804,7 +804,7 @@ mod tests {
             eligible: true,
             blocker_codes: Vec::new(),
         };
-        let interface = ForgeProvisioningEthernetInterface {
+        let interface = PulseProvisioningEthernetInterface {
             id: "pci-0000:00:03.0".to_string(),
             name: "enp0s3".to_string(),
             mac: "52:54:00:12:34:56".to_string(),
@@ -812,7 +812,7 @@ mod tests {
             addresses: vec!["192.0.2.10/24".to_string()],
             gateway: Some("192.0.2.1".to_string()),
         };
-        let inventory = ForgeProvisioningInventory {
+        let inventory = PulseProvisioningInventory {
             manufacturer: "Cybex".to_string(),
             model: "Qualification VM".to_string(),
             serial_number: "vm-1".to_string(),
@@ -845,7 +845,7 @@ mod tests {
             "hardware_digest": hardware_digest(&inventory).unwrap(),
             "provisioning_public_key_fingerprint": provisioning_fingerprint,
             "reserved_device_id": "dev_0123456789abcdef0123456789abcdef",
-            "display_name": "Qualification Forge",
+            "display_name": "Qualification Pulse",
             "target_disk_id": disk.id,
             "target_disk": disk,
             "network_interface": interface,
@@ -880,11 +880,11 @@ mod tests {
                 (
                     "appliance_release".to_string(),
                     json!({
-                        "schema": "cybex.forge.appliance-release.v1",
+                        "schema": "cybex.pulse.appliance-release.v1",
                         "release_id": "1.2.3",
                         "ubuntu_snapshot_id": "20260801T120000Z",
                         "cybex_repository_snapshot": {
-                            "url": "https://releases.cybex.net/cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst",
+                            "url": "https://releases.cybex.net/cybex-pulse-appliance-packages-1.2.3-x86_64-linux.tar.zst",
                             "sha256": "b".repeat(64),
                             "size_bytes": 1024
                         },
@@ -899,7 +899,7 @@ mod tests {
                 ),
                 (
                     "package_transport_url".to_string(),
-                    json!("http://192.168.122.1:8080/cybex-forge-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
+                    json!("http://192.168.122.1:8080/cybex-pulse-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
                 ),
             ]);
         }

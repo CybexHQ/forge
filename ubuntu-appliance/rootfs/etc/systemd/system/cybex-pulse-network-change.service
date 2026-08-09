@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply a signed two-phase Cybex Pulse Netplan change
+After=network-online.target cybex-pulse.service
+Wants=network-online.target cybex-pulse.service
+ConditionPathExists=/var/lib/cybex-pulse/state/appliance-network-change-request.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-pulse/cybex-pulse-network-change
+TimeoutStartSec=5min

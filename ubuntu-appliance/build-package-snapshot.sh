@@ -3,13 +3,13 @@ set -Eeuo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 --output-dir DIR --forge-binary FILE --bootstrap-binary FILE --version SEMVER --ubuntu-snapshot-id ID --release-public-key BASE64" >&2
+  echo "usage: $0 --output-dir DIR --pulse-binary FILE --bootstrap-binary FILE --version SEMVER --ubuntu-snapshot-id ID --release-public-key BASE64" >&2
   exit 2
 }
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 output_dir=""
-forge_binary=""
+pulse_binary=""
 bootstrap_binary=""
 version=""
 snapshot_id=""
@@ -18,7 +18,7 @@ release_public_key=""
 while (($#)); do
   case "$1" in
     --output-dir) output_dir="${2:-}"; shift 2 ;;
-    --forge-binary) forge_binary="${2:-}"; shift 2 ;;
+    --pulse-binary) pulse_binary="${2:-}"; shift 2 ;;
     --bootstrap-binary) bootstrap_binary="${2:-}"; shift 2 ;;
     --version) version="${2:-}"; shift 2 ;;
     --ubuntu-snapshot-id) snapshot_id="${2:-}"; shift 2 ;;
@@ -27,11 +27,11 @@ while (($#)); do
   esac
 done
 
-test -n "$output_dir" && test -n "$forge_binary" && test -n "$bootstrap_binary"
+test -n "$output_dir" && test -n "$pulse_binary" && test -n "$bootstrap_binary"
 test -n "$version" && test -n "$snapshot_id" && test -n "$release_public_key"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
 [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-test -f "$forge_binary" && test -x "$forge_binary"
+test -f "$pulse_binary" && test -x "$pulse_binary"
 test -f "$bootstrap_binary" && test -x "$bootstrap_binary"
 
 for command_name in \
@@ -54,13 +54,13 @@ do
     exit 1
   }
 done
-python3 -B "$repository_root/tools/forge-release.py" validate-public-key \
+python3 -B "$repository_root/tools/pulse-release.py" validate-public-key \
   --trusted-public-key "$release_public_key" >/dev/null
 
 mkdir -p -- "$output_dir"
 output_dir="$(cd -- "$output_dir" && pwd -P)"
-package_bundle_name="cybex-forge-appliance-packages-$version-x86_64-linux.tar.zst"
-package_metadata_name="cybex-forge-appliance-packages-$version-x86_64-linux.json"
+package_bundle_name="cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst"
+package_metadata_name="cybex-pulse-appliance-packages-$version-x86_64-linux.json"
 test ! -e "$output_dir/$package_bundle_name" || {
   echo "error: refusing to overwrite existing release candidate $output_dir/$package_bundle_name" >&2
   exit 1
@@ -80,7 +80,7 @@ mkdir -p -- "$offline_repository"
 
 "$repository_root/ubuntu-appliance/build-offline-repo.sh" \
   --output "$offline_repository" \
-  --forge-binary "$forge_binary" \
+  --pulse-binary "$pulse_binary" \
   --bootstrap-binary "$bootstrap_binary" \
   --version "$version" \
   --ubuntu-snapshot-id "$snapshot_id" \
@@ -93,9 +93,9 @@ tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 \
 
 required_versions='{}'
 for package_name in \
-  cybex-forge \
-  cybex-forge-bootstrap \
-  cybex-forge-appliance \
+  cybex-pulse \
+  cybex-pulse-bootstrap \
+  cybex-pulse-appliance \
   linux-generic \
   linux-firmware \
   nix-bin
@@ -134,7 +134,7 @@ done
 
 package_metadata="$work_dir/$package_metadata_name"
 jq -n \
-  --arg schema 'cybex.forge.appliance-package-snapshot.v1' \
+  --arg schema 'cybex.pulse.appliance-package-snapshot.v1' \
   --arg release_id "$version" \
   --arg ubuntu_snapshot_id "$snapshot_id" \
   --arg filename "$package_bundle_name" \
@@ -147,4 +147,4 @@ jq -n \
 mv -- "$package_bundle" "$output_dir/$package_bundle_name"
 mv -- "$package_metadata" "$output_dir/$package_metadata_name"
 
-echo "built Forge appliance package snapshot: $output_dir/$package_bundle_name"
+echo "built Pulse appliance package snapshot: $output_dir/$package_bundle_name"

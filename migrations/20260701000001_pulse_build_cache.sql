@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS forge_build_jobs (
+CREATE TABLE IF NOT EXISTS pulse_build_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     managed_job_id TEXT UNIQUE,
     requested_artifact_type TEXT NOT NULL,
@@ -22,10 +22,10 @@ CREATE TABLE IF NOT EXISTS forge_build_jobs (
     updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_forge_build_jobs_status_updated
-ON forge_build_jobs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pulse_build_jobs_status_updated
+ON pulse_build_jobs(status, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS forge_cache_artifacts (
+CREATE TABLE IF NOT EXISTS pulse_cache_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     managed_artifact_id TEXT UNIQUE,
     artifact_type TEXT NOT NULL,
@@ -49,5 +49,5 @@ CREATE TABLE IF NOT EXISTS forge_cache_artifacts (
     UNIQUE (artifact_type, hash)
 );
 
-CREATE INDEX IF NOT EXISTS idx_forge_cache_artifacts_created
-ON forge_cache_artifacts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pulse_cache_artifacts_created
+ON pulse_cache_artifacts(created_at DESC);

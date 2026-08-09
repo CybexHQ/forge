@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-state_dir=/var/lib/cybex-forge/state
+state_dir=/var/lib/cybex-pulse/state
 request="$state_dir/appliance-network-change-request.json"
 status="$state_dir/appliance-network-change-status.json"
 ack="$state_dir/netplan-ack.sha256"
@@ -24,7 +24,7 @@ write_status() {
     '{status:$status,stage:$stage,change_id:$change_id,config_sha256:$config_sha256,
       candidate_sha256:$candidate_sha256,failure_code:$failure_code,
       reported_at:$reported_at}' > "$status.tmp"
-  chown root:cybex-forge "$status.tmp"
+  chown root:cybex-pulse "$status.tmp"
   chmod 0640 "$status.tmp"
   mv -f "$status.tmp" "$status"
   sync -f "$state_dir"
@@ -42,11 +42,11 @@ rollback() {
 trap rollback ERR
 
 write_status applying preflight
-candidate="$(/usr/bin/cybex-forge verify-appliance-network-change)"
-test "$candidate" = "/run/cybex-forge-network-change/$change_id.yaml"
+candidate="$(/usr/bin/cybex-pulse verify-appliance-network-change)"
+test "$candidate" = "/run/cybex-pulse-network-change/$change_id.yaml"
 candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
 write_status applying netplan_try "$candidate_sha256"
-/usr/lib/cybex-forge/cybex-forge-netplan-apply "$candidate" "$ack"
+/usr/lib/cybex-pulse/cybex-pulse-netplan-apply "$candidate" "$ack"
 write_status acknowledged committed "$candidate_sha256"
 rm -f "$request" "$candidate"
 trap - ERR

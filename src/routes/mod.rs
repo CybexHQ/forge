@@ -268,7 +268,7 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        let root = temp_test_dir("cybex-forge-router");
+        let root = temp_test_dir("cybex-pulse-router");
         let config_path = root.join("config.toml");
         let www = root.join("www");
         fs::create_dir_all(&www).unwrap();
@@ -283,7 +283,7 @@ public_base_url = "http://boot.example"
 
 [paths]
 data_dir = "{root}/data"
-database_path = "{root}/data/cybex-forge.sqlite"
+database_path = "{root}/data/cybex-pulse.sqlite"
 boot_assets_dir = "{root}/www"
 static_dir = "{root}/www/assets"
 tftp_dir = "{root}/tftp"

@@ -1,5 +1,5 @@
 [Unit]
-Description=Check for approved Cybex Forge appliance updates
+Description=Check for approved Cybex Pulse appliance updates
 
 [Timer]
 OnBootSec=15min

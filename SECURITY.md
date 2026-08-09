@@ -2,13 +2,13 @@
 
 ## Supported platform
 
-Only the Ubuntu 26.04 Forge appliance installed from a personalized Cybex
+Only the Ubuntu 26.04 Pulse appliance installed from a personalized Cybex
 Manage provisioning V2 ISO is supported. Legacy NixOS appliance and
 Proxmox/LXC deployments receive no security updates and must be replaced.
 
 ## Trust boundaries
 
-- The offline ISO template and release descriptors are signed by the Forge
+- The offline ISO template and release descriptors are signed by the Pulse
   release key.
 - The fixed personalization slot contains a bounded, signed, single-use V2
   provisioning envelope.
