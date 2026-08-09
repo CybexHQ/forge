@@ -15,11 +15,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::release_transport;
 
 pub const APPLIANCE_UPDATE_CAPABILITY: &str = "appliance_update_v1";
 const RELEASE_PATH: &str = "/usr/share/cybex-forge/appliance-release.json";
@@ -42,6 +45,12 @@ const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.forge.appliance-release.v1";
 const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-NETWORK-CHANGE-V1";
 const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-FORGE-NETWORK-ACK-V1";
 const MAX_UPDATE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const SNAPSHOT_ID_MAX_BYTES: u64 = 64;
+const SNAPSHOT_CHECKSUMS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SNAPSHOT_PACKAGES_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const THIN_INSTALLER_BOOT_PACKAGES: [&str; 3] =
+    ["grub-efi-amd64", "grub-efi-amd64-signed", "shim-signed"];
+static UPDATE_QUEUE: Mutex<ApplianceUpdateQueue> = Mutex::new(ApplianceUpdateQueue::new());
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +91,30 @@ pub struct ManagedApplianceUpdate {
     pub attempt_id: uuid::Uuid,
     pub requested_at: DateTime<Utc>,
     pub release: SignedApplianceRelease,
+}
+
+struct ApplianceUpdateQueue {
+    worker_running: bool,
+    pending: Option<ManagedApplianceUpdate>,
+}
+
+impl ApplianceUpdateQueue {
+    const fn new() -> Self {
+        Self {
+            worker_running: false,
+            pending: None,
+        }
+    }
+
+    fn enqueue(&mut self, update: ManagedApplianceUpdate) -> bool {
+        self.pending = Some(update);
+        if self.worker_running {
+            false
+        } else {
+            self.worker_running = true;
+            true
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -161,6 +194,42 @@ pub fn is_managed_ubuntu() -> bool {
     Path::new(RELEASE_PATH).is_file() && Path::new(INSTALLED_STATE_PATH).is_file()
 }
 
+pub fn queue_update_request(update: ManagedApplianceUpdate) -> bool {
+    let start_worker = UPDATE_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .enqueue(update);
+    if start_worker {
+        tokio::spawn(drain_update_queue());
+    }
+    start_worker
+}
+
+async fn drain_update_queue() {
+    loop {
+        let update = {
+            let mut queue = UPDATE_QUEUE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match queue.pending.take() {
+                Some(update) => update,
+                None => {
+                    queue.worker_running = false;
+                    return;
+                }
+            }
+        };
+        let attempt_id = update.attempt_id;
+        if let Err(error) = store_update_request(Some(update)).await {
+            tracing::warn!(
+                %attempt_id,
+                error = %error,
+                "appliance update staging failed; the latest desired attempt will retry automatically"
+            );
+        }
+    }
+}
+
 pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Result<()> {
     let Some(update) = update else {
         return Ok(());
@@ -168,19 +237,17 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
     if !is_managed_ubuntu() {
         bail!("received an Ubuntu appliance update on a non-appliance Forge host")
     }
-    validate_managed_update(&update)?;
-    if read_optional_bounded_json::<Value>(Path::new(UPDATE_STATUS_PATH), 128 * 1024).is_some_and(
-        |status| {
-            status.get("attempt_id").and_then(Value::as_str)
-                == Some(update.attempt_id.to_string().as_str())
-                && matches!(
-                    status.get("status").and_then(Value::as_str),
-                    Some("succeeded" | "rolled_back" | "failed")
-                )
-        },
-    ) {
+    // Manage continues advertising the desired attempt until it receives the
+    // terminal report. Authenticate that replay, then accept the exact
+    // terminal attempt before applying the strictly-newer transition rule: a
+    // succeeded update is now equal to the installed release by definition.
+    validate_managed_update_identity(&update)?;
+    if read_optional_bounded_json::<Value>(Path::new(UPDATE_STATUS_PATH), 128 * 1024)
+        .is_some_and(|status| completed_update_matches(&status, &update))
+    {
         return Ok(());
     }
+    validate_managed_update_transition(&update)?;
     if let Some(existing) = read_optional_bounded_json::<StoredApplianceUpdate>(
         Path::new(UPDATE_REQUEST_PATH),
         256 * 1024,
@@ -255,17 +322,21 @@ pub fn verify_and_extract_stored_update() -> Result<PathBuf> {
     fs::create_dir_all(UPDATE_ROOT).context("create appliance update root")?;
     let release_root = Path::new(UPDATE_ROOT).join(&request.release.release_id);
     let packages = release_root.join("packages");
-    if packages.is_dir() {
-        verify_extracted_snapshot(&packages, &request.release)?;
+    if prepare_appliance_release_root(&release_root, &packages, &request.release)? {
         return Ok(packages);
     }
-    fs::create_dir(&release_root).context("create appliance release update directory")?;
-    fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))?;
     let temporary = release_root.join(format!(".packages.{}", request.attempt_id));
     fs::create_dir(&temporary).context("create appliance package staging directory")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
     let extract_result = (|| -> Result<()> {
         use std::io::Seek;
+        bundle.rewind().context("rewind appliance update bundle")?;
+        let expanded_bytes = inspect_snapshot_reader(&mut bundle, 32 * 1024 * 1024 * 1024u64)?;
+        crate::disk::ensure_headroom(
+            &temporary,
+            expanded_bytes,
+            "appliance package snapshot extraction",
+        )?;
         bundle.rewind().context("rewind appliance update bundle")?;
         extract_snapshot(&mut bundle, &temporary)?;
         verify_extracted_snapshot(&temporary, &request.release)?;
@@ -285,11 +356,68 @@ pub fn verify_and_extract_stored_update() -> Result<PathBuf> {
     Ok(packages)
 }
 
+fn prepare_appliance_release_root(
+    release_root: &Path,
+    packages: &Path,
+    release: &SignedApplianceRelease,
+) -> Result<bool> {
+    match fs::symlink_metadata(release_root) {
+        Ok(metadata)
+            if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {}
+        Ok(_) => bail!("appliance release update directory is unsafe"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(release_root).context("create appliance release update directory")?;
+        }
+        Err(error) => return Err(error).context("inspect appliance release update directory"),
+    }
+    fs::set_permissions(release_root, fs::Permissions::from_mode(0o700))?;
+    match fs::symlink_metadata(packages) {
+        Ok(metadata)
+            if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } =>
+        {
+            if verify_extracted_snapshot(packages, release).is_ok() {
+                return Ok(true);
+            }
+            fs::remove_dir_all(packages)
+                .context("remove corrupt extracted appliance package snapshot")?;
+            sync_directory(release_root)?;
+        }
+        Ok(_) => bail!("extracted appliance package snapshot path is unsafe"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect extracted appliance package snapshot"),
+    }
+    for entry in fs::read_dir(release_root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("appliance release update entry is not UTF-8"))?;
+        if !name.starts_with(".packages.") {
+            bail!("appliance release update directory contains an unexpected entry")
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("appliance package staging directory is unsafe")
+        }
+        fs::remove_dir_all(entry.path()).context("remove stale appliance package staging")?;
+    }
+    sync_directory(release_root)?;
+    Ok(false)
+}
+
 fn validate_managed_update(update: &ManagedApplianceUpdate) -> Result<()> {
+    validate_managed_update_identity(update)?;
+    validate_managed_update_transition(update)
+}
+
+fn validate_managed_update_identity(update: &ManagedApplianceUpdate) -> Result<()> {
     if update.attempt_id.is_nil() {
         bail!("appliance update attempt ID is nil")
     }
-    validate_signed_release(&update.release)?;
+    validate_signed_release(&update.release)
+}
+
+fn validate_managed_update_transition(update: &ManagedApplianceUpdate) -> Result<()> {
     let installed: ApplianceRelease = read_bounded_json(Path::new(RELEASE_PATH), 64 * 1024)?;
     let current = semver::Version::parse(&installed.release_id)
         .context("installed appliance release is not canonical SemVer")?;
@@ -304,7 +432,42 @@ fn validate_managed_update(update: &ManagedApplianceUpdate) -> Result<()> {
     Ok(())
 }
 
+fn completed_update_matches(status: &Value, update: &ManagedApplianceUpdate) -> bool {
+    status.get("attempt_id").and_then(Value::as_str) == Some(update.attempt_id.to_string().as_str())
+        && status.get("target_release").and_then(Value::as_str)
+            == Some(update.release.release_id.as_str())
+        && matches!(
+            status.get("status").and_then(Value::as_str),
+            Some("succeeded" | "rolled_back" | "failed")
+        )
+}
+
 fn validate_signed_release(release: &SignedApplianceRelease) -> Result<()> {
+    validate_signed_release_with_policy(
+        release,
+        Path::new(RELEASE_PUBLIC_KEY_PATH),
+        MAX_UPDATE_BUNDLE_BYTES,
+    )
+}
+
+pub(crate) fn validate_install_release(
+    release: &SignedApplianceRelease,
+    expected_release_id: &str,
+    public_key_path: &Path,
+    maximum_bundle_bytes: u64,
+) -> Result<()> {
+    validate_signed_release_with_policy(release, public_key_path, maximum_bundle_bytes)?;
+    if release.release_id != expected_release_id {
+        bail!("appliance release does not match the approved install plan")
+    }
+    Ok(())
+}
+
+fn validate_signed_release_with_policy(
+    release: &SignedApplianceRelease,
+    public_key_path: &Path,
+    maximum_bundle_bytes: u64,
+) -> Result<()> {
     if release.schema != APPLIANCE_RELEASE_SCHEMA
         || release.minimum_protocol != 4
         || release.minimum_state_schema != 1
@@ -338,7 +501,7 @@ fn validate_signed_release(release: &SignedApplianceRelease) -> Result<()> {
         bail!("appliance package snapshot URL is not canonical HTTPS")
     }
     require_sha256(&snapshot.sha256)?;
-    if snapshot.size_bytes == 0 || snapshot.size_bytes > MAX_UPDATE_BUNDLE_BYTES {
+    if snapshot.size_bytes == 0 || snapshot.size_bytes > maximum_bundle_bytes {
         bail!("appliance package snapshot size is invalid")
     }
     let expected_packages = BTreeSet::from([
@@ -373,8 +536,21 @@ fn validate_signed_release(release: &SignedApplianceRelease) -> Result<()> {
         bail!("appliance release notes URL is invalid")
     }
 
-    let key_text =
-        fs::read_to_string(RELEASE_PUBLIC_KEY_PATH).context("read appliance release public key")?;
+    let key_metadata = fs::symlink_metadata(public_key_path).with_context(|| {
+        format!(
+            "inspect appliance release public key at {}",
+            public_key_path.display()
+        )
+    })?;
+    if !key_metadata.file_type().is_file() {
+        bail!("appliance release public key path is unsafe")
+    }
+    let key_text = fs::read_to_string(public_key_path).with_context(|| {
+        format!(
+            "read appliance release public key from {}",
+            public_key_path.display()
+        )
+    })?;
     let key_bytes = canonical_base64(key_text.trim_end_matches('\n'), 32)?;
     if key_text != format!("{}\n", STANDARD.encode(&key_bytes)) {
         bail!("appliance release public key file is not canonical")
@@ -409,23 +585,60 @@ fn validate_signed_release(release: &SignedApplianceRelease) -> Result<()> {
 }
 
 async fn download_snapshot(snapshot: &ApplianceRepositorySnapshot, target: &Path) -> Result<()> {
-    if target.exists() {
-        let mut existing = fs::File::open(target)?;
-        return verify_bundle_reader(&mut existing, snapshot.size_bytes, &snapshot.sha256);
+    download_snapshot_with_policy(snapshot, target, false).await
+}
+
+async fn download_snapshot_with_policy(
+    snapshot: &ApplianceRepositorySnapshot,
+    target: &Path,
+    allow_private_urls: bool,
+) -> Result<()> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == unsafe { libc::geteuid() } =>
+        {
+            let mut existing = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(target)
+                .context("open cached appliance package snapshot")?;
+            let opened = existing.metadata()?;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                bail!("cached appliance package snapshot changed while it was opened")
+            }
+            if verify_bundle_reader(&mut existing, snapshot.size_bytes, &snapshot.sha256).is_ok() {
+                return Ok(());
+            }
+            drop(existing);
+            fs::remove_file(target).context("remove corrupt cached appliance package snapshot")?;
+            sync_directory(
+                target
+                    .parent()
+                    .ok_or_else(|| anyhow!("appliance package snapshot has no parent"))?,
+            )?;
+        }
+        Ok(_) => bail!("cached appliance package snapshot path is unsafe"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect cached appliance package snapshot"),
     }
     let temporary = target.with_extension(format!("tar.zst.part.{}", uuid::Uuid::new_v4()));
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(4 * 60 * 60))
-        .build()?;
-    let mut response = client
-        .get(&snapshot.url)
-        .header(reqwest::header::ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .context("download appliance package snapshot")?;
-    if !response.status().is_success()
+    crate::disk::ensure_headroom(
+        target,
+        snapshot.size_bytes,
+        "appliance package snapshot download",
+    )?;
+    let mut response = release_transport::get(
+        &snapshot.url,
+        allow_private_urls,
+        true,
+        std::time::Duration::from_secs(4 * 60 * 60),
+        None,
+    )
+    .await
+    .context("download appliance package snapshot")?;
+    if response.status() != reqwest::StatusCode::OK
         || response
             .content_length()
             .is_some_and(|length| length != snapshot.size_bytes)
@@ -435,6 +648,8 @@ async fn download_snapshot(snapshot: &ApplianceRepositorySnapshot, target: &Path
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temporary)
         .await?;
     let mut hasher = Sha256::new();
@@ -456,6 +671,11 @@ async fn download_snapshot(snapshot: &ApplianceRepositorySnapshot, target: &Path
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&temporary, target).await?;
+        sync_directory(
+            target
+                .parent()
+                .ok_or_else(|| anyhow!("appliance package snapshot has no parent"))?,
+        )?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -499,14 +719,50 @@ fn verify_bundle_reader(
 }
 
 fn extract_snapshot(bundle: &mut fs::File, output: &Path) -> Result<()> {
-    let decoder = zstd::Decoder::new(bundle).context("open appliance package snapshot")?;
-    let mut archive = tar::Archive::new(decoder);
+    extract_snapshot_reader(bundle, output, 32 * 1024 * 1024 * 1024u64)
+}
+
+pub(crate) fn extract_snapshot_reader(
+    bundle: impl Read,
+    output: &Path,
+    maximum_expanded_bytes: u64,
+) -> Result<()> {
+    process_snapshot_reader(bundle, Some(output), maximum_expanded_bytes).map(|_| ())
+}
+
+fn inspect_snapshot_reader(bundle: impl Read, maximum_expanded_bytes: u64) -> Result<u64> {
+    process_snapshot_reader(bundle, None, maximum_expanded_bytes)
+}
+
+fn process_snapshot_reader(
+    bundle: impl Read,
+    output: Option<&Path>,
+    maximum_expanded_bytes: u64,
+) -> Result<u64> {
+    let mut decoder = zstd::Decoder::new(bundle).context("open appliance package snapshot")?;
+    decoder
+        .window_log_max(27)
+        .context("bound appliance package decompression window")?;
+    let maximum_stream_bytes = maximum_expanded_bytes
+        .checked_add(32 * 1024 * 1024)
+        .ok_or_else(|| anyhow!("appliance package stream bound overflow"))?;
+    let bounded = ExpandedSnapshotReader {
+        inner: decoder,
+        consumed: 0,
+        maximum: maximum_stream_bytes,
+    };
+    let mut archive = tar::Archive::new(bounded);
     let mut names = BTreeSet::new();
     let mut extracted_bytes = 0u64;
+    let mut entry_count = 0usize;
     for entry in archive
         .entries()
         .context("read appliance package snapshot")?
     {
+        entry_count += 1;
+        if entry_count > 16_384 {
+            bail!("appliance package snapshot contains too many entries")
+        }
         let mut entry = entry.context("read appliance package entry")?;
         let path = entry.path().context("read appliance package path")?;
         let Some(name) = archive_root_name(&path)? else {
@@ -524,18 +780,29 @@ fn extract_snapshot(bundle: &mut fs::File, output: &Path) -> Result<()> {
         extracted_bytes = extracted_bytes
             .checked_add(entry.size())
             .ok_or_else(|| anyhow!("appliance package snapshot expanded size overflow"))?;
-        if extracted_bytes > 32 * 1024 * 1024 * 1024u64 {
+        if extracted_bytes > maximum_expanded_bytes {
             bail!("appliance package snapshot expands beyond its limit")
         }
-        let destination = output.join(&name);
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&destination)
-            .with_context(|| format!("create appliance package file {name}"))?;
-        std::io::copy(&mut entry, &mut file)?;
-        file.sync_all()?;
+        let copied = if let Some(output) = output {
+            let destination = output.join(&name);
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&destination)
+                .with_context(|| format!("create appliance package file {name}"))?;
+            let copied = std::io::copy(&mut entry, &mut file)?;
+            file.sync_all()?;
+            copied
+        } else {
+            std::io::copy(&mut entry, &mut std::io::sink())?
+        };
+        if copied != entry.size() {
+            bail!("appliance package snapshot entry was truncated")
+        }
     }
+    let mut bounded = archive.into_inner();
+    std::io::copy(&mut bounded, &mut std::io::sink())
+        .context("finish appliance package snapshot stream")?;
     for required in [
         "Packages",
         "Packages.gz",
@@ -550,7 +817,29 @@ fn extract_snapshot(bundle: &mut fs::File, output: &Path) -> Result<()> {
     if !names.iter().any(|name| name.ends_with(".deb")) {
         bail!("appliance package snapshot contains no Debian packages")
     }
-    Ok(())
+    Ok(extracted_bytes)
+}
+
+struct ExpandedSnapshotReader<R> {
+    inner: R,
+    consumed: u64,
+    maximum: u64,
+}
+
+impl<R: Read> Read for ExpandedSnapshotReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.consumed = self
+            .consumed
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("expanded appliance snapshot size overflow"))?;
+        if self.consumed > self.maximum {
+            return Err(std::io::Error::other(
+                "expanded appliance snapshot exceeded its stream bound",
+            ));
+        }
+        Ok(read)
+    }
 }
 
 fn archive_root_name(path: &Path) -> Result<Option<String>> {
@@ -586,15 +875,39 @@ fn is_allowed_snapshot_filename(name: &str) -> bool {
         })
 }
 
-fn verify_extracted_snapshot(directory: &Path, release: &SignedApplianceRelease) -> Result<()> {
-    let snapshot_id = fs::read_to_string(directory.join("UBUNTU-SNAPSHOT-ID"))?;
+pub(crate) fn verify_extracted_snapshot(
+    directory: &Path,
+    release: &SignedApplianceRelease,
+) -> Result<()> {
+    let mut repository_files = BTreeSet::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            bail!("appliance package repository contains a non-file entry")
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("appliance package repository filename is not UTF-8"))?;
+        if (name != "UBUNTU-SNAPSHOT-ID" && !is_allowed_snapshot_filename(&name))
+            || !repository_files.insert(name)
+        {
+            bail!("appliance package repository contains an unsafe filename")
+        }
+    }
+    let snapshot_id = read_bounded_snapshot_text(
+        &directory.join("UBUNTU-SNAPSHOT-ID"),
+        SNAPSHOT_ID_MAX_BYTES,
+        "appliance package Ubuntu snapshot identifier",
+    )?;
     if snapshot_id != format!("{}\n", release.ubuntu_snapshot_id) {
         bail!("appliance package Ubuntu snapshot identifier changed")
     }
-    let checksums = fs::read_to_string(directory.join("SHA256SUMS"))?;
-    if checksums.len() > 8 * 1024 * 1024 || checksums.is_empty() {
-        bail!("appliance package checksum manifest is invalid")
-    }
+    let checksums = read_bounded_snapshot_text(
+        &directory.join("SHA256SUMS"),
+        SNAPSHOT_CHECKSUMS_MAX_BYTES,
+        "appliance package checksum manifest",
+    )?;
     let mut covered = BTreeSet::new();
     for line in checksums.lines() {
         let (digest, filename) = line
@@ -627,25 +940,19 @@ fn verify_extracted_snapshot(directory: &Path, release: &SignedApplianceRelease)
             bail!("appliance package file checksum changed")
         }
     }
-    let actual_files = fs::read_dir(directory)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(|kind| kind.is_file())
-                .map(|_| entry.file_name().to_string_lossy().to_string())
-        })
+    let actual_files = repository_files
+        .into_iter()
         .filter(|name| name != "SHA256SUMS" && name != "UBUNTU-SNAPSHOT-ID")
         .collect::<BTreeSet<_>>();
     if covered != actual_files {
         bail!("appliance package checksum coverage is incomplete")
     }
 
-    let packages = fs::read_to_string(directory.join("Packages"))?;
-    if packages.len() > 16 * 1024 * 1024 {
-        bail!("appliance package index is too large")
-    }
+    let packages = read_bounded_snapshot_text(
+        &directory.join("Packages"),
+        SNAPSHOT_PACKAGES_MAX_BYTES,
+        "appliance package index",
+    )?;
     let mut indexed_versions = BTreeMap::new();
     for stanza in packages.split("\n\n") {
         let mut package = None;
@@ -667,6 +974,89 @@ fn verify_extracted_snapshot(directory: &Path, release: &SignedApplianceRelease)
         }
     }
     Ok(())
+}
+
+pub(crate) fn verify_thin_installer_snapshot(
+    directory: &Path,
+    release: &SignedApplianceRelease,
+) -> Result<()> {
+    verify_extracted_snapshot(directory, release)?;
+    let packages = read_bounded_snapshot_text(
+        &directory.join("Packages"),
+        SNAPSHOT_PACKAGES_MAX_BYTES,
+        "appliance package index",
+    )?;
+    let required = THIN_INSTALLER_BOOT_PACKAGES
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut present = BTreeSet::new();
+    for stanza in packages.split("\n\n") {
+        let mut package = None;
+        let mut filename = None;
+        for line in stanza.lines() {
+            if let Some(value) = line.strip_prefix("Package: ") {
+                package = Some(value);
+            } else if let Some(value) = line.strip_prefix("Filename: ") {
+                filename = Some(value);
+            }
+        }
+        let Some(package) = package else {
+            continue;
+        };
+        if !required.contains(package) {
+            continue;
+        }
+        let filename = filename
+            .ok_or_else(|| anyhow!("thin installer boot package has no repository file"))?;
+        let filename = filename.strip_prefix("./").unwrap_or(filename);
+        if !filename.ends_with(".deb") || !is_allowed_snapshot_filename(filename) {
+            bail!("thin installer boot package filename is unsafe")
+        }
+        let metadata = fs::symlink_metadata(directory.join(filename))?;
+        if !metadata.file_type().is_file() {
+            bail!("thin installer boot package repository file is unsafe")
+        }
+        present.insert(package);
+    }
+    if present != required {
+        bail!("thin installer repository omitted its signed UEFI boot package closure")
+    }
+    Ok(())
+}
+
+fn read_bounded_snapshot_text(path: &Path, maximum_bytes: u64, label: &str) -> Result<String> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("inspect {label}"))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum_bytes {
+        bail!("{label} is invalid")
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {label}"))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect open {label}"))?;
+    if !opened.file_type().is_file()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.len() != metadata.len()
+    {
+        bail!("{label} changed before it was read")
+    }
+    let capacity = usize::try_from(opened.len()).map_err(|_| anyhow!("{label} is too large"))?;
+    let read_limit = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("{label} size limit overflow"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {label}"))?;
+    if bytes.len() as u64 != opened.len() || bytes.len() as u64 > maximum_bytes {
+        bail!("{label} changed while it was read")
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow!("{label} is not UTF-8"))
 }
 
 fn write_atomic_json(path: &Path, value: &impl Serialize, mode: u32) -> Result<()> {
@@ -1289,9 +1679,379 @@ fn read_optional_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path, max: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    fn signed_release_fixture() -> (SignedApplianceRelease, SigningKey) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let required_package_versions = BTreeMap::from([
+            ("cybex-forge".to_string(), "0.1.2-1".to_string()),
+            ("cybex-forge-appliance".to_string(), "0.1.2-1".to_string()),
+            ("cybex-forge-bootstrap".to_string(), "0.1.2-1".to_string()),
+            (
+                "linux-firmware".to_string(),
+                "20260319.git217ca6e4.1ubuntu".to_string(),
+            ),
+            ("linux-generic".to_string(), "7.0.0-29.29".to_string()),
+            ("nix-bin".to_string(), "2.34.3+dfsg-1".to_string()),
+        ]);
+        let mut release = SignedApplianceRelease {
+            schema: APPLIANCE_RELEASE_SCHEMA.to_string(),
+            release_id: "0.1.2".to_string(),
+            ubuntu_snapshot_id: "20260805T000000Z".to_string(),
+            cybex_repository_snapshot: ApplianceRepositorySnapshot {
+                url: "https://github.com/CybexHQ/forge/releases/download/v0.1.2/cybex-forge-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: 1024 * 1024 * 1024,
+            },
+            required_package_versions,
+            expected_kernel: "7.0.0-29.29".to_string(),
+            minimum_protocol: 4,
+            minimum_state_schema: 1,
+            rollback_compatible: true,
+            release_notes: "https://github.com/CybexHQ/forge/releases/tag/v0.1.2".to_string(),
+            signature: String::new(),
+        };
+        let mut unsigned = serde_json::to_value(&release).unwrap();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let body = serde_json::to_vec(&canonical_json(unsigned)).unwrap();
+        let mut payload = APPLIANCE_RELEASE_SIGNATURE_DOMAIN.as_bytes().to_vec();
+        payload.push(b'\n');
+        payload.extend_from_slice(&body);
+        release.signature = STANDARD.encode(key.sign(&payload).to_bytes());
+        (release, key)
+    }
+
+    fn test_directory(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("cybex-forge-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn compressed_tar(build: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_bytes);
+            build(&mut archive);
+            archive.finish().unwrap();
+        }
+        zstd::stream::encode_all(tar_bytes.as_slice(), 1).unwrap()
+    }
+
+    fn append_test_file(archive: &mut tar::Builder<&mut Vec<u8>>, name: &str, body: &[u8]) {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive.append_data(&mut header, name, body).unwrap();
+    }
+
+    fn write_test_repository(
+        directory: &Path,
+        release: &SignedApplianceRelease,
+        packages: &[&str],
+    ) {
+        let mut index = String::new();
+        let mut checksum_names = Vec::new();
+        for package in packages {
+            let version = release
+                .required_package_versions
+                .get(*package)
+                .map(String::as_str)
+                .unwrap_or("1.0-1");
+            let filename = format!("{package}_{version}_amd64.deb");
+            fs::write(directory.join(&filename), format!("fixture {package}\n")).unwrap();
+            checksum_names.push(filename.clone());
+            index.push_str(&format!(
+                "Package: {package}\nVersion: {version}\nFilename: ./{filename}\n\n"
+            ));
+        }
+        fs::write(directory.join("Packages"), index).unwrap();
+        fs::write(directory.join("Packages.gz"), b"fixture packages gzip\n").unwrap();
+        fs::write(directory.join("Release"), b"Origin: Cybex\n").unwrap();
+        fs::write(
+            directory.join("UBUNTU-SNAPSHOT-ID"),
+            format!("{}\n", release.ubuntu_snapshot_id),
+        )
+        .unwrap();
+        checksum_names.extend([
+            "Packages".to_string(),
+            "Packages.gz".to_string(),
+            "Release".to_string(),
+        ]);
+        checksum_names.sort();
+        let checksums = checksum_names
+            .into_iter()
+            .fold(String::new(), |mut checksums, name| {
+                let body = fs::read(directory.join(&name)).unwrap();
+                checksums.push_str(&hex::encode(Sha256::digest(body)));
+                checksums.push_str("  ");
+                checksums.push_str(&name);
+                checksums.push('\n');
+                checksums
+            });
+        fs::write(directory.join("SHA256SUMS"), checksums).unwrap();
+    }
 
     #[test]
     fn update_capability_is_versioned() {
         assert_eq!(APPLIANCE_UPDATE_CAPABILITY, "appliance_update_v1");
+    }
+
+    #[test]
+    fn terminal_update_replay_requires_the_exact_attempt_and_target() {
+        let (release, _key) = signed_release_fixture();
+        let update = ManagedApplianceUpdate {
+            attempt_id: uuid::Uuid::new_v4(),
+            requested_at: Utc::now(),
+            release,
+        };
+        let terminal = json!({
+            "status": "succeeded",
+            "attempt_id": update.attempt_id,
+            "target_release": update.release.release_id,
+        });
+        assert!(completed_update_matches(&terminal, &update));
+
+        let mut wrong_attempt = terminal.clone();
+        wrong_attempt["attempt_id"] = json!(uuid::Uuid::new_v4());
+        assert!(!completed_update_matches(&wrong_attempt, &update));
+
+        let mut wrong_target = terminal.clone();
+        wrong_target["target_release"] = json!("0.1.3");
+        assert!(!completed_update_matches(&wrong_target, &update));
+
+        let mut nonterminal = terminal;
+        nonterminal["status"] = json!("applying");
+        assert!(!completed_update_matches(&nonterminal, &update));
+    }
+
+    #[test]
+    fn appliance_update_queue_keeps_only_the_latest_attempt() {
+        let (release, _key) = signed_release_fixture();
+        let update = |attempt_id| ManagedApplianceUpdate {
+            attempt_id,
+            requested_at: Utc::now(),
+            release: release.clone(),
+        };
+        let first = uuid::Uuid::new_v4();
+        let latest = uuid::Uuid::new_v4();
+        let mut queue = ApplianceUpdateQueue::new();
+        assert!(queue.enqueue(update(first)));
+        assert!(!queue.enqueue(update(latest)));
+        assert_eq!(queue.pending.unwrap().attempt_id, latest);
+    }
+
+    #[tokio::test]
+    async fn corrupt_cached_snapshot_is_removed_and_downloaded_again() {
+        let root = test_directory("corrupt-cached-snapshot");
+        let target = root.join("snapshot.tar.zst");
+        fs::write(&target, b"truncated").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let body = b"complete signed appliance snapshot".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /snapshot"));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                expected_body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&expected_body).await.unwrap();
+        });
+        let snapshot = ApplianceRepositorySnapshot {
+            url: format!("http://{address}/snapshot"),
+            sha256: hex::encode(Sha256::digest(&body)),
+            size_bytes: body.len() as u64,
+        };
+
+        download_snapshot_with_policy(&snapshot, &target, true)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(fs::read(&target).unwrap(), body);
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_release_uses_the_offline_key_and_exact_package_anchors() {
+        let root = test_directory("install-release-signature");
+        let key_path = root.join("release-public-key");
+        let (mut release, key) = signed_release_fixture();
+        fs::write(
+            &key_path,
+            format!("{}\n", STANDARD.encode(key.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        assert_eq!(
+            release
+                .required_package_versions
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "cybex-forge",
+                "cybex-forge-appliance",
+                "cybex-forge-bootstrap",
+                "linux-firmware",
+                "linux-generic",
+                "nix-bin",
+            ])
+        );
+        validate_install_release(&release, "0.1.2", &key_path, 4 * 1024 * 1024 * 1024).unwrap();
+
+        release.cybex_repository_snapshot.sha256 = "b".repeat(64);
+        assert!(
+            validate_install_release(&release, "0.1.2", &key_path, 4 * 1024 * 1024 * 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("signature")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_update_snapshot_does_not_require_thin_installer_boot_packages() {
+        let (release, _key) = signed_release_fixture();
+        let legacy_root = test_directory("legacy-six-package-snapshot");
+        let legacy_packages = release
+            .required_package_versions
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        write_test_repository(&legacy_root, &release, &legacy_packages);
+        verify_extracted_snapshot(&legacy_root, &release).unwrap();
+        assert!(
+            verify_thin_installer_snapshot(&legacy_root, &release)
+                .unwrap_err()
+                .to_string()
+                .contains("UEFI boot package closure")
+        );
+        fs::remove_dir_all(legacy_root).unwrap();
+
+        let thin_root = test_directory("thin-installer-package-snapshot");
+        let mut thin_packages = legacy_packages;
+        thin_packages.extend(THIN_INSTALLER_BOOT_PACKAGES);
+        write_test_repository(&thin_root, &release, &thin_packages);
+        verify_thin_installer_snapshot(&thin_root, &release).unwrap();
+        fs::remove_dir_all(thin_root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_partial_extracted_snapshot_is_reconciled_to_a_clean_root() {
+        let (release, _key) = signed_release_fixture();
+        let root = test_directory("extracted-snapshot-recovery");
+        let release_root = root.join("release");
+        let packages = release_root.join("packages");
+        fs::create_dir(&release_root).unwrap();
+        fs::create_dir(&packages).unwrap();
+        let package_names = release
+            .required_package_versions
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        write_test_repository(&packages, &release, &package_names);
+        assert!(prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
+
+        fs::write(packages.join("Packages"), b"corrupt\n").unwrap();
+        assert!(!prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
+        assert!(!packages.exists());
+
+        let stale = release_root.join(".packages.crashed-attempt");
+        fs::create_dir(&stale).unwrap();
+        assert!(!prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
+        assert!(!stale.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repository_metadata_reads_are_bounded_before_allocation() {
+        let root = test_directory("bounded-repository-metadata");
+        for (name, maximum, label) in [
+            (
+                "UBUNTU-SNAPSHOT-ID",
+                SNAPSHOT_ID_MAX_BYTES,
+                "appliance package Ubuntu snapshot identifier",
+            ),
+            (
+                "SHA256SUMS",
+                SNAPSHOT_CHECKSUMS_MAX_BYTES,
+                "appliance package checksum manifest",
+            ),
+            (
+                "Packages",
+                SNAPSHOT_PACKAGES_MAX_BYTES,
+                "appliance package index",
+            ),
+        ] {
+            let path = root.join(name);
+            let file = fs::File::create(&path).unwrap();
+            file.set_len(maximum + 1).unwrap();
+            let error = read_bounded_snapshot_text(&path, maximum, label).unwrap_err();
+            assert!(error.to_string().contains("is invalid"), "{error:#}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_stream_extraction_rejects_links_duplicates_and_expansion() {
+        let link_archive = compressed_tar(|archive| {
+            let mut header = tar::Header::new_ustar();
+            header.set_path("unsafe.deb").unwrap();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("target").unwrap();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            archive.append(&header, std::io::empty()).unwrap();
+        });
+        let link_root = test_directory("snapshot-link");
+        assert!(
+            extract_snapshot_reader(link_archive.as_slice(), &link_root, 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe entry")
+        );
+        fs::remove_dir_all(link_root).unwrap();
+
+        let duplicate_archive = compressed_tar(|archive| {
+            append_test_file(archive, "duplicate.deb", b"one");
+            append_test_file(archive, "duplicate.deb", b"two");
+        });
+        let duplicate_root = test_directory("snapshot-duplicate");
+        assert!(
+            extract_snapshot_reader(duplicate_archive.as_slice(), &duplicate_root, 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe entry")
+        );
+        fs::remove_dir_all(duplicate_root).unwrap();
+
+        let oversized_archive = compressed_tar(|archive| {
+            append_test_file(archive, "large.deb", b"four");
+        });
+        let oversized_root = test_directory("snapshot-oversized");
+        assert!(
+            extract_snapshot_reader(oversized_archive.as_slice(), &oversized_root, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("expands beyond")
+        );
+        fs::remove_dir_all(oversized_root).unwrap();
     }
 }

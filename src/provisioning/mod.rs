@@ -5,6 +5,7 @@
 //! that installed identity.
 
 mod inventory;
+mod packages;
 mod protocol;
 mod storage;
 
@@ -19,8 +20,13 @@ pub use inventory::{ForgeProvisioningDisk, ForgeProvisioningInventory};
 pub use protocol::{ProvisioningEnvelope, SignedInstallPlan};
 
 pub const PRODUCTION_MANAGE_ORIGIN: &str = "https://manage.cybex.net";
+pub const REQUIRED_MANAGE_ORIGIN: &str = match option_env!("CYBEX_FORGE_BUILD_MANAGE_ORIGIN") {
+    Some(origin) => origin,
+    None => PRODUCTION_MANAGE_ORIGIN,
+};
 pub const DEFAULT_ENVELOPE_PATH: &str = "/cdrom/CYBEX_PROVISIONING.BIN";
 pub const DEFAULT_PROVISIONING_KEYS_PATH: &str = "/cdrom/cybex/provisioning-public-keys";
+pub const DEFAULT_RELEASE_PUBLIC_KEY_PATH: &str = packages::RELEASE_PUBLIC_KEY_PATH;
 pub const DEFAULT_AUTOINSTALL_PATH: &str = "/autoinstall.yaml";
 pub const DEFAULT_STATE_MOUNT: &str = "/run/cybex-state";
 
@@ -28,6 +34,7 @@ pub const DEFAULT_STATE_MOUNT: &str = "/run/cybex-state";
 pub struct PrepareOptions {
     pub envelope_path: PathBuf,
     pub provisioning_keys_path: PathBuf,
+    pub release_public_key_path: PathBuf,
     pub autoinstall_path: PathBuf,
     pub state_mount: PathBuf,
     pub required_manage_origin: String,
@@ -38,9 +45,10 @@ impl Default for PrepareOptions {
         Self {
             envelope_path: PathBuf::from(DEFAULT_ENVELOPE_PATH),
             provisioning_keys_path: PathBuf::from(DEFAULT_PROVISIONING_KEYS_PATH),
+            release_public_key_path: PathBuf::from(DEFAULT_RELEASE_PUBLIC_KEY_PATH),
             autoinstall_path: PathBuf::from(DEFAULT_AUTOINSTALL_PATH),
             state_mount: PathBuf::from(DEFAULT_STATE_MOUNT),
-            required_manage_origin: PRODUCTION_MANAGE_ORIGIN.to_string(),
+            required_manage_origin: REQUIRED_MANAGE_ORIGIN.to_string(),
         }
     }
 }
@@ -82,16 +90,17 @@ impl DurableProvisioningState {
 /// Claim the media, wait for approval, create state first, rotate identity,
 /// then replace Subiquity's autoinstall document.
 pub async fn prepare(options: PrepareOptions) -> Result<()> {
+    let media_layout = packages::inspect_media_layout()?;
     let trusted_keys = protocol::load_trusted_provisioning_keys(&options.provisioning_keys_path)?;
     let verified = protocol::load_and_verify_envelope(
         &options.envelope_path,
         &trusted_keys,
         &options.required_manage_origin,
     )?;
-    if let Some(state) =
+    if let Some(probe) =
         storage::existing_state_for_session(&options.state_mount, verified.envelope.session_id)?
     {
-        return resume_prepare(&options, &verified, state).await;
+        return resume_prepare(&options, &verified, probe, media_layout).await;
     }
 
     let provisioning_key = protocol::derive_provisioning_key(&verified.envelope.media_secret)?;
@@ -135,6 +144,7 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
 
     let fresh_inventory = inventory::collect_inventory().await?;
     inventory::revalidate_plan_hardware(&signed_plan, &fresh_inventory)?;
+    let package_delivery = packages::validate_plan_delivery(&signed_plan, media_layout)?;
     inventory::preflight_network(
         &signed_plan,
         &fresh_inventory,
@@ -153,8 +163,19 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
             "Approved install plan validated",
         )
         .await?;
-    // This is the server-side point of no return. No disk command runs before
-    // the accepted destructive-stage event.
+    if package_delivery == packages::PackageDelivery::NetworkSnapshot {
+        packages::stage_network_snapshot(&signed_plan, &options.release_public_key_path).await?;
+    }
+    let fresh_inventory = inventory::collect_inventory().await?;
+    inventory::revalidate_plan_hardware(&signed_plan, &fresh_inventory)?;
+    inventory::preflight_network(
+        &signed_plan,
+        &fresh_inventory,
+        &verified.envelope.manage_origin,
+    )
+    .await?;
+    // This is the server-side point of no return. No target-disk mutation runs
+    // before the accepted destructive-stage event.
     client
         .send_event(
             &provisioning_key,
@@ -236,15 +257,22 @@ pub async fn prepare(options: PrepareOptions) -> Result<()> {
         .await?;
     durable.next_event_sequence = 6;
     storage::save_durable_state(&prepared.state_mount, &durable)?;
-    storage::write_autoinstall(&options.autoinstall_path, &prepared, &signed_plan)?;
+    storage::write_autoinstall(
+        &options.autoinstall_path,
+        &prepared,
+        &signed_plan,
+        package_delivery,
+    )?;
     Ok(())
 }
 
 async fn resume_prepare(
     options: &PrepareOptions,
     verified: &protocol::VerifiedEnvelope,
-    mut durable: DurableProvisioningState,
+    probe: storage::ExistingStateProbe,
+    media_layout: packages::MediaLayout,
 ) -> Result<()> {
+    let mut durable = probe.state.clone();
     if durable.manage_origin != verified.envelope.manage_origin
         || durable.management_signing_public_key_b64
             != protocol::standard_base64(verified.signing_key.to_bytes())
@@ -260,11 +288,20 @@ async fn resume_prepare(
         &verified.envelope,
         &inventory,
     )?;
+    let package_delivery = packages::validate_plan_delivery(&signed_plan, media_layout)?;
+    inventory::revalidate_durable_plan_hardware(&signed_plan, &inventory)?;
+    inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)
+        .await?;
+    if package_delivery == packages::PackageDelivery::NetworkSnapshot {
+        packages::stage_network_snapshot(&signed_plan, &options.release_public_key_path).await?;
+    }
+    let inventory = inventory::collect_inventory().await?;
     inventory::revalidate_durable_plan_hardware(&signed_plan, &inventory)?;
     inventory::preflight_network(&signed_plan, &inventory, &verified.envelope.manage_origin)
         .await?;
     let prepared =
         storage::resume_prepared_storage(&signed_plan, &inventory, &options.state_mount).await?;
+    durable = storage::activate_existing_state(&options.state_mount, &probe)?;
     let provisioning_key = protocol::derive_provisioning_key(&verified.envelope.media_secret)?;
     let device_key = durable.signing_key()?;
     if durable.device_public_key_b64
@@ -331,7 +368,12 @@ async fn resume_prepare(
         durable.next_event_sequence = 6;
         storage::save_durable_state(&prepared.state_mount, &durable)?;
     }
-    storage::write_autoinstall(&options.autoinstall_path, &prepared, &signed_plan)
+    storage::write_autoinstall(
+        &options.autoinstall_path,
+        &prepared,
+        &signed_plan,
+        package_delivery,
+    )
 }
 
 /// Send one late-install event using the device key on CYBEX_STATE.

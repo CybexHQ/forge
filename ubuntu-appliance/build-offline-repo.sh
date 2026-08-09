@@ -93,6 +93,8 @@ declare -a packages=(
   e2fsprogs
   efibootmgr
   gdisk
+  grub-efi-amd64
+  grub-efi-amd64-signed
   intel-microcode
   iproute2
   iputils-arping
@@ -111,6 +113,8 @@ declare -a packages=(
   openssh-server
   parted
   sbsigntool
+  secureboot-db
+  shim-signed
   systemd
   tftpd-hpa
   ubuntu-keyring

@@ -227,7 +227,8 @@ fn contains_unsafe_credential_assignment(text: &str) -> bool {
             continue;
         }
         if is_credential_reference_key(&canonical)
-            && safe_runtime_secret_reference(assignment_value)
+            && (safe_runtime_secret_reference(assignment_value)
+                || safe_public_account_database_reference(&canonical, assignment_value))
         {
             continue;
         }
@@ -368,7 +369,16 @@ fn assignment_key(text: &str, equals: usize) -> Option<&str> {
     if end > 0 && matches!(bytes[end - 1], b'\'' | b'"') {
         let quote = bytes[end - 1];
         let start = bytes[..end - 1].iter().rposition(|byte| *byte == quote)?;
-        return (start + 1 < end - 1).then_some(&text[start + 1..end - 1]);
+        let key = (start + 1 < end - 1).then_some(&text[start + 1..end - 1])?;
+        // In shell tests, `"$variable" = value` is a comparison expression,
+        // not an assignment. It cannot persist a credential and treating it
+        // as a quoted attribute made the captured-home absolute-path guard
+        // look like a second `passwd_file` assignment. A real quoted key such
+        // as `"password" = value` does not begin with `$` and remains covered.
+        if key.starts_with('$') {
+            return None;
+        }
+        return Some(key);
     }
     let mut start = end;
     while start > 0
@@ -376,15 +386,60 @@ fn assignment_key(text: &str, equals: usize) -> Option<&str> {
     {
         start -= 1;
     }
+    // Manage embeds shell helpers in a JSON-escaped Nix string. A logical
+    // newline is therefore written as `\n`, and the old reader accidentally
+    // treated that `n` as the first character of the following assignment.
+    if start > 0
+        && start + 1 < end
+        && bytes[start - 1] == b'\\'
+        && matches!(bytes[start], b'n' | b'r')
+    {
+        start += 1;
+    }
     (start < end).then_some(&text[start..end])
 }
 
 fn assignment_value(text: &str, start: usize) -> &str {
     let remainder = text[start..].trim_start();
-    let end = remainder
-        .find([';', '\n', '\r', ','])
-        .unwrap_or(remainder.len());
+    let bytes = remainder.as_bytes();
+    let mut end = remainder.len();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if matches!(bytes[index], b';' | b'\n' | b'\r' | b',') {
+            end = index;
+            break;
+        }
+        if bytes[index] == b'\\' {
+            let escape_start = index;
+            while index < bytes.len() && bytes[index] == b'\\' {
+                index += 1;
+            }
+            if (index - escape_start) % 2 == 1
+                && bytes
+                    .get(index)
+                    .is_some_and(|byte| matches!(byte, b'n' | b'r'))
+            {
+                end = escape_start;
+                break;
+            }
+            continue;
+        }
+        index += 1;
+    }
     remainder[..end].trim()
+}
+
+/// `/etc/passwd` is the public NSS account database, not the protected shadow
+/// database. Older Manage revisions embed a captured-home helper whose third
+/// argument defaults to this path. Accept only those exact spellings so the
+/// historical revisions remain buildable without allowing `/etc/shadow`, an
+/// arbitrary file, or a literal credential value.
+fn safe_public_account_database_reference(canonical_key: &str, value: &str) -> bool {
+    canonical_key == "passwdfile"
+        && matches!(
+            value.trim(),
+            "/etc/passwd" | "\"/etc/passwd\"" | "${3:-/etc/passwd}" | "\\${3:-/etc/passwd}"
+        )
 }
 
 fn json_credential_value_is_safe_reference(canonical_key: &str, value: &Value) -> bool {
@@ -887,6 +942,31 @@ mod tests {
             );
             let error = validate_build_spec(&rejected).unwrap_err().to_string();
             assert!(!error.contains(&rejected_path));
+        }
+    }
+
+    #[test]
+    fn allows_only_the_public_passwd_database_reference() {
+        for generated_nix in [
+            "passwd_file = /etc/passwd;",
+            "passwd_file = \"/etc/passwd\";",
+            "passwd_file=${3:-/etc/passwd}\n",
+            "text = \"#!/usr/bin/env bash\\npasswd_file=\\${3:-/etc/passwd}\\nhome_root=\\${4:-/home}\\n\";",
+            "text = \"passwd_file=\\${3:-/etc/passwd}\\n[[ \\\"$state_dir\\\" = /* && \\\"$passwd_file\\\" = /* && \\\"$home_root\\\" = /* ]] || exit 1\\n\";",
+        ] {
+            validate_generated_nix(generated_nix).unwrap();
+        }
+
+        for generated_nix in [
+            "passwd_file = /etc/shadow;",
+            "passwd_file = /tmp/passwd;",
+            "passwd_file=${3:-/etc/shadow}\n",
+            "text = \"passwd_file=\\${3:-/etc/shadow}\\n\";",
+        ] {
+            let error = validate_generated_nix(generated_nix)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("literal credential assignment"));
         }
     }
 

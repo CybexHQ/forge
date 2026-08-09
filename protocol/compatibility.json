@@ -8,5 +8,59 @@
   "forge": {
     "minimum_manage_protocol": 4,
     "maximum_manage_protocol": 4
+  },
+  "workstation_runtime": {
+    "compatibility_epoch": 1,
+    "descriptor_schema": "cybex.forge.workstation-netboot.v1",
+    "manifest_schema": "cybex.forge.workstation-netboot-manifest.v1",
+    "architecture": "x86_64-linux",
+    "format": "split-squashfs-v1",
+    "required_forge_protocol": 4,
+    "import_states": [
+      "absent",
+      "queued",
+      "downloading",
+      "verifying",
+      "extracting",
+      "ready",
+      "failed",
+      "held"
+    ],
+    "import_error_codes": [
+      "invalid_descriptor",
+      "integrity_mismatch",
+      "insufficient_disk_space",
+      "network_or_server",
+      "local_io_or_processing",
+      "compatibility_epoch_unsupported",
+      "unknown"
+    ],
+    "resolution_states": [
+      "ready",
+      "using_last_known_good",
+      "unavailable",
+      "not_configured"
+    ],
+    "resolution_error_codes": [
+      "release_unavailable",
+      "runtime_missing",
+      "descriptor_invalid",
+      "compatibility_epoch_unsupported",
+      "trust_invalid",
+      "rollback_rejected",
+      "storage_unavailable",
+      "internal_error"
+    ],
+    "report_receipt_states": [
+      "accepted",
+      "rejected",
+      "unavailable"
+    ],
+    "report_receipt_error_codes": [
+      "runtime_report_missing",
+      "runtime_report_invalid",
+      "runtime_report_stale",
+      "runtime_report_storage_unavailable"
+    ]
   }
 }

@@ -25,7 +25,7 @@ while (($#)); do
 done
 test -f "$template" && test -f "$manifest" && test -f "$token_file" && test -n "$output"
 [[ "$manage_origin" =~ ^https://[^/]+$ ]]
-for command_name in curl jq qemu-system-x86_64 truncate sha256sum openssl ssh-keygen; do
+for command_name in curl ip jq python3 qemu-system-x86_64 truncate sha256sum openssl ssh-keygen; do
   command -v "$command_name" >/dev/null || { echo "error: missing $command_name" >&2; exit 1; }
 done
 bridge="${CYBEX_FORGE_QUALIFICATION_BRIDGE:?set the isolated qualification bridge}"
@@ -36,6 +36,7 @@ release_version="$(jq -er '.version' "$manifest")"
 
 work_dir="$(mktemp -d)"
 qemu_pid=""
+package_server_pid=""
 session_id=""
 lifecycle_succeeded=false
 personalized="$work_dir/personalized.iso"
@@ -43,6 +44,10 @@ cleanup() {
   if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$package_server_pid" ]] && kill -0 "$package_server_pid" 2>/dev/null; then
+    kill "$package_server_pid" 2>/dev/null || true
+    wait "$package_server_pid" 2>/dev/null || true
   fi
   if [[ -n "$session_id" && "$lifecycle_succeeded" != true ]]; then
     cleanup_session="$work_dir/cleanup-session.json"
@@ -74,10 +79,87 @@ api() {
   fi
 }
 
+package_delivery="$(jq -er '.installer_iso_template_v2.package_delivery // "embedded"' "$manifest")"
+package_transport_url=""
+case "$package_delivery" in
+  embedded) ;;
+  network-snapshot-v1)
+    test "$(jq -er '.appliance_release_v1.schema' "$manifest")" = \
+      cybex.forge.appliance-release.v1
+    package_filename="cybex-forge-appliance-packages-$release_version-x86_64-linux.tar.zst"
+    signed_package_url="$(jq -er '.appliance_release_v1.cybex_repository_snapshot.url' "$manifest")"
+    [[ "$signed_package_url" = */"$package_filename" ]]
+    manifest_directory="$(cd -- "$(dirname -- "$manifest")" && pwd -P)"
+    package_snapshot="$manifest_directory/$package_filename"
+    test -f "$package_snapshot" && test ! -L "$package_snapshot"
+    test "$(stat -c '%s' "$package_snapshot")" = \
+      "$(jq -er '.appliance_release_v1.cybex_repository_snapshot.size_bytes' "$manifest")"
+    test "$(sha256sum "$package_snapshot" | awk '{print $1}')" = \
+      "$(jq -er '.appliance_release_v1.cybex_repository_snapshot.sha256' "$manifest")"
+
+    mapfile -t bridge_addresses < <(
+      ip -4 -o address show dev "$bridge" scope global \
+        | awk '{sub(/\/.*/, "", $4); print $4}'
+    )
+    bridge_ipv4="${CYBEX_FORGE_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
+    if [[ -n "$bridge_ipv4" ]]; then
+      printf '%s\n' "${bridge_addresses[@]}" | grep -Fx "$bridge_ipv4" >/dev/null
+    else
+      for candidate in "${bridge_addresses[@]}"; do
+        if python3 -B -c \
+          'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); raise SystemExit(not (a.version == 4 and a.is_private and not a.is_loopback))' \
+          "$candidate"
+        then
+          bridge_ipv4="$candidate"
+          break
+        fi
+      done
+    fi
+    test -n "$bridge_ipv4" || {
+      echo "error: qualification bridge $bridge has no private IPv4 address" >&2
+      exit 1
+    }
+    python3 -B -c \
+      'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); raise SystemExit(not (a.version == 4 and a.is_private and not a.is_loopback))' \
+      "$bridge_ipv4"
+
+    package_port_file="$work_dir/package-server.port"
+    python3 -B \
+      "$repository_root/ubuntu-appliance/qualification/serve-package-snapshot.py" \
+      --bind "$bridge_ipv4" --file "$package_snapshot" \
+      --port-file "$package_port_file" &
+    package_server_pid=$!
+    for _attempt in $(seq 1 100); do
+      [[ -s "$package_port_file" ]] && break
+      kill -0 "$package_server_pid"
+      sleep 0.1
+    done
+    package_port="$(tr -d '\r\n' < "$package_port_file")"
+    [[ "$package_port" =~ ^[1-9][0-9]{0,4}$ ]] && ((package_port <= 65535))
+    package_transport_url="http://$bridge_ipv4:$package_port/$package_filename"
+    curl --fail --silent --show-error --proto '=http' --head \
+      "$package_transport_url" >/dev/null
+    ;;
+  *)
+    echo "error: unsupported installer package delivery contract: $package_delivery" >&2
+    exit 1
+    ;;
+esac
+
 create_response="$work_dir/create.json"
-create_body="$(jq -c \
-  '{label:"release qualification",qualification_candidate:{release_version:.version,installer_iso_template_v2:.installer_iso_template_v2}}' \
-  "$manifest")"
+if [[ -n "$package_transport_url" ]]; then
+  create_body="$(jq -c --arg package_transport_url "$package_transport_url" \
+    '{label:"release qualification",qualification_candidate:{release_version:.version,installer_iso_template_v2:.installer_iso_template_v2,appliance_release_v1:.appliance_release_v1,package_transport_url:$package_transport_url}}' \
+    "$manifest")"
+else
+  create_body="$(jq -c '
+    . as $manifest
+    | {label:"release qualification",qualification_candidate:{release_version:$manifest.version,installer_iso_template_v2:$manifest.installer_iso_template_v2}}
+    | if ($manifest | has("appliance_release_v1"))
+      then .qualification_candidate.appliance_release_v1 = $manifest.appliance_release_v1
+      else .
+      end' "$manifest")"
+fi
 api POST /v1/forge/provisioning-sessions "$create_body" > "$create_response"
 session_id="$(jq -er '.session.id' "$create_response")"
 media_secret="$(jq -er '.media_secret' "$create_response")"

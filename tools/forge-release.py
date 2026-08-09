@@ -26,6 +26,13 @@ from urllib.parse import urlsplit
 
 
 SCHEMA = "cybex.forge.release.v1"
+RELEASE_COMPATIBILITY_SCHEMA = "cybex.forge.release-compatibility.v1"
+RELEASE_COMPATIBILITY_SIGNATURE_DOMAIN = (
+    "CYBEX-FORGE-RELEASE-COMPATIBILITY-V1"
+)
+COMPONENT_COMPATIBILITY_SCHEMA = "cybex.component-compatibility.v1"
+RELEASE_MANIFEST_FILENAME = "cybex-forge-release.json"
+RELEASE_COMPATIBILITY_FILENAME = "cybex-forge-release-compatibility.json"
 INSTALLER_ISO_ARCHITECTURE = "x86_64-linux"
 INSTALLER_ISO_MAX_BYTES = 16 * 1024 * 1024 * 1024
 INSTALLER_ISO_TEMPLATE_SIGNATURE_DOMAIN = (
@@ -34,6 +41,8 @@ INSTALLER_ISO_TEMPLATE_SIGNATURE_DOMAIN = (
 INSTALLER_ISO_TEMPLATE_BASE_OS = "ubuntu"
 INSTALLER_ISO_TEMPLATE_BASE_OS_VERSION = "26.04"
 INSTALLER_ISO_TEMPLATE_PERSONALIZATION_SIZE = 8192
+INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY = "network-snapshot-v1"
+APPLIANCE_PACKAGE_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024 * 1024
 APPLIANCE_RELEASE_SIGNATURE_DOMAIN = "CYBEX-FORGE-APPLIANCE-RELEASE-V1"
 APPLIANCE_RELEASE_SCHEMA = "cybex.forge.appliance-release.v1"
 WORKSTATION_NETBOOT_SIGNATURE_DOMAIN = "CYBEX-FORGE-WORKSTATION-NETBOOT-V1"
@@ -284,6 +293,40 @@ def _validate_version(value: str) -> str:
     return value
 
 
+def _compare_semver(left_value: str, right_value: str) -> int:
+    """Return SemVer precedence for left versus right, ignoring build metadata."""
+
+    def parts(value: str) -> tuple[tuple[int, int, int], list[str] | None]:
+        value = _validate_version(value).split("+", 1)[0]
+        core, separator, prerelease = value.partition("-")
+        major, minor, patch = (int(component) for component in core.split("."))
+        return (major, minor, patch), prerelease.split(".") if separator else None
+
+    left_core, left_prerelease = parts(left_value)
+    right_core, right_prerelease = parts(right_value)
+    if left_core != right_core:
+        return 1 if left_core > right_core else -1
+    if left_prerelease is None or right_prerelease is None:
+        if left_prerelease is right_prerelease:
+            return 0
+        return 1 if left_prerelease is None else -1
+    for left_identifier, right_identifier in zip(
+        left_prerelease, right_prerelease, strict=False
+    ):
+        if left_identifier == right_identifier:
+            continue
+        left_numeric = left_identifier.isdigit()
+        right_numeric = right_identifier.isdigit()
+        if left_numeric and right_numeric:
+            return 1 if int(left_identifier) > int(right_identifier) else -1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return 1 if left_identifier > right_identifier else -1
+    if len(left_prerelease) == len(right_prerelease):
+        return 0
+    return 1 if len(left_prerelease) > len(right_prerelease) else -1
+
+
 def _validate_url(value: str, label: str) -> str:
     if (
         not value
@@ -482,7 +525,7 @@ def _canonical_message(version: str, sha256: str, artifact_url: str) -> bytes:
 
 
 def _installer_iso_template_message(descriptor: dict[str, Any]) -> bytes:
-    return (
+    message = (
         f"{INSTALLER_ISO_TEMPLATE_SIGNATURE_DOMAIN}\n"
         f"{descriptor['version']}\n"
         f"{descriptor['architecture']}\n"
@@ -495,18 +538,31 @@ def _installer_iso_template_message(descriptor: dict[str, Any]) -> bytes:
         f"{descriptor['personalization_size']}\n"
         f"{descriptor['placeholder_sha256']}\n"
         f"{','.join(descriptor['provisioning_public_keys'])}\n"
-    ).encode("utf-8")
+    )
+    package_delivery = descriptor.get("package_delivery")
+    # Legacy embedded-package V2 descriptors omit this field; do not append an
+    # empty line because that would change their signed canonical bytes.
+    if package_delivery is not None:
+        message += f"{package_delivery}\n"
+    return message.encode("utf-8")
 
 
 def _installer_iso_template_inputs(
     arguments: argparse.Namespace,
     version: str,
-) -> tuple[Path, str, int, list[str]] | None:
+) -> tuple[Path, str, int, list[str], str | None] | None:
     path_value = arguments.installer_iso_template
     url_value = arguments.installer_iso_template_url
     offset_value = arguments.installer_iso_template_personalization_offset
     keys = arguments.provisioning_public_key or []
-    supplied = bool(path_value or url_value or offset_value is not None or keys)
+    package_delivery = arguments.installer_iso_template_package_delivery
+    supplied = bool(
+        path_value
+        or url_value
+        or offset_value is not None
+        or keys
+        or package_delivery is not None
+    )
     if not supplied:
         return None
     if not path_value or not url_value or offset_value is None or not keys:
@@ -533,14 +589,16 @@ def _installer_iso_template_inputs(
         _fail("provisioning public keys must contain between one and eight unique keys")
     if normalized_keys != sorted(normalized_keys):
         _fail("provisioning public keys must be supplied in sorted order")
-    return path, url, offset_value, normalized_keys
+    if package_delivery not in (None, INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY):
+        _fail("installer ISO template package delivery is invalid")
+    return path, url, offset_value, normalized_keys, package_delivery
 
 
 def _inspect_installer_iso_template(
-    inputs: tuple[Path, str, int, list[str]],
+    inputs: tuple[Path, str, int, list[str], str | None],
     version: str,
 ) -> dict[str, Any]:
-    path, url, offset, provisioning_public_keys = inputs
+    path, url, offset, provisioning_public_keys, package_delivery = inputs
     template_sha256, size_bytes = _inspect_artifact(
         path,
         "installer ISO template",
@@ -557,7 +615,7 @@ def _inspect_installer_iso_template(
         os.close(fd)
     if placeholder != bytes(INSTALLER_ISO_TEMPLATE_PERSONALIZATION_SIZE):
         _fail("installer ISO template personalization slot must contain exactly zero bytes")
-    return {
+    descriptor = {
         "version": version,
         "architecture": INSTALLER_ISO_ARCHITECTURE,
         "base_os": INSTALLER_ISO_TEMPLATE_BASE_OS,
@@ -570,6 +628,9 @@ def _inspect_installer_iso_template(
         "placeholder_sha256": hashlib.sha256(placeholder).hexdigest(),
         "provisioning_public_keys": provisioning_public_keys,
     }
+    if package_delivery is not None:
+        descriptor["package_delivery"] = package_delivery
+    return descriptor
 
 
 def _appliance_release_message(descriptor: dict[str, Any]) -> bytes:
@@ -642,7 +703,7 @@ def _appliance_release_inputs(
     actual_sha, actual_size = _inspect_artifact(
         bundle,
         "appliance package snapshot",
-        maximum_bytes=INSTALLER_ISO_MAX_BYTES,
+        maximum_bytes=APPLIANCE_PACKAGE_SNAPSHOT_MAX_BYTES,
     )
     if metadata["sha256"] != actual_sha or metadata["size_bytes"] != actual_size:
         _fail("appliance package snapshot metadata does not match the bundle")
@@ -901,6 +962,7 @@ def _verify_workstation_netboot_archive(
     tree: Path,
     source_date_epoch: int,
 ) -> None:
+    _verify_workstation_netboot_ustar(bundle)
     expected_names = sorted(["manifest.json", *WORKSTATION_NETBOOT_COMPONENTS])
     try:
         decompressor = subprocess.Popen(
@@ -973,6 +1035,65 @@ def _verify_workstation_netboot_archive(
         _fail("workstation netboot archive entries are not the exact sorted allowlist")
 
 
+def _verify_workstation_netboot_ustar(bundle: Path) -> None:
+    try:
+        decompressor = subprocess.Popen(
+            ["zstd", "--decompress", "--stdout", "--quiet", str(bundle)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, OSError):
+        _fail("zstd is required to inspect the workstation netboot archive")
+    assert decompressor.stdout is not None
+
+    def read_exact(size: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = decompressor.stdout.read(remaining)
+            if not chunk:
+                _fail("workstation netboot archive is malformed or truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    entries = 0
+    try:
+        while True:
+            header = read_exact(512)
+            if header == bytes(512):
+                if read_exact(512) != bytes(512):
+                    _fail("workstation netboot archive has an invalid end marker")
+                while trailing := decompressor.stdout.read(64 * 1024):
+                    if any(trailing):
+                        _fail("workstation netboot archive has nonzero trailing data")
+                break
+            if header[257:263] != b"ustar\0" or header[263:265] != b"00":
+                _fail("workstation netboot archive must use strict ustar headers")
+            if header[156:157] not in (b"\0", b"0"):
+                _fail("workstation netboot archive extensions are not permitted")
+            try:
+                size_field = header[124:136].rstrip(b"\0 ") or b"0"
+                payload_size = int(size_field, 8)
+            except ValueError:
+                _fail("workstation netboot archive has an invalid size field")
+            if payload_size > WORKSTATION_NETBOOT_MAX_BYTES:
+                _fail("workstation netboot archive entry exceeds its size bound")
+            read_exact((payload_size + 511) // 512 * 512)
+            entries += 1
+            if entries > len(WORKSTATION_NETBOOT_COMPONENTS) + 1:
+                _fail("workstation netboot archive contains too many entries")
+    finally:
+        decompressor.stdout.close()
+        if decompressor.stderr is not None:
+            decompressor.stderr.read()
+            decompressor.stderr.close()
+        return_code = decompressor.wait()
+    if return_code != 0:
+        _fail("workstation netboot archive decompression failed")
+
+
 def _manifest_command(arguments: argparse.Namespace) -> None:
     artifact = Path(arguments.artifact)
     private_key = Path(arguments.private_key)
@@ -988,6 +1109,12 @@ def _manifest_command(arguments: argparse.Namespace) -> None:
     installer_iso_template: dict[str, Any] | None = None
     appliance_release_inputs = _appliance_release_inputs(arguments, version, notes_url)
     appliance_release: dict[str, Any] | None = None
+    if (
+        installer_iso_template_inputs[4]
+        == INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY
+        and appliance_release_inputs is None
+    ):
+        _fail("network installer ISO templates require an appliance package snapshot")
     workstation_netboot_inputs = _workstation_netboot_inputs(arguments)
     workstation_netboot: dict[str, Any] | None = None
     protected_inputs = [(artifact, "artifact"), (private_key, "private key")]
@@ -1133,6 +1260,880 @@ def _require_sha256(value: object, label: str) -> str:
     return value
 
 
+def _require_positive_int(value: object, label: str, *, maximum: int) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+        or value > maximum
+    ):
+        _fail(f"{label} must be a positive bounded integer")
+    return value
+
+
+def _canonical_json_body(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _fail("JSON value cannot be represented canonically")
+
+
+def _validate_compatibility_vocabulary(value: object, label: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > 64
+        or any(
+            not isinstance(entry, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", entry)
+            for entry in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        _fail(f"{label} must be a non-empty bounded list of unique identifiers")
+    return value
+
+
+def _validate_compatibility_contract(
+    value: object, *, require_current_runtime_contract: bool = True
+) -> dict[str, Any]:
+    contract = _require_exact_object_keys(
+        value,
+        {"schema", "protocol_version", "manage", "forge", "workstation_runtime"},
+        "component compatibility contract",
+    )
+    if contract["schema"] != COMPONENT_COMPATIBILITY_SCHEMA:
+        _fail(
+            "component compatibility contract schema must be "
+            f"{COMPONENT_COMPATIBILITY_SCHEMA}"
+        )
+    _require_positive_int(
+        contract["protocol_version"],
+        "component compatibility protocol version",
+        maximum=2**31 - 1,
+    )
+    manage = _require_exact_object_keys(
+        contract["manage"],
+        {"minimum_forge_protocol", "maximum_forge_protocol"},
+        "Manage compatibility range",
+    )
+    forge = _require_exact_object_keys(
+        contract["forge"],
+        {"minimum_manage_protocol", "maximum_manage_protocol"},
+        "Forge compatibility range",
+    )
+    manage_minimum = _require_positive_int(
+        manage["minimum_forge_protocol"],
+        "Manage minimum Forge protocol",
+        maximum=2**31 - 1,
+    )
+    manage_maximum = _require_positive_int(
+        manage["maximum_forge_protocol"],
+        "Manage maximum Forge protocol",
+        maximum=2**31 - 1,
+    )
+    forge_minimum = _require_positive_int(
+        forge["minimum_manage_protocol"],
+        "Forge minimum Manage protocol",
+        maximum=2**31 - 1,
+    )
+    forge_maximum = _require_positive_int(
+        forge["maximum_manage_protocol"],
+        "Forge maximum Manage protocol",
+        maximum=2**31 - 1,
+    )
+    if manage_minimum > manage_maximum or forge_minimum > forge_maximum:
+        _fail("component compatibility protocol range is inverted")
+
+    runtime = _require_exact_object_keys(
+        contract["workstation_runtime"],
+        {
+            "compatibility_epoch",
+            "descriptor_schema",
+            "manifest_schema",
+            "architecture",
+            "format",
+            "required_forge_protocol",
+            "import_states",
+            "import_error_codes",
+            "resolution_states",
+            "resolution_error_codes",
+            "report_receipt_states",
+            "report_receipt_error_codes",
+        },
+        "workstation runtime compatibility contract",
+    )
+    _require_positive_int(
+        runtime["compatibility_epoch"],
+        "workstation runtime compatibility epoch",
+        maximum=2**31 - 1,
+    )
+    _require_positive_int(
+        runtime["required_forge_protocol"],
+        "workstation runtime required Forge protocol",
+        maximum=2**31 - 1,
+    )
+    if require_current_runtime_contract:
+        expected_runtime_scalars = {
+            "descriptor_schema": WORKSTATION_NETBOOT_SCHEMA,
+            "manifest_schema": WORKSTATION_NETBOOT_MANIFEST_SCHEMA,
+            "architecture": WORKSTATION_NETBOOT_ARCHITECTURE,
+            "format": WORKSTATION_NETBOOT_FORMAT,
+            "required_forge_protocol": WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL,
+        }
+        for field, expected in expected_runtime_scalars.items():
+            if runtime[field] != expected:
+                _fail(f"workstation runtime compatibility {field} is unsupported")
+    else:
+        for field in ("descriptor_schema", "manifest_schema", "architecture", "format"):
+            value = runtime[field]
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > 128
+                or any(
+                    character.isspace() or ord(character) < 32 or ord(character) == 127
+                    for character in value
+                )
+            ):
+                _fail(f"historical workstation runtime compatibility {field} is invalid")
+    for field in (
+        "import_states",
+        "import_error_codes",
+        "resolution_states",
+        "resolution_error_codes",
+        "report_receipt_states",
+        "report_receipt_error_codes",
+    ):
+        _validate_compatibility_vocabulary(
+            runtime[field], f"workstation runtime {field}"
+        )
+    return contract
+
+
+def _runtime_compatibility_tuple(contract: dict[str, Any]) -> dict[str, object]:
+    runtime = contract["workstation_runtime"]
+    return {
+        field: runtime[field]
+        for field in (
+            "compatibility_epoch",
+            "descriptor_schema",
+            "manifest_schema",
+            "architecture",
+            "format",
+            "required_forge_protocol",
+        )
+    }
+
+
+def _verify_component_compatibility_command(arguments: argparse.Namespace) -> None:
+    forge_value, _ = _load_bounded_json(
+        Path(arguments.forge_compatibility),
+        "Forge component compatibility contract",
+        maximum_bytes=1024 * 1024,
+    )
+    manage_value, _ = _load_bounded_json(
+        Path(arguments.manage_compatibility),
+        "Manage component compatibility contract",
+        maximum_bytes=1024 * 1024,
+    )
+    forge = _validate_compatibility_contract(forge_value)
+    manage = _validate_compatibility_contract(
+        manage_value, require_current_runtime_contract=False
+    )
+    forge_protocol = forge["protocol_version"]
+    manage_protocol = manage["protocol_version"]
+    if not (
+        manage["manage"]["minimum_forge_protocol"]
+        <= forge_protocol
+        <= manage["manage"]["maximum_forge_protocol"]
+    ):
+        _fail(f"Manage does not accept selected Forge protocol {forge_protocol}")
+    if not (
+        forge["forge"]["minimum_manage_protocol"]
+        <= manage_protocol
+        <= forge["forge"]["maximum_manage_protocol"]
+    ):
+        _fail(f"selected Forge does not accept Manage protocol {manage_protocol}")
+    if _runtime_compatibility_tuple(forge) != _runtime_compatibility_tuple(manage):
+        _fail("Forge and Manage workstation runtime compatibility tuples do not match")
+    print(
+        "verified semantic Forge/Manage compatibility: "
+        f"forge_protocol={forge_protocol} manage_protocol={manage_protocol} "
+        f"runtime_epoch={forge['workstation_runtime']['compatibility_epoch']}"
+    )
+
+
+def _release_manifest_artifact_identities(
+    value: object,
+) -> tuple[str, dict[str, object], list[tuple[bytes, bytes]]]:
+    if not isinstance(value, dict):
+        _fail("release manifest must be a JSON object")
+    required_fields = {
+        "schema",
+        "version",
+        "release_url",
+        "notes_url",
+        "published_at",
+        "artifact",
+        "signature",
+        "installer_iso_template_v2",
+    }
+    optional_fields = {"appliance_release_v1", "workstation_netboot"}
+    if not required_fields <= set(value) or not set(value) <= (
+        required_fields | optional_fields
+    ):
+        _fail("release manifest fields are not the exact supported set")
+    if value["schema"] != SCHEMA:
+        _fail(f"release manifest schema must be {SCHEMA}")
+    if not isinstance(value["version"], str):
+        _fail("release manifest version must be a string")
+    version = _validate_version(value["version"])
+    if not isinstance(value["release_url"], str) or not isinstance(
+        value["notes_url"], str
+    ):
+        _fail("release manifest URLs must be strings")
+    _validate_url(value["release_url"], "release-url")
+    _validate_url(value["notes_url"], "notes-url")
+    if not isinstance(value["published_at"], str):
+        _fail("release manifest published-at must be a string")
+    _validate_published_at(value["published_at"])
+
+    artifact = _require_exact_object_keys(
+        value["artifact"], {"url", "sha256"}, "binary artifact"
+    )
+    if not isinstance(artifact["url"], str):
+        _fail("artifact-url must be a string")
+    artifact_url = _validate_url(artifact["url"], "artifact-url")
+    if urlsplit(artifact_url).path.rsplit("/", 1)[-1] != "cybex-forge-x86_64-linux":
+        _fail("artifact-url filename does not bind the Forge binary")
+    artifact_sha256 = _require_sha256(artifact["sha256"], "artifact.sha256")
+    binary_signature = _canonical_base64(
+        value["signature"], "binary signature", expected_bytes=64
+    )
+    signed_messages = [
+        (
+            binary_signature,
+            _canonical_message(version, artifact_sha256, artifact_url),
+        )
+    ]
+
+    template_fields = {
+        "version",
+        "architecture",
+        "base_os",
+        "base_os_version",
+        "url",
+        "size_bytes",
+        "template_sha256",
+        "personalization_offset",
+        "personalization_size",
+        "placeholder_sha256",
+        "provisioning_public_keys",
+        "signature",
+    }
+    template_value = value["installer_iso_template_v2"]
+    if isinstance(template_value, dict) and "package_delivery" in template_value:
+        template_fields.add("package_delivery")
+    template = _require_exact_object_keys(
+        template_value, template_fields, "installer ISO template descriptor"
+    )
+    if (
+        template["version"] != version
+        or template["architecture"] != INSTALLER_ISO_ARCHITECTURE
+        or template["base_os"] != INSTALLER_ISO_TEMPLATE_BASE_OS
+        or template["base_os_version"] != INSTALLER_ISO_TEMPLATE_BASE_OS_VERSION
+        or template["personalization_size"]
+        != INSTALLER_ISO_TEMPLATE_PERSONALIZATION_SIZE
+    ):
+        _fail("installer ISO template descriptor is incompatible")
+    if not isinstance(template["url"], str):
+        _fail("installer ISO template URL must be a string")
+    template_url = _validate_url(template["url"], "installer-iso-template-url")
+    expected_template_name = (
+        f"cybex-forge-appliance-template-{version}-{INSTALLER_ISO_ARCHITECTURE}.iso"
+    )
+    if urlsplit(template_url).path.rsplit("/", 1)[-1] != expected_template_name:
+        _fail("installer ISO template URL does not bind its release filename")
+    template_size = _require_positive_int(
+        template["size_bytes"],
+        "installer ISO template size",
+        maximum=INSTALLER_ISO_MAX_BYTES,
+    )
+    template_sha256 = _require_sha256(
+        template["template_sha256"], "installer_iso_template_v2.template_sha256"
+    )
+    _require_sha256(
+        template["placeholder_sha256"],
+        "installer_iso_template_v2.placeholder_sha256",
+    )
+    if (
+        not isinstance(template["personalization_offset"], int)
+        or isinstance(template["personalization_offset"], bool)
+        or template["personalization_offset"] < 0
+        or template["personalization_offset"]
+        + INSTALLER_ISO_TEMPLATE_PERSONALIZATION_SIZE
+        > template_size
+    ):
+        _fail("installer ISO template personalization offset is invalid")
+    keys = template["provisioning_public_keys"]
+    if not isinstance(keys, list) or not 1 <= len(keys) <= 8:
+        _fail("installer ISO template provisioning keys are invalid")
+    if (
+        any(not isinstance(entry, str) for entry in keys)
+        or len(set(keys)) != len(keys)
+        or keys != sorted(keys)
+    ):
+        _fail("installer ISO template provisioning keys are invalid")
+    for key in keys:
+        _trusted_public_key(key, "installer ISO template provisioning public key")
+    package_delivery = template.get("package_delivery")
+    if package_delivery not in (
+        None,
+        INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY,
+    ):
+        _fail("installer ISO template package delivery is invalid")
+    template_unsigned = dict(template)
+    template_signature = _canonical_base64(
+        template_unsigned.pop("signature"),
+        "installer ISO template signature",
+        expected_bytes=64,
+    )
+    signed_messages.append(
+        (template_signature, _installer_iso_template_message(template_unsigned))
+    )
+
+    appliance_identity: dict[str, object] | None = None
+    if "appliance_release_v1" in value:
+        appliance = _require_exact_object_keys(
+            value["appliance_release_v1"],
+            {
+                "schema",
+                "release_id",
+                "ubuntu_snapshot_id",
+                "cybex_repository_snapshot",
+                "required_package_versions",
+                "expected_kernel",
+                "minimum_protocol",
+                "minimum_state_schema",
+                "rollback_compatible",
+                "release_notes",
+                "signature",
+            },
+            "appliance release descriptor",
+        )
+        if (
+            appliance["schema"] != APPLIANCE_RELEASE_SCHEMA
+            or appliance["release_id"] != version
+            or appliance["minimum_protocol"] != WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL
+            or appliance["minimum_state_schema"] != 1
+            or appliance["rollback_compatible"] is not True
+        ):
+            _fail("appliance release descriptor is incompatible")
+        snapshot = _require_exact_object_keys(
+            appliance["cybex_repository_snapshot"],
+            {"url", "sha256", "size_bytes"},
+            "appliance repository snapshot",
+        )
+        if not isinstance(snapshot["url"], str):
+            _fail("appliance package snapshot URL must be a string")
+        snapshot_url = _validate_url(
+            snapshot["url"], "appliance-package-snapshot-url"
+        )
+        expected_snapshot_name = (
+            f"cybex-forge-appliance-packages-{version}-x86_64-linux.tar.zst"
+        )
+        if urlsplit(snapshot_url).path.rsplit("/", 1)[-1] != expected_snapshot_name:
+            _fail("appliance package snapshot URL does not bind its release filename")
+        snapshot_sha256 = _require_sha256(
+            snapshot["sha256"], "appliance package snapshot SHA-256"
+        )
+        snapshot_size = _require_positive_int(
+            snapshot["size_bytes"],
+            "appliance package snapshot size",
+            maximum=APPLIANCE_PACKAGE_SNAPSHOT_MAX_BYTES,
+        )
+        appliance_unsigned = dict(appliance)
+        appliance_signature = _canonical_base64(
+            appliance_unsigned.pop("signature"),
+            "appliance release signature",
+            expected_bytes=64,
+        )
+        signed_messages.append(
+            (appliance_signature, _appliance_release_message(appliance_unsigned))
+        )
+        appliance_identity = {
+            "url": snapshot_url,
+            "sha256": snapshot_sha256,
+            "size_bytes": snapshot_size,
+        }
+    if (
+        package_delivery == INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY
+        and appliance_identity is None
+    ):
+        _fail("network installer ISO template is missing its appliance release")
+
+    workstation_identity: dict[str, object] | None = None
+    if "workstation_netboot" in value:
+        workstation = _require_exact_object_keys(
+            value["workstation_netboot"],
+            {
+                "schema",
+                "runtime_version",
+                "manage_source_revision",
+                "nixpkgs_revision",
+                "architecture",
+                "format",
+                "required_forge_protocol",
+                "url",
+                "sha256",
+                "size_bytes",
+                "manifest_sha256",
+                "components",
+                "signature",
+            },
+            "workstation netboot descriptor",
+        )
+        if (
+            workstation["schema"] != WORKSTATION_NETBOOT_SCHEMA
+            or workstation["architecture"] != WORKSTATION_NETBOOT_ARCHITECTURE
+            or workstation["format"] != WORKSTATION_NETBOOT_FORMAT
+            or workstation["required_forge_protocol"]
+            != WORKSTATION_NETBOOT_REQUIRED_FORGE_PROTOCOL
+            or not isinstance(workstation["runtime_version"], str)
+            or not isinstance(workstation["manage_source_revision"], str)
+            or not isinstance(workstation["nixpkgs_revision"], str)
+        ):
+            _fail("workstation netboot descriptor is incompatible")
+        runtime_version = _validate_version(workstation["runtime_version"])
+        manage_revision = _validate_revision(
+            workstation["manage_source_revision"],
+            "workstation netboot Manage revision",
+        )
+        _validate_revision(
+            workstation["nixpkgs_revision"],
+            "workstation netboot nixpkgs revision",
+        )
+        if not isinstance(workstation["url"], str):
+            _fail("workstation netboot URL must be a string")
+        workstation_url = _validate_url(
+            workstation["url"], "workstation-netboot-url"
+        )
+        expected_workstation_name = (
+            f"cybex-workstation-netboot-{runtime_version}-{manage_revision[:12]}-"
+            f"{WORKSTATION_NETBOOT_ARCHITECTURE}.tar.zst"
+        )
+        if (
+            urlsplit(workstation_url).path.rsplit("/", 1)[-1]
+            != expected_workstation_name
+        ):
+            _fail("workstation netboot URL does not bind its release filename")
+        _require_sha256(workstation["sha256"], "workstation netboot SHA-256")
+        _require_sha256(
+            workstation["manifest_sha256"],
+            "workstation netboot manifest SHA-256",
+        )
+        _require_positive_int(
+            workstation["size_bytes"],
+            "workstation netboot size",
+            maximum=WORKSTATION_NETBOOT_MAX_BYTES,
+        )
+        components = _require_exact_object_keys(
+            workstation["components"],
+            set(WORKSTATION_NETBOOT_COMPONENTS),
+            "workstation netboot components",
+        )
+        for name in WORKSTATION_NETBOOT_COMPONENTS:
+            component = _require_exact_object_keys(
+                components[name],
+                {"sha256", "size_bytes"},
+                f"workstation netboot component {name}",
+            )
+            _require_sha256(component["sha256"], f"workstation component {name}")
+            _require_positive_int(
+                component["size_bytes"],
+                f"workstation component {name} size",
+                maximum=WORKSTATION_NETBOOT_MAX_BYTES,
+            )
+        workstation_unsigned = dict(workstation)
+        workstation_signature = _canonical_base64(
+            workstation_unsigned.pop("signature"),
+            "workstation netboot signature",
+            expected_bytes=64,
+        )
+        signed_messages.append(
+            (
+                workstation_signature,
+                _workstation_netboot_message(workstation_unsigned),
+            )
+        )
+        workstation_identity = workstation_unsigned
+
+    identities: dict[str, object] = {
+        "forge_binary": {"url": artifact_url, "sha256": artifact_sha256},
+        "appliance_iso_template": {
+            "url": template_url,
+            "sha256": template_sha256,
+            "size_bytes": template_size,
+        },
+        "appliance_package_snapshot": appliance_identity,
+        "workstation_runtime": workstation_identity,
+    }
+    return version, identities, signed_messages
+
+
+def _release_compatibility_unsigned_payload(
+    manifest: dict[str, Any],
+    manifest_body: bytes,
+    manifest_url_value: object,
+    compatibility: dict[str, Any],
+    public_key_value: object,
+) -> tuple[dict[str, object], list[tuple[bytes, bytes]]]:
+    if not isinstance(manifest_url_value, str):
+        _fail("release-manifest-url must be a string")
+    manifest_url = _validate_url(manifest_url_value, "release-manifest-url")
+    if urlsplit(manifest_url).path.rsplit("/", 1)[-1] != RELEASE_MANIFEST_FILENAME:
+        _fail(f"release-manifest-url path must end in /{RELEASE_MANIFEST_FILENAME}")
+    public_key = base64.b64encode(
+        _trusted_public_key(public_key_value, "release compatibility public key")
+    ).decode("ascii")
+    contract = _validate_compatibility_contract(compatibility)
+    version, artifacts, signed_messages = _release_manifest_artifact_identities(
+        manifest
+    )
+    runtime = artifacts["workstation_runtime"]
+    if runtime is not None:
+        assert isinstance(runtime, dict)
+        runtime_contract = contract["workstation_runtime"]
+        assert isinstance(runtime_contract, dict)
+        expected_runtime_contract = {
+            "descriptor_schema": runtime["schema"],
+            "architecture": runtime["architecture"],
+            "format": runtime["format"],
+            "required_forge_protocol": runtime["required_forge_protocol"],
+        }
+        for field, expected in expected_runtime_contract.items():
+            if runtime_contract[field] != expected:
+                _fail(
+                    f"release workstation runtime does not match compatibility {field}"
+                )
+    compatibility_body = _canonical_json_body(contract)
+    return (
+        {
+            "schema": RELEASE_COMPATIBILITY_SCHEMA,
+            "forge_release_version": version,
+            "release_manifest": {
+                "url": manifest_url,
+                "sha256": hashlib.sha256(manifest_body).hexdigest(),
+            },
+            "compatibility": contract,
+            "compatibility_sha256": hashlib.sha256(compatibility_body).hexdigest(),
+            "artifacts": artifacts,
+            "public_key": public_key,
+        },
+        signed_messages,
+    )
+
+
+def _release_compatibility_message(payload: dict[str, object]) -> bytes:
+    return (
+        RELEASE_COMPATIBILITY_SIGNATURE_DOMAIN.encode("ascii")
+        + b"\n"
+        + _canonical_json_body(payload)
+    )
+
+
+def _verified_release_compatibility_payload(
+    asset: object,
+    asset_body: bytes,
+    trusted_public_key_value: object,
+    *,
+    require_current_runtime_contract: bool = True,
+) -> dict[str, Any]:
+    if asset_body != _canonical_json_body(asset):
+        _fail("release compatibility asset must be canonical compact sorted JSON")
+    expected_asset_fields = {
+        "schema",
+        "forge_release_version",
+        "release_manifest",
+        "compatibility",
+        "compatibility_sha256",
+        "artifacts",
+        "public_key",
+        "signature",
+    }
+    asset = _require_exact_object_keys(
+        asset, expected_asset_fields, "release compatibility asset"
+    )
+    if asset["schema"] != RELEASE_COMPATIBILITY_SCHEMA:
+        _fail(
+            f"release compatibility asset schema must be {RELEASE_COMPATIBILITY_SCHEMA}"
+        )
+    if not isinstance(asset["forge_release_version"], str):
+        _fail("release compatibility Forge version must be a string")
+    _validate_version(asset["forge_release_version"])
+    release_manifest = _require_exact_object_keys(
+        asset["release_manifest"],
+        {"url", "sha256"},
+        "referenced release manifest",
+    )
+    if not isinstance(release_manifest["url"], str):
+        _fail("referenced release manifest URL must be a string")
+    manifest_url = _validate_url(
+        release_manifest["url"], "release compatibility manifest URL"
+    )
+    if urlsplit(manifest_url).path.rsplit("/", 1)[-1] != RELEASE_MANIFEST_FILENAME:
+        _fail(
+            f"release compatibility manifest URL must end in /{RELEASE_MANIFEST_FILENAME}"
+        )
+    _require_sha256(
+        release_manifest["sha256"], "referenced release manifest SHA-256"
+    )
+    _require_exact_object_keys(
+        asset["artifacts"],
+        {
+            "forge_binary",
+            "appliance_iso_template",
+            "appliance_package_snapshot",
+            "workstation_runtime",
+        },
+        "release compatibility artifacts",
+    )
+    contract = _validate_compatibility_contract(
+        asset["compatibility"],
+        require_current_runtime_contract=require_current_runtime_contract,
+    )
+    compatibility_sha256 = _require_sha256(
+        asset["compatibility_sha256"],
+        "release compatibility contract SHA-256",
+    )
+    if compatibility_sha256 != hashlib.sha256(
+        _canonical_json_body(contract)
+    ).hexdigest():
+        _fail("release compatibility contract SHA-256 does not match its contract")
+    signature = _canonical_base64(
+        asset["signature"], "release compatibility signature", expected_bytes=64
+    )
+    embedded_public_key = _trusted_public_key(
+        asset["public_key"], "release compatibility public key"
+    )
+    trusted_public_key = _trusted_public_key(trusted_public_key_value)
+    if embedded_public_key != trusted_public_key:
+        _fail("release compatibility public key does not match the trusted public key")
+    payload = dict(asset)
+    payload.pop("signature")
+    _self_verify(
+        ED25519_PUBLIC_DER_PREFIX + trusted_public_key,
+        signature,
+        _release_compatibility_message(payload),
+    )
+    return payload
+
+
+def _enforce_epoch_runtime_identity_transition(
+    previous_asset_path: Path,
+    current_payload: dict[str, object],
+    trusted_public_key: str,
+) -> None:
+    previous_asset, previous_body = _load_bounded_json(
+        previous_asset_path,
+        "previous release compatibility asset",
+        maximum_bytes=1024 * 1024,
+    )
+    previous_payload = _verified_release_compatibility_payload(
+        previous_asset,
+        previous_body,
+        trusted_public_key,
+        require_current_runtime_contract=False,
+    )
+    previous_epoch = previous_payload["compatibility"]["workstation_runtime"][
+        "compatibility_epoch"
+    ]
+    current_epoch = current_payload["compatibility"]["workstation_runtime"][
+        "compatibility_epoch"
+    ]
+    if previous_epoch == current_epoch:
+        return
+    previous_runtime = previous_payload["artifacts"]["workstation_runtime"]
+    current_runtime = current_payload["artifacts"]["workstation_runtime"]
+    if not isinstance(previous_runtime, dict) or not isinstance(current_runtime, dict):
+        _fail(
+            "a workstation runtime artifact is required when its compatibility epoch changes"
+        )
+    previous_sha256 = _require_sha256(
+        previous_runtime.get("sha256"),
+        "previous workstation runtime SHA-256",
+    )
+    current_sha256 = _require_sha256(
+        current_runtime.get("sha256"),
+        "current workstation runtime SHA-256",
+    )
+    if previous_sha256 == current_sha256:
+        _fail(
+            "workstation runtime bundle SHA-256 must change when its compatibility epoch changes"
+        )
+
+
+def _verify_signed_messages(
+    public_der: bytes, signed_messages: Sequence[tuple[bytes, bytes]]
+) -> None:
+    for signature, message in signed_messages:
+        _self_verify(public_der, signature, message)
+
+
+def _release_compatibility_command(arguments: argparse.Namespace) -> None:
+    manifest_path = Path(arguments.manifest)
+    compatibility_path = Path(arguments.compatibility)
+    private_key_path = Path(arguments.private_key)
+    output = Path(arguments.output)
+    previous_compatibility_path = (
+        Path(arguments.previous_compatibility)
+        if arguments.previous_compatibility
+        else None
+    )
+    manifest, manifest_body = _load_bounded_json(
+        manifest_path, "release manifest", maximum_bytes=512 * 1024
+    )
+    compatibility, _compatibility_source_body = _load_bounded_json(
+        compatibility_path,
+        "component compatibility contract",
+        maximum_bytes=512 * 1024,
+    )
+    protected_inputs = [
+        (manifest_path, "release manifest"),
+        (compatibility_path, "component compatibility contract"),
+        (private_key_path, "private key"),
+    ]
+    if previous_compatibility_path is not None:
+        protected_inputs.append(
+            (previous_compatibility_path, "previous release compatibility asset")
+        )
+    _validate_output(output, protected_inputs)
+    private_fd = _open_regular(private_key_path, "private key", private=True)
+    try:
+        private_identity = _private_key_identity(private_fd)
+        public_der = _public_der(private_fd)
+        _require_stable_private_key(private_fd, private_identity)
+        raw_public_key = public_der[len(ED25519_PUBLIC_DER_PREFIX) :]
+        public_key = base64.b64encode(raw_public_key).decode("ascii")
+        payload, manifest_signed_messages = _release_compatibility_unsigned_payload(
+            manifest,
+            manifest_body,
+            arguments.manifest_url,
+            compatibility,
+            public_key,
+        )
+        _verify_signed_messages(public_der, manifest_signed_messages)
+        if previous_compatibility_path is not None:
+            _enforce_epoch_runtime_identity_transition(
+                previous_compatibility_path,
+                payload,
+                public_key,
+            )
+        message = _release_compatibility_message(payload)
+        signature = _sign(private_fd, message)
+        _require_stable_private_key(private_fd, private_identity)
+    finally:
+        os.close(private_fd)
+    _self_verify(public_der, signature, message)
+    asset = {**payload, "signature": base64.b64encode(signature).decode("ascii")}
+    _atomic_write(output, _canonical_json_body(asset))
+    print(f"wrote signed Forge release compatibility asset: {output}")
+
+
+def _verify_release_compatibility_command(arguments: argparse.Namespace) -> None:
+    asset_path = Path(arguments.asset)
+    manifest_path = Path(arguments.manifest)
+    compatibility_path = Path(arguments.compatibility)
+    asset, asset_body = _load_bounded_json(
+        asset_path, "release compatibility asset", maximum_bytes=1024 * 1024
+    )
+    actual_payload = _verified_release_compatibility_payload(
+        asset, asset_body, arguments.trusted_public_key
+    )
+
+    manifest, manifest_body = _load_bounded_json(
+        manifest_path, "release manifest", maximum_bytes=512 * 1024
+    )
+    compatibility, _compatibility_source_body = _load_bounded_json(
+        compatibility_path,
+        "component compatibility contract",
+        maximum_bytes=512 * 1024,
+    )
+    expected_payload, manifest_signed_messages = _release_compatibility_unsigned_payload(
+        manifest,
+        manifest_body,
+        arguments.manifest_url,
+        compatibility,
+        arguments.trusted_public_key,
+    )
+    if actual_payload != expected_payload:
+        _fail(
+            "release compatibility asset does not exactly match its manifest and contract"
+        )
+    public_der = ED25519_PUBLIC_DER_PREFIX + _trusted_public_key(
+        arguments.trusted_public_key
+    )
+    _verify_signed_messages(public_der, manifest_signed_messages)
+    print(
+        "verified signed Forge release compatibility asset: "
+        f"version={actual_payload['forge_release_version']} "
+        f"manifest_sha256={actual_payload['release_manifest']['sha256']} "
+        f"compatibility_sha256={actual_payload['compatibility_sha256']}"
+    )
+
+
+def _verify_release_successor_command(arguments: argparse.Namespace) -> None:
+    current_path = Path(arguments.current_compatibility)
+    previous_path = Path(arguments.previous_compatibility)
+    current_asset, current_body = _load_bounded_json(
+        current_path,
+        "current release compatibility asset",
+        maximum_bytes=1024 * 1024,
+    )
+    current_payload = _verified_release_compatibility_payload(
+        current_asset,
+        current_body,
+        arguments.trusted_public_key,
+    )
+    previous_asset, previous_body = _load_bounded_json(
+        previous_path,
+        "previous release compatibility asset",
+        maximum_bytes=1024 * 1024,
+    )
+    previous_payload = _verified_release_compatibility_payload(
+        previous_asset,
+        previous_body,
+        arguments.trusted_public_key,
+        require_current_runtime_contract=False,
+    )
+    current_version = current_payload["forge_release_version"]
+    previous_version = previous_payload["forge_release_version"]
+    if _compare_semver(current_version, previous_version) <= 0:
+        _fail(
+            "current Forge release version must have greater SemVer precedence "
+            "than the latest published predecessor"
+        )
+    _enforce_epoch_runtime_identity_transition(
+        previous_path,
+        current_payload,
+        arguments.trusted_public_key,
+    )
+    print(
+        "verified Forge release successor: "
+        f"previous={previous_version} current={current_version}"
+    )
+
+
 def _verify_command(arguments: argparse.Namespace) -> None:
     manifest_path = Path(arguments.manifest)
     artifact_path = Path(arguments.artifact)
@@ -1201,22 +2202,26 @@ def _verify_command(arguments: argparse.Namespace) -> None:
     )
     template_sha = None
     if verify_installer_template:
+        descriptor_fields = {
+            "version",
+            "architecture",
+            "base_os",
+            "base_os_version",
+            "url",
+            "size_bytes",
+            "template_sha256",
+            "personalization_offset",
+            "personalization_size",
+            "placeholder_sha256",
+            "provisioning_public_keys",
+            "signature",
+        }
+        descriptor_value = manifest["installer_iso_template_v2"]
+        if isinstance(descriptor_value, dict) and "package_delivery" in descriptor_value:
+            descriptor_fields.add("package_delivery")
         descriptor = _require_exact_object_keys(
-            manifest["installer_iso_template_v2"],
-            {
-                "version",
-                "architecture",
-                "base_os",
-                "base_os_version",
-                "url",
-                "size_bytes",
-                "template_sha256",
-                "personalization_offset",
-                "personalization_size",
-                "placeholder_sha256",
-                "provisioning_public_keys",
-                "signature",
-            },
+            descriptor_value,
+            descriptor_fields,
             "installer ISO template descriptor",
         )
         signature_text = descriptor.pop("signature")
@@ -1238,6 +2243,17 @@ def _verify_command(arguments: argparse.Namespace) -> None:
             _fail("installer ISO template personalization offset is invalid")
         if not isinstance(descriptor["provisioning_public_keys"], list):
             _fail("installer ISO template provisioning keys are invalid")
+        package_delivery = descriptor.get("package_delivery")
+        if package_delivery not in (
+            None,
+            INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY,
+        ):
+            _fail("installer ISO template package delivery is invalid")
+        if (
+            package_delivery == INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY
+            and "appliance_release_v1" not in manifest
+        ):
+            _fail("network installer ISO template is missing its appliance release")
         inspection_arguments = argparse.Namespace(
             installer_iso_template=arguments.installer_iso_template,
             installer_iso_template_url=descriptor["url"],
@@ -1245,6 +2261,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
                 "personalization_offset"
             ],
             provisioning_public_key=descriptor["provisioning_public_keys"],
+            installer_iso_template_package_delivery=package_delivery,
         )
         inputs = _installer_iso_template_inputs(inspection_arguments, version)
         if inputs is None:
@@ -1310,7 +2327,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
         actual_snapshot_sha, actual_snapshot_size = _inspect_artifact(
             snapshot_path,
             "appliance package snapshot",
-            maximum_bytes=INSTALLER_ISO_MAX_BYTES,
+            maximum_bytes=APPLIANCE_PACKAGE_SNAPSHOT_MAX_BYTES,
         )
         if (
             snapshot["sha256"] != actual_snapshot_sha
@@ -1432,6 +2449,11 @@ def _parser() -> argparse.ArgumentParser:
         help="exact byte offset of the 8192-byte personalization slot",
     )
     manifest.add_argument(
+        "--installer-iso-template-package-delivery",
+        choices=[INSTALLER_ISO_TEMPLATE_NETWORK_PACKAGE_DELIVERY],
+        help="package source contract for a network-delivered thin installer",
+    )
+    manifest.add_argument(
         "--provisioning-public-key",
         action="append",
         help="sorted standard-Base64 online provisioning Ed25519 public key; repeat for rotation overlap",
@@ -1478,6 +2500,109 @@ def _parser() -> argparse.ArgumentParser:
         help="fixed UTC RFC3339 timestamp with second precision",
     )
     manifest.set_defaults(handler=_manifest_command)
+
+    verify_components = commands.add_parser(
+        "verify-component-compatibility",
+        allow_abbrev=False,
+        help="verify semantic compatibility between selected Forge and Manage contracts",
+    )
+    verify_components.add_argument(
+        "--forge-compatibility", required=True, help="Forge component compatibility contract"
+    )
+    verify_components.add_argument(
+        "--manage-compatibility", required=True, help="Manage component compatibility contract"
+    )
+    verify_components.set_defaults(handler=_verify_component_compatibility_command)
+
+    compatibility = commands.add_parser(
+        "compatibility",
+        allow_abbrev=False,
+        help="bind a release manifest and compatibility contract in a signed asset",
+    )
+    compatibility.add_argument(
+        "--manifest", required=True, help="exact signed Forge release manifest"
+    )
+    compatibility.add_argument(
+        "--manifest-url",
+        required=True,
+        help="exact immutable URL for cybex-forge-release.json",
+    )
+    compatibility.add_argument(
+        "--compatibility",
+        required=True,
+        help="exact component compatibility contract",
+    )
+    compatibility.add_argument(
+        "--private-key", required=True, help="mode-0600 Ed25519 PEM private key"
+    )
+    compatibility.add_argument(
+        "--previous-compatibility",
+        help=(
+            "latest previously published signed release compatibility asset; "
+            "required by production aggregation when a prior release exists"
+        ),
+    )
+    compatibility.add_argument(
+        "--output",
+        required=True,
+        help="cybex-forge-release-compatibility.json output path",
+    )
+    compatibility.set_defaults(handler=_release_compatibility_command)
+
+    verify_compatibility = commands.add_parser(
+        "verify-compatibility",
+        allow_abbrev=False,
+        help="independently verify a signed release compatibility asset",
+    )
+    verify_compatibility.add_argument(
+        "--asset", required=True, help="signed release compatibility asset"
+    )
+    verify_compatibility.add_argument(
+        "--manifest", required=True, help="exact referenced Forge release manifest"
+    )
+    verify_compatibility.add_argument(
+        "--manifest-url",
+        required=True,
+        help="exact immutable URL for the referenced release manifest",
+    )
+    verify_compatibility.add_argument(
+        "--compatibility",
+        required=True,
+        help="exact expected component compatibility contract",
+    )
+    verify_compatibility.add_argument(
+        "--trusted-public-key",
+        required=True,
+        help="canonical standard-Base64 raw Ed25519 public key",
+    )
+    verify_compatibility.set_defaults(
+        handler=_verify_release_compatibility_command
+    )
+
+    verify_successor = commands.add_parser(
+        "verify-successor",
+        allow_abbrev=False,
+        help=(
+            "verify that a signed release compatibility asset is a safe SemVer "
+            "and runtime-epoch successor to the latest published asset"
+        ),
+    )
+    verify_successor.add_argument(
+        "--previous-compatibility",
+        required=True,
+        help="latest published signed release compatibility asset",
+    )
+    verify_successor.add_argument(
+        "--current-compatibility",
+        required=True,
+        help="signed candidate release compatibility asset",
+    )
+    verify_successor.add_argument(
+        "--trusted-public-key",
+        required=True,
+        help="canonical standard-Base64 raw Ed25519 public key",
+    )
+    verify_successor.set_defaults(handler=_verify_release_successor_command)
 
     public_key = commands.add_parser(
         "public-key", help="derive the canonical standard-Base64 raw Ed25519 public key"

@@ -1,6 +1,7 @@
 use super::{
     DurableProvisioningState,
     inventory::ForgeProvisioningInventory,
+    packages::{PackageDelivery, STAGED_REPOSITORY_PATH},
     protocol::{ForgeProvisioningNetworkPlan, SignedInstallPlan},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,7 +10,10 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Command as StdCommand,
 };
@@ -21,6 +25,7 @@ const EFI_BYTES: u64 = GIB;
 const ROOT_BYTES: u64 = 48 * GIB;
 const STATE_BYTES: u64 = 16 * GIB;
 const SWAP_BYTES: u64 = 8 * GIB;
+const EXT4_SUPER_MAGIC: i64 = 0xef53;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedStorage {
@@ -31,16 +36,34 @@ pub(crate) struct PreparedStorage {
     partition_ends: [u64; 5],
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExistingStateProbe {
+    pub state: DurableProvisioningState,
+    device_path: PathBuf,
+    requires_rw_mount: bool,
+}
+
 pub(crate) fn existing_state_for_session(
     state_mount: &Path,
     session_id: Uuid,
-) -> Result<Option<DurableProvisioningState>> {
-    if !DurableProvisioningState::path(state_mount).exists() {
-        mount_existing_state(state_mount)?;
-    }
-    let state_path = DurableProvisioningState::path(state_mount);
-    if !state_path.exists() {
+) -> Result<Option<ExistingStateProbe>> {
+    let Some(device_path) = existing_state_device()? else {
+        if DurableProvisioningState::path(state_mount).exists() {
+            bail!("mounted CYBEX_STATE has no unique partition-label device")
+        }
         return Ok(None);
+    };
+    let state_path = DurableProvisioningState::path(state_mount);
+    let requires_rw_mount = if state_path.exists() {
+        validate_state_mount(state_mount, &device_path)?;
+        validate_existing_recovery_probe(state_mount)?;
+        true
+    } else {
+        mount_existing_state_probe(state_mount, &device_path)?;
+        true
+    };
+    if !state_path.exists() {
+        bail!("CYBEX_STATE does not contain durable provisioning state")
     }
     let state = load_durable_state(state_mount)?;
     if state.session_id == session_id {
@@ -48,12 +71,16 @@ pub(crate) fn existing_state_for_session(
             boot_installed_appliance()?;
             bail!("completed appliance reboot command unexpectedly returned")
         }
-        return Ok(Some(state));
+        return Ok(Some(ExistingStateProbe {
+            state,
+            device_path,
+            requires_rw_mount,
+        }));
     }
     bail!("an existing CYBEX_STATE identity belongs to different provisioning media")
 }
 
-fn mount_existing_state(state_mount: &Path) -> Result<()> {
+fn existing_state_device() -> Result<Option<PathBuf>> {
     let mut candidates = fs::read_dir("/dev/disk/by-partlabel")
         .ok()
         .into_iter()
@@ -64,20 +91,191 @@ fn mount_existing_state(state_mount: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     candidates.sort();
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     if candidates.len() != 1 {
         bail!("multiple CYBEX_STATE partitions are present; detach unrelated appliance disks")
     }
+    Ok(candidates.pop())
+}
+
+fn mount_existing_state_probe(state_mount: &Path, device_path: &Path) -> Result<()> {
     fs::create_dir_all(state_mount).context("create existing state mountpoint")?;
     let status = StdCommand::new("mount")
-        .args(["-o", "nodev,nosuid"])
-        .arg(&candidates[0])
+        .args(["-t", "ext4", "-o", recovery_probe_mount_options()])
+        .arg(device_path)
         .arg(state_mount)
         .status()
-        .context("mount existing CYBEX_STATE")?;
+        .context("mount existing CYBEX_STATE recovery probe")?;
     if !status.success() {
-        bail!("existing CYBEX_STATE could not be mounted")
+        bail!("existing CYBEX_STATE could not be mounted read-only without journal replay")
+    }
+    validate_state_mount(state_mount, device_path)?;
+    validate_existing_recovery_probe(state_mount)?;
+    Ok(())
+}
+
+pub(crate) fn activate_existing_state(
+    state_mount: &Path,
+    probe: &ExistingStateProbe,
+) -> Result<DurableProvisioningState> {
+    if probe.requires_rw_mount {
+        let status = StdCommand::new("umount")
+            .arg(state_mount)
+            .status()
+            .context("unmount read-only CYBEX_STATE recovery probe")?;
+        if !status.success() {
+            bail!("read-only CYBEX_STATE recovery probe could not be unmounted")
+        }
+        let status = StdCommand::new("mount")
+            .args(["-t", "ext4", "-o", recovery_active_mount_options()])
+            .arg(&probe.device_path)
+            .arg(state_mount)
+            .status()
+            .context("mount active CYBEX_STATE recovery state")?;
+        if !status.success() {
+            bail!("CYBEX_STATE could not be activated after package verification")
+        }
+    }
+    validate_state_mount(state_mount, &probe.device_path)?;
+    if mount_is_read_only(state_mount)? {
+        bail!("active CYBEX_STATE recovery mount remained read-only")
+    }
+    let refreshed = load_durable_state(state_mount)?;
+    validate_recovered_state_transition(&probe.state, &refreshed)?;
+    if refreshed.installation_complete {
+        boot_installed_appliance()?;
+        bail!("completed appliance reboot command unexpectedly returned")
+    }
+    Ok(refreshed)
+}
+
+fn recovery_probe_mount_options() -> &'static str {
+    "ro,noload,nodev,nosuid"
+}
+
+fn recovery_active_mount_options() -> &'static str {
+    "rw,nodev,nosuid"
+}
+
+fn require_read_only_recovery_probe(read_only: bool) -> Result<()> {
+    if !read_only {
+        bail!("refusing recovery while CYBEX_STATE is writable; reboot to obtain a read-only probe")
+    }
+    Ok(())
+}
+
+fn validate_existing_recovery_probe(path: &Path) -> Result<()> {
+    require_read_only_recovery_probe(mount_is_read_only(path)?)?;
+    let mountinfo = fs::read("/proc/self/mountinfo").context("read recovery mount metadata")?;
+    if mountinfo.len() > 4 * 1024 * 1024
+        || !mountinfo_has_safe_recovery_probe(&mountinfo, path.as_os_str().as_bytes())
+    {
+        bail!("CYBEX_STATE recovery probe did not disable ext4 journal replay")
+    }
+    Ok(())
+}
+
+fn mountinfo_has_safe_recovery_probe(mountinfo: &[u8], mount_path: &[u8]) -> bool {
+    let escaped_path = escape_mountinfo_path(mount_path);
+    mountinfo.split(|byte| *byte == b'\n').any(|line| {
+        let fields = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let Some(separator) = fields.iter().position(|field| *field == b"-") else {
+            return false;
+        };
+        if fields.len() <= separator + 3
+            || fields.get(4).copied() != Some(escaped_path.as_slice())
+            || fields.get(separator + 1).copied() != Some(b"ext4")
+        {
+            return false;
+        }
+        let mount_options = fields[5];
+        let super_options = fields[separator + 3];
+        comma_option(mount_options, b"ro")
+            && (comma_option(mount_options, b"noload")
+                || comma_option(mount_options, b"norecovery")
+                || comma_option(super_options, b"noload")
+                || comma_option(super_options, b"norecovery"))
+    })
+}
+
+fn escape_mountinfo_path(path: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(path.len());
+    for byte in path {
+        match byte {
+            b' ' => escaped.extend_from_slice(b"\\040"),
+            b'\t' => escaped.extend_from_slice(b"\\011"),
+            b'\n' => escaped.extend_from_slice(b"\\012"),
+            b'\\' => escaped.extend_from_slice(b"\\134"),
+            byte => escaped.push(*byte),
+        }
+    }
+    escaped
+}
+
+fn comma_option(options: &[u8], expected: &[u8]) -> bool {
+    options
+        .split(|byte| *byte == b',')
+        .any(|option| option == expected)
+}
+
+fn mount_is_read_only(path: &Path) -> Result<bool> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("CYBEX_STATE mount path contains NUL"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect CYBEX_STATE mount flags");
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_flag & libc::ST_RDONLY as libc::c_ulong != 0)
+}
+
+fn mounted_filesystem_type(path: &Path) -> Result<i64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("CYBEX_STATE mount path contains NUL"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect CYBEX_STATE filesystem type");
+    }
+    Ok(unsafe { stats.assume_init() }.f_type)
+}
+
+fn validate_state_mount(state_mount: &Path, device_path: &Path) -> Result<()> {
+    let mount = fs::metadata(state_mount).context("inspect CYBEX_STATE mountpoint")?;
+    let device = fs::metadata(device_path).context("inspect CYBEX_STATE block device")?;
+    if !mount.is_dir()
+        || !device.file_type().is_block_device()
+        || mounted_filesystem_type(state_mount)? != EXT4_SUPER_MAGIC
+        || libc::major(mount.dev()) != libc::major(device.rdev())
+        || libc::minor(mount.dev()) != libc::minor(device.rdev())
+    {
+        bail!("CYBEX_STATE mount does not match its unique partition-label device")
+    }
+    Ok(())
+}
+
+fn validate_recovered_state_transition(
+    probed: &DurableProvisioningState,
+    active: &DurableProvisioningState,
+) -> Result<()> {
+    if active.schema != probed.schema
+        || active.session_id != probed.session_id
+        || serde_json::to_vec(&active.plan)? != serde_json::to_vec(&probed.plan)?
+        || active.manage_origin != probed.manage_origin
+        || active.management_signing_public_key_b64 != probed.management_signing_public_key_b64
+        || active.device_private_key_b64 != probed.device_private_key_b64
+        || active.device_public_key_b64 != probed.device_public_key_b64
+        || active.device_public_key_fingerprint != probed.device_public_key_fingerprint
+        || active.next_event_sequence < probed.next_event_sequence
+        || active.next_event_sequence > if active.installation_complete { 9 } else { 6 }
+        || (probed.identity_active && !active.identity_active)
+        || (probed.installation_complete && !active.installation_complete)
+        || active.updated_at < probed.updated_at
+    {
+        bail!("CYBEX_STATE changed incompatibly while its recovery probe was read-only")
     }
     Ok(())
 }
@@ -420,7 +618,9 @@ pub(crate) fn write_autoinstall(
     path: &Path,
     prepared: &PreparedStorage,
     plan: &SignedInstallPlan,
+    package_delivery: PackageDelivery,
 ) -> Result<()> {
+    configure_live_offline_apt(Path::new("/"), package_delivery)?;
     let hostname = format!("forge-{}", device_id_suffix(&plan.reserved_device_id));
     let config = json!({
         "autoinstall": {
@@ -429,7 +629,7 @@ pub(crate) fn write_autoinstall(
             "locale": "en_US.UTF-8",
             "keyboard": {"layout": "us"},
             "refresh-installer": {"update": false},
-            "apt": offline_apt_config(),
+            "apt": offline_apt_config(package_delivery),
             "storage": {"config": storage_config(prepared)?},
             "ssh": {"install-server": true, "allow-pw": false},
             "user-data": {
@@ -437,7 +637,7 @@ pub(crate) fn write_autoinstall(
                 "disable_root": true,
                 "users": []
             },
-            "late-commands": offline_package_install_commands(),
+            "late-commands": offline_package_install_commands(package_delivery),
             "shutdown": "reboot"
         }
     });
@@ -445,21 +645,62 @@ pub(crate) fn write_autoinstall(
     atomic_write(path, &body, 0o600)
 }
 
-fn offline_apt_config() -> Value {
+fn offline_apt_config(package_delivery: PackageDelivery) -> Value {
+    let repository = repository_path(package_delivery);
     json!({
-        "preserve_sources_list": false,
+        "preserve_sources_list": true,
         "fallback": "offline-install",
-        // Curtin's `sources` form immediately runs apt-get update while
-        // Subiquity is still configuring its temporary source overlay. The
-        // installation media is not bind-mounted there yet, so a file:///cdrom
-        // source fails before installation starts. A complete sources-list
-        // template is written without that eager probe and is consumed after
-        // Subiquity makes /cdrom available to the installation environment.
-        "sources_list": "deb [trusted=yes] file:///cdrom/cybex/apt ./"
+        "conf": concat!(
+            "Dir::Etc::sourcelist \"/etc/apt/sources.list.d/cybex-appliance.sources\";\n",
+            "Dir::Etc::sourceparts \"-\";\n",
+            "Acquire::Languages \"none\";\n"
+        ),
+        "sources": {
+            // Curtin treats the map key as the literal filename below
+            // /etc/apt/sources.list.d. Keep the deb822 suffix here; APT ignores
+            // extensionless source files, and the extracted target needs this
+            // repository during its built-in UEFI curthooks.
+            "cybex-appliance.sources": {
+                // Curtin's Ubuntu 26.04 legacy-to-deb822 converter drops the
+                // trusted option. Supply deb822 directly so apt retains the
+                // independently verified repository's trust boundary. Curtin
+                // requires the Components field even for a flat repository;
+                // an explicitly empty value is valid for the exact-path suite.
+                "source": format!(
+                    "Types: deb\nURIs: file://{repository}\nSuites: ./\nComponents:\nTrusted: yes\n"
+                )
+            }
+        }
     })
 }
 
-fn offline_package_install_commands() -> Value {
+fn configure_live_offline_apt(root: &Path, package_delivery: PackageDelivery) -> Result<()> {
+    let sources_dir = root.join("etc/apt/sources.list.d");
+    fs::create_dir_all(&sources_dir)
+        .with_context(|| format!("create {}", sources_dir.display()))?;
+    for filename in ["cdrom.sources", "ubuntu.sources"] {
+        let path = sources_dir.join(filename);
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    let legacy_sources = root.join("etc/apt/sources.list");
+    atomic_write(
+        &legacy_sources,
+        b"# Cybex Forge installation uses the verified offline package snapshot.\n",
+        0o644,
+    )?;
+    let repository = repository_path(package_delivery);
+    let source =
+        format!("Types: deb\nURIs: file://{repository}\nSuites: ./\nComponents:\nTrusted: yes\n");
+    atomic_write(
+        &sources_dir.join("cybex-appliance.sources"),
+        source.as_bytes(),
+        0o644,
+    )
+}
+
+fn offline_package_install_commands(package_delivery: PackageDelivery) -> Value {
     let packages = [
         "cybex-forge",
         "cybex-forge-bootstrap",
@@ -468,6 +709,9 @@ fn offline_package_install_commands() -> Value {
         "linux-firmware",
         "intel-microcode",
         "amd64-microcode",
+        "shim-signed",
+        "grub-efi-amd64-signed",
+        "secureboot-db",
         "nginx-core",
         "tftpd-hpa",
         "ipxe",
@@ -480,13 +724,20 @@ fn offline_package_install_commands() -> Value {
     let apt_options = "-o Dir::Etc::sourcelist=/tmp/cybex-offline.list \
                        -o Dir::Etc::sourceparts=- \
                        -o Acquire::Languages=none";
+    let (prepare_repository, cleanup_repository) = match package_delivery {
+        PackageDelivery::Embedded => (
+            "mkdir -p /target/cdrom; mount --bind /cdrom /target/cdrom; ",
+            "; umount /target/cdrom",
+        ),
+        PackageDelivery::NetworkSnapshot => ("", ""),
+    };
+    let repository = repository_path(package_delivery);
     let install = format!(
-        "mkdir -p /target/cdrom; \
-         mount --bind /cdrom /target/cdrom; \
-         printf '%s\\n' 'deb [trusted=yes] file:///cdrom/cybex/apt ./' \
+        "{prepare_repository}\
+         printf '%s\\n' 'deb [trusted=yes] file://{repository} ./' \
          > /target/tmp/cybex-offline.list; \
          chmod 0644 /target/tmp/cybex-offline.list; \
-         trap 'rm -f /target/tmp/cybex-offline.list; umount /target/cdrom' EXIT; \
+         trap 'rm -f /target/tmp/cybex-offline.list{cleanup_repository}' EXIT; \
          curtin in-target --target=/target -- apt-get {apt_options} update; \
          curtin in-target --target=/target -- env DEBIAN_FRONTEND=noninteractive \
          apt-get {apt_options} install --yes --no-install-recommends {}",
@@ -499,6 +750,13 @@ fn offline_package_install_commands() -> Value {
         "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage installing_bootloader --status succeeded --progress-percent 95 --message 'Signed Ubuntu bootloader installed'",
         "/cdrom/cybex/bootstrap/cybex-forge-bootstrap event --state-mount /run/cybex-state --stage rebooting --status succeeded --progress-percent 99 --message 'Rebooting into the managed appliance'"
     ])
+}
+
+fn repository_path(package_delivery: PackageDelivery) -> &'static str {
+    match package_delivery {
+        PackageDelivery::Embedded => "/cdrom/cybex/apt",
+        PackageDelivery::NetworkSnapshot => STAGED_REPOSITORY_PATH,
+    }
 }
 
 fn storage_config(prepared: &PreparedStorage) -> Result<Value> {
@@ -556,6 +814,11 @@ pub(crate) fn materialize_target(
     let target_netplan = target.join("etc/netplan");
     for directory in [&target_state, &target_etc, &target_ssh, &target_netplan] {
         fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    }
+    let transient_apt_source = target.join("etc/apt/sources.list.d/cybex-appliance.sources");
+    if transient_apt_source.exists() {
+        fs::remove_file(&transient_apt_source)
+            .with_context(|| format!("remove {}", transient_apt_source.display()))?;
     }
 
     let managed_state = json!({
@@ -899,6 +1162,153 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn durable_state_fixture() -> DurableProvisioningState {
+        let now = Utc::now();
+        let plan = serde_json::from_value(json!({
+            "schema": "cybex.forge.install-plan.v1",
+            "id": "11111111-1111-4111-8111-111111111111",
+            "organization_id": "22222222-2222-4222-8222-222222222222",
+            "plan_revision": 1,
+            "session_id": "33333333-3333-4333-8333-333333333333",
+            "session_revision": 2,
+            "inventory_sha256": "a".repeat(64),
+            "hardware_digest": "b".repeat(64),
+            "provisioning_public_key_fingerprint": "c".repeat(64),
+            "reserved_device_id": "dev_0123456789abcdef0123456789abcdef",
+            "display_name": "Recovery Forge",
+            "target_disk_id": "disk-1",
+            "target_disk": {
+                "id": "disk-1",
+                "path": "/dev/sda",
+                "model": "Disk",
+                "serial": "serial-1",
+                "wwn": "",
+                "size_bytes": 171798691840_u64,
+                "removable": false,
+                "mounted": false,
+                "held": false,
+                "eligible": true,
+                "blocker_codes": []
+            },
+            "network_interface": {
+                "id": "pci-0000:00:03.0",
+                "name": "enp0s3",
+                "mac": "52:54:00:12:34:56",
+                "link_up": true,
+                "addresses": [],
+                "gateway": null
+            },
+            "network": {
+                "mode": "dhcp",
+                "interface_id": "pci-0000:00:03.0",
+                "address_cidr": null,
+                "gateway": null,
+                "dns_servers": []
+            },
+            "maintenance_window": {
+                "timezone": "UTC",
+                "weekday": 0,
+                "start": "02:00",
+                "duration_minutes": 120
+            },
+            "management_cidrs": [],
+            "ssh_ca_public_keys": ["ssh-ed25519 AAAA recovery"],
+            "base_os": "ubuntu",
+            "base_os_version": "26.04",
+            "release_version": "1.2.3",
+            "at_rest_protection": "none",
+            "issued_at": now,
+            "expires_at": now + chrono::Duration::minutes(20),
+            "plan_sha256": "d".repeat(64),
+            "signature": "signature"
+        }))
+        .unwrap();
+        DurableProvisioningState {
+            schema: "cybex.forge.provisioning-state.v1".to_string(),
+            session_id: uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            plan,
+            manage_origin: "https://manage.cybex.net".to_string(),
+            management_signing_public_key_b64: "management-key".to_string(),
+            device_private_key_b64: "private-key".to_string(),
+            device_public_key_b64: "public-key".to_string(),
+            device_public_key_fingerprint: "fingerprint".to_string(),
+            next_event_sequence: 3,
+            identity_active: false,
+            installation_complete: false,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn recovery_probe_is_read_only_without_journal_replay() {
+        let probe = recovery_probe_mount_options()
+            .split(',')
+            .collect::<Vec<_>>();
+        assert_eq!(probe, ["ro", "noload", "nodev", "nosuid"]);
+        let active = recovery_active_mount_options()
+            .split(',')
+            .collect::<Vec<_>>();
+        assert_eq!(active, ["rw", "nodev", "nosuid"]);
+        assert!(!active.contains(&"ro"));
+        assert!(!active.contains(&"noload"));
+    }
+
+    #[test]
+    fn preexisting_rw_state_mount_is_rejected_before_staging() {
+        require_read_only_recovery_probe(true).unwrap();
+        assert!(require_read_only_recovery_probe(false).is_err());
+    }
+
+    #[test]
+    fn existing_probe_requires_read_only_ext4_with_replay_disabled() {
+        let safe = b"36 29 8:3 / /run/cybex-state ro,nosuid,nodev - ext4 /dev/sda3 ro,norecovery\n";
+        assert!(mountinfo_has_safe_recovery_probe(safe, b"/run/cybex-state"));
+        let writable = b"36 29 8:3 / /run/cybex-state rw,nosuid,nodev - ext4 /dev/sda3 rw\n";
+        assert!(!mountinfo_has_safe_recovery_probe(
+            writable,
+            b"/run/cybex-state"
+        ));
+        let replaying = b"36 29 8:3 / /run/cybex-state ro,nosuid,nodev - ext4 /dev/sda3 ro\n";
+        assert!(!mountinfo_has_safe_recovery_probe(
+            replaying,
+            b"/run/cybex-state"
+        ));
+        let wrong_filesystem =
+            b"36 29 8:3 / /run/cybex-state ro,nosuid,nodev,noload - xfs /dev/sda3 ro\n";
+        assert!(!mountinfo_has_safe_recovery_probe(
+            wrong_filesystem,
+            b"/run/cybex-state"
+        ));
+        let escaped =
+            b"36 29 8:3 / /run/cybex\\040state ro,nosuid,nodev,noload - ext4 /dev/sda3 ro\n";
+        assert!(mountinfo_has_safe_recovery_probe(
+            escaped,
+            b"/run/cybex state"
+        ));
+    }
+
+    #[test]
+    fn journal_replay_may_only_advance_non_secret_recovery_progress() {
+        let probed = durable_state_fixture();
+        let mut active = probed.clone();
+        active.next_event_sequence = 5;
+        active.identity_active = true;
+        active.updated_at += chrono::Duration::seconds(1);
+        validate_recovered_state_transition(&probed, &active).unwrap();
+
+        let mut changed_plan = active.clone();
+        changed_plan.plan.release_version = "9.9.9".to_string();
+        assert!(validate_recovered_state_transition(&probed, &changed_plan).is_err());
+
+        let mut changed_key = active.clone();
+        changed_key.device_private_key_b64 = "other-private-key".to_string();
+        assert!(validate_recovered_state_transition(&probed, &changed_key).is_err());
+
+        let mut regressed = probed.clone();
+        regressed.next_event_sequence = 2;
+        assert!(validate_recovered_state_transition(&probed, &regressed).is_err());
+    }
+
     #[test]
     fn exact_layout_preserves_state_and_cache_minimum() {
         let sectors = (128 * GIB) / 512;
@@ -956,20 +1366,56 @@ mod tests {
     }
 
     #[test]
-    fn offline_apt_source_does_not_trigger_curtins_early_repository_probe() {
-        let config = offline_apt_config();
-        assert_eq!(config["preserve_sources_list"], false);
+    fn offline_apt_source_configures_curtins_installation_overlay() {
+        let config = offline_apt_config(PackageDelivery::Embedded);
+        assert_eq!(config["preserve_sources_list"], true);
         assert_eq!(config["fallback"], "offline-install");
-        assert_eq!(
-            config["sources_list"],
-            "deb [trusted=yes] file:///cdrom/cybex/apt ./"
+        assert!(config.get("sources_list").is_none());
+        assert!(
+            config["conf"]
+                .as_str()
+                .unwrap()
+                .contains("cybex-appliance.sources")
         );
-        assert!(config.get("sources").is_none());
+        assert!(
+            config["conf"]
+                .as_str()
+                .unwrap()
+                .contains("sourceparts \"-\"")
+        );
+        assert_eq!(
+            config["sources"]["cybex-appliance.sources"]["source"],
+            "Types: deb\nURIs: file:///cdrom/cybex/apt\nSuites: ./\nComponents:\nTrusted: yes\n"
+        );
+    }
+
+    #[test]
+    fn live_offline_apt_source_replaces_ubuntu_and_cdrom_sources() {
+        let root =
+            std::env::temp_dir().join(format!("cybex-forge-offline-apt-test-{}", Uuid::new_v4()));
+        let sources_dir = root.join("etc/apt/sources.list.d");
+        fs::create_dir_all(&sources_dir).unwrap();
+        fs::write(sources_dir.join("cdrom.sources"), b"cdrom\n").unwrap();
+        fs::write(sources_dir.join("ubuntu.sources"), b"ubuntu\n").unwrap();
+
+        configure_live_offline_apt(&root, PackageDelivery::NetworkSnapshot).unwrap();
+
+        assert!(!sources_dir.join("cdrom.sources").exists());
+        assert!(!sources_dir.join("ubuntu.sources").exists());
+        assert_eq!(
+            fs::read_to_string(sources_dir.join("cybex-appliance.sources")).unwrap(),
+            "Types: deb\nURIs: file:///run/cybex-appliance-repo/packages\nSuites: ./\nComponents:\nTrusted: yes\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/apt/sources.list")).unwrap(),
+            "# Cybex Forge installation uses the verified offline package snapshot.\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn offline_packages_install_only_after_media_is_visible_inside_target() {
-        let commands = offline_package_install_commands();
+        let commands = offline_package_install_commands(PackageDelivery::Embedded);
         let commands = commands.as_array().unwrap();
         let install_command = commands[0].as_array().unwrap();
         assert_eq!(install_command[0], "sh");
@@ -1000,6 +1446,7 @@ mod tests {
             "cybex-forge-bootstrap",
             "cybex-forge-appliance",
             "linux-generic",
+            "shim-signed",
             "openssh-server",
             "btrfs-progs",
         ] {
@@ -1010,6 +1457,40 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("installing_packages")
+        );
+    }
+
+    #[test]
+    fn network_snapshot_uses_curtins_run_bind_without_a_nested_mount() {
+        let config = offline_apt_config(PackageDelivery::NetworkSnapshot);
+        assert_eq!(config["preserve_sources_list"], true);
+        assert!(config.get("sources_list").is_none());
+        assert!(
+            config["conf"]
+                .as_str()
+                .unwrap()
+                .contains("cybex-appliance.sources")
+        );
+        assert_eq!(
+            config["sources"]["cybex-appliance.sources"]["source"],
+            "Types: deb\nURIs: file:///run/cybex-appliance-repo/packages\nSuites: ./\nComponents:\nTrusted: yes\n"
+        );
+        let commands = offline_package_install_commands(PackageDelivery::NetworkSnapshot);
+        let install = commands[0].as_array().unwrap()[2].as_str().unwrap();
+        let source = install
+            .find("file:///run/cybex-appliance-repo/packages")
+            .unwrap();
+        let update = install.find(" update;").unwrap();
+        assert!(source < update);
+        assert!(!install.contains("mount --bind"));
+        assert!(!install.contains("umount"));
+        assert!(install.contains("trap 'rm -f /target/tmp/cybex-offline.list' EXIT"));
+        assert!(
+            StdCommand::new("sh")
+                .args(["-n", "-c", install])
+                .status()
+                .unwrap()
+                .success()
         );
     }
 
