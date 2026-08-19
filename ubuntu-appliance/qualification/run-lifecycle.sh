@@ -37,6 +37,11 @@ token="$(tr -d '\r\n' < "$token_file")"
 test -n "$token"
 release_version="$(jq -er '.version' "$manifest")"
 ubuntu_snapshot_id="$(jq -er '.appliance_release_v1.ubuntu_snapshot_id' "$manifest")"
+has_predecessor="${CYBEX_JAMES_HAS_PREDECESSOR:?set the governed predecessor state}"
+case "$has_predecessor" in
+  true|false) ;;
+  *) echo 'error: invalid governed predecessor state' >&2; exit 1 ;;
+esac
 
 work_dir="$(mktemp -d)"
 qemu_pid=""
@@ -376,27 +381,45 @@ jq -e '[.. | objects | .package_ref? // empty] | index("nodejs") == null' \
   "$hyprland_config" >/dev/null
 
 runtime_status="$work_dir/workstation-runtime.json"
+runtime_operational=false
 runtime_converged=false
-for _attempt in $(seq 1 720); do
+runtime_prepublication_deferred=false
+if [[ "$has_predecessor" = false ]]; then
   api GET "/v1/james/nodes/$device_id/workstation-netboot" > "$runtime_status"
-  if [[ "$(jq -er '.operational' "$runtime_status")" = true ]] \
-    && [[ "$(jq -er '.converged' "$runtime_status")" = true ]]
-  then
-    runtime_converged=true
-    break
-  fi
-  if [[ "$(jq -er '.state' "$runtime_status")" = failed ]] \
-    && [[ "$(jq -er '.operational' "$runtime_status")" = false ]]
-  then
-    echo 'error: fresh James has no verified usable workstation runtime' >&2
-    jq '{state,operational,converged,failure_code,failure_message}' \
-      "$runtime_status" >&2
-    exit 1
-  fi
-  kill -0 "$qemu_pid"
-  sleep 5
-done
-test "$runtime_converged" = true
+  test "$(jq -er '.state' "$runtime_status")" = absent
+  test "$(jq -er '.operational' "$runtime_status")" = false
+  test "$(jq -er '.converged' "$runtime_status")" = false
+  test "$(jq -r '.desired // ""' "$runtime_status")" = ""
+  test "$(jq -r '.active // ""' "$runtime_status")" = ""
+  # The first immutable release cannot be downloaded from its final governed
+  # URL before publication. Its candidate bundle was already authenticated and
+  # byte-verified above this lifecycle; record the bounded deferral explicitly
+  # instead of claiming live delivery or waiting on an impossible dependency.
+  runtime_prepublication_deferred=true
+else
+  for _attempt in $(seq 1 720); do
+    api GET "/v1/james/nodes/$device_id/workstation-netboot" > "$runtime_status"
+    if [[ "$(jq -er '.operational' "$runtime_status")" = true ]] \
+      && [[ "$(jq -er '.converged' "$runtime_status")" = true ]]
+    then
+      runtime_operational=true
+      runtime_converged=true
+      break
+    fi
+    if [[ "$(jq -er '.state' "$runtime_status")" = failed ]] \
+      && [[ "$(jq -er '.operational' "$runtime_status")" = false ]]
+    then
+      echo 'error: fresh James has no verified usable workstation runtime' >&2
+      jq '{state,operational,converged,failure_code,failure_message}' \
+        "$runtime_status" >&2
+      exit 1
+    fi
+    kill -0 "$qemu_pid"
+    sleep 5
+  done
+  test "$runtime_operational" = true
+  test "$runtime_converged" = true
+fi
 
 build_jobs="$work_dir/build-jobs.json"
 builtins_deliverable=false
@@ -524,6 +547,9 @@ jq -n \
   --arg root_generation "$(jq -er '.root_generation | tostring' "$node")" \
   --arg session_id "$session_id" --arg template_sha256 "$template_sha" \
   --arg personalized_sha256 "$personalized_sha" \
+  --argjson workstation_runtime_operational "$runtime_operational" \
+  --argjson workstation_runtime_converged "$runtime_converged" \
+  --argjson workstation_runtime_prepublication_deferred "$runtime_prepublication_deferred" \
   --arg completed_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
   '{schema:$schema,ok:true,release_version:$release_version,
     ubuntu_snapshot_id:$ubuntu_snapshot_id,root_generation:$root_generation,
@@ -531,7 +557,9 @@ jq -n \
     personalized_sha256:$personalized_sha256,secure_boot:true,
     no_disk_write_before_approval:true,identity_rotation:true,
     installed_media_left_attached:true,appliance_projection_healthy:true,
-    workstation_runtime_operational:true,workstation_runtime_converged:true,
+    workstation_runtime_operational:$workstation_runtime_operational,
+    workstation_runtime_converged:$workstation_runtime_converged,
+    workstation_runtime_prepublication_deferred:$workstation_runtime_prepublication_deferred,
     builtin_blueprints_source_free:true,builtin_blueprints_deliverable:true,
     builtin_blueprints_qualified_on_new_james:true,
     two_phase_network_acknowledged:true,exact_principal_ssh_certificate:true,
