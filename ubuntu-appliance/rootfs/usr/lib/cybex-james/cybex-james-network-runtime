@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+result="$(/usr/lib/cybex-james/cybex-james-bootstrap reconcile-network-runtime)"
+case "$result" in
+  unchanged|changed) ;;
+  *)
+    echo "network runtime reconciliation returned an invalid outcome" >&2
+    exit 1
+    ;;
+esac
+
+james_state="$(systemctl show --property=ActiveState --value cybex-james.service)"
+case "$james_state" in
+  active)
+    if [[ "$result" = changed ]]; then
+      # Queue rather than wait on the unit ordered after this prerequisite.
+      systemctl --no-block try-restart cybex-james.service
+    fi
+    ;;
+  inactive|failed)
+    # A failed initial prerequisite leaves James down. A later successful timer
+    # reconciliation must make the appliance self-heal without operator input.
+    systemctl --no-block start cybex-james.service
+    ;;
+  activating|deactivating|reloading)
+    # James already has a converging job. Starting it again from its own
+    # prerequisite would create a needless transaction loop.
+    ;;
+  *)
+    echo "James service returned an invalid ActiveState" >&2
+    exit 1
+    ;;
+esac

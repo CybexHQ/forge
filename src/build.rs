@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use crate::{
     AppState, cache,
     config::{AppConfig, BuildTargetConfig, pinned_nixpkgs_revision},
-    db,
+    db, manage_source,
     models::BuildJob,
     nix_log::{InternalJsonParser, derivation_display_name},
     protected_material,
@@ -46,7 +46,7 @@ const CAPACITY_ACCOUNTING_TOLERANCE_BYTES: u64 = 1024 * 1024;
 const BUILDING_PROGRESS_START: i32 = 25;
 const BUILDING_PROGRESS_END: i32 = 79;
 // These files are part of the pinned nixpkgs materialization machinery used
-// by Pulse's current source lock. A nixpkgs update must deliberately refresh
+// by James's current source lock. A nixpkgs update must deliberately refresh
 // the hashes after reviewing the new scripts. Derivation attributes and names
 // alone are explicitly not treated as provenance.
 const TRUSTED_STDENV_SOURCE_SHA256: &str =
@@ -225,15 +225,15 @@ pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         match db::recover_running_build_jobs(
             &state.db,
-            "Pulse restarted while this build was running; mark failed for explicit retry.",
+            "James restarted while this build was running; mark failed for explicit retry.",
         )
         .await
         {
             Ok(count) if count > 0 => {
-                warn!(count, "recovered stale running Pulse build jobs");
+                warn!(count, "recovered stale running James build jobs");
             }
             Ok(_) => {}
-            Err(err) => warn!(error = %err, "failed to recover running Pulse build jobs"),
+            Err(err) => warn!(error = %err, "failed to recover running James build jobs"),
         }
         sweep_stale_job_dirs(&state.config).await;
 
@@ -251,9 +251,9 @@ async fn worker_loop(state: AppState, worker_index: usize) {
             Ok(Some(job)) => {
                 claim_failures = 0;
                 let job_id = job.id;
-                info!(job_id, worker_index, "claimed Pulse build job");
+                info!(job_id, worker_index, "claimed James build job");
                 if let Err(err) = execute_claimed_job(&state, job).await {
-                    warn!(error = %safe_error(&err), worker_index, "Pulse build job execution failed");
+                    warn!(error = %safe_error(&err), worker_index, "James build job execution failed");
                     recover_failed_job_execution(&state, job_id, worker_index).await;
                 }
                 cleanup_job_dirs(&state.config, job_id).await;
@@ -265,7 +265,7 @@ async fn worker_loop(state: AppState, worker_index: usize) {
             Err(err) => {
                 claim_failures = claim_failures.saturating_add(1);
                 let delay = (5u64 << claim_failures.saturating_sub(1).min(5)).min(120);
-                warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim Pulse build job");
+                warn!(error = %err, worker_index, retry_in_seconds = delay, "failed to claim James build job");
                 sleep(Duration::from_secs(delay)).await;
             }
         }
@@ -274,14 +274,14 @@ async fn worker_loop(state: AppState, worker_index: usize) {
 
 async fn recover_failed_job_execution(state: &AppState, job_id: i64, worker_index: usize) {
     const RECOVERY_REASON: &str =
-        "Pulse stopped the build safely after an internal worker error; retry the build.";
+        "James stopped the build safely after an internal worker error; retry the build.";
     let mut failures: u32 = 0;
     loop {
         match db::fail_running_build_job_after_worker_error(&state.db, job_id, RECOVERY_REASON)
             .await
         {
             Ok(true) => {
-                warn!(job_id, worker_index, "recovered failed Pulse build worker");
+                warn!(job_id, worker_index, "recovered failed James build worker");
                 return;
             }
             Ok(false) => return,
@@ -294,7 +294,7 @@ async fn recover_failed_job_execution(state: &AppState, job_id: i64, worker_inde
                     job_id,
                     worker_index,
                     retry_in_seconds = delay,
-                    "failed to persist Pulse build worker recovery"
+                    "failed to persist James build worker recovery"
                 );
                 sleep(Duration::from_secs(delay)).await;
             }
@@ -315,13 +315,13 @@ async fn cleanup_job_dirs(config: &AppConfig, job_id: i64) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                warn!(error = %err, path = %dir.display(), "failed to remove Pulse build job directory");
+                warn!(error = %err, path = %dir.display(), "failed to remove James build job directory");
             }
         }
     }
 }
 
-/// Remove job dirs left behind by earlier Pulse runs. Runs once at startup,
+/// Remove job dirs left behind by earlier James runs. Runs once at startup,
 /// after stale running jobs have been marked failed and before workers start,
 /// so nothing under these names can be live.
 async fn sweep_stale_job_dirs(config: &AppConfig) {
@@ -334,7 +334,7 @@ async fn sweep_stale_job_dirs(config: &AppConfig) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                warn!(error = %err, path = %root.display(), "failed to scan Pulse build directory");
+                warn!(error = %err, path = %root.display(), "failed to scan James build directory");
                 continue;
             }
         };
@@ -353,13 +353,13 @@ async fn sweep_stale_job_dirs(config: &AppConfig) {
             match tokio::fs::remove_dir_all(entry.path()).await {
                 Ok(()) => removed += 1,
                 Err(err) => {
-                    warn!(error = %err, path = %entry.path().display(), "failed to remove stale Pulse build job directory");
+                    warn!(error = %err, path = %entry.path().display(), "failed to remove stale James build job directory");
                 }
             }
         }
     }
     if removed > 0 {
-        info!(removed, "removed stale Pulse build job directories");
+        info!(removed, "removed stale James build job directories");
     }
 }
 
@@ -432,7 +432,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     if let Err(err) = crate::disk::ensure_headroom(
         Path::new("/nix/store"),
         state.config.build.max_artifact_size_bytes,
-        "Pulse build",
+        "James build",
     ) {
         db::finish_build_job(
             &state.db,
@@ -463,7 +463,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 "failed",
                 "",
                 &format!(
-                    "could not inspect Pulse memory capacity: {}",
+                    "could not inspect James memory capacity: {}",
                     safe_error(&err)
                 ),
                 "",
@@ -488,7 +488,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         Some((
             "insufficient_memory",
             format!(
-                "Pulse requires at least {} bytes of memory for Build/Cache; detected {} bytes",
+                "James requires at least {} bytes of memory for Build/Cache; detected {} bytes",
                 state.config.build.minimum_memory_bytes, capacity.memory_bytes
             ),
         ))
@@ -496,7 +496,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         Some((
             "insufficient_swap",
             format!(
-                "Pulse requires at least {} bytes of emergency swap for Build/Cache; detected {} bytes",
+                "James requires at least {} bytes of emergency swap for Build/Cache; detected {} bytes",
                 state.config.build.minimum_swap_bytes, capacity.swap_bytes
             ),
         ))
@@ -585,7 +585,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
             Ok(_) => {}
             Err(err) => {
                 let error = format!(
-                    "Pulse could not verify binary cache coverage, so this source-disabled build was stopped safely: {}",
+                    "James could not verify binary cache coverage, so this source-disabled build was stopped safely: {}",
                     safe_error(&err)
                 );
                 db::finish_build_job(
@@ -684,7 +684,7 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
                 job.id,
                 Some(90),
                 "exporting",
-                "Exporting closure to Pulse cache",
+                "Exporting closure to James cache",
             )
             .await?;
             let mut cached = match cache::export_output(
@@ -833,6 +833,7 @@ fn capacity_meets_minimum(actual: u64, minimum: u64) -> bool {
 
 fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBuildSpec> {
     protected_material::validate_build_spec(&job.build_spec)?;
+    let raw_build_input = job.build_spec.get("build_input").cloned();
     let spec: BuildSpec = serde_json::from_value(job.build_spec.clone())
         .context("build_spec does not match schema")?;
     if spec.schema_version != 1 {
@@ -847,7 +848,7 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         .iter()
         .any(|value| value == &system)
     {
-        bail!("system is not allowed on this Pulse node");
+        bail!("system is not allowed on this James node");
     }
     let input_revision = normalize_revision(&spec.input_revision)?;
     let input_config_hash = normalize_sha256(&spec.input_config_hash)?;
@@ -898,6 +899,23 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         .iter()
         .map(|value| normalize_package_ref(value))
         .collect::<Result<Vec<_>>>()?;
+    if target == "installer_target" {
+        validate_installer_target_build_binding(
+            &input_revision,
+            &input_config_hash,
+            blueprint_id.as_deref(),
+            blueprint_revision_id.as_deref(),
+            blueprint_revision_config_hash.as_deref(),
+            nixpkgs_commit.as_deref(),
+            source_lock_sha256.as_deref(),
+            build_input.as_ref().ok_or_else(|| {
+                anyhow!("installer target requires its exact Blueprint build input")
+            })?,
+            raw_build_input.as_ref().ok_or_else(|| {
+                anyhow!("installer target requires its exact raw Blueprint build input")
+            })?,
+        )?;
+    }
     Ok(ValidatedBuildSpec {
         artifact_type,
         target,
@@ -915,16 +933,96 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_installer_target_build_binding(
+    input_revision: &str,
+    input_config_hash: &str,
+    blueprint_id: Option<&str>,
+    blueprint_revision_id: Option<&str>,
+    blueprint_revision_config_hash: Option<&str>,
+    nixpkgs_commit: Option<&str>,
+    source_lock_sha256: Option<&str>,
+    build_input: &ValidatedBlueprintBuildInput,
+    raw_build_input: &Value,
+) -> Result<()> {
+    if canonical_json_sha256(raw_build_input)? != input_config_hash {
+        bail!("installer target build input does not match its canonical hash");
+    }
+    let identity = build_input
+        .installer_target
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("installer target identity is required"))?;
+    let identity_text = |field: &str| {
+        identity
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("installer_target.{field} is required"))
+    };
+    let expected_state = build_input
+        .expected_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("installer target expected state is required"))?;
+    let artifact_config_hash = normalize_sha256(
+        expected_state
+            .pointer("/deployment/artifact_config_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("installer target artifact config hash is required"))?,
+    )?;
+    if blueprint_id != Some(identity_text("blueprint_id")?)
+        || blueprint_revision_id != Some(identity_text("blueprint_revision_id")?)
+        || blueprint_revision_id != Some(input_revision)
+        || nixpkgs_commit != Some(identity_text("nixpkgs_revision")?)
+        || source_lock_sha256 != Some(identity_text("source_lock_sha256")?)
+        || blueprint_revision_config_hash != Some(artifact_config_hash.as_str())
+    {
+        bail!("installer target provenance fields do not match");
+    }
+    Ok(())
+}
+
+fn canonical_json_sha256(value: &Value) -> Result<String> {
+    fn write(value: &Value, output: &mut Vec<u8>) -> serde_json::Result<()> {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                serde_json::to_writer(output, value)
+            }
+            Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    write(value, output)?;
+                }
+                output.push(b']');
+                Ok(())
+            }
+            Value::Object(object) => {
+                output.push(b'{');
+                let mut keys = object.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    serde_json::to_writer(&mut *output, key)?;
+                    output.push(b':');
+                    write(&object[key], output)?;
+                }
+                output.push(b'}');
+                Ok(())
+            }
+        }
+    }
+    let mut canonical = Vec::new();
+    write(value, &mut canonical).context("serialize canonical installer build input")?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
 fn validate_blueprint_build_input(
     input: BlueprintBuildInput,
 ) -> Result<ValidatedBlueprintBuildInput> {
-    protected_material::validate_generated_nix(&input.generated_nix)?;
-    if let Some(desktop_module_nix) = input.desktop_module_nix.as_deref() {
-        protected_material::validate_desktop_module_nix(desktop_module_nix)?;
-    }
-    if let Some(expected_state) = input.expected_state.as_ref() {
-        protected_material::validate_expected_state(expected_state)?;
-    }
     let kind = input.kind.trim();
     if !matches!(
         kind,
@@ -935,6 +1033,23 @@ fn validate_blueprint_build_input(
         bail!("unsupported build_input kind");
     }
     let installer_target_build = kind == INSTALLER_TARGET_BUILD_INPUT_KIND;
+    if !installer_target_build {
+        protected_material::validate_generated_nix(&input.generated_nix)?;
+    }
+    if let Some(desktop_module_nix) = input.desktop_module_nix.as_deref() {
+        protected_material::validate_desktop_module_nix(desktop_module_nix)?;
+    }
+    if let Some(expected_state) = input.expected_state.as_ref() {
+        if installer_target_build {
+            protected_material::validate_installer_target_expected_state(expected_state)?;
+            protected_material::validate_installer_target_generated_nix(
+                &input.generated_nix,
+                expected_state,
+            )?;
+        } else {
+            protected_material::validate_expected_state(expected_state)?;
+        }
+    }
     if input.generated_nix.trim().is_empty() {
         bail!("build_input.generated_nix is required");
     }
@@ -965,7 +1080,7 @@ fn validate_blueprint_build_input(
         ) {
             bail!("build_input.expected_state has an unsupported schema");
         }
-    } else if input.expected_state.is_some() {
+    } else if input.expected_state.is_some() && !installer_target_build {
         bail!("build_input.expected_state requires desktop_module_nix");
     }
     if installer_target_build {
@@ -978,6 +1093,10 @@ fn validate_blueprint_build_input(
             hardware_module_nix,
             MAX_HARDWARE_MODULE_NIX_BYTES,
         )?;
+        protected_material::validate_installer_target_non_blueprint_module(
+            "build_spec.build_input.hardware_module_nix",
+            hardware_module_nix,
+        )?;
         let target_module_nix = input
             .target_module_nix
             .as_deref()
@@ -986,6 +1105,10 @@ fn validate_blueprint_build_input(
             "build_input.target_module_nix",
             target_module_nix,
             MAX_TARGET_MODULE_NIX_BYTES,
+        )?;
+        protected_material::validate_installer_target_non_blueprint_module(
+            "build_spec.build_input.target_module_nix",
+            target_module_nix,
         )?;
         let manage_source_revision = input
             .manage_source_revision
@@ -1000,8 +1123,25 @@ fn validate_blueprint_build_input(
                 .ok_or_else(|| anyhow!("installer target identity is required"))?,
             manage_source_revision,
         )?;
-        if input.desktop_module_nix.is_none() || input.expected_state.is_none() {
-            bail!("installer target requires the reviewed desktop module and expected state");
+        let expected_revision = input
+            .expected_state
+            .as_ref()
+            .and_then(|value| value.pointer("/deployment/blueprint_revision_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("installer target expected-state revision is required"))?;
+        if input
+            .installer_target
+            .as_ref()
+            .and_then(|value| value.get("blueprint_revision_id"))
+            .and_then(Value::as_str)
+            != Some(expected_revision)
+        {
+            bail!("installer target Blueprint revision fields do not match");
+        }
+        if input.desktop_module_nix.is_some() || input.expected_state.is_none() {
+            bail!(
+                "installer target must use the packaged Manage desktop module and requires expected state"
+            );
         }
     } else if input.hardware_module_nix.is_some()
         || input.target_module_nix.is_some()
@@ -1056,7 +1196,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
         "hardware_facts_sha256",
         "hardware_driver_policy",
         "disk_layout_sha256",
-        "pulse_device_id",
+        "james_device_id",
         "bundle_sha256",
         "profile_id",
         "managed_device_id",
@@ -1081,7 +1221,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
         "blueprint_revision_id",
         "profile_id",
     ] {
-        normalize_optional_uuidish(
+        normalize_canonical_uuid(
             field,
             object
                 .get(field)
@@ -1092,7 +1232,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
     for field in ["managed_device_id", "reinstall_request_id"] {
         if let Some(value) = object.get(field).and_then(Value::as_str) {
             if field == "reinstall_request_id" {
-                normalize_optional_uuidish(field, value)?;
+                normalize_canonical_uuid(field, value)?;
             } else {
                 normalize_public_identifier(field, value, 160)?;
             }
@@ -1107,7 +1247,7 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
     {
         bail!("installer_target reinstall bindings must both be present or both be null");
     }
-    for field in ["device_id", "pulse_device_id"] {
+    for field in ["device_id", "james_device_id"] {
         normalize_public_identifier(
             field,
             object
@@ -1156,6 +1296,15 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
     Ok(())
 }
 
+fn normalize_canonical_uuid(field: &str, value: &str) -> Result<String> {
+    let parsed = uuid::Uuid::parse_str(value).with_context(|| format!("{field} must be a UUID"))?;
+    let canonical = parsed.hyphenated().to_string();
+    if value != canonical {
+        bail!("{field} must be a canonical lowercase UUID");
+    }
+    Ok(canonical)
+}
+
 fn normalize_public_identifier(field: &str, value: &str, max_chars: usize) -> Result<String> {
     if value.is_empty()
         || value != value.trim()
@@ -1190,7 +1339,7 @@ fn build_target<'a>(
             .context("validate configured Blueprint nixpkgs pin")?;
         if spec.nixpkgs_commit.as_deref() != Some(configured_revision) {
             bail!(
-                "Blueprint nixpkgs_commit does not match this Pulse target's reviewed source pin"
+                "Blueprint nixpkgs_commit does not match this James target's reviewed source pin"
             );
         }
     }
@@ -1310,14 +1459,14 @@ fn classify_nix_build_failure(logs: &str, oom_killed: bool) -> (&'static str, St
     if oom_killed || lower.contains("out of memory") || lower.contains("oom-kill") {
         return (
             "out_of_memory",
-            "Pulse exhausted its build memory; increase memory/swap or reduce max_build_cores"
+            "James exhausted its build memory; increase memory/swap or reduce max_build_cores"
                 .to_string(),
         );
     }
     if lower.contains("no space left on device") || lower.contains("disk full") {
         return (
             "insufficient_disk_space",
-            "Pulse ran out of disk space while building the Nix closure".to_string(),
+            "James ran out of disk space while building the Nix closure".to_string(),
         );
     }
     if lower.contains("unable to start any build") {
@@ -1366,7 +1515,7 @@ const REJECT_FLAKE_CONFIG_NIX_OPTION: [&str; 3] = ["--option", "accept-flake-con
 const REQUIRE_BUILD_SANDBOX_NIX_OPTION: [&str; 3] = ["--option", "sandbox", "true"];
 
 fn append_source_policy_nix_options(args: &mut Vec<String>, allow_source_builds: bool) {
-    // Pulse is a trusted Nix client because it exports and signs closures.
+    // James is a trusted Nix client because it exports and signs closures.
     // Pin the daemon-side sandbox and refuse flake-supplied client settings on
     // every path so a Blueprint cannot use that trust to relax isolation.
     args.extend(
@@ -1661,14 +1810,14 @@ fn extract_would_build_derivations(text: &str, cap: usize) -> WouldBuildDerivati
 }
 
 fn source_build_blocked_message(candidates: &[String]) -> String {
-    let advice = "Replace source-built software with cache-backed native nixpkgs packages, \
-                  or choose a pinned nixpkgs revision with substitutes. If source compilation \
-                  is genuinely unavoidable, explicitly enable \"Allow building from source\" \
-                  for this Blueprint.";
+    let advice = "Review the listed derivations. For an administrator-authored Blueprint, \
+                  preserve its package choices unless an administrator selects a cache-backed \
+                  equivalent, chooses a pinned nixpkgs revision with substitutes, or explicitly \
+                  enables \"Allow building from source\" in the organization Software delivery policy.";
     if candidates.is_empty() {
         return format!(
-            "Blocked: this build requires compiling packages from source, \
-             which is not allowed for this Blueprint. {advice}"
+            "Blocked: this build requires compiling derivations from source, \
+             which is disabled by the organization Software delivery policy. {advice}"
         );
     }
     let shown = candidates
@@ -1683,7 +1832,7 @@ fn source_build_blocked_message(candidates: &[String]) -> String {
         String::new()
     };
     format!(
-        "Blocked: {} package(s) are not available from the binary cache and would be \
+        "Blocked: {} derivation(s) are not available from the binary cache and would be \
          compiled from source: {shown}{suffix}. {advice}",
         candidates.len()
     )
@@ -2056,6 +2205,12 @@ where
                     verify_source,
                     would_build,
                     trusted_local,
+                ) || derivation_is_reviewed_json_to_toml_materialization(
+                    drv,
+                    &attrs,
+                    verify_source,
+                    would_build,
+                    trusted_local,
                 ) || derivation_is_nixos_substitution_glue(
                     drv,
                     &attrs,
@@ -2208,7 +2363,7 @@ fn script_sha256_with_store_path_policy(script: &str, preserve_executables: bool
 /// Nix 2.26 serializes `__structuredAttrs` inside `env.__json`, while newer
 /// releases expose `structuredAttrs` directly. Merge both shapes with the
 /// ordinary string environment so policy decisions do not depend on the Nix
-/// client version installed on Pulse.
+/// client version installed on James.
 fn derivation_attributes(drv: &Value) -> serde_json::Map<String, Value> {
     let mut merged = serde_json::Map::new();
     let mut conflict = false;
@@ -2840,6 +2995,13 @@ const UDEV_GENERATOR_TOOL_INPUTS: &[ReviewedToolInput] = &[ReviewedToolInput {
     output: "out",
 }];
 
+const REMARSHAL_GENERATOR_TOOL_INPUTS: &[ReviewedToolInput] = &[ReviewedToolInput {
+    attribute: "nativeBuildInputs",
+    path: "/nix/store/mclvsxxbggf9v0lh98jpw8n79apb56v8-python3.13-remarshal-1.3.0",
+    drv_path: "/nix/store/9m8clx8fvsxzv5nrvxz59wwslv0r8lkp-python3.13-remarshal-1.3.0.drv",
+    output: "out",
+}];
+
 // The current native initrd assembler is also local glue, but it invokes only
 // these two pinned cache-backed tools. Keep this descriptor separate so a
 // change to either provider requires an explicit source-lock review.
@@ -3077,6 +3239,76 @@ fn reviewed_tool_inputs_match(
     true
 }
 
+// The Standard Workstation's Firefox ESR result is a local policy wrapper over
+// a substituted firefox-unwrapped output. These are the exact 74cc63f wrapper
+// bytes with the current managed policies (locked direct proxy mode and locked
+// network.manage-offline-status=false). It copies/links the substituted runtime
+// and writes configuration; it does not compile Firefox.
+const PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT: &str =
+    "bb1b77a969a9075224e0ea886d35c8251bbdabe357f3f4c29fbb4670b8aabb67";
+const PINNED_FIREFOX_ESR_POLICY_WRAPPER_EXECUTABLE_FINGERPRINT: &str =
+    "d9777cea0832997030cb318148429ecb0bd41a0ff35bbe2579730804d865f341";
+
+// The exact 74cc63f udev rule assembler for the current Standard Workstation.
+// It concatenates cache-backed rule files, substitutes pinned utility paths,
+// and validates them with the pinned systemd-minimal udevadm provider.
+const PINNED_STANDARD_UDEV_RULES_FINGERPRINT: &str =
+    "af25f58ac48c4d94dd367f4b29965536e33ce6412918a25daef9e251e980cd76";
+const PINNED_STANDARD_UDEV_RULES_EXECUTABLE_FINGERPRINT: &str =
+    "72b10dfed390d3e9a728f87deff6a2904be3165392a2e45eee5f4a9b06489d1f";
+const PINNED_STANDARD_USER_UNITS_FINGERPRINT: &str =
+    "c249951a8098f8167ba02ada9f9339962bcf467125bb6c904ce8cc7f036b9a9f";
+const PINNED_STANDARD_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "3a9ac4beb722e6dc228fec93bbfef51f90f003c16df4120cf9bc82ed3ad74a74";
+const PINNED_STANDARD_SYSTEM_UNITS_FINGERPRINT: &str =
+    "82fd44dec38b45a5a86ff3f32e9ca99481adeb2849ce222b7465fad82d0ac954";
+const PINNED_STANDARD_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "274335bbebf5ef49a42045f79c51691489437e876087d404a86f2ba70d17e937";
+const PINNED_STANDARD_ETC_FINGERPRINT: &str =
+    "4767105ffdde658ccaf7462ee02dde479b982e99e60cb4779ca755e6c1adea0f";
+const PINNED_STANDARD_ETC_EXECUTABLE_FINGERPRINT: &str =
+    "ef11903699d4c1fc0af0f26f7118a62a635119106c0f19a57d76d8b86880b28f";
+const PINNED_DOCK_SYSTEM_UNITS_FINGERPRINT: &str =
+    "7f9e27b1ad689e73e2fe71e74b14cfffa60f5b362e50aac3463cfefd9b1cf137";
+const PINNED_DOCK_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "9f7efa401593bd05762ea03b3c08682fe8045f2941b319f7dd78623b9a9878f2";
+const PINNED_DOCK_UDEV_RULES_FINGERPRINT: &str =
+    "8c0fa3cca08bd5e0be9a797fcab74dabfc28163f9af2077d851a0e2fa4ef55bc";
+const PINNED_DOCK_UDEV_RULES_EXECUTABLE_FINGERPRINT: &str =
+    "f6efc8832680052fca0a295d7ea96aaec657b6dc3409ba57f74b35b9e4c77b82";
+const PINNED_DOCK_USER_UNITS_FINGERPRINT: &str =
+    "65e6b60d0ded1f8a84caf42cebe3b3901aac8529364a441beaf355d3fd90067c";
+const PINNED_DOCK_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "304c8459e90a7e78f2680fe06427fac3defd03880a3b25cb88bcefa975d46f17";
+const PINNED_DOCK_ETC_FINGERPRINT: &str =
+    "52cf635393b4ddeba8ea1335b68f8715a1a011a34120fa469aa8bcae8a980872";
+const PINNED_DOCK_ETC_EXECUTABLE_FINGERPRINT: &str =
+    "48dbdfea0e0232e9949cad2627facc12815d39dccb3a26217935bfd28ac7d324";
+const PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT: &str =
+    "ca6cb4d2ea7130188608a324d2f580d304091a2334dc67b2ec2ba10f1b45a7b2";
+const PINNED_HYPRLAND_UDEV_RULES_EXECUTABLE_FINGERPRINT: &str =
+    "71704c00e88c6868a3599727623703cabbe35a6cdb056a6bccfc402facfeb719";
+const PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_FINGERPRINT: &str =
+    "ad47ba6d5e0944d2a25b5c0605a9b3b054b9f568ef51262b4c06f5bb7c709ccd";
+const PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_EXECUTABLE_FINGERPRINT: &str =
+    "55a8619307897813e8e5b171fc4aee67e302ccdf6b3b73c9c87a4311fe531123";
+const PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_FINGERPRINT: &str =
+    "58488979024a1b2b39be25bb46fece8a4b1a401a17a6bd6e96b1bb28c781a79a";
+const PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_EXECUTABLE_FINGERPRINT: &str =
+    "fbb0f7dc9862d1e5b70ca0d0a0cca7c7826dd35deeabe7d66ee5d70602c95fd1";
+const PINNED_HYPRLAND_USER_UNITS_FINGERPRINT: &str =
+    "283eb48f8f899f1791f4a1605efb02ada58b853a107f5657c18655882e7eda92";
+const PINNED_HYPRLAND_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "837685f4f538928f90cf993d62135d209db19cdd3f8977313d596a3d27d71836";
+const PINNED_HYPRLAND_SYSTEM_UNITS_FINGERPRINT: &str =
+    "00f33c9b3568d9183d5b2673ec97ffad110f8d2aeb791f6aea4afe2403249d66";
+const PINNED_HYPRLAND_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
+    "d026d0482802f935164611b3d7b91f7788cc88426a6808f805fe444713ffe5d6";
+const PINNED_HYPRLAND_ETC_FINGERPRINT: &str =
+    "75b0534ec0b3ac8b033807df2eb7972fb23d24f53545f33c1aa15fb67216d469";
+const PINNED_HYPRLAND_ETC_EXECUTABLE_FINGERPRINT: &str =
+    "f9423240fde6ddb41962f097443a48474d8d1ea77ab67d447c4c74d9a058d609";
+
 // Exact 74cc63f fingerprints for native desktop/NixOS materializers reviewed
 // from real source-disabled KDE and Hyprland closures. They only write
 // configuration, copy or link cache-backed store inputs, validate udev rules,
@@ -3167,6 +3399,58 @@ const PINNED_DESKTOP_NIXOS_GENERATOR_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "3ee4be64b7ae61e457c188845565f35d592ef1f43afd7828c7f9f6f222f44c4b",
         "c1e3714ff277c969f8daf643cc5e8917c5afdee31b149041d651fe93a472f0e6",
+    ),
+    (
+        PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT,
+        PINNED_FIREFOX_ESR_POLICY_WRAPPER_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_STANDARD_UDEV_RULES_FINGERPRINT,
+        PINNED_STANDARD_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_STANDARD_USER_UNITS_FINGERPRINT,
+        PINNED_STANDARD_USER_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_STANDARD_SYSTEM_UNITS_FINGERPRINT,
+        PINNED_STANDARD_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_STANDARD_ETC_FINGERPRINT,
+        PINNED_STANDARD_ETC_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_DOCK_SYSTEM_UNITS_FINGERPRINT,
+        PINNED_DOCK_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_DOCK_UDEV_RULES_FINGERPRINT,
+        PINNED_DOCK_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_DOCK_USER_UNITS_FINGERPRINT,
+        PINNED_DOCK_USER_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_DOCK_ETC_FINGERPRINT,
+        PINNED_DOCK_ETC_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT,
+        PINNED_HYPRLAND_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_HYPRLAND_USER_UNITS_FINGERPRINT,
+        PINNED_HYPRLAND_USER_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_HYPRLAND_SYSTEM_UNITS_FINGERPRINT,
+        PINNED_HYPRLAND_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+    ),
+    (
+        PINNED_HYPRLAND_ETC_FINGERPRINT,
+        PINNED_HYPRLAND_ETC_EXECUTABLE_FINGERPRINT,
     ),
 ];
 
@@ -3424,6 +3708,7 @@ fn empty_build_tool_attributes(attrs: &serde_json::Map<String, Value>) -> bool {
 
 const STOCK_WRITE_TEXT_COMMAND: &str = "target=$out$destination\nmkdir -p \"$(dirname \"$target\")\"\n\nif [ -e \"$textPath\" ]; then\n  mv \"$textPath\" \"$target\"\nelse\n  printf \"%s\" \"$text\" > \"$target\"\nfi\n\nif [ -n \"$executable\" ]; then\n  chmod +x \"$target\"\nfi\n\neval \"$checkPhase\"\n";
 const STOCK_CONCAT_TEXT_COMMAND: &str = "file=$out$destination\nmkdir -p \"$(dirname \"$file\")\"\ncat $files > \"$file\"\n\nif [ -n \"$executable\" ]; then\n  chmod +x \"$file\"\nfi\n\neval \"$checkPhase\"\n";
+const STOCK_JSON_TO_TOML_COMMAND: &str = "valuePath=\"$TMPDIR/value\"\nprintf \"%s\" \"$value\" > \"$valuePath\"\njson2toml \"$valuePath\" \"$out\"\n";
 
 fn stock_write_text_check_phase(
     drv: &Value,
@@ -3463,21 +3748,33 @@ fn stock_write_text_check_phase(
     })
 }
 
-fn stock_unit_materializer(script: &str) -> bool {
-    let mut lines = script.lines();
-    let Some(name_line) = lines.next() else {
-        return false;
-    };
-    let Some(name) = name_line.strip_prefix("name=") else {
-        return false;
-    };
+fn safe_unit_materializer_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 192
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@'))
+}
+
+fn stock_unit_materializer(script: &str) -> bool {
+    let mut lines = script.lines();
+    let Some(name) = lines.next().and_then(|line| line.strip_prefix("name=")) else {
+        return false;
+    };
+    safe_unit_materializer_name(name)
         && lines.next() == Some("mkdir -p \"$out/$(dirname -- \"$name\")\"")
         && lines.next() == Some("mv \"$textPath\" \"$out/$name\"")
+        && lines.next().is_none()
+}
+
+fn stock_disabled_unit_materializer(script: &str) -> bool {
+    let mut lines = script.lines();
+    let Some(name) = lines.next().and_then(|line| line.strip_prefix("name=")) else {
+        return false;
+    };
+    safe_unit_materializer_name(name)
+        && lines.next() == Some("mkdir -p \"$out/$(dirname \"$name\")\"")
+        && lines.next() == Some("ln -s /dev/null \"$out/$name\"")
         && lines.next().is_none()
 }
 
@@ -3520,10 +3817,66 @@ where
     if build_command == STOCK_CONCAT_TEXT_COMMAND {
         return empty_build_tool_attributes(attrs) && only_reviewed_phase_hooks(attrs, &[]);
     }
-    if stock_unit_materializer(build_command) {
+    if stock_unit_materializer(build_command) || stock_disabled_unit_materializer(build_command) {
         return empty_build_tool_attributes(attrs) && only_reviewed_phase_hooks(attrs, &[]);
     }
     derivation_is_pinned_link_farm(drv, attrs, verify_source, would_build, trusted_local)
+}
+
+/// NixOS renders typed service settings through the pinned remarshal
+/// `json2toml` helper. This materializer writes data only: it receives a valid
+/// JSON object through one quoted environment value and invokes one exact,
+/// cache-backed converter. Keep it separate from the general generator
+/// fingerprint set so TOML data cannot authorize another shell recipe.
+fn derivation_is_reviewed_json_to_toml_materialization<F>(
+    drv: &Value,
+    attrs: &serde_json::Map<String, Value>,
+    verify_source: &F,
+    would_build: &HashSet<String>,
+    trusted_local: &HashSet<String>,
+) -> bool
+where
+    F: Fn(&str, &str) -> bool,
+{
+    derivation_attr_truthy(attrs, "preferLocalBuild")
+        && derivation_attr_text(attrs, "buildCommand") == STOCK_JSON_TO_TOML_COMMAND
+        && attrs
+            .get("passAsFile")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some("buildCommand"))
+        && attrs
+            .get("value")
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .is_some_and(|value| value.is_object())
+        && has_pinned_stdenv_materializer(
+            drv,
+            attrs,
+            verify_source,
+            TRUSTED_STDENV_NO_CC_OUTPUT,
+            would_build,
+            trusted_local,
+        )
+        && reviewed_tool_inputs_match(
+            drv,
+            attrs,
+            REMARSHAL_GENERATOR_TOOL_INPUTS,
+            would_build,
+            trusted_local,
+        )
+        && only_reviewed_phase_hooks(attrs, &[])
+        && [
+            "src",
+            "source",
+            "cargoDeps",
+            "cargoVendorDir",
+            "goModules",
+            "configurePhase",
+            "installPhase",
+            "buildPhase",
+        ]
+        .iter()
+        .all(|key| derivation_attr_is_empty(attrs, key))
 }
 
 fn derivation_is_pinned_link_farm<F>(
@@ -3625,6 +3978,27 @@ where
             }
             &[]
         }
+        (
+            PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_FINGERPRINT,
+            PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_EXECUTABLE_FINGERPRINT,
+        ) => {
+            // Hyprland has no icon theme in the system path, so nixpkgs omits
+            // the GTK icon-cache branch while retaining the other three
+            // cache-backed index updaters from the stock system-path hook.
+            if !SYSTEM_PATH_POST_BUILD_TOOLS[..3].iter().all(|tool| {
+                post_build.contains(tool.path)
+                    && reviewed_store_output_is_trusted(
+                        drv,
+                        tool.path,
+                        *tool,
+                        would_build,
+                        trusted_local,
+                    )
+            }) {
+                return false;
+            }
+            &[]
+        }
         _ => return false,
     };
     reviewed_tool_inputs_match(drv, attrs, expected_tools, would_build, trusted_local)
@@ -3683,18 +4057,18 @@ fn reviewed_generator_tool_inputs(fingerprint: &str) -> &'static [ReviewedToolIn
         | "8e2876a0163080a391c5a2e262fe50c1ce94896b0a59b711300b4591374eb274"
         | "b8ad9d93841f3878d9002c305c986c6341ed591300917aaf98d64e3b81bcb303"
         | "88e4e96d3d47f2439559310bc29f36051c4728d0e3436cf4b50201d399c819b8"
-        | "6c95edcf4bb40bf57b7dd83d10e2b27cc0b9357c340cf250ddd9687c826f9acf" => {
-            UDEV_GENERATOR_TOOL_INPUTS
-        }
+        | "6c95edcf4bb40bf57b7dd83d10e2b27cc0b9357c340cf250ddd9687c826f9acf"
+        | PINNED_STANDARD_UDEV_RULES_FINGERPRINT
+        | PINNED_DOCK_UDEV_RULES_FINGERPRINT
+        | PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT => UDEV_GENERATOR_TOOL_INPUTS,
         "acb5b353de414cd3988d256fe53adf60d806084585f72bcddc734d7faebef9e6" => {
             INITRD_GENERATOR_TOOL_INPUTS
         }
         "772f6d9925d49139b03405d5ace988184e0671bcb099e0b6103a0bae20dafbc7" => {
             GTK_IMMODULE_TOOL_INPUTS
         }
-        "c061170cd0760a05e004a38f9c4014f960d2d96c9985b5c733b034ada5fb144d" => {
-            FIREFOX_WRAPPER_TOOL_INPUTS
-        }
+        "c061170cd0760a05e004a38f9c4014f960d2d96c9985b5c733b034ada5fb144d"
+        | PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT => FIREFOX_WRAPPER_TOOL_INPUTS,
         "a733046379d65a3d26f7a7c10b082d8afeff67d1464dfeb146ed6e8f499e0dd2" => {
             SHELL_WRAPPER_TOOL_INPUTS
         }
@@ -3732,12 +4106,15 @@ where
     let build_command = derivation_attr_text(attrs, "buildCommand");
     let fingerprint = normalized_script_sha256(build_command);
     let executable_fingerprint = executable_pinned_script_sha256(build_command);
-    let expected_stdenv =
-        if fingerprint == "c061170cd0760a05e004a38f9c4014f960d2d96c9985b5c733b034ada5fb144d" {
-            TRUSTED_STDENV_FULL_OUTPUT
-        } else {
-            TRUSTED_STDENV_NO_CC_OUTPUT
-        };
+    let expected_stdenv = if matches!(
+        fingerprint.as_str(),
+        "c061170cd0760a05e004a38f9c4014f960d2d96c9985b5c733b034ada5fb144d"
+            | PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT
+    ) {
+        TRUSTED_STDENV_FULL_OUTPUT
+    } else {
+        TRUSTED_STDENV_NO_CC_OUTPUT
+    };
     if !has_pinned_stdenv_materializer(
         drv,
         attrs,
@@ -3954,6 +4331,9 @@ where
             "f18a7b7c27d7028c344b37c24b185fed3fd5a4a23b0aa0d208d7aa50ab7fd0cc",
             "a677a90325d5e32882f560489c044a08b915301969f3ea695c495d27b64adfaa",
         ) => NIXOS_GENERATE_CONFIG_TOOL_INPUTS,
+        (phase, executable) if pinned_hyprland_nixos_generate_config_phase(phase, executable) => {
+            NIXOS_GENERATE_CONFIG_TOOL_INPUTS
+        }
         (
             "3489e136a18e68375d5e57de9d5b9199f407915249c0082cf87763e79c521eff",
             "4bb1e28d9e38c00705275e997fae6b860d4dde2bfe7536f30805ae9fc3f0e551",
@@ -3982,6 +4362,11 @@ where
                         .is_some_and(|sources| sources.iter().any(|source| source == path))
             });
     approved_phase && reviewed_check && reviewed_post_install
+}
+
+fn pinned_hyprland_nixos_generate_config_phase(normalized: &str, executable_pinned: &str) -> bool {
+    normalized == PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_FINGERPRINT
+        && executable_pinned == PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_EXECUTABLE_FINGERPRINT
 }
 
 /// `security.wrappers` is native NixOS configuration glue. It compiles the
@@ -4103,7 +4488,7 @@ fn build_result_metadata(
     let mut metadata = job.cache_metadata.as_object().cloned().unwrap_or_default();
     metadata.insert(
         "result_schema".to_string(),
-        json!("cybex.pulse.build.result.v1"),
+        json!("cybex.james.build.result.v1"),
     );
     metadata.insert(
         "max_build_cores".to_string(),
@@ -4329,13 +4714,56 @@ fn blueprint_nix_build_command(
 ) -> Result<NixBuildCommand> {
     // ValidatedBuildSpec is private, but keep the write boundary independently
     // guarded so future internal call sites cannot materialize protected data.
-    protected_material::validate_generated_nix(&build_input.generated_nix)?;
+    if build_input.kind != INSTALLER_TARGET_BUILD_INPUT_KIND {
+        protected_material::validate_generated_nix(&build_input.generated_nix)?;
+    }
     if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
         protected_material::validate_desktop_module_nix(desktop_module_nix)?;
     }
     if let Some(expected_state) = build_input.expected_state.as_ref() {
-        protected_material::validate_expected_state(expected_state)?;
+        if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+            protected_material::validate_installer_target_expected_state(expected_state)?;
+            protected_material::validate_installer_target_generated_nix(
+                &build_input.generated_nix,
+                expected_state,
+            )?;
+        } else {
+            protected_material::validate_expected_state(expected_state)?;
+        }
     }
+    if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+        protected_material::validate_installer_target_non_blueprint_module(
+            "build_spec.build_input.hardware_module_nix",
+            build_input
+                .hardware_module_nix
+                .as_deref()
+                .expect("validated installer target hardware module"),
+        )?;
+        protected_material::validate_installer_target_non_blueprint_module(
+            "build_spec.build_input.target_module_nix",
+            build_input
+                .target_module_nix
+                .as_deref()
+                .expect("validated installer target target module"),
+        )?;
+    }
+    let manage_source_url = if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
+        let revision = build_input
+            .manage_source_revision
+            .as_deref()
+            .expect("validated installer target Manage revision");
+        Some(
+            manage_source::verify_revision(
+                &config.build.manage_source_url_template,
+                revision,
+                config.workstation_netboot.allow_private_release_urls,
+            )
+            .context("verify packaged Manage source for installer target")?
+            .url,
+        )
+    } else {
+        None
+    };
 
     fs::create_dir_all(&config.build.work_dir).with_context(|| {
         format!(
@@ -4349,8 +4777,10 @@ fn blueprint_nix_build_command(
         .with_context(|| format!("create build input directory {}", input_dir.display()))?;
     set_private_job_input_dir_permissions(&input_dir)?;
     write_job_input_file(input_dir.join("blueprint.nix"), &build_input.generated_nix)?;
-    if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
-        write_job_input_file(input_dir.join("cybex-blueprints.nix"), desktop_module_nix)?;
+    if build_input.kind != INSTALLER_TARGET_BUILD_INPUT_KIND {
+        if let Some(desktop_module_nix) = build_input.desktop_module_nix.as_deref() {
+            write_job_input_file(input_dir.join("cybex-blueprints.nix"), desktop_module_nix)?;
+        }
     }
     if let Some(expected_state) = build_input.expected_state.as_ref() {
         let expected_state = serde_json::to_string_pretty(expected_state)
@@ -4374,11 +4804,11 @@ fn blueprint_nix_build_command(
     )?;
     write_job_input_file(
         input_dir.join("configuration.nix"),
-        &pulse_nixos_configuration(build_input),
+        &james_nixos_configuration(build_input),
     )?;
     write_job_input_file(
         input_dir.join("flake.nix"),
-        &pulse_nixos_flake(
+        &james_nixos_flake(
             &format!(
                 "github:NixOS/nixpkgs/{}",
                 spec.nixpkgs_commit
@@ -4387,7 +4817,7 @@ fn blueprint_nix_build_command(
             ),
             &spec.system,
             build_input,
-            &config.build.manage_source_url_template,
+            manage_source_url.as_deref(),
         ),
     )?;
 
@@ -4458,11 +4888,11 @@ fn set_private_job_input_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn pulse_nixos_flake(
+fn james_nixos_flake(
     nixpkgs_flake: &str,
     system: &str,
     build_input: &ValidatedBlueprintBuildInput,
-    manage_source_url_template: &str,
+    manage_source_url: Option<&str>,
 ) -> String {
     let name = build_input.blueprint_name.as_deref().unwrap_or("Blueprint");
     let revision = build_input
@@ -4470,18 +4900,14 @@ fn pulse_nixos_flake(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let description = serde_json::to_string(&format!(
-        "Cybex Pulse Blueprint build: {name} rev {revision}"
+        "Cybex James Blueprint build: {name} rev {revision}"
     ))
-    .unwrap_or_else(|_| "\"Cybex Pulse Blueprint build\"".to_string());
+    .unwrap_or_else(|_| "\"Cybex James Blueprint build\"".to_string());
     let nixpkgs_flake =
         serde_json::to_string(nixpkgs_flake).unwrap_or_else(|_| "\"nixpkgs\"".to_string());
     if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
-        let manage_revision = build_input
-            .manage_source_revision
-            .as_deref()
-            .expect("validated installer target Manage revision");
         let manage_flake = serde_json::to_string(
-            &manage_source_url_template.replace("{revision}", manage_revision),
+            manage_source_url.expect("verified installer target Manage source"),
         )
         .unwrap_or_else(|_| "\"manage\"".to_string());
         return format!(
@@ -4543,15 +4969,16 @@ fn pulse_nixos_flake(
     )
 }
 
-fn pulse_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> String {
+fn james_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> String {
     let include_desktop_module = build_input.desktop_module_nix.is_some();
     if build_input.kind == INSTALLER_TARGET_BUILD_INPUT_KIND {
-        return r#"{ ... }:
+        return r#"{ manageSource, ... }:
 
 {
   imports = [
     ./cybex-compat-options.nix
-    ./cybex-blueprints.nix
+    (manageSource + "/deploy/nixos/cybex-blueprints.nix")
+    (manageSource + "/deploy/nixos/cybex-agent-module.nix")
     ./blueprint.nix
     ./hardware.nix
     ./target.nix
@@ -4575,7 +5002,7 @@ fn pulse_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> Stri
   ];
 
   system.stateVersion = lib.mkDefault lib.trivial.release;
-  networking.hostName = lib.mkDefault "cybex-pulse-build";
+  networking.hostName = lib.mkDefault "cybex-james-build";
   networking.useDHCP = lib.mkDefault true;
 
   fileSystems."/" = {
@@ -4607,17 +5034,21 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
   options.cybex = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Blueprint metadata accepted while Pulse prebuilds a generic NixOS closure.";
+    description = "Cybex Blueprint metadata accepted while James prebuilds a generic NixOS closure.";
   };
 
   options.services.cybex-agent = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Agent policy accepted while Pulse prebuilds a generic NixOS closure.";
+    description = "Cybex Agent policy accepted while James prebuilds a generic NixOS closure.";
   };
 }
 "#;
     }
+    // The reviewed desktop module owns the Cybex option declarations. Keep
+    // this shim limited to the legacy catalog alias and the generic Agent
+    // policy sink; redeclaring an option in two imported NixOS modules makes
+    // the entire evaluation fail before cache/source policy can be checked.
     r#"{ lib, ... }:
 
 {
@@ -4627,43 +5058,18 @@ fn blueprint_compat_module(include_desktop_module: bool) -> &'static str {
       [ "cybex" "blueprint" "applications" ])
   ];
 
-  options.cybex.desktop.environment = lib.mkOption {
-    type = lib.types.str;
-    default = "";
-    description = "Cybex desktop environment metadata from the assigned Blueprint.";
-  };
-
-  options.cybex.blueprint.applications = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.submodule {
-      options = {
-        package = lib.mkOption { type = lib.types.str; default = ""; };
-        source = lib.mkOption { type = lib.types.str; default = ""; };
-        policy = lib.mkOption { type = lib.types.str; default = ""; };
-        channel = lib.mkOption { type = lib.types.str; default = ""; };
-        version = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
-        pinned = lib.mkOption { type = lib.types.bool; default = false; };
-      };
-    });
-    default = {};
-    description = "Cybex application metadata from the assigned Blueprint.";
-  };
-
-  options.cybex.security.luks.enable = lib.mkOption {
-    type = lib.types.bool;
-    default = false;
-    description = "Cybex disk-encryption intent metadata.";
-  };
-
   options.services.cybex-agent = lib.mkOption {
     type = lib.types.attrsOf lib.types.anything;
     default = {};
-    description = "Cybex Agent policy accepted while Pulse prebuilds a generic NixOS closure.";
+    description = "Cybex Agent policy accepted while James prebuilds a generic NixOS closure.";
   };
 }
 "#
 }
 
 fn installer_target_compat_module() -> &'static str {
+    // Installer targets always import the reviewed desktop module and the
+    // real cybex-agent module, so both option trees already have one owner.
     r#"{ lib, ... }:
 
 {
@@ -4672,33 +5078,6 @@ fn installer_target_compat_module() -> &'static str {
       [ "cybex" "catalog" "applications" ]
       [ "cybex" "blueprint" "applications" ])
   ];
-
-  options.cybex.desktop.environment = lib.mkOption {
-    type = lib.types.str;
-    default = "";
-    description = "Cybex desktop environment metadata from the assigned Blueprint.";
-  };
-
-  options.cybex.blueprint.applications = lib.mkOption {
-    type = lib.types.attrsOf (lib.types.submodule {
-      options = {
-        package = lib.mkOption { type = lib.types.str; default = ""; };
-        source = lib.mkOption { type = lib.types.str; default = ""; };
-        policy = lib.mkOption { type = lib.types.str; default = ""; };
-        channel = lib.mkOption { type = lib.types.str; default = ""; };
-        version = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
-        pinned = lib.mkOption { type = lib.types.bool; default = false; };
-      };
-    });
-    default = {};
-    description = "Cybex application metadata from the assigned Blueprint.";
-  };
-
-  options.cybex.security.luks.enable = lib.mkOption {
-    type = lib.types.bool;
-    default = false;
-    description = "Cybex disk-encryption intent metadata.";
-  };
 }
 "#
 }
@@ -4767,7 +5146,7 @@ async fn run_nix_build(
                 warn!(
                     error = %safe_error(&err.into()),
                     job_id = job.id,
-                    "could not check Pulse build cancellation; build supervision will retry"
+                    "could not check James build cancellation; build supervision will retry"
                 );
             }
         }
@@ -4794,7 +5173,7 @@ async fn run_nix_build(
                 warn!(
                     error = %safe_error(&err.into()),
                     job_id = job.id,
-                    "could not persist Pulse build logs; build supervision will retry"
+                    "could not persist James build logs; build supervision will retry"
                 );
             }
             let update = progress
@@ -4822,7 +5201,7 @@ async fn run_nix_build(
                         Err(err) => warn!(
                             error = %safe_error(&err.into()),
                             job_id = job.id,
-                            "could not persist Pulse build progress; build supervision will retry"
+                            "could not persist James build progress; build supervision will retry"
                         ),
                     }
                 }
@@ -5225,7 +5604,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-nix-daemon-feature-test-{}",
+            "cybex-james-nix-daemon-feature-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5267,7 +5646,7 @@ esac
             "hardware_facts_sha256": "11".repeat(32),
             "hardware_driver_policy": "auto",
             "disk_layout_sha256": "22".repeat(32),
-            "pulse_device_id": "pulse_1",
+            "james_device_id": "james_1",
             "bundle_sha256": "33".repeat(32),
             "profile_id": "00000000-0000-4000-8000-000000000005",
             "managed_device_id": null,
@@ -5276,6 +5655,145 @@ esac
             "nixpkgs_revision": "5".repeat(40),
             "source_lock_sha256": "66".repeat(32)
         })
+    }
+
+    fn valid_installer_target_build_job() -> BuildJob {
+        let revision = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
+        let profile_generation = "b".repeat(64);
+        let secret_ref =
+            protected_material::local_account_secret_ref(revision, &profile_generation, "student");
+        let build_input = json!({
+            "kind": INSTALLER_TARGET_BUILD_INPUT_KIND,
+            "generated_nix": protected_material::installer_target_test_generated_nix(&[(
+                "student",
+                "Shared Student",
+                false,
+                &["audio", "networkmanager", "video"],
+                &secret_ref,
+            )]),
+            "expected_state": {
+                "schema": "cybex.blueprint.expected-state.v2",
+                "compiler_version": 2,
+                "deployment": {
+                    "blueprint_revision_id": revision,
+                    "artifact_config_hash": "7".repeat(64),
+                    "local_account_profile_generation_sha256": profile_generation,
+                },
+                "checks": [{
+                    "id": "identity.local-account.inventory",
+                    "kind": "local-account-inventory",
+                    "expected": {
+                        "accounts": [{
+                            "username": "student",
+                            "display_name": "Shared Student",
+                            "admin": false,
+                            "groups": ["audio", "networkmanager", "video"],
+                        }],
+                    },
+                }, {
+                    "id": "identity.local-account.student.password",
+                    "kind": "local-account-password-hash",
+                    "expected": {
+                        "username": "student",
+                        "password_secret_ref": secret_ref,
+                    },
+                }],
+            },
+            "blueprint_name": "Device-specific installer target",
+            "blueprint_revision": 1,
+            "hardware_module_nix": "{ ... }: {}",
+            "target_module_nix": "{ ... }: { cybex.agent.organizationSlug = \"users\"; }",
+            "manage_source_revision": "4".repeat(40),
+            "installer_target": valid_installer_target_identity(),
+        });
+        let input_config_hash = canonical_json_sha256(&build_input).unwrap();
+        let build_spec = json!({
+            "schema_version": 1,
+            "artifact_type": "nixos_closure",
+            "target": "installer_target",
+            "system": "x86_64-linux",
+            "input_revision": revision,
+            "input_config_hash": input_config_hash,
+            "blueprint_id": "00000000-0000-4000-8000-000000000003",
+            "blueprint_revision_id": revision,
+            "blueprint_revision_config_hash": "7".repeat(64),
+            "nixpkgs_commit": "5".repeat(40),
+            "source_lock_sha256": "66".repeat(32),
+            "software_package_refs": [],
+            "build_input": build_input,
+            "allow_source_builds": true,
+        });
+        BuildJob {
+            id: 1,
+            managed_job_id: Some("00000000-0000-4000-8000-000000000009".to_string()),
+            requested_artifact_type: "nixos_closure".to_string(),
+            build_spec,
+            target: "installer_target".to_string(),
+            system: "x86_64-linux".to_string(),
+            input_revision: revision.to_string(),
+            input_config_hash,
+            status: "queued".to_string(),
+            progress_percent: None,
+            progress_stage: None,
+            progress_message: None,
+            logs: String::new(),
+            error: String::new(),
+            rejection_code: String::new(),
+            output_path: String::new(),
+            output_sha256: String::new(),
+            output_size_bytes: 0,
+            exit_code: None,
+            cache_metadata: json!({}),
+            started_at: None,
+            completed_at: None,
+            cancel_requested_at: None,
+            created_at: "2026-08-12T00:00:00Z".to_string(),
+            updated_at: "2026-08-12T00:00:00Z".to_string(),
+        }
+    }
+
+    fn refresh_installer_target_input_hash(job: &mut BuildJob) {
+        let hash = canonical_json_sha256(&job.build_spec["build_input"]).unwrap();
+        job.input_config_hash.clone_from(&hash);
+        job.build_spec["input_config_hash"] = json!(hash);
+    }
+
+    #[test]
+    fn installer_target_build_spec_binds_every_provenance_field_and_canonical_input() {
+        let config = AppConfig::default();
+        validate_build_spec(&config, &valid_installer_target_build_job()).unwrap();
+
+        for pointer in [
+            "/build_input/installer_target/blueprint_id",
+            "/build_input/installer_target/nixpkgs_revision",
+            "/build_input/installer_target/source_lock_sha256",
+        ] {
+            let mut changed = valid_installer_target_build_job();
+            *changed.build_spec.pointer_mut(pointer).unwrap() = match pointer {
+                "/build_input/installer_target/blueprint_id" => {
+                    json!("00000000-0000-4000-8000-000000000008")
+                }
+                "/build_input/installer_target/nixpkgs_revision" => json!("8".repeat(40)),
+                _ => json!("88".repeat(32)),
+            };
+            refresh_installer_target_input_hash(&mut changed);
+            assert!(validate_build_spec(&config, &changed).is_err(), "{pointer}");
+        }
+
+        let mut wrong_input_revision = valid_installer_target_build_job();
+        wrong_input_revision.input_revision = "00000000-0000-4000-8000-000000000008".to_string();
+        wrong_input_revision.build_spec["input_revision"] =
+            json!(wrong_input_revision.input_revision.clone());
+        assert!(validate_build_spec(&config, &wrong_input_revision).is_err());
+
+        let mut wrong_artifact_hash = valid_installer_target_build_job();
+        wrong_artifact_hash.build_spec["blueprint_revision_config_hash"] = json!("8".repeat(64));
+        assert!(validate_build_spec(&config, &wrong_artifact_hash).is_err());
+
+        let mut wrong_build_input_hash = valid_installer_target_build_job();
+        wrong_build_input_hash.build_spec["input_config_hash"] = json!("8".repeat(64));
+        wrong_build_input_hash.input_config_hash = "8".repeat(64);
+        assert!(validate_build_spec(&config, &wrong_build_input_hash).is_err());
     }
 
     #[test]
@@ -5309,6 +5827,10 @@ esac
                 .to_string()
                 .contains("does not match its schema")
         );
+
+        let mut noncanonical_uuid = valid_installer_target_identity();
+        noncanonical_uuid["preparation_id"] = json!("00000000000040008000000000000001");
+        assert!(validate_installer_target_identity(&noncanonical_uuid, &"4".repeat(40)).is_err());
     }
 
     fn import_from_derivation_is_disabled(args: &[String]) -> bool {
@@ -5382,7 +5904,7 @@ esac
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-software-inventory-policy-test-{}",
+            "cybex-james-software-inventory-policy-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5437,7 +5959,7 @@ printf '123.4\n'
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-software-inventory-timeout-test-{}",
+            "cybex-james-software-inventory-timeout-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5495,7 +6017,7 @@ sleep 5
     #[tokio::test]
     async fn cleanup_and_sweep_remove_job_dirs() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-build-cleanup-test-{}",
+            "cybex-james-build-cleanup-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5604,6 +6126,62 @@ sleep 5
     }
 
     #[test]
+    fn installer_target_build_input_accepts_exact_local_account_reference_contract() {
+        let revision = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
+        let profile_generation = "b".repeat(64);
+        let secret_ref =
+            protected_material::local_account_secret_ref(revision, &profile_generation, "student");
+        let validated = validate_blueprint_build_input(BlueprintBuildInput {
+            kind: INSTALLER_TARGET_BUILD_INPUT_KIND.to_string(),
+            generated_nix: protected_material::installer_target_test_generated_nix(&[(
+                "student",
+                "Shared Student",
+                false,
+                &["audio", "networkmanager", "video"],
+                &secret_ref,
+            )]),
+            desktop_module_nix: None,
+            expected_state: Some(json!({
+                "schema": "cybex.blueprint.expected-state.v2",
+                "compiler_version": 2,
+                "deployment": {
+                    "blueprint_revision_id": revision,
+                    "local_account_profile_generation_sha256": profile_generation,
+                },
+                "checks": [{
+                    "id": "identity.local-account.inventory",
+                    "kind": "local-account-inventory",
+                    "expected": {
+                        "accounts": [{
+                            "username": "student",
+                            "display_name": "Shared Student",
+                            "admin": false,
+                            "groups": ["audio", "networkmanager", "video"],
+                        }],
+                    },
+                }, {
+                    "id": "identity.local-account.student.password",
+                    "kind": "local-account-password-hash",
+                    "expected": {
+                        "username": "student",
+                        "password_secret_ref": secret_ref,
+                    },
+                }],
+            })),
+            blueprint_name: Some("Device-specific installer target".to_string()),
+            blueprint_revision: Some(1),
+            hardware_module_nix: Some("{ ... }: {}".to_string()),
+            target_module_nix: Some("{ ... }: {}".to_string()),
+            manage_source_revision: Some("4".repeat(40)),
+            installer_target: Some(valid_installer_target_identity()),
+        })
+        .unwrap();
+
+        assert_eq!(validated.kind, INSTALLER_TARGET_BUILD_INPUT_KIND);
+        assert!(validated.expected_state.is_some());
+    }
+
+    #[test]
     fn blueprint_build_input_requires_expected_state_with_real_desktop_module() {
         let input = BlueprintBuildInput {
             kind: BLUEPRINT_BUILD_INPUT_KIND.to_string(),
@@ -5657,13 +6235,13 @@ sleep 5
     #[test]
     fn nix_build_command_uses_allowlisted_attr() {
         let mut config = AppConfig::default();
-        config.build.output_dir = PathBuf::from("/tmp/cybex-pulse-test-builds");
+        config.build.output_dir = PathBuf::from("/tmp/cybex-james-test-builds");
         config.build.nix_binary = "nix".to_string();
         let target = BuildTargetConfig {
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-james/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let mut spec = ValidatedBuildSpec {
@@ -5688,7 +6266,7 @@ sleep 5
         assert_eq!(command.args[0], "build");
         assert!(
             command.args.contains(
-                &"/srv/cybex-pulse/build-inputs/cybex#packages.x86_64-linux.desktop-experience"
+                &"/srv/cybex-james/build-inputs/cybex#packages.x86_64-linux.desktop-experience"
                     .to_string()
             )
         );
@@ -6115,6 +6693,182 @@ sleep 5
     }
 
     #[test]
+    fn source_policy_pins_current_builtin_desktop_glue_as_exact_pairs() {
+        let current_pairs = [
+            (
+                PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT,
+                PINNED_FIREFOX_ESR_POLICY_WRAPPER_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_STANDARD_UDEV_RULES_FINGERPRINT,
+                PINNED_STANDARD_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_STANDARD_USER_UNITS_FINGERPRINT,
+                PINNED_STANDARD_USER_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_STANDARD_SYSTEM_UNITS_FINGERPRINT,
+                PINNED_STANDARD_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_STANDARD_ETC_FINGERPRINT,
+                PINNED_STANDARD_ETC_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_DOCK_SYSTEM_UNITS_FINGERPRINT,
+                PINNED_DOCK_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_DOCK_UDEV_RULES_FINGERPRINT,
+                PINNED_DOCK_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_DOCK_USER_UNITS_FINGERPRINT,
+                PINNED_DOCK_USER_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_DOCK_ETC_FINGERPRINT,
+                PINNED_DOCK_ETC_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT,
+                PINNED_HYPRLAND_UDEV_RULES_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_HYPRLAND_USER_UNITS_FINGERPRINT,
+                PINNED_HYPRLAND_USER_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_HYPRLAND_SYSTEM_UNITS_FINGERPRINT,
+                PINNED_HYPRLAND_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT,
+            ),
+            (
+                PINNED_HYPRLAND_ETC_FINGERPRINT,
+                PINNED_HYPRLAND_ETC_EXECUTABLE_FINGERPRINT,
+            ),
+        ];
+
+        for (index, &(normalized, executable)) in current_pairs.iter().enumerate() {
+            assert!(reviewed_generator_fingerprints_match(
+                normalized, executable
+            ));
+            let next = current_pairs[(index + 1) % current_pairs.len()];
+            assert!(
+                !reviewed_generator_fingerprints_match(normalized, next.1),
+                "a normalized script fingerprint must not be combined with another reviewed executable-provider fingerprint"
+            );
+            assert!(
+                !reviewed_generator_fingerprints_match(next.0, executable),
+                "an executable-provider fingerprint must not be combined with another reviewed script fingerprint"
+            );
+        }
+
+        let compile_script = "gcc source.c -o $out/bin/payload";
+        assert!(!reviewed_generator_fingerprints_match(
+            &normalized_script_sha256(compile_script),
+            &executable_pinned_script_sha256(compile_script),
+        ));
+    }
+
+    fn synthetic_reviewed_tool_inputs(expected: &[ReviewedToolInput]) -> Value {
+        let build_inputs = expected
+            .iter()
+            .filter(|input| input.attribute == "buildInputs")
+            .map(|input| input.path)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let native_build_inputs = expected
+            .iter()
+            .filter(|input| input.attribute == "nativeBuildInputs")
+            .map(|input| input.path)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut drv = synthetic_materializer(
+            json!({
+                "buildInputs": build_inputs,
+                "nativeBuildInputs": native_build_inputs,
+            }),
+            vec![],
+        );
+        for input in expected {
+            drv["inputDrvs"][input.drv_path] = json!([input.output]);
+        }
+        drv
+    }
+
+    #[test]
+    fn source_policy_pins_current_firefox_and_udev_tool_providers() {
+        let families = [
+            (
+                PINNED_FIREFOX_ESR_POLICY_WRAPPER_FINGERPRINT,
+                FIREFOX_WRAPPER_TOOL_INPUTS,
+            ),
+            (
+                PINNED_STANDARD_UDEV_RULES_FINGERPRINT,
+                UDEV_GENERATOR_TOOL_INPUTS,
+            ),
+            (
+                PINNED_DOCK_UDEV_RULES_FINGERPRINT,
+                UDEV_GENERATOR_TOOL_INPUTS,
+            ),
+            (
+                PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT,
+                UDEV_GENERATOR_TOOL_INPUTS,
+            ),
+        ];
+
+        for (fingerprint, expected) in families {
+            let mapped = reviewed_generator_tool_inputs(fingerprint);
+            assert_eq!(mapped.len(), expected.len());
+            for (actual, expected) in mapped.iter().zip(expected) {
+                assert_eq!(actual.attribute, expected.attribute);
+                assert_eq!(actual.path, expected.path);
+                assert_eq!(actual.drv_path, expected.drv_path);
+                assert_eq!(actual.output, expected.output);
+            }
+
+            let valid = synthetic_reviewed_tool_inputs(expected);
+            assert!(reviewed_tool_inputs_match(
+                &valid,
+                &derivation_attributes(&valid),
+                expected,
+                &HashSet::new(),
+                &HashSet::new(),
+            ));
+
+            let first = expected[0];
+            let provider_name = first
+                .drv_path
+                .strip_prefix("/nix/store/")
+                .unwrap()
+                .split_once('-')
+                .unwrap()
+                .1;
+            let forged_provider =
+                format!("/nix/store/ffffffffffffffffffffffffffffffff-{provider_name}");
+            let mut forged = valid;
+            forged["inputDrvs"]
+                .as_object_mut()
+                .unwrap()
+                .remove(first.drv_path);
+            forged["inputDrvs"][&forged_provider] = json!([first.output]);
+            assert!(
+                !reviewed_tool_inputs_match(
+                    &forged,
+                    &derivation_attributes(&forged),
+                    expected,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
+                "a same-name provider at another store hash must fail closed"
+            );
+        }
+
+        assert!(reviewed_generator_tool_inputs(&"0".repeat(64)).is_empty());
+    }
+
+    #[test]
     fn source_policy_requires_all_toplevel_script_paths_to_have_trusted_providers() {
         let trusted_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-switch-to-configuration";
         let trusted_drv = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-switch-to-configuration.drv";
@@ -6169,6 +6923,84 @@ sleep 5
         assert_eq!(inputs[0].path, UDEV_GENERATOR_TOOL_INPUTS[0].path);
         assert_eq!(inputs[0].drv_path, UDEV_GENERATOR_TOOL_INPUTS[0].drv_path);
         assert_eq!(inputs[0].output, UDEV_GENERATOR_TOOL_INPUTS[0].output);
+    }
+
+    #[test]
+    fn source_policy_allows_only_pinned_json_to_toml_materialization() {
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-greetd.toml.drv";
+        let value = r#"{"default_session":{"command":"/nix/store/ffffffffffffffffffffffffffffffff-tuigreet/bin/tuigreet","user":"greeter"},"terminal":{"vt":1}}"#;
+        let mut valid = synthetic_materializer(
+            json!({
+                "buildCommand": STOCK_JSON_TO_TOML_COMMAND,
+                "nativeBuildInputs": REMARSHAL_GENERATOR_TOOL_INPUTS[0].path,
+                "passAsFile": ["buildCommand"],
+                "value": value,
+            }),
+            vec![],
+        );
+        valid["inputDrvs"][REMARSHAL_GENERATOR_TOOL_INPUTS[0].drv_path] =
+            json!([REMARSHAL_GENERATOR_TOOL_INPUTS[0].output]);
+        assert!(derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&valid),
+            &synthetic_pinned_source,
+        ));
+
+        for (key, value) in [
+            (
+                "buildCommand",
+                "json2toml $valuePath $out; gcc source.c -o $out/payload",
+            ),
+            ("value", "not-json"),
+        ] {
+            let mut forged = valid.clone();
+            forged["env"][key] = json!(value);
+            assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+                path,
+                Some(&forged),
+                &synthetic_pinned_source,
+            ));
+        }
+
+        let mut forged_provider = valid;
+        forged_provider["inputDrvs"]
+            .as_object_mut()
+            .unwrap()
+            .remove(REMARSHAL_GENERATOR_TOOL_INPUTS[0].drv_path);
+        forged_provider["inputDrvs"]["/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3.13-remarshal-1.3.0.drv"] =
+            json!(["out"]);
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&forged_provider),
+            &synthetic_pinned_source,
+        ));
+    }
+
+    #[test]
+    fn source_policy_allows_only_stock_disabled_unit_link() {
+        let path =
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-unit-autovt-tty1.service-disabled.drv";
+        let stock = "name=autovt@tty1.service\nmkdir -p \"$out/$(dirname \"$name\")\"\nln -s /dev/null \"$out/$name\"\n";
+        let valid = synthetic_materializer(json!({"buildCommand": stock}), vec![]);
+        assert!(derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&valid),
+            &synthetic_pinned_source,
+        ));
+
+        for forged_command in [
+            stock.replace("/dev/null", "/nix/store/payload"),
+            stock.replace("ln -s", "gcc source.c -o $out/payload\nln -s"),
+            stock.replace("autovt@tty1.service", "../escape.service"),
+        ] {
+            let mut forged = valid.clone();
+            forged["env"]["buildCommand"] = json!(forged_command);
+            assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+                path,
+                Some(&forged),
+                &synthetic_pinned_source,
+            ));
+        }
     }
 
     fn synthetic_coredump_substitution() -> Value {
@@ -6394,7 +7226,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         let write_text = synthetic_materializer(
             json!({
                 "buildCommand": STOCK_WRITE_TEXT_COMMAND,
-                "text": "pulse-host\n",
+                "text": "james-host\n",
                 "checkPhase": ""
             }),
             vec![],
@@ -6440,7 +7272,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         // materializer exemption; complex stock generators use reviewed
         // fingerprints instead of a permissive shell parser.
         assert!(!derivation_is_exempt_from_source_policy_with_verifier(
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-pulse-26.05.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-james-26.05.drv",
             Some(&structured),
             &synthetic_pinned_source,
         ));
@@ -6615,6 +7447,74 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
             &derivation_attributes(&ambiguous),
             &ambiguous_would_build,
             &ambiguous_would_build,
+        ));
+    }
+
+    #[test]
+    fn source_policy_pins_hyprland_system_path_hook_and_tool_providers() {
+        let hook = r#"# Remove wrapped binaries, they shouldn't be accessible via PATH.
+find $out/bin -maxdepth 1 -name ".*-wrapped" -type l -delete
+find $out/bin -maxdepth 1 -name ".*-wrapped_*" -type l -delete
+
+if [ -x $out/bin/glib-compile-schemas -a -w $out/share/glib-2.0/schemas ]; then
+    $out/bin/glib-compile-schemas $out/share/glib-2.0/schemas
+fi
+
+if [ -w $out/share/info ]; then
+  shopt -s nullglob
+  for i in $out/share/info/*.info $out/share/info/*.info.gz; do
+      /nix/store/c8mrrp6s3rjfbqn47ihlicazjabkji6j-texinfo-7.2/bin/install-info $i $out/share/info/dir
+  done
+fi
+
+if [ -w $out/share/mime ] && [ -d $out/share/mime/packages ]; then
+    XDG_DATA_DIRS=$out/share PKGSYSTEM_ENABLE_FSYNC=0 /nix/store/hcgqddzbkw6w3zhk528mmwh3n0jqfas1-shared-mime-info-2.4/bin/update-mime-database -V $out/share/mime > /dev/null
+fi
+
+if [ -w $out/share/applications ]; then
+    /nix/store/1gl5mj5cpi3j8ajp3wkkmkfl86vpiz6m-desktop-file-utils-0.28/bin/update-desktop-database $out/share/applications
+fi
+
+"#;
+        assert_eq!(
+            normalized_script_sha256(hook),
+            PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_FINGERPRINT
+        );
+        assert_eq!(
+            executable_pinned_script_sha256(hook),
+            PINNED_HYPRLAND_SYSTEM_PATH_POST_BUILD_EXECUTABLE_FINGERPRINT
+        );
+
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-path.drv";
+        let mut valid = synthetic_link_farm(hook);
+        for tool in &SYSTEM_PATH_POST_BUILD_TOOLS[..3] {
+            valid["inputDrvs"][tool.drv_path] = json!([tool.output]);
+        }
+        assert!(derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&valid),
+            &synthetic_pinned_source,
+        ));
+
+        let mut changed_script = valid.clone();
+        changed_script["env"]["postBuild"] = json!(format!("{hook}gcc source.c -o $out/payload\n"));
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&changed_script),
+            &synthetic_pinned_source,
+        ));
+
+        let mut forged_provider = valid;
+        forged_provider["inputDrvs"]
+            .as_object_mut()
+            .unwrap()
+            .remove(SYSTEM_PATH_POST_BUILD_TOOLS[0].drv_path);
+        forged_provider["inputDrvs"]["/nix/store/ffffffffffffffffffffffffffffffff-texinfo-7.2.drv"] =
+            json!(["out"]);
+        assert!(!derivation_is_exempt_from_source_policy_with_verifier(
+            path,
+            Some(&forged_provider),
+            &synthetic_pinned_source,
         ));
     }
 
@@ -6923,6 +7823,19 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
                 &synthetic_pinned_source,
             ));
         }
+
+        assert!(pinned_hyprland_nixos_generate_config_phase(
+            PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_FINGERPRINT,
+            PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_EXECUTABLE_FINGERPRINT,
+        ));
+        assert!(!pinned_hyprland_nixos_generate_config_phase(
+            PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_FINGERPRINT,
+            &"0".repeat(64),
+        ));
+        assert!(!pinned_hyprland_nixos_generate_config_phase(
+            &"0".repeat(64),
+            PINNED_HYPRLAND_NIXOS_GENERATE_CONFIG_PHASE_EXECUTABLE_FINGERPRINT,
+        ));
     }
 
     #[cfg(unix)]
@@ -6933,7 +7846,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         let mut nonce = [0_u8; 8];
         OsRng.fill_bytes(&mut nonce);
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-bounded-spawn-test-{}-{}",
+            "cybex-james-bounded-spawn-test-{}-{}",
             std::process::id(),
             hex::encode(nonce)
         ));
@@ -6972,7 +7885,7 @@ grep -q '[^[:space:]]' "$out/session.conf" || (echo "\"$out/session.conf\" was g
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-test-{}",
+            "cybex-james-source-policy-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7044,7 +7957,7 @@ esac
             return;
         }
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-ifd-test-{}",
+            "cybex-james-source-policy-ifd-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7172,7 +8085,7 @@ esac
     #[tokio::test]
     async fn source_policy_bounds_dry_run_pipes_and_cleans_isolated_store() {
         let overflow_root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-overflow-test-{}",
+            "cybex-james-source-policy-overflow-test-{}",
             std::process::id()
         ));
         let (config, command) = source_policy_test_command(
@@ -7189,7 +8102,7 @@ esac
         let _ = std::fs::remove_dir_all(&overflow_root);
 
         let timeout_root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-timeout-test-{}",
+            "cybex-james-source-policy-timeout-test-{}",
             std::process::id()
         ));
         let (config, command) =
@@ -7208,7 +8121,7 @@ esac
     #[tokio::test]
     async fn source_policy_timeout_kills_helpers_that_inherit_capture_pipes() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-process-group-test-{}",
+            "cybex-james-source-policy-process-group-test-{}",
             std::process::id()
         ));
         let helper_pid = root.join("helper.pid");
@@ -7249,7 +8162,7 @@ esac
     #[tokio::test]
     async fn source_policy_bounds_derivation_show_while_reading_and_cleans_store() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-source-policy-show-overflow-test-{}",
+            "cybex-james-source-policy-show-overflow-test-{}",
             std::process::id()
         ));
         let (config, command) = source_policy_test_command(
@@ -7349,19 +8262,19 @@ esac
 
         let names: Vec<String> = (0..7).map(|index| format!("pkg-{index}")).collect();
         let message = source_build_blocked_message(&names);
-        assert!(message.starts_with("Blocked: 7 package(s)"));
+        assert!(message.starts_with("Blocked: 7 derivation(s)"));
         assert!(message.contains("pkg-4"));
         assert!(!message.contains("pkg-5"));
         assert!(message.contains("(+2 more)"));
-        assert!(
-            source_build_blocked_message(&[]).contains("requires compiling packages from source")
-        );
+        let generic_message = source_build_blocked_message(&[]);
+        assert!(generic_message.contains("requires compiling derivations from source"));
+        assert!(generic_message.contains("organization Software delivery policy"));
     }
 
     #[test]
     fn nix_build_command_writes_blueprint_flake_input() {
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-build-input-test-{}",
+            "cybex-james-build-input-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7373,7 +8286,7 @@ esac
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-james/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let mut spec = ValidatedBuildSpec {
@@ -7461,14 +8374,17 @@ esac
         let compatibility =
             std::fs::read_to_string(root.join("work/job-42-input/cybex-compat-options.nix"))
                 .unwrap();
-        assert!(compatibility.contains("options.cybex.blueprint.applications"));
         assert!(compatibility.contains("lib.mkAliasOptionModule"));
+        assert!(compatibility.contains("options.services.cybex-agent"));
+        assert!(!compatibility.contains("options.cybex.desktop.environment"));
+        assert!(!compatibility.contains("options.cybex.blueprint.applications"));
+        assert!(!compatibility.contains("options.cybex.security.luks.enable"));
         let flake = std::fs::read_to_string(root.join("work/job-42-input/flake.nix")).unwrap();
         assert!(flake.contains(&format!(
             r#"inputs.nixpkgs.url = "github:NixOS/nixpkgs/{}";"#,
             "c".repeat(40)
         )));
-        assert!(!flake.contains("/srv/cybex-pulse/build-inputs/cybex"));
+        assert!(!flake.contains("/srv/cybex-james/build-inputs/cybex"));
 
         spec.allow_source_builds = true;
         let source_enabled = nix_build_command(&config, &target, &spec, 43).unwrap();
@@ -7479,10 +8395,117 @@ esac
     }
 
     #[test]
-    fn nix_build_command_rejects_protected_material_before_writing_inputs() {
-        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
+    fn installer_target_compatibility_does_not_redeclare_owned_options() {
+        let compatibility = installer_target_compat_module();
+
+        assert!(compatibility.contains("lib.mkAliasOptionModule"));
+        assert!(!compatibility.contains("options.services.cybex-agent"));
+        assert!(!compatibility.contains("options.cybex.desktop.environment"));
+        assert!(!compatibility.contains("options.cybex.blueprint.applications"));
+        assert!(!compatibility.contains("options.cybex.security.luks.enable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_target_build_uses_only_verified_packaged_manage_source() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = std::env::temp_dir().join(format!(
-            "cybex-pulse-protected-build-input-test-{}",
+            "cybex-james-installer-source-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let revision = "4".repeat(40);
+        let source_dir = root.join("manage-source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive_body = b"deterministic installer Manage source";
+        let archive_path = source_dir.join(format!("{revision}.tar"));
+        std::fs::write(&archive_path, archive_body).unwrap();
+        std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let metadata_path = source_dir.join(format!("{revision}.json"));
+        std::fs::write(
+            &metadata_path,
+            format!(
+                "{{\"filename\":\"{revision}.tar\",\"revision\":\"{revision}\",\"schema\":\"cybex.james.manage-source.v1\",\"sha256\":\"{}\",\"size_bytes\":{}}}\n",
+                hex::encode(Sha256::digest(archive_body)),
+                archive_body.len()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut config = AppConfig::default();
+        config.build.work_dir = root.join("work");
+        config.build.output_dir = root.join("out");
+        config.workstation_netboot.allow_private_release_urls = true;
+        config.build.manage_source_url_template =
+            format!("tarball+file://{}/{{revision}}.tar", source_dir.display());
+        let target = BuildTargetConfig {
+            artifact_type: "nixos_closure".to_string(),
+            target: "blueprint".to_string(),
+            system: "x86_64-linux".to_string(),
+            flake: "github:NixOS/nixpkgs/fixture".to_string(),
+            attr: "packages.x86_64-linux.desktop-experience".to_string(),
+        };
+        let spec = ValidatedBuildSpec {
+            artifact_type: "nixos_closure".to_string(),
+            target: "blueprint".to_string(),
+            system: "x86_64-linux".to_string(),
+            input_revision: "fixture".to_string(),
+            input_config_hash: "a".repeat(64),
+            blueprint_id: None,
+            blueprint_revision_id: None,
+            blueprint_revision_config_hash: None,
+            nixpkgs_commit: Some("5".repeat(40)),
+            source_lock_sha256: Some("6".repeat(64)),
+            software_package_refs: Vec::new(),
+            build_input: None,
+            allow_source_builds: false,
+        };
+        let build_input = ValidatedBlueprintBuildInput {
+            kind: INSTALLER_TARGET_BUILD_INPUT_KIND.to_string(),
+            generated_nix: "{ ... }: {}".to_string(),
+            desktop_module_nix: None,
+            expected_state: None,
+            blueprint_name: Some("Installer fixture".to_string()),
+            blueprint_revision: Some(1),
+            hardware_module_nix: Some("{ ... }: {}".to_string()),
+            target_module_nix: Some("{ ... }: {}".to_string()),
+            manage_source_revision: Some(revision.clone()),
+            installer_target: Some(valid_installer_target_identity()),
+        };
+
+        blueprint_nix_build_command(&config, &target, &spec, &build_input, 44).unwrap();
+        let flake = std::fs::read_to_string(root.join("work/job-44-input/flake.nix")).unwrap();
+        assert!(flake.contains(&format!(
+            "tarball+file://{}/{revision}.tar",
+            source_dir.display()
+        )));
+        assert!(!flake.contains("github:CybexHQ/manage"));
+        let configuration =
+            std::fs::read_to_string(root.join("work/job-44-input/configuration.nix")).unwrap();
+        assert!(configuration.contains("(manageSource + \"/deploy/nixos/cybex-blueprints.nix\")"));
+        assert!(
+            configuration.contains("(manageSource + \"/deploy/nixos/cybex-agent-module.nix\")")
+        );
+        assert!(!root.join("work/job-44-input/cybex-blueprints.nix").exists());
+
+        std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&archive_path, b"tampered source").unwrap();
+        std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let error =
+            blueprint_nix_build_command(&config, &target, &spec, &build_input, 45).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("size does not match"));
+        assert!(!root.join("work/job-45-input").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nix_build_command_rejects_protected_material_before_writing_inputs() {
+        let sentinel = "CYBEX_JAMES_PROTECTED_SENTINEL_7f922a";
+        let root = std::env::temp_dir().join(format!(
+            "cybex-james-protected-build-input-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7493,7 +8516,7 @@ esac
             artifact_type: "nixos_closure".to_string(),
             target: "blueprint".to_string(),
             system: "x86_64-linux".to_string(),
-            flake: "/srv/cybex-pulse/build-inputs/cybex".to_string(),
+            flake: "/srv/cybex-james/build-inputs/cybex".to_string(),
             attr: "packages.x86_64-linux.desktop-experience".to_string(),
         };
         let spec = ValidatedBuildSpec {
@@ -7574,7 +8597,7 @@ esac
 
     #[tokio::test]
     async fn log_capture_redacts_spaced_nix_assignments_and_modular_hashes() {
-        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_JAMES_PROTECTED_SENTINEL_7f922a";
         let password_hash = "$6$rounds=5000$abcdefghijklmnop$uHL2DmwkR2iK6s.wDbxLW3GxvjJT7qW2rEHemZz3oMlKlfj8JwHc99.FNZrTO4drUslZ0MRyYkBDumQxKdL8q/";
         let log = SharedLog::new(4096);
         log.append(&format!(
@@ -7590,11 +8613,11 @@ esac
 
     #[tokio::test]
     async fn log_capture_redacts_assignments_split_across_stream_chunks() {
-        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_JAMES_PROTECTED_SENTINEL_7f922a";
         let log = SharedLog::new(4096);
-        log.append("users.users.alice.hashedPassword = \"CYBEX_PULSE_")
+        log.append("users.users.alice.hashedPassword = \"CYBEX_JAMES_")
             .await;
-        assert!(!log.snapshot().await.contains("CYBEX_PULSE_"));
+        assert!(!log.snapshot().await.contains("CYBEX_JAMES_"));
 
         log.append("PROTECTED_SENTINEL_7f922a\"; done\n").await;
         let snapshot = log.snapshot().await;
@@ -7666,7 +8689,7 @@ esac
     #[test]
     fn managed_metadata_cannot_replace_verified_cache_export_fields() {
         let mut destination = json!({
-            "cache_schema": "cybex.pulse.cache.v1",
+            "cache_schema": "cybex.james.cache.v1",
             "closure_manifest": {"verified": true},
             "closure_manifest_sha256": "a".repeat(64)
         });
@@ -7679,7 +8702,7 @@ esac
 
         merge_build_metadata(&mut destination, &source);
 
-        assert_eq!(destination["cache_schema"], "cybex.pulse.cache.v1");
+        assert_eq!(destination["cache_schema"], "cybex.james.cache.v1");
         assert_eq!(destination["closure_manifest"], json!({"verified": true}));
         assert_eq!(destination["closure_manifest_sha256"], "a".repeat(64));
         assert_eq!(destination["target"], "blueprint");

@@ -1,0 +1,91 @@
+#!/bin/sh
+set -eu
+
+if ! getent group cybex-james >/dev/null 2>&1; then
+  addgroup --system cybex-james
+fi
+if ! getent passwd cybex-james >/dev/null 2>&1; then
+  adduser --system --ingroup cybex-james --home /var/lib/cybex-james \
+    --no-create-home --disabled-login --shell /usr/sbin/nologin cybex-james
+fi
+if getent group nix-users >/dev/null 2>&1; then
+  adduser cybex-james nix-users >/dev/null
+fi
+if ! getent passwd cybex-support >/dev/null 2>&1; then
+  adduser --disabled-password --gecos 'Cybex short-lived certificate support' \
+    --home /var/lib/cybex-support --shell /bin/bash cybex-support
+fi
+passwd -l cybex-support >/dev/null 2>&1 || true
+
+legacy_state=false
+if [ -f /etc/cybex-james/config.toml ] \
+  && grep -F 'database_path = "/var/lib/cybex-james/state/cybex-james.sqlite"' /etc/cybex-james/config.toml >/dev/null \
+  && grep -F 'state_path = "/var/lib/cybex-james/state/manage-state.json"' /etc/cybex-james/config.toml >/dev/null
+then
+  legacy_state=true
+  install -m 0644 -o root -g root /dev/null /etc/cybex-james/legacy-state-layout
+fi
+james_root=/var/lib/cybex-james
+if [ -e "$james_root" ] || [ -L "$james_root" ]; then
+  [ -d "$james_root" ] && [ ! -L "$james_root" ] || exit 1
+else
+  mkdir "$james_root"
+fi
+chown root:cybex-james "$james_root"
+chmod 0750 "$james_root"
+for protected in "$james_root/control" "$james_root/status"; do
+  if [ -e "$protected" ] || [ -L "$protected" ]; then
+    [ -d "$protected" ] && [ ! -L "$protected" ] || exit 1
+    [ "$(stat -c '%U:%G:%a' "$protected")" = root:cybex-james:750 ] || exit 1
+  else
+    mkdir "$protected"
+  fi
+  chown root:cybex-james "$protected"
+  chmod 0750 "$protected"
+done
+if [ "$legacy_state" = false ]; then
+  install -d -m 0750 -o root -g cybex-james /var/lib/cybex-james/state
+  install -d -m 0700 -o cybex-james -g cybex-james /var/lib/cybex-james/state/agent
+fi
+install -d -m 0700 -o cybex-james -g cybex-james /var/lib/cybex-james/state/inbox
+install -d -m 0755 -o root -g root /var/cache/cybex-james
+install -d -m 0755 -o root -g root /var/cache/cybex-james/nix
+# HOME cannot be the root-owned appliance trust boundary: Nix creates
+# per-client evaluator state below HOME/XDG paths before it can evaluate a
+# Blueprint. Keep the path names root-controlled and expose only these private
+# leaves to the unprivileged service.
+agent_cache=/var/cache/cybex-james/agent
+if [ -e "$agent_cache" ] || [ -L "$agent_cache" ]; then
+  [ -d "$agent_cache" ] && [ ! -L "$agent_cache" ] || exit 1
+fi
+install -d -m 0750 -o root -g cybex-james "$agent_cache"
+for private in home cache config state tmp; do
+  path="$agent_cache/$private"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] || exit 1
+  fi
+  install -d -m 0700 -o cybex-james -g cybex-james "$path"
+done
+install -d -m 0750 -o cybex-james -g cybex-james /var/cache/cybex-james/www
+getent passwd tftp >/dev/null
+getent group tftp >/dev/null
+# tftpd-hpa deliberately applies its public-readability policy after dropping
+# privileges. The TFTP root contains only immutable package-provided EFI
+# launchers and their credential-free iPXE handoff script, so make that narrow
+# tree traversable/readable while retaining root-only mutation. Runtime and
+# secret-bearing state remain private above.
+if [ -e /var/cache/cybex-james/tftp ] || [ -L /var/cache/cybex-james/tftp ]; then
+  [ -d /var/cache/cybex-james/tftp ] && [ ! -L /var/cache/cybex-james/tftp ] || exit 1
+fi
+install -d -m 0755 -o root -g root /var/cache/cybex-james/tftp
+install -d -m 0755 /etc/cybex-james /etc/ssh/sshd_config.d
+
+systemctl mask apt-daily.service apt-daily-upgrade.service \
+  apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable cybex-james-first-boot.service cybex-james-firewall.service cybex-james.service \
+  cybex-james-generation-commit.service cybex-james-appliance-update.timer \
+  cybex-james-network-change.path cybex-james-network-runtime.timer \
+  getty@tty1.service nginx tftpd-hpa nix-daemon ssh >/dev/null 2>&1 || true
+
+exit 0

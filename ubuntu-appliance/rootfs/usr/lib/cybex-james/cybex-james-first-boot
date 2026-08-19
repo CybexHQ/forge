@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-james/state
+control_dir=/var/lib/cybex-james/control
+status_dir=/var/lib/cybex-james/status
+inbox_dir="$state_dir/inbox"
+release=/usr/share/cybex-james/appliance-release.json
+/usr/lib/cybex-james/cybex-james-state-layout
+if [[ -f /etc/cybex-james/legacy-state-layout ]]; then
+  agent_dir="$state_dir"
+else
+  agent_dir="$state_dir/agent"
+fi
+test -s "$agent_dir/manage-state.json"
+for directory in "$state_dir" "$control_dir" "$agent_dir" "$inbox_dir" "$status_dir"; do
+  test -d "$directory" && test ! -L "$directory"
+done
+test "$(stat -c '%U:%G:%a' "$control_dir")" = root:cybex-james:750
+test "$(stat -c '%U:%G:%a' "$status_dir")" = root:cybex-james:750
+test "$(stat -c '%U:%G:%a' "$inbox_dir")" = cybex-james:cybex-james:700
+if [[ "$agent_dir" = "$state_dir" ]]; then
+  test "$(stat -c '%U:%G:%a' "$state_dir")" = cybex-james:cybex-james:700
+else
+  test "$(stat -c '%U:%G:%a' "$state_dir")" = root:cybex-james:750
+  test "$(stat -c '%U:%G:%a' "$agent_dir")" = cybex-james:cybex-james:700
+fi
+
+secure_control_file() {
+  local path="$1" maximum="$2" size links
+  test -f "$path" && test ! -L "$path"
+  size="$(stat -c '%s' "$path")"
+  links="$(stat -c '%h' "$path")"
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size > 0 && size <= maximum))
+  test "$links" = 1
+  test "$(stat -c '%U:%G:%a' "$path")" = root:cybex-james:640
+}
+secure_control_file "$control_dir/provisioning-state.json" 524288
+secure_control_file "$control_dir/install-plan.json" 1048576
+secure_control_file "$control_dir/netplan-approved.json" 1048576
+secure_control_file "$control_dir/netplan-dhcp-fallback.json" 1048576
+secure_control_file "$control_dir/appliance-release.json" 65536
+secure_control_file "$control_dir/management-cidrs.txt" 65536
+if [[ -e "$control_dir/network-fallback-active" ]]; then
+  test -f "$control_dir/network-fallback-active" && test ! -L "$control_dir/network-fallback-active"
+  chown root:root "$control_dir/network-fallback-active"
+  chmod 0600 "$control_dir/network-fallback-active"
+fi
+if [[ -e /etc/cybex-james/legacy-state-layout ]]; then
+  /usr/lib/cybex-james/cybex-james-bootstrap validate-legacy-state-promotion
+fi
+
+# The installed-state projection is derived only from the immutable package
+# descriptor and actual booted Btrfs generation, never from a migrated flat
+# file that James could previously replace.
+root_fsroot="$(findmnt -n -o FSROOT /)"
+if [[ "$root_fsroot" = / ]]; then
+  actual_generation=0
+else
+  [[ "$root_fsroot" =~ ^/\.cybex-root-generations/([0-9]+)$ ]]
+  actual_generation="${BASH_REMATCH[1]}"
+fi
+temporary="$(mktemp "$control_dir/.appliance-release.XXXXXX")"
+jq -n --arg release_id "$(jq -er '.release_id' "$release")" \
+  --arg snapshot_id "$(jq -er '.ubuntu_snapshot_id' "$release")" \
+  --arg generation "$actual_generation" \
+  '{schema:"cybex.james.installed-appliance.v1",release:$release_id,
+    appliance_release:$release_id,base_os:"ubuntu",base_os_version:"26.04",
+    ubuntu_snapshot_id:$snapshot_id,root_generation:$generation,
+    at_rest_protection:"none"}' > "$temporary"
+chown root:cybex-james "$temporary"
+chmod 0640 "$temporary"
+sync -f "$temporary"
+mv -f "$temporary" "$control_dir/appliance-release.json"
+sync -f "$control_dir"
+
+test -s "$control_dir/install-plan.json"
+test -s "$release"
+test "$(jq -er '.base_os' "$control_dir/appliance-release.json")" = ubuntu
+test "$(jq -er '.base_os_version' "$control_dir/appliance-release.json")" = 26.04
+test "$(jq -er '.at_rest_protection' "$control_dir/appliance-release.json")" = none
+test -d /sys/firmware/efi
+
+secure_boot=0
+for value in /sys/firmware/efi/efivars/SecureBoot-*; do
+  if [[ -f "$value" ]] && [[ "$(od -An -t u1 -j 4 -N 1 "$value" | tr -d ' ')" = 1 ]]; then
+    secure_boot=1
+  fi
+done
+test "$secure_boot" -eq 1
+
+generations=/.cybex-root-generations
+if [[ "$root_fsroot" = / ]]; then
+  # Subiquity initially installs into Btrfs' top-level subvolume. Move the
+  # running system into generation zero before James is allowed to report
+  # ready, so every later snapshot is a sibling addressed from subvolid 5.
+  mkdir -p "$generations"
+  if [[ -e "$generations/0" ]]; then
+    btrfs subvolume show "$generations/0" >/dev/null
+  else
+    btrfs subvolume snapshot / "$generations/0"
+  fi
+  printf '%s\n' 0 > "$control_dir/root-generation"
+  update-grub
+  grub-set-default cybex-james-generation-0
+  sync
+  systemctl reboot
+  exit 0
+fi
+[[ "$root_fsroot" =~ ^/\.cybex-root-generations/[0-9]+$ ]]
+
+# /nix must be the executable bind mount backed by CYBEX_CACHE. Initialize it
+# before nix-daemon or James starts, and never delegate store ownership to the
+# unprivileged James service account.
+mountpoint -q /var/cache/cybex-james
+mountpoint -q /nix
+test "$(findmnt -n -o UUID /var/cache/cybex-james)" = "$(findmnt -n -o UUID /nix)"
+test "$(findmnt -n -o FSROOT /nix)" = /nix
+nix_mount_options=",$(findmnt -n -o OPTIONS /nix),"
+[[ "$nix_mount_options" == *,rw,* ]]
+[[ "$nix_mount_options" == *,nodev,* ]]
+[[ "$nix_mount_options" == *,nosuid,* ]]
+[[ "$nix_mount_options" != *,noexec,* ]]
+install -d -m 0755 -o root -g root /var/cache/cybex-james /var/cache/cybex-james/nix /nix
+nix-store --init
+test -d /nix/store
+test -d /nix/var/nix/db
+chown root:root /var/cache/cybex-james /var/cache/cybex-james/nix /nix
+
+agent_cache=/var/cache/cybex-james/agent
+if [[ -e "$agent_cache" || -L "$agent_cache" ]]; then
+  [[ -d "$agent_cache" && ! -L "$agent_cache" ]]
+fi
+install -d -m 0750 -o root -g cybex-james "$agent_cache"
+for private in home cache config state tmp; do
+  path="$agent_cache/$private"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]]
+  fi
+  install -d -m 0700 -o cybex-james -g cybex-james "$path"
+  test "$(stat -c '%U:%G:%a' "$path")" = cybex-james:cybex-james:700
+done
+test "$(stat -c '%U:%G:%a' "$agent_cache")" = root:cybex-james:750
+
+install -d -m 0750 -o cybex-james -g cybex-james \
+  /var/cache/cybex-james/{www/assets,www/cache,build,build-outputs}
+getent passwd tftp >/dev/null
+getent group tftp >/dev/null
+if [[ -e /var/cache/cybex-james/tftp || -L /var/cache/cybex-james/tftp ]]; then
+  [[ -d /var/cache/cybex-james/tftp && ! -L /var/cache/cybex-james/tftp ]]
+fi
+install -d -m 0755 -o root -g root /var/cache/cybex-james/tftp
+chown -R cybex-james:cybex-james /var/cache/cybex-james/{www,build,build-outputs}
+chown cybex-james:cybex-james "$agent_dir/manage-state.json"
+chmod 0600 "$agent_dir/manage-state.json"
+chown root:cybex-james /etc/cybex-james/config.toml
+chmod 0640 /etc/cybex-james/config.toml
+
+stage_ipxe() {
+  local source="$1" target="$2" size magic
+  test -f "$source" && test ! -L "$source"
+  size="$(stat -c '%s' "$source")"
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size >= 32768 && size <= 4194304))
+  magic="$(head -c 2 "$source")"
+  test "$magic" = MZ
+  # tftpd-hpa refuses otherwise valid group-readable files under its public
+  # readability check. These two launchers contain no organization data and
+  # remain immutable to both the service and the dedicated tftp account.
+  install -m 0644 -o root -g root "$source" \
+    "/var/cache/cybex-james/tftp/$target"
+}
+stage_ipxe /usr/lib/ipxe/snponly.efi snponly.efi
+stage_ipxe /usr/lib/ipxe/ipxe-amd64.efi ipxe.efi
+
+stage_ipxe_script() {
+  local source="$1" target="$2" size first_line
+  test -f "$source" && test ! -L "$source"
+  size="$(stat -c '%s' "$source")"
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size >= 64 && size <= 4096))
+  IFS= read -r first_line < "$source"
+  test "$first_line" = '#!ipxe'
+  # The script contains no organization data or credentials. Root-only
+  # mutation and an exact readiness comparison keep the public TFTP handoff
+  # immutable while allowing stock iPXE to break its chainload loop.
+  install -m 0644 -o root -g root "$source" \
+    "/var/cache/cybex-james/tftp/$target"
+}
+stage_ipxe_script /usr/share/cybex-james/autoexec.ipxe autoexec.ipxe
+
+tftp_defaults="$(mktemp /etc/default/.cybex-tftpd-hpa.XXXXXX)"
+trap 'rm -f "$tftp_defaults"' EXIT
+cat >"$tftp_defaults" <<'EOF'
+TFTP_USERNAME="tftp"
+TFTP_DIRECTORY="/var/cache/cybex-james/tftp"
+TFTP_ADDRESS=":69"
+TFTP_OPTIONS="--secure"
+EOF
+chmod 0644 "$tftp_defaults"
+chown root:root "$tftp_defaults"
+mv -f "$tftp_defaults" /etc/default/tftpd-hpa
+
+/usr/lib/cybex-james/cybex-james-network-guard
+/usr/lib/cybex-james/cybex-james-network-runtime
+/usr/bin/cybex-james --config /etc/cybex-james/config.toml \
+  validate-appliance-config
+ln -sfn /etc/nginx/sites-available/cybex-james /etc/nginx/sites-enabled/cybex-james
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+sshd -t
+systemctl enable nix-daemon nginx tftpd-hpa cybex-james-firewall ssh
+systemctl enable cybex-james.service cybex-james-appliance-update.timer
+systemctl enable cybex-james-network-runtime.timer
+
+generation="$(jq -er '.root_generation' "$control_dir/appliance-release.json")"
+delete_root_generation() (
+  set -Eeuo pipefail
+  local generation_id="$1"
+  [[ "$generation_id" =~ ^[0-9]+$ ]]
+  local root_uuid root_top candidate
+  root_uuid="$(findmnt -n -o UUID /)"
+  [[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+  root_top="$(mktemp -d /run/cybex-root-cleanup.XXXXXX)"
+  trap 'umount "$root_top" 2>/dev/null || true; rmdir "$root_top" 2>/dev/null || true' EXIT
+  mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+  candidate="$root_top/.cybex-root-generations/$generation_id"
+  if btrfs subvolume show "$candidate" >/dev/null 2>&1; then
+    btrfs subvolume delete "$candidate"
+  fi
+)
+write_update_status() {
+  local result="$1" stage="$2" progress="$3" pending="$4" resulting="$5" reason="$6"
+  local temporary
+  temporary="$(mktemp "$status_dir/.appliance-update-status.XXXXXX")"
+  jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
+    --arg target_release "$target_release" --arg pending "$pending" \
+    --arg resulting "$resulting" --arg rollback_reason "$reason" \
+    --argjson progress_percent "$progress" \
+    --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      progress_percent:$progress_percent,candidate_root_generation:$pending,
+      resulting_root_generation:$resulting,rollback_reason:$rollback_reason,
+      reported_at:$reported_at}' > "$temporary"
+  chown root:cybex-james "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$status_dir/appliance-update-status.json"
+  sync -f "$status_dir"
+}
+
+pending_seal="$control_dir/pending-root-generation.json"
+legacy_pending="$state_dir/pending-root-generation"
+request="$inbox_dir/appliance-update-request.json"
+remove_terminal_bundle() {
+  local bundle_dir="$inbox_dir/appliance-update-bundles"
+  rm -f -- "$bundle_dir/$attempt_id.tar.zst"
+  [[ ! -d "$bundle_dir" ]] || sync -f "$bundle_dir"
+  sync -f "$inbox_dir"
+}
+if [[ ! -e "$pending_seal" && -s "$legacy_pending" ]]; then
+  # A dev.3 updater could only leave a mutable flat pending marker. Rebuild a
+  # root-owned seal from the actual booted generation after authenticating the
+  # signed candidate release and bundle; never trust the legacy marker alone.
+  packages="$(/usr/bin/cybex-james verify-appliance-candidate-update)"
+  fsroot="$(findmnt -n -o FSROOT /)"
+  [[ "$fsroot" =~ ^/\.cybex-root-generations/([0-9]+)$ ]]
+  pending="${BASH_REMATCH[1]}"
+  test "$(tr -d '\n' < "$legacy_pending")" = "$pending"
+  source_generation="$((pending - 1))"
+  verified="${packages%/packages}/verified-update.json"
+  test "$(stat -c '%U:%G:%a:%h' "$verified")" = root:root:600:1
+  attempt_id="$(jq -er '.attempt_id' "$verified")"
+  target_release="$(jq -er '.target_release' "$verified")"
+  request_sha256="$(jq -er '.request_sha256' "$verified")"
+  temporary="$(mktemp "$control_dir/.pending-root-generation.XXXXXX")"
+  jq -n --arg generation "$pending" --arg source_generation "$source_generation" \
+    --arg attempt_id "$attempt_id" \
+    --arg target_release "$target_release" --arg request_sha256 "$request_sha256" \
+    '{schema:"cybex.james.pending-root-generation.v1",generation:$generation,
+      source_generation:$source_generation,
+      attempt_id:$attempt_id,target_release:$target_release,
+      request_sha256:$request_sha256,legacy_flat_layout:true}' > "$temporary"
+  chown root:cybex-james "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$pending_seal"
+  staging="${packages%/packages}"
+  test -d "$staging" && test ! -L "$staging"
+  test "$(stat -c '%U:%h' "$staging")" = root:1
+  rm -rf --one-file-system -- "$staging"
+  sync -f "$control_dir"
+fi
+
+if [[ -e "$pending_seal" ]]; then
+  secure_control_file "$pending_seal" 65536
+  test "$(jq -er '.schema' "$pending_seal")" = cybex.james.pending-root-generation.v1
+  pending="$(jq -er '.generation' "$pending_seal")"
+  source_generation="$(jq -er '.source_generation' "$pending_seal")"
+  attempt_id="$(jq -er '.attempt_id' "$pending_seal")"
+  target_release="$(jq -er '.target_release' "$pending_seal")"
+  request_sha256="$(jq -er '.request_sha256' "$pending_seal")"
+  [[ "$pending" =~ ^[0-9]+$ ]]
+  [[ "$source_generation" =~ ^[0-9]+$ ]] && ((source_generation < pending))
+  [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+  [[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
+  [[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
+  fsroot="$(findmnt -n -o FSROOT /)"
+  if [[ "$fsroot" = "/.cybex-root-generations/$pending" ]]; then
+    generation="$pending"
+    write_update_status health_checking booted_candidate 90 "$pending" "" ""
+  else
+    test "$generation" = "$source_generation"
+    status_file="$status_dir/appliance-update-status.json"
+    if [[ -s "$status_file" && ! -L "$status_file" ]] \
+      && [[ "$(stat -c '%U:%G:%a:%h' "$status_file")" = root:cybex-james:640:1 ]] \
+      && [[ "$(jq -er '.status' "$status_file")" = succeeded ]] \
+      && [[ "$(jq -er '.attempt_id' "$status_file")" = "$attempt_id" ]] \
+      && [[ "$(jq -er '.target_release' "$status_file")" = "$target_release" ]] \
+      && [[ "$(jq -er '.resulting_root_generation' "$status_file")" = "$pending" ]]; then
+      # The healthy candidate crossed the durable success point before this
+      # source was selected manually. Preserve it and only finish the exact
+      # source-side handoff cleanup.
+      grub-set-default "cybex-james-generation-$pending"
+      rm -f "$request" "$pending_seal"
+      sync -f "$inbox_dir"
+      sync -f "$control_dir"
+      remove_terminal_bundle
+    else
+      write_update_status rolled_back boot_fallback 100 "$pending" "$generation" candidate_boot_failed
+      grub-set-default "cybex-james-generation-$source_generation"
+      grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+      delete_root_generation "$pending"
+      rm -f "$request" "$pending_seal"
+      sync -f "$inbox_dir"
+      sync -f "$control_dir"
+      remove_terminal_bundle
+    fi
+  fi
+fi
+
+# A retained generation has its own root-local status history. Never report an
+# old nonterminal update forever after its target release committed elsewhere
+# and its protected handoff seal is gone.
+status_file="$status_dir/appliance-update-status.json"
+if [[ ! -e "$pending_seal" && -s "$status_file" && ! -L "$status_file" ]] \
+  && [[ "$(stat -c '%U:%G:%a:%h' "$status_file")" = root:cybex-james:640:1 ]]; then
+  status_value="$(jq -er '.status' "$status_file")"
+  status_target="$(jq -er '.target_release' "$status_file")"
+  packaged_release="$(jq -er '.release_id' "$release")"
+  if [[ "$status_value" =~ ^(waiting_window|preparing|applying|rebooting|health_checking)$ ]] \
+    && [[ "$status_target" != "$packaged_release" ]]; then
+    rm -f "$status_file"
+    sync -f "$status_dir"
+  fi
+fi
+
+temporary="$(mktemp "$control_dir/.root-generation.XXXXXX")"
+printf '%s\n' "$generation" > "$temporary"
+chown root:cybex-james "$temporary"
+chmod 0640 "$temporary"
+sync -f "$temporary"
+mv -f "$temporary" "$control_dir/root-generation"
+sync -f "$control_dir"

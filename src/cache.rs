@@ -27,17 +27,18 @@ use crate::{
 };
 
 const CACHE_MUTATION_LOCK_FILENAME: &str = ".cybex-cache-mutation.lock";
-const CLOSURE_MANIFEST_SCHEMA: &str = "cybex.pulse.closure-manifest.v1";
+const CLOSURE_MANIFEST_SCHEMA: &str = "cybex.james.closure-manifest.v1";
 const CLOSURE_MANIFEST_VALIDATION_LEVEL: &str = "compressed_file_hash";
+const CACHE_EXPORT_COPY_MAX_ATTEMPTS: usize = 2;
 const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// Cross-process lease for the cache filesystem and its artifact inventory.
 ///
-/// A process-local mutex would still let an overlapping Pulse process (for
+/// A process-local mutex would still let an overlapping James process (for
 /// example during a service restart) sweep files that `nix copy` is publishing.
 /// Keep this descriptor open for the complete filesystem + SQLite mutation so
-/// all Pulse processes agree on the same serialization boundary.
+/// all James processes agree on the same serialization boundary.
 #[derive(Debug)]
 struct CacheMutationLock(fs::File);
 
@@ -311,7 +312,7 @@ pub async fn export_output(
     evaluated_derivation: Option<&str>,
 ) -> Result<CachedNixArtifact> {
     if !config.cache.enabled {
-        bail!("Pulse Cache is disabled");
+        bail!("James Cache is disabled");
     }
     let mutation_lock = acquire_cache_mutation_lock(config).await?;
     if db::protected_build_job_remediation_exists(pool, job.id).await? {
@@ -320,7 +321,7 @@ pub async fn export_output(
     crate::disk::ensure_headroom(
         &config.cache.root_dir,
         closure_size_bytes.max(0) as u64,
-        "Pulse cache export",
+        "James cache export",
     )?;
     let public_key = ensure_signing_key(config).await?;
     let cache_dir = config.cache.root_dir.clone();
@@ -343,20 +344,14 @@ pub async fn export_output(
             cache_dir.display(),
             private_key_path.display()
         );
-        let mut command = crate::nix_command::std_command(&nix_binary);
-        command
-            .arg("copy")
-            .arg("--to")
-            .arg(&destination)
-            .arg(&store_path);
-        let output = command_output_with_transient_exec_retry(&mut command)
-            .with_context(|| format!("run {nix_binary} copy to local binary cache"))?;
-        if !output.status.success() {
-            bail!(
-                "nix copy failed: {}",
-                bounded_command_error(&output.stderr, &private_key_path)
-            );
-        }
+        copy_store_path_to_cache(
+            &nix_binary,
+            &destination,
+            &cache_dir,
+            &quarantine_dir,
+            &private_key_path,
+            &store_path,
+        )?;
         let cache_info = read_nix_cache_info(&cache_dir)?;
         let verified = build_or_quarantine_closure_manifest(
             &cache_dir,
@@ -377,7 +372,7 @@ pub async fn export_output(
             .to_string();
         let narinfo = verified.root_narinfo;
         let metadata = json!({
-            "cache_schema": "cybex.pulse.cache.v1",
+            "cache_schema": "cybex.james.cache.v1",
             "public_key_fingerprint": public_key_fingerprint(&public_key),
             "nix_cache_info": cache_info,
             "narinfo": narinfo_name,
@@ -410,6 +405,104 @@ pub async fn export_output(
     })
     .await
     .context("join cache export task")?
+}
+
+fn copy_store_path_to_cache(
+    nix_binary: &str,
+    destination: &str,
+    cache_root: &Path,
+    quarantine_root: &Path,
+    private_key_path: &Path,
+    store_path: &str,
+) -> Result<()> {
+    for attempt in 0..CACHE_EXPORT_COPY_MAX_ATTEMPTS {
+        let mut command = crate::nix_command::std_command(nix_binary);
+        command
+            .arg("copy")
+            .arg("--to")
+            .arg(destination)
+            .arg(store_path);
+        let output = command_output_with_transient_exec_retry(&mut command)
+            .with_context(|| format!("run {nix_binary} copy to local binary cache"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let command_error = bounded_command_error(&output.stderr, private_key_path);
+        let quarantined =
+            quarantine_interrupted_export_narinfo(cache_root, quarantine_root, &output.stderr)?;
+        if let Some(narinfo_filename) = quarantined {
+            tracing::warn!(
+                narinfo_filename,
+                attempt = attempt + 1,
+                retrying = attempt + 1 < CACHE_EXPORT_COPY_MAX_ATTEMPTS,
+                "quarantined incomplete NARInfo left by an interrupted cache export"
+            );
+            if attempt + 1 < CACHE_EXPORT_COPY_MAX_ATTEMPTS {
+                continue;
+            }
+        }
+        bail!("nix copy failed: {command_error}");
+    }
+    unreachable!("cache export copy loop returns on its final attempt")
+}
+
+/// Recover only the exact incomplete metadata shape Nix reports after an
+/// interrupted `file://` cache publication. The command's stderr is merely a
+/// locator: the named cache-root member must also be a bounded, owned regular
+/// file that our strict parser independently rejects before it is unpublished.
+/// Valid signed metadata, unsafe names, and unrelated command failures are
+/// never removed.
+fn quarantine_interrupted_export_narinfo(
+    cache_root: &Path,
+    quarantine_root: &Path,
+    stderr: &[u8],
+) -> Result<Option<String>> {
+    let Some(filename) = interrupted_export_narinfo_filename(stderr) else {
+        return Ok(None);
+    };
+    let path = cache_root.join(&filename);
+    let Ok(raw) = read_safe_narinfo(cache_root, &filename) else {
+        return Ok(None);
+    };
+    if parse_narinfo_strict(&raw).is_ok() {
+        return Ok(None);
+    }
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ok(None);
+    };
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Ok(None);
+    }
+    let quarantined = quarantine_narinfo_records(cache_root, quarantine_root, &[path])?;
+    Ok((quarantined == 1).then_some(filename))
+}
+
+fn interrupted_export_narinfo_filename(stderr: &[u8]) -> Option<String> {
+    const PREFIX: &str = "NAR info file '";
+    const SUFFIX: &str = "' is corrupt: StorePath missing";
+
+    for line in String::from_utf8_lossy(stderr).lines() {
+        let Some(start) = line.find(PREFIX).map(|index| index + PREFIX.len()) else {
+            continue;
+        };
+        let Some(candidate) = line
+            .get(start..)
+            .and_then(|value| value.strip_suffix(SUFFIX))
+        else {
+            continue;
+        };
+        let Some(hash) = candidate.strip_suffix(".narinfo") else {
+            continue;
+        };
+        if hash.len() == 32 && hash.bytes().all(|byte| NIX_BASE32_ALPHABET.contains(&byte)) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 pub async fn record_cached_artifact(
@@ -797,7 +890,7 @@ fn verify_narinfo_signature(narinfo: &ParsedNarInfo, public_key: &str) -> Result
             .is_ok()
     });
     if !verified {
-        bail!("NARInfo did not carry a valid signature from the active Pulse cache key");
+        bail!("NARInfo did not carry a valid signature from the active James cache key");
     }
     Ok(())
 }
@@ -806,17 +899,17 @@ fn parse_cache_public_key(public_key: &str) -> Result<(&str, VerifyingKey)> {
     let (key_name, encoded_key) = public_key
         .split_once(':')
         .filter(|(name, encoded)| !name.is_empty() && !encoded.is_empty())
-        .ok_or_else(|| anyhow!("Pulse cache public key had an invalid shape"))?;
+        .ok_or_else(|| anyhow!("James cache public key had an invalid shape"))?;
     let key_bytes = BASE64_STANDARD
         .decode(encoded_key)
-        .context("decode Pulse cache public key")?;
+        .context("decode James cache public key")?;
     let key_bytes: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| anyhow!("Pulse cache public key was not 256-bit"))?;
+        .map_err(|_| anyhow!("James cache public key was not 256-bit"))?;
     let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).context("parse Pulse cache public key")?;
+        VerifyingKey::from_bytes(&key_bytes).context("parse James cache public key")?;
     if verifying_key.is_weak() {
-        bail!("Pulse cache public key must not be a weak Ed25519 key");
+        bail!("James cache public key must not be a weak Ed25519 key");
     }
     Ok((key_name, verifying_key))
 }
@@ -1070,7 +1163,7 @@ pub async fn remediate_protected_build_jobs(
     }
     tracing::warn!(
         remediated_jobs = completed,
-        "withdrew legacy protected build roots and swept unreferenced members from the Pulse static cache; /nix/store GC remains operator-managed"
+        "withdrew legacy protected build roots and swept unreferenced members from the James static cache; /nix/store GC remains operator-managed"
     );
     Ok(completed)
 }
@@ -1240,7 +1333,7 @@ pub async fn try_enforce_retention(pool: &SqlitePool, config: &AppConfig) -> Res
 async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Result<()> {
     if config.cache.max_bytes == 0 {
         tracing::warn!(
-            "cache.max_bytes is 0: Pulse Cache retention is disabled and the cache root can grow without bound"
+            "cache.max_bytes is 0: James Cache retention is disabled and the cache root can grow without bound"
         );
         return Ok(());
     }
@@ -1355,7 +1448,7 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
         tracing::warn!(
             total_size_bytes = total,
             max_size_bytes = config.cache.max_bytes,
-            "Pulse Cache remains above max_bytes after evicting every eligible artifact"
+            "James Cache remains above max_bytes after evicting every eligible artifact"
         );
     }
     Ok(())
@@ -1456,7 +1549,7 @@ async fn scrub_cache_artifact(
         artifact_type = %artifact.artifact_type,
         hash = %artifact.hash,
         reason = %verification_error,
-        "removing missing or corrupt Pulse cache artifact for automatic repair"
+        "removing missing or corrupt James cache artifact for automatic repair"
     );
     db::delete_cache_artifact(pool, artifact.id).await?;
     Ok(true)
@@ -2006,7 +2099,7 @@ fn narinfo_filename_for_store_path(store_path: &str) -> Result<String> {
 fn public_key_fingerprint(public_key: &str) -> String {
     // Cybex Manage validates this as the full 64-char sha256 hex of the
     // decoded ed25519 key material ("name:base64" -> sha256 of the decoded
-    // 32 bytes), and rejects the whole pulse report when it differs.
+    // 32 bytes), and rejects the whole james report when it differs.
     public_key
         .split_once(':')
         .and_then(|(_, material)| BASE64_STANDARD.decode(material).ok())
@@ -2054,7 +2147,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-pulse-cache-{label}-{}-{nanos}",
+            "cybex-james-cache-{label}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -2361,7 +2454,7 @@ mod tests {
         );
         protected_material::validate_cache_metadata(&first.manifest).unwrap();
         let encoded = serde_json::to_string(&first.manifest).unwrap();
-        assert!(!encoded.contains("CYBEX_PULSE_PROTECTED_SENTINEL"));
+        assert!(!encoded.contains("CYBEX_JAMES_PROTECTED_SENTINEL"));
         assert!(!encoded.contains("$6$rounds="));
 
         // Reference ordering in NARInfo must not affect the manifest or its
@@ -2837,6 +2930,178 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
     }
 
     #[test]
+    fn interrupted_export_narinfo_parser_accepts_only_exact_safe_nix_error() {
+        let hash = "zvpg4yhjf295z20ws2sn24azajh2qcpa";
+        let filename = format!("{hash}.narinfo");
+        assert_eq!(
+            interrupted_export_narinfo_filename(
+                format!("error: NAR info file '{filename}' is corrupt: StorePath missing\n")
+                    .as_bytes()
+            )
+            .as_deref(),
+            Some(filename.as_str())
+        );
+        assert!(
+            interrupted_export_narinfo_filename(
+                format!("error: NAR info file '../{filename}' is corrupt: StorePath missing\n")
+                    .as_bytes()
+            )
+            .is_none()
+        );
+        assert!(
+            interrupted_export_narinfo_filename(
+                format!("error: NAR info file '{filename}' is corrupt: signature invalid\n")
+                    .as_bytes()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn interrupted_export_quarantines_only_independently_invalid_regular_narinfo() {
+        let root = test_temp_dir("interrupted-export-quarantine");
+        let cache_root = root.join("cache");
+        let quarantine_root = root.join("private-quarantine");
+        fs::create_dir_all(&cache_root).unwrap();
+        let store_path = test_store_path('a', "output");
+        let filename = narinfo_filename_for_store_path(&store_path).unwrap();
+        let narinfo_path = cache_root.join(&filename);
+        fs::write(&narinfo_path, []).unwrap();
+        let stderr = format!("error: NAR info file '{filename}' is corrupt: StorePath missing\n");
+
+        assert_eq!(
+            quarantine_interrupted_export_narinfo(&cache_root, &quarantine_root, stderr.as_bytes())
+                .unwrap(),
+            Some(filename.clone())
+        );
+        assert!(!narinfo_path.exists());
+        let quarantined = fs::read_dir(&quarantine_root)
+            .unwrap()
+            .flat_map(|batch| fs::read_dir(batch.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined, vec![std::ffi::OsString::from(filename)]);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn interrupted_export_does_not_quarantine_parseable_narinfo() {
+        let root = test_temp_dir("interrupted-export-valid");
+        let cache_root = root.join("cache");
+        let quarantine_root = root.join("private-quarantine");
+        let store_path = test_store_path('b', "output");
+        let (narinfo_path, _) =
+            write_manifest_cache_member(&cache_root, &store_path, b"payload", &[]);
+        let filename = narinfo_path.file_name().unwrap().to_str().unwrap();
+        let stderr = format!("error: NAR info file '{filename}' is corrupt: StorePath missing\n");
+
+        assert_eq!(
+            quarantine_interrupted_export_narinfo(&cache_root, &quarantine_root, stderr.as_bytes())
+                .unwrap(),
+            None
+        );
+        assert!(narinfo_path.exists());
+        assert!(!quarantine_root.exists());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn interrupted_export_retries_once_then_succeeds() {
+        let root = test_temp_dir("interrupted-export-retry");
+        let cache_root = root.join("cache");
+        let quarantine_root = root.join("private-quarantine");
+        let nix_binary = root.join("fake-nix");
+        let attempts = root.join("attempts");
+        let filename = format!("{}.narinfo", "c".repeat(32));
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::write(cache_root.join(&filename), []).unwrap();
+        fs::write(
+            &nix_binary,
+            format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 attempts='{attempts}'\n\
+                 count=0\n\
+                 if [ -f \"$attempts\" ]; then count=$(cat \"$attempts\"); fi\n\
+                 count=$((count + 1))\n\
+                 printf '%s\\n' \"$count\" > \"$attempts\"\n\
+                 if [ \"$count\" -eq 1 ]; then\n\
+                   printf '%s\\n' \"error: NAR info file '{filename}' is corrupt: StorePath missing\" >&2\n\
+                   exit 1\n\
+                 fi\n",
+                attempts = attempts.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&nix_binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        copy_store_path_to_cache(
+            nix_binary.to_str().unwrap(),
+            "file:///cache?secret-key=/private/key",
+            &cache_root,
+            &quarantine_root,
+            Path::new("/private/key"),
+            &test_store_path('d', "output"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "2");
+        assert!(!cache_root.join(filename).exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn interrupted_export_retry_is_bounded_to_one() {
+        let root = test_temp_dir("interrupted-export-bounded");
+        let cache_root = root.join("cache");
+        let quarantine_root = root.join("private-quarantine");
+        let nix_binary = root.join("fake-nix");
+        let attempts = root.join("private-attempts");
+        let first = format!("{}.narinfo", "f".repeat(32));
+        let second = format!("{}.narinfo", "g".repeat(32));
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::write(cache_root.join(&first), []).unwrap();
+        fs::write(cache_root.join(&second), []).unwrap();
+        fs::write(
+            &nix_binary,
+            format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 attempts='{attempts}'\n\
+                 count=0\n\
+                 if [ -f \"$attempts\" ]; then count=$(cat \"$attempts\"); fi\n\
+                 count=$((count + 1))\n\
+                 printf '%s\\n' \"$count\" > \"$attempts\"\n\
+                 if [ \"$count\" -eq 1 ]; then file='{first}'; else file='{second}'; fi\n\
+                 printf '%s\\n' \"error: NAR info file '$file' is corrupt: StorePath missing\" >&2\n\
+                 exit 1\n",
+                attempts = attempts.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&nix_binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = copy_store_path_to_cache(
+            nix_binary.to_str().unwrap(),
+            "file:///cache?secret-key=/private/key",
+            &cache_root,
+            &quarantine_root,
+            Path::new("/private/key"),
+            &test_store_path('g', "output"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "2");
+        assert!(error.contains("nix copy failed"));
+        assert!(!cache_root.join(first).exists());
+        assert!(!cache_root.join(second).exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn narinfo_parser_requires_signature() {
         let err = parse_narinfo(
             "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test\n\
@@ -2897,13 +3162,13 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         let public = ensure_signing_key_blocking_with_command(
             &private_key,
             &public_key,
-            "cybex-pulse-cache",
+            "cybex-james-cache",
             &fake_nix_store,
         )
         .unwrap();
         release_writer.join().unwrap();
 
-        assert!(public.starts_with("cybex-pulse-cache:"));
+        assert!(public.starts_with("cybex-james-cache:"));
         let fingerprint = public_key_fingerprint(&public);
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -2962,7 +3227,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         fs::write(&config.cache.private_key_path, "private").unwrap();
         fs::write(
             &config.cache.public_key_path,
-            "cybex-pulse-cache:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            "cybex-james-cache:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         )
         .unwrap();
         fs::set_permissions(
@@ -2975,7 +3240,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
 
         assert_eq!(report.status, "ready");
         assert_eq!(report.total_size_bytes, 4136);
-        assert!(report.public_key.starts_with("cybex-pulse-cache:"));
+        assert!(report.public_key.starts_with("cybex-james-cache:"));
         assert_eq!(report.public_key_fingerprint.len(), 64);
         assert_eq!(
             fs::metadata(&config.cache.private_key_path)
@@ -3076,7 +3341,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://james.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: source,
                     cache_metadata: None,
                 },
@@ -3161,7 +3426,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                 references: Some(json!([
                     "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-protected"
                 ])),
-                serving_url: Some("http://pulse.example/cache/nar/protected.nar.xz".to_string()),
+                serving_url: Some("http://james.example/cache/nar/protected.nar.xz".to_string()),
                 source_build_job_id: Some("active-job".to_string()),
                 cache_metadata: None,
             },
@@ -3189,7 +3454,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                 references: Some(json!([
                     "/nix/store/cccccccccccccccccccccccccccccccc-unprotected"
                 ])),
-                serving_url: Some("http://pulse.example/cache/nar/unprotected.nar.xz".to_string()),
+                serving_url: Some("http://james.example/cache/nar/unprotected.nar.xz".to_string()),
                 source_build_job_id: None,
                 cache_metadata: None,
             },
@@ -3306,7 +3571,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: Some(footprint as i64),
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://james.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: source,
                     cache_metadata: None,
                 },
@@ -3384,7 +3649,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     closure_file_size_bytes: None,
                     compression: Some("xz".to_string()),
                     references: Some(json!([])),
-                    serving_url: Some(format!("http://pulse.example/cache/nar/{name}.nar.xz")),
+                    serving_url: Some(format!("http://james.example/cache/nar/{name}.nar.xz")),
                     source_build_job_id: None,
                     cache_metadata: None,
                 },
@@ -3488,12 +3753,12 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
                     compression: Some(root_narinfo.compression),
                     references: Some(json!(root_narinfo.references)),
                     serving_url: Some(format!(
-                        "http://pulse.example/cache/{}",
+                        "http://james.example/cache/{}",
                         root_narinfo.store_path
                     )),
                     source_build_job_id: None,
                     cache_metadata: Some(json!({
-                        "cache_schema": "cybex.pulse.cache.v1",
+                        "cache_schema": "cybex.james.cache.v1",
                         "public_key_fingerprint": public_key_fingerprint(&public_key),
                         "closure_manifest": verified.manifest,
                         "closure_manifest_sha256": verified.manifest_sha256,
@@ -3650,7 +3915,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         .unwrap();
 
         sqlx::query(
-            "UPDATE pulse_build_jobs
+            "UPDATE james_build_jobs
              SET build_spec = ?, status = 'succeeded', output_path = ?, logs = ?, error = ?
              WHERE id = ?",
         )
@@ -3678,7 +3943,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         assert_eq!(ledger.3, "pending_purge");
         let scrubbed: (String, String, String, String, String) = sqlx::query_as(
             "SELECT build_spec, cache_metadata, status, logs, error
-             FROM pulse_build_jobs WHERE id = ?",
+             FROM james_build_jobs WHERE id = ?",
         )
         .bind(job.id)
         .fetch_one(&pool)
@@ -3754,7 +4019,7 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
         assert_eq!(purge_status.0, "purged");
         assert!(purge_status.1.is_some());
         let metadata: String =
-            sqlx::query_scalar("SELECT cache_metadata FROM pulse_build_jobs WHERE id = ?")
+            sqlx::query_scalar("SELECT cache_metadata FROM james_build_jobs WHERE id = ?")
                 .bind(job.id)
                 .fetch_one(&pool)
                 .await

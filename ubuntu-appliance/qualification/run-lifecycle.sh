@@ -24,15 +24,19 @@ while (($#)); do
   esac
 done
 test -f "$template" && test -f "$manifest" && test -f "$token_file" && test -n "$output"
-[[ "$manage_origin" =~ ^https://[^/]+$ ]]
 for command_name in curl ip jq python3 qemu-system-x86_64 truncate sha256sum openssl ssh-keygen; do
   command -v "$command_name" >/dev/null || { echo "error: missing $command_name" >&2; exit 1; }
 done
-bridge="${CYBEX_PULSE_QUALIFICATION_BRIDGE:?set the isolated qualification bridge}"
-management_cidr="${CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
+python3 -B "$repository_root/tools/james-release.py" validate-manage-origin \
+  --expected-manage-origin "$manage_origin" >/dev/null
+test "$(jq -er '.installer_iso_template_v2.manage_origin' "$manifest")" = \
+  "$manage_origin"
+bridge="${CYBEX_JAMES_QUALIFICATION_BRIDGE:?set the isolated qualification bridge}"
+management_cidr="${CYBEX_JAMES_QUALIFICATION_MANAGEMENT_CIDR:?set the qualification Management CIDR}"
 token="$(tr -d '\r\n' < "$token_file")"
 test -n "$token"
 release_version="$(jq -er '.version' "$manifest")"
+ubuntu_snapshot_id="$(jq -er '.appliance_release_v1.ubuntu_snapshot_id' "$manifest")"
 
 work_dir="$(mktemp -d)"
 qemu_pid=""
@@ -51,11 +55,11 @@ cleanup() {
   fi
   if [[ -n "$session_id" && "$lifecycle_succeeded" != true ]]; then
     cleanup_session="$work_dir/cleanup-session.json"
-    if api GET "/v1/pulse/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
+    if api GET "/v1/james/provisioning-sessions/$session_id" > "$cleanup_session" 2>/dev/null \
       && [[ "$(jq -r '.destructive_started_at // ""' "$cleanup_session")" = "" ]] \
       && [[ "$(jq -r '.state' "$cleanup_session")" =~ ^(created|claimed|awaiting_approval|approved|failed)$ ]]
     then
-      api POST "/v1/pulse/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
+      api POST "/v1/james/provisioning-sessions/$session_id/revoke" >/dev/null 2>&1 || true
     fi
   fi
   if [[ -f "$personalized" ]]; then
@@ -85,8 +89,8 @@ case "$package_delivery" in
   embedded) ;;
   network-snapshot-v1)
     test "$(jq -er '.appliance_release_v1.schema' "$manifest")" = \
-      cybex.pulse.appliance-release.v1
-    package_filename="cybex-pulse-appliance-packages-$release_version-x86_64-linux.tar.zst"
+      cybex.james.appliance-release.v1
+    package_filename="cybex-james-appliance-packages-$release_version-x86_64-linux.tar.zst"
     signed_package_url="$(jq -er '.appliance_release_v1.cybex_repository_snapshot.url' "$manifest")"
     [[ "$signed_package_url" = */"$package_filename" ]]
     manifest_directory="$(cd -- "$(dirname -- "$manifest")" && pwd -P)"
@@ -101,7 +105,7 @@ case "$package_delivery" in
       ip -4 -o address show dev "$bridge" scope global \
         | awk '{sub(/\/.*/, "", $4); print $4}'
     )
-    bridge_ipv4="${CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
+    bridge_ipv4="${CYBEX_JAMES_QUALIFICATION_PACKAGE_BIND_ADDRESS:-}"
     if [[ -n "$bridge_ipv4" ]]; then
       printf '%s\n' "${bridge_addresses[@]}" | grep -Fx "$bridge_ipv4" >/dev/null
     else
@@ -160,27 +164,28 @@ else
       else .
       end' "$manifest")"
 fi
-api POST /v1/pulse/provisioning-sessions "$create_body" > "$create_response"
+api POST /v1/james/provisioning-sessions "$create_body" > "$create_response"
 session_id="$(jq -er '.session.id' "$create_response")"
 media_secret="$(jq -er '.media_secret' "$create_response")"
 download_path="$(jq -er '.download_path' "$create_response")"
-[[ "$download_path" = "/v1/pulse/provisioning-sessions/$session_id/appliance-iso" ]]
+[[ "$download_path" = "/v1/james/provisioning-sessions/$session_id/appliance-iso" ]]
 personalization_path="$(jq -er '.personalization_path' "$create_response")"
-[[ "$personalization_path" = "/v1/pulse/provisioning-sessions/$session_id/personalization-envelope" ]]
+[[ "$personalization_path" = "/v1/james/provisioning-sessions/$session_id/personalization-envelope" ]]
 
 headers="$work_dir/download.headers"
 envelope="$work_dir/personalization-envelope.bin"
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
   --header "Authorization: Bearer $token" \
-  --header "X-Cybex-Pulse-Provisioning-Secret: $media_secret" \
+  --header "X-Cybex-James-Provisioning-Secret: $media_secret" \
   --dump-header "$headers" --output "$envelope" "$manage_origin$personalization_path"
 test "$(stat -c '%s' "$envelope")" -eq 8192
 cp --reflink=auto -- "$template" "$personalized"
+chmod 0600 "$personalized"
 personalization_offset="$(jq -er '.installer_iso_template_v2.personalization_offset' "$manifest")"
 dd if="$envelope" of="$personalized" bs=1 seek="$personalization_offset" conv=notrunc status=none
 rm -f -- "$envelope"
 verification="$work_dir/media-verification.json"
-CYBEX_PULSE_MEDIA_SECRET="$media_secret" \
+CYBEX_JAMES_MEDIA_SECRET="$media_secret" \
   python3 -B "$repository_root/ubuntu-appliance/qualification/verify-personalized-media.py" \
     --iso "$personalized" --manifest "$manifest" --headers "$headers" \
     --session-id "$session_id" > "$verification"
@@ -190,8 +195,8 @@ rm -f "$create_response"
 disk="$work_dir/appliance.raw"
 truncate -s 160G "$disk"
 preapproval_digest="$(dd if="$disk" bs=1M count=16 status=none | sha256sum | awk '{print $1}')"
-vars_template="${CYBEX_PULSE_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}"
-code="${CYBEX_PULSE_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
+vars_template="${CYBEX_JAMES_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}"
+code="${CYBEX_JAMES_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
 test -f "$vars_template" && test -f "$code"
 cp -- "$vars_template" "$work_dir/OVMF_VARS.fd"
 
@@ -224,7 +229,7 @@ start_qemu installer
 session="$work_dir/session.json"
 claimed=false
 for _attempt in $(seq 1 180); do
-  api GET "/v1/pulse/provisioning-sessions/$session_id" > "$session"
+  api GET "/v1/james/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = awaiting_approval ]]; then claimed=true; break; fi
   [[ "$state" != failed && "$state" != revoked && "$state" != expired ]]
@@ -246,14 +251,14 @@ session_suffix="${session_id%%-*}"
 approve_body="$(jq -cn \
   --argjson revision "$revision" --arg inventory "$inventory_sha" \
   --arg disk "$disk_id" --arg interface "$interface_id" --arg cidr "$management_cidr" \
-  --arg display_name "Pulse release qualification $release_version $session_suffix" \
+  --arg display_name "James release qualification $release_version $session_suffix" \
   '{session_revision:$revision,inventory_sha256:$inventory,display_name:$display_name,target_disk_id:$disk,network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]},maintenance_window:{timezone:"UTC",weekday:0,start:"02:00",duration_minutes:120},management_cidrs:[$cidr]}')"
-api POST "/v1/pulse/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
+api POST "/v1/james/provisioning-sessions/$session_id/approve" "$approve_body" >/dev/null
 
 ready=false
 pre_destructive_deadline=$((SECONDS + 300))
 for _attempt in $(seq 1 1080); do
-  api GET "/v1/pulse/provisioning-sessions/$session_id" > "$session"
+  api GET "/v1/james/provisioning-sessions/$session_id" > "$session"
   state="$(jq -er '.state' "$session")"
   if [[ "$state" = ready ]]; then ready=true; break; fi
   if [[ -s "$work_dir/serial.log" ]] \
@@ -272,7 +277,7 @@ for _attempt in $(seq 1 1080); do
     && [[ "$(jq -r '.destructive_started_at // ""' "$session")" = "" ]] \
     && ((SECONDS >= pre_destructive_deadline))
   then
-    echo 'error: approved Pulse candidate did not acknowledge its plan before the qualification deadline' >&2
+    echo 'error: approved James candidate did not acknowledge its plan before the qualification deadline' >&2
     jq '{state,heartbeat_at,destructive_started_at,progress,failure_code,failure_message}' "$session" >&2
     if [[ -s "$work_dir/serial.log" ]]; then
       echo 'bounded qualification serial console follows:' >&2
@@ -295,7 +300,7 @@ for _attempt in $(seq 1 1080); do
   if [[ "$state" = rebooting && "$qemu_restart_count" -eq 1 ]] \
     && ((SECONDS >= cold_restart_deadline))
   then
-    echo 'error: installed Pulse disk did not activate after its bounded cold restart' >&2
+    echo 'error: installed James disk did not activate after its bounded cold restart' >&2
     if [[ -s "$work_dir/serial.log" ]]; then
       echo 'bounded qualification serial console follows:' >&2
       tail -n 500 "$work_dir/serial.log" >&2
@@ -312,7 +317,7 @@ nodes="$work_dir/nodes.json"
 node="$work_dir/node.json"
 appliance_projection_ready=false
 for _attempt in $(seq 1 120); do
-  api GET '/v1/pulse/nodes?limit=100&offset=0' > "$nodes"
+  api GET '/v1/james/nodes?limit=100&offset=0' > "$nodes"
   jq -e --arg device "$device_id" '.nodes[] | select(.device_id == $device)' "$nodes" > "$node" || true
   if [[ -s "$node" ]] \
     && [[ "$(jq -er '.appliance_base_os' "$node")" = ubuntu ]] \
@@ -332,15 +337,149 @@ for _attempt in $(seq 1 120); do
 done
 test "$appliance_projection_ready" = true
 
+# Product-level greenfield contract: the exact candidate must converge with
+# the organization's untouched built-ins under the default source-disabled
+# delivery policy. Checking node-scoped jobs prevents an artifact retained on
+# another James from making this freshly installed disk appear qualified.
+delivery_policy="$work_dir/delivery-policy.json"
+api GET '/v1/james/delivery-policy' > "$delivery_policy"
+test "$(jq -er '.allow_james_source_builds' "$delivery_policy")" = false
+test "$(jq -er '.source_builds_allowed' "$delivery_policy")" = false
+
+blueprints="$work_dir/blueprints.json"
+builtins_discovered=false
+for _attempt in $(seq 1 120); do
+  api GET '/v1/blueprints?platform=nixos&limit=100&offset=0' > "$blueprints"
+  if jq -e '
+      ["standard_taskbar_workstation", "dock_workstation", "hyprland_developer"] as $expected
+      | ([.blueprints[]
+          | select(.slug as $slug | $expected | index($slug))
+          | select(.metadata_json.built_in == true)
+          | select(.metadata_json.blueprint_type == "builtin_profile")
+          | select(.current_revision_id != null and .current_revision == 1)
+          | .slug] | unique | sort) == ($expected | sort)
+    ' "$blueprints" >/dev/null
+  then
+    builtins_discovered=true
+    break
+  fi
+  kill -0 "$qemu_pid"
+  sleep 5
+done
+test "$builtins_discovered" = true
+
+hyprland_config="$work_dir/hyprland-config.json"
+api GET '/v1/blueprints/hyprland_developer/config' > "$hyprland_config"
+jq -e '[.. | objects | .package_ref? // empty] | index("deno") != null' \
+  "$hyprland_config" >/dev/null
+jq -e '[.. | objects | .package_ref? // empty] | index("nodejs") == null' \
+  "$hyprland_config" >/dev/null
+
+runtime_status="$work_dir/workstation-runtime.json"
+runtime_converged=false
+for _attempt in $(seq 1 720); do
+  api GET "/v1/james/nodes/$device_id/workstation-netboot" > "$runtime_status"
+  if [[ "$(jq -er '.operational' "$runtime_status")" = true ]] \
+    && [[ "$(jq -er '.converged' "$runtime_status")" = true ]]
+  then
+    runtime_converged=true
+    break
+  fi
+  if [[ "$(jq -er '.state' "$runtime_status")" = failed ]] \
+    && [[ "$(jq -er '.operational' "$runtime_status")" = false ]]
+  then
+    echo 'error: fresh James has no verified usable workstation runtime' >&2
+    jq '{state,operational,converged,failure_code,failure_message}' \
+      "$runtime_status" >&2
+    exit 1
+  fi
+  kill -0 "$qemu_pid"
+  sleep 5
+done
+test "$runtime_converged" = true
+
+build_jobs="$work_dir/build-jobs.json"
+builtins_deliverable=false
+for _attempt in $(seq 1 720); do
+  api GET "/v1/james/nodes/$device_id/build/jobs?limit=200&offset=0" > "$build_jobs"
+  source_blocked_builtin_job="$(jq -c --slurpfile blueprints "$blueprints" '
+    [.jobs[]
+      | select(.status == "failed")
+      | select(.cache_metadata.error_kind == "source_build_blocked")
+      | select(.build_spec.blueprint_revision_id as $revision
+          | $blueprints[0].blueprints
+          | any(.current_revision_id == $revision and .metadata_json.built_in == true))]
+    | first // empty
+  ' "$build_jobs")"
+  if [[ -n "$source_blocked_builtin_job" ]]; then
+    echo 'error: an official built-in Blueprint violates the source-free release contract' >&2
+    jq '{blueprint_id:.build_spec.blueprint_id,
+         blueprint_revision_id:.build_spec.blueprint_revision_id,status,error,
+         error_kind:.cache_metadata.error_kind,
+         source_build_candidates:.cache_metadata.source_build_candidates}' \
+      <<<"$source_blocked_builtin_job" >&2
+    exit 1
+  fi
+  if jq -e --slurpfile blueprints "$blueprints" '
+      ["standard_taskbar_workstation", "dock_workstation", "hyprland_developer"] as $expected
+      | ([.jobs[]
+          | select(.status == "succeeded")
+          | .build_spec.blueprint_revision_id as $revision
+          | $blueprints[0].blueprints[]
+          | select(.current_revision_id == $revision)
+          | select(.metadata_json.built_in == true)
+          | .slug] | unique | sort) == ($expected | sort)
+    ' "$build_jobs" >/dev/null
+  then
+    all_cached=true
+    while IFS=$'\t' read -r blueprint_id revision_id; do
+      cache_status="$work_dir/cache-status-$blueprint_id.json"
+      api GET "/v1/blueprints/$blueprint_id/james-cache?revision_id=$revision_id" \
+        > "$cache_status"
+      if [[ "$(jq -er '.cached' "$cache_status")" != true ]] \
+        || [[ "$(jq -er '.required_replicas > 0 and .ready_replicas == .required_replicas' "$cache_status")" != true ]]
+      then
+        all_cached=false
+      fi
+    done < <(jq -r '.blueprints[]
+      | select(.metadata_json.built_in == true)
+      | select(.slug == "standard_taskbar_workstation"
+               or .slug == "dock_workstation"
+               or .slug == "hyprland_developer")
+      | [.id,.current_revision_id] | @tsv' "$blueprints")
+    if [[ "$all_cached" = true ]]; then
+      builtins_deliverable=true
+      break
+    fi
+  fi
+  kill -0 "$qemu_pid"
+  sleep 5
+done
+if [[ "$builtins_deliverable" != true ]]; then
+  echo 'error: official built-in Blueprints did not converge on the new James' >&2
+  jq --slurpfile blueprints "$blueprints" '
+    [.jobs[]
+      | select(.build_spec.blueprint_revision_id as $revision
+          | $blueprints[0].blueprints
+          | any(.current_revision_id == $revision and .metadata_json.built_in == true))
+      | {blueprint_id:.build_spec.blueprint_id,
+         blueprint_revision_id:.build_spec.blueprint_revision_id,status,error,
+         error_kind:.cache_metadata.error_kind,
+         source_build_candidates:.cache_metadata.source_build_candidates}]
+    | .[:20]
+  ' "$build_jobs" >&2
+  exit 1
+fi
+
 network_change="$work_dir/network-change.json"
 network_body="$(jq -cn --arg interface "$interface_id" \
   '{network:{mode:"dhcp",interface_id:$interface,address_cidr:null,gateway:null,dns_servers:[]}}')"
-api POST "/v1/pulse/nodes/$device_id/network-changes" "$network_body" > "$network_change"
+api POST "/v1/james/nodes/$device_id/network-changes" "$network_body" > "$network_change"
 network_change_id="$(jq -er '.id' "$network_change")"
 test "$(jq -er '.state' "$network_change")" = requested
 network_acknowledged=false
 for _attempt in $(seq 1 120); do
-  api GET '/v1/pulse/nodes?limit=100&offset=0' > "$nodes"
+  api GET '/v1/james/nodes?limit=100&offset=0' > "$nodes"
   jq -e --arg device "$device_id" '.nodes[] | select(.device_id == $device)' "$nodes" > "$node"
   reported_change_id="$(jq -r '.appliance_network.network_change.change_id // ""' "$node")"
   reported_change_status="$(jq -r '.appliance_network.network_change.status // "idle"' "$node")"
@@ -359,7 +498,7 @@ certificate_response="$work_dir/ssh-certificate.json"
 certificate_request="$(jq -cn \
   --arg public_key "$(cat "$work_dir/operator-key.pub")" \
   '{public_key:$public_key,reason:"exact candidate release qualification",validity_minutes:5,allow_forwarding:false}')"
-api POST "/v1/pulse/nodes/$device_id/ssh-certificates" "$certificate_request" > "$certificate_response"
+api POST "/v1/james/nodes/$device_id/ssh-certificates" "$certificate_request" > "$certificate_response"
 test "$(jq -er '.principal' "$certificate_response")" = "$device_id"
 valid_after="$(date -u -d "$(jq -er '.valid_after' "$certificate_response")" +%s)"
 valid_before="$(date -u -d "$(jq -er '.valid_before' "$certificate_response")" +%s)"
@@ -379,11 +518,24 @@ rm -f -- "$work_dir/operator-key" "$work_dir/operator-key.pub" \
 template_sha="$(jq -er '.template_sha256' "$verification")"
 personalized_sha="$(jq -er '.personalized_sha256' "$verification")"
 jq -n \
-  --arg schema 'cybex.pulse.ubuntu-appliance-qualification.v1' \
+  --arg schema 'cybex.james.ubuntu-appliance-qualification.v1' \
+  --arg release_version "$release_version" \
+  --arg ubuntu_snapshot_id "$ubuntu_snapshot_id" \
+  --arg root_generation "$(jq -er '.root_generation | tostring' "$node")" \
   --arg session_id "$session_id" --arg template_sha256 "$template_sha" \
   --arg personalized_sha256 "$personalized_sha" \
   --arg completed_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-  '{schema:$schema,ok:true,session_id:$session_id,template_sha256:$template_sha256,personalized_sha256:$personalized_sha256,secure_boot:true,no_disk_write_before_approval:true,identity_rotation:true,installed_media_left_attached:true,appliance_projection_healthy:true,two_phase_network_acknowledged:true,exact_principal_ssh_certificate:true,final_state:"ready",completed_at:$completed_at}' \
+  '{schema:$schema,ok:true,release_version:$release_version,
+    ubuntu_snapshot_id:$ubuntu_snapshot_id,root_generation:$root_generation,
+    session_id:$session_id,template_sha256:$template_sha256,
+    personalized_sha256:$personalized_sha256,secure_boot:true,
+    no_disk_write_before_approval:true,identity_rotation:true,
+    installed_media_left_attached:true,appliance_projection_healthy:true,
+    workstation_runtime_operational:true,workstation_runtime_converged:true,
+    builtin_blueprints_source_free:true,builtin_blueprints_deliverable:true,
+    builtin_blueprints_qualified_on_new_james:true,
+    two_phase_network_acknowledged:true,exact_principal_ssh_certificate:true,
+    final_state:"ready",completed_at:$completed_at}' \
   > "$output"
 chmod 0644 "$output"
 lifecycle_succeeded=true

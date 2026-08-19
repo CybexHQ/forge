@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+active=/etc/netplan/90-cybex-james.yaml
+runtime_dir=/run/systemd/network
+
+validate_active_plan() {
+  test -f "$active" && test ! -L "$active"
+  test "$(stat -c '%U:%G:%a:%h' "$active")" = root:root:600:1
+  test "$(jq -er '.network.version' "$active")" = 2
+  test "$(jq -er '.network.renderer' "$active")" = networkd
+  test "$(jq -er '.network.ethernets | keys | join(" ")' "$active")" = cybex-james
+
+  interface="$(jq -er '.network.ethernets["cybex-james"]["set-name"]' "$active")"
+  [[ "$interface" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]]
+  [[ "$interface" != . && "$interface" != .. ]]
+  case "$(jq -er '.network.ethernets["cybex-james"].dhcp4' "$active")" in
+    true) mode=dhcp ;;
+    false) mode=static ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_generated_files() {
+  local expected="$1" generated
+  local -a generated_files
+  shopt -s nullglob
+  generated_files=("$runtime_dir"/10-netplan-*.network)
+  shopt -u nullglob
+  ((${#generated_files[@]} > 0))
+  test -f "$expected" && test ! -L "$expected"
+  # Netplan deliberately requests 0640 root:systemd-network. A caller's
+  # restrictive umask can silently reduce that to 0600 and make networkd drop
+  # profiles on reload, so assert the effective contract for the entire
+  # generated networkd set rather than checking only the selected profile.
+  for generated in "${generated_files[@]}"; do
+    if [[ ! -f "$generated" || -L "$generated" ]] \
+      || [[ "$(stat -c '%U:%G:%a:%h' "$generated")" != root:systemd-network:640:1 ]]; then
+      printf 'error: generated networkd profile has unsafe permissions: %s\n' \
+        "$generated" >&2
+      return 1
+    fi
+  done
+}
+
+wait_for_active_profile() {
+  local expected="$1" output selected=""
+  for _attempt in $(seq 1 60); do
+    output="$(SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 LC_ALL=C \
+      networkctl --no-pager status -- "$interface" 2>&1 || true)"
+    selected="$(sed -n 's/^[[:space:]]*Network File:[[:space:]]*//p' <<<"$output" | head -n 1)"
+    if [[ "$selected" = "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  printf 'error: managed interface %s selected %s instead of %s (%s plan)\n' \
+    "$interface" "${selected:-no network file}" "$expected" "$mode" >&2
+  return 1
+}
+
+activate() {
+  local expected
+  validate_active_plan
+  # Netplan creates its networkd files with requested mode 0640, subject to
+  # the process umask. Scope only generation/application to 0027; all signed
+  # plans, markers, backups, and acknowledgements remain under umask 0077.
+  (
+    umask 0027
+    netplan generate
+    netplan apply
+  )
+  # Netplan's networkd backend names this file from the stable netdef ID using
+  # URI escaping; '-' is URI-safe and therefore remains literal.
+  expected="$runtime_dir/10-netplan-cybex-james.network"
+  validate_generated_files "$expected"
+  wait_for_active_profile "$expected"
+}
+
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  activate
+fi

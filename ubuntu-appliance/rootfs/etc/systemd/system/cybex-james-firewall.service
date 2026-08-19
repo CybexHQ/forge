@@ -1,0 +1,13 @@
+[Unit]
+Description=Restrict Cybex support SSH to Management-approved CIDRs
+Before=ssh.service
+After=network-pre.target
+ConditionPathExists=/var/lib/cybex-james/control/management-cidrs.txt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-james/cybex-james-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

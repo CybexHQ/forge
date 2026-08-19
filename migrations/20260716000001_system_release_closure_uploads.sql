@@ -15,7 +15,7 @@ CREATE TABLE managed_system_release_closure_uploads (
     uploaded_at TEXT NOT NULL,
     PRIMARY KEY (local_artifact_id, managed_job_id, closure_sha256),
     FOREIGN KEY (local_artifact_id)
-        REFERENCES pulse_cache_artifacts(id) ON DELETE CASCADE
+        REFERENCES james_cache_artifacts(id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_managed_system_release_closure_upload_identity

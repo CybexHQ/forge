@@ -1,0 +1,17 @@
+[Unit]
+Description=Verify and activate the managed Cybex James appliance
+After=local-fs.target systemd-udev-settle.service
+Before=network-online.target nix-daemon.service nginx.service tftpd-hpa.service cybex-james.service
+Wants=systemd-udev-settle.service
+RequiresMountsFor=/var/lib/cybex-james/state
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-james/cybex-james-first-boot
+RemainAfterExit=yes
+# A dev.3 bridge re-pins up to 16 GiB and performs two independently bounded
+# 32-GiB expanded-stream passes before any privileged state is promoted.
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target

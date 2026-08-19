@@ -1,6 +1,7 @@
 use std::{
     fs,
     net::SocketAddr,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -15,16 +16,18 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::manage_source;
+
 #[derive(Debug, Parser)]
-#[command(name = "cybex-pulse")]
+#[command(name = "cybex-james")]
 #[command(about = "UEFI-only PXE/iPXE boot control service")]
 #[command(version)]
 pub struct Cli {
     #[arg(
         short,
         long,
-        default_value = "/etc/cybex-pulse/config.toml",
-        env = "CYBEX_PULSE_CONFIG"
+        default_value = "/etc/cybex-james/config.toml",
+        env = "CYBEX_JAMES_CONFIG"
     )]
     pub config: PathBuf,
 
@@ -40,8 +43,14 @@ pub enum Command {
     ValidateApplianceConfig,
     /// Re-verify and extract the currently staged signed Ubuntu package update.
     VerifyApplianceUpdate,
+    /// Re-authenticate a legacy update request from its already-booted candidate.
+    VerifyApplianceCandidateUpdate,
     /// Re-verify and materialize the currently staged signed Netplan change.
     VerifyApplianceNetworkChange,
+    /// Re-derive a signed Netplan candidate for idempotent post-crash recovery.
+    VerifyApplianceNetworkChangeRecovery,
+    /// Re-verify the complete signed Management acknowledgement for Netplan.
+    VerifyApplianceNetworkAcknowledgement,
     SyncOnce,
     PrintConfig,
 }
@@ -123,6 +132,18 @@ pub struct BuildTargetConfig {
     pub attr: String,
 }
 
+pub const RELEASE_NIXPKGS_REVISION: &str = env!("CYBEX_RELEASE_NIXPKGS_REVISION");
+
+pub(crate) fn governed_blueprint_build_target() -> BuildTargetConfig {
+    BuildTargetConfig {
+        artifact_type: "nixos_closure".to_string(),
+        target: "blueprint".to_string(),
+        system: "x86_64-linux".to_string(),
+        flake: format!("github:NixOS/nixpkgs/{RELEASE_NIXPKGS_REVISION}"),
+        attr: "packages.x86_64-linux.desktop-experience".to_string(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CacheConfig {
@@ -144,8 +165,8 @@ pub struct UpdateConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorkstationNetbootConfig {
-    /// Allows isolated test fixtures to use HTTP or non-public addresses.
-    /// Production appliances must leave this disabled.
+    /// Development-only escape: allows private transport and unsigned runtime
+    /// descriptors. Production appliances must leave this disabled.
     pub allow_private_release_urls: bool,
 }
 
@@ -190,46 +211,82 @@ impl AppConfig {
         if self.server.listen_addr != "127.0.0.1:8080" {
             bail!("appliance server.listen_addr must remain 127.0.0.1:8080");
         }
+        validate_appliance_public_base_url(&self.server.public_base_url)?;
 
+        let legacy_bridge = legacy_state_bridge_active()?;
         require_appliance_path(
             "paths.data_dir",
             &self.paths.data_dir,
-            "/var/lib/cybex-pulse",
+            if legacy_bridge {
+                "/var/lib/cybex-james/state"
+            } else {
+                "/var/lib/cybex-james/state/agent"
+            },
         )?;
         require_appliance_path(
             "paths.database_path",
             &self.paths.database_path,
-            "/var/lib/cybex-pulse/cybex-pulse.sqlite",
+            if legacy_bridge {
+                "/var/lib/cybex-james/state/cybex-james.sqlite"
+            } else {
+                "/var/lib/cybex-james/state/agent/cybex-james.sqlite"
+            },
+        )?;
+        require_appliance_path(
+            "paths.boot_assets_dir",
+            &self.paths.boot_assets_dir,
+            "/var/cache/cybex-james/www",
+        )?;
+        require_appliance_path(
+            "paths.static_dir",
+            &self.paths.static_dir,
+            "/var/cache/cybex-james/www/assets",
         )?;
         require_appliance_path(
             "paths.tftp_dir",
             &self.paths.tftp_dir,
-            "/srv/cybex-pulse/tftp",
+            "/var/cache/cybex-james/tftp",
         )?;
-        for (field, path) in [
-            (
-                "paths.boot_assets_dir",
-                self.paths.boot_assets_dir.as_path(),
-            ),
-            ("paths.static_dir", self.paths.static_dir.as_path()),
-            ("build.work_dir", self.build.work_dir.as_path()),
-            ("build.output_dir", self.build.output_dir.as_path()),
-            ("cache.root_dir", self.cache.root_dir.as_path()),
-        ] {
-            require_appliance_srv_path(field, path)?;
+        require_appliance_path(
+            "build.work_dir",
+            &self.build.work_dir,
+            "/var/cache/cybex-james/build",
+        )?;
+        require_appliance_path(
+            "build.output_dir",
+            &self.build.output_dir,
+            "/var/cache/cybex-james/build-outputs",
+        )?;
+        require_appliance_path(
+            "cache.root_dir",
+            &self.cache.root_dir,
+            "/var/cache/cybex-james/www/cache",
+        )?;
+        if self.build.nix_binary != "/usr/bin/nix" {
+            bail!("appliance build.nix_binary must remain /usr/bin/nix");
         }
-        if self.build.nix_binary != "/run/current-system/sw/bin/nix" {
-            bail!("appliance build.nix_binary must remain /run/current-system/sw/bin/nix");
+        if self.build.manage_source_url_template != manage_source::MANAGE_SOURCE_URL_TEMPLATE {
+            bail!(
+                "appliance build.manage_source_url_template must remain the packaged Manage source archive"
+            );
         }
         require_appliance_path(
             "cache.private_key_path",
             &self.cache.private_key_path,
-            "/var/lib/cybex-pulse/cache/cache-priv-key.pem",
+            if legacy_bridge {
+                "/var/lib/cybex-james/state/cache-private.pem"
+            } else {
+                "/var/lib/cybex-james/state/agent/cache-private.pem"
+            },
         )?;
         require_appliance_path(
             "cache.public_key_path",
             &self.cache.public_key_path,
-            "/var/lib/cybex-pulse/cache/cache-pub-key.pem",
+            if legacy_bridge {
+                "/var/lib/cybex-james/state/cache-public.pem"
+            } else {
+                "/var/lib/cybex-james/state/agent/cache-public.pem"
+            },
         )?;
 
         if self.update.trusted_public_key.is_empty() {
@@ -240,10 +297,6 @@ impl AppConfig {
             &self.update.trusted_public_key,
         )
         .context("validate appliance update trust key")?;
-        if self.workstation_netboot.allow_private_release_urls {
-            bail!("appliance workstation netboot fixture URLs must remain disabled");
-        }
-
         if !self.manage.enabled {
             bail!("appliance managed mode must remain enabled");
         }
@@ -257,7 +310,11 @@ impl AppConfig {
         require_appliance_path(
             "manage.state_path",
             &self.manage.state_path,
-            "/var/lib/cybex-pulse/state/manage-state.json",
+            if legacy_bridge {
+                "/var/lib/cybex-james/state/manage-state.json"
+            } else {
+                "/var/lib/cybex-james/state/agent/manage-state.json"
+            },
         )?;
         Ok(())
     }
@@ -307,7 +364,7 @@ impl AppConfig {
         self.build.output_dir =
             normalize_absolute_config_path("build.output_dir", &self.build.output_dir)?;
         self.build.nix_binary = normalize_program_name("build.nix_binary", &self.build.nix_binary)?;
-        self.build.manage_source_url_template = normalize_manage_source_url_template(
+        self.build.manage_source_url_template = manage_source::normalize_url_template(
             &self.build.manage_source_url_template,
             self.workstation_netboot.allow_private_release_urls,
         )?;
@@ -387,6 +444,23 @@ impl AppConfig {
     }
 }
 
+fn legacy_state_bridge_active() -> anyhow::Result<bool> {
+    let path = Path::new("/etc/cybex-james/legacy-state-layout");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspect appliance legacy-state marker"),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o7777 != 0o644
+    {
+        bail!("appliance legacy-state marker is unsafe")
+    }
+    Ok(true)
+}
+
 fn require_appliance_path(field: &str, actual: &Path, expected: &str) -> anyhow::Result<()> {
     let expected = Path::new(expected);
     if actual != expected {
@@ -395,10 +469,30 @@ fn require_appliance_path(field: &str, actual: &Path, expected: &str) -> anyhow:
     Ok(())
 }
 
-fn require_appliance_srv_path(field: &str, path: &Path) -> anyhow::Result<()> {
-    let preserved_root = Path::new("/srv/cybex-pulse");
-    if path == preserved_root || !path.starts_with(preserved_root) {
-        bail!("appliance {field} must be below /srv/cybex-pulse");
+fn validate_appliance_public_base_url(value: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(value).context("appliance server.public_base_url is invalid")?;
+    if parsed.scheme() != "http"
+        || parsed.port().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("appliance server.public_base_url must be exactly http://<active-ipv4>");
+    }
+    let address: std::net::Ipv4Addr = parsed
+        .host_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!("appliance server.public_base_url must include an IPv4 host")
+        })?
+        .parse()
+        .context("appliance server.public_base_url must use an IPv4 host")?;
+    if address.is_loopback()
+        || address.is_link_local()
+        || address.is_multicast()
+        || address.is_unspecified()
+        || address.octets() == [255, 255, 255, 255]
+    {
+        bail!("appliance server.public_base_url must use a usable interface IPv4 address");
     }
     Ok(())
 }
@@ -629,36 +723,6 @@ fn normalize_build_target_config(target: &mut BuildTargetConfig) -> anyhow::Resu
     Ok(())
 }
 
-fn normalize_manage_source_url_template(
-    value: &str,
-    allow_private_fixture: bool,
-) -> anyhow::Result<String> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
-        bail!("build.manage_source_url_template is invalid");
-    }
-    if value.matches("{revision}").count() != 1 {
-        bail!("build.manage_source_url_template must contain exactly one {{revision}} placeholder");
-    }
-    if value == "github:CybexHQ/manage/{revision}" {
-        return Ok(value.to_string());
-    }
-    let candidate = value.replace("{revision}", &"0".repeat(40));
-    let parsed = Url::parse(&candidate)
-        .context("build.manage_source_url_template must be an absolute source URL")?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        bail!("build.manage_source_url_template must not contain credentials");
-    }
-    match parsed.scheme() {
-        "https" | "git+https" => {}
-        "file" | "git+file" if allow_private_fixture => {}
-        _ => bail!(
-            "build.manage_source_url_template must use HTTPS; file fixtures require workstation_netboot.allow_private_release_urls"
-        ),
-    }
-    Ok(value.to_string())
-}
-
 pub fn pinned_nixpkgs_revision(flake: &str) -> anyhow::Result<&str> {
     let revision = flake.strip_prefix("github:NixOS/nixpkgs/").ok_or_else(|| {
         anyhow::anyhow!(
@@ -786,7 +850,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:8080".to_string(),
-            public_base_url: "http://CYBEX_PULSE_IP".to_string(),
+            public_base_url: "http://CYBEX_JAMES_IP".to_string(),
         }
     }
 }
@@ -794,11 +858,11 @@ impl Default for ServerConfig {
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from("/var/lib/cybex-pulse"),
-            database_path: PathBuf::from("/var/lib/cybex-pulse/cybex-pulse.sqlite"),
-            boot_assets_dir: PathBuf::from("/srv/cybex-pulse/www"),
-            static_dir: PathBuf::from("/srv/cybex-pulse/www/assets"),
-            tftp_dir: PathBuf::from("/srv/cybex-pulse/tftp"),
+            data_dir: PathBuf::from("/var/lib/cybex-james"),
+            database_path: PathBuf::from("/var/lib/cybex-james/cybex-james.sqlite"),
+            boot_assets_dir: PathBuf::from("/srv/cybex-james/www"),
+            static_dir: PathBuf::from("/srv/cybex-james/www/assets"),
+            tftp_dir: PathBuf::from("/srv/cybex-james/tftp"),
         }
     }
 }
@@ -834,10 +898,13 @@ impl Default for BuildConfig {
             max_log_bytes: 64 * 1024,
             max_artifact_size_bytes: 20 * 1024 * 1024 * 1024,
             allowed_systems: vec!["x86_64-linux".to_string()],
-            work_dir: PathBuf::from("/var/lib/cybex-pulse/build"),
-            output_dir: PathBuf::from("/var/lib/cybex-pulse/build-outputs"),
+            work_dir: PathBuf::from("/var/lib/cybex-james/build"),
+            output_dir: PathBuf::from("/var/lib/cybex-james/build-outputs"),
             nix_binary: "nix".to_string(),
-            manage_source_url_template: "github:CybexHQ/manage/{revision}".to_string(),
+            manage_source_url_template: manage_source::MANAGE_SOURCE_URL_TEMPLATE.to_string(),
+            // Standalone or incomplete configuration remains fail-closed.
+            // The signed appliance provisioning path emits its one governed
+            // target explicitly from release/nixpkgs.nix.
             targets: Vec::new(),
         }
     }
@@ -847,10 +914,10 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            root_dir: PathBuf::from("/srv/cybex-pulse/www/cache"),
-            signing_key_name: "cybex-pulse-cache".to_string(),
-            private_key_path: PathBuf::from("/var/lib/cybex-pulse/cache/cache-priv-key.pem"),
-            public_key_path: PathBuf::from("/var/lib/cybex-pulse/cache/cache-pub-key.pem"),
+            root_dir: PathBuf::from("/srv/cybex-james/www/cache"),
+            signing_key_name: "cybex-james-cache".to_string(),
+            private_key_path: PathBuf::from("/var/lib/cybex-james/cache/cache-priv-key.pem"),
+            public_key_path: PathBuf::from("/var/lib/cybex-james/cache/cache-pub-key.pem"),
             max_bytes: 64 * 1024 * 1024 * 1024,
             retain_recent_builds: 50,
         }
@@ -864,7 +931,7 @@ impl Default for ManageConfig {
             api_url: String::new(),
             organization_id: String::new(),
             organization_slug: String::new(),
-            state_path: PathBuf::from("/var/lib/cybex-pulse/state/manage-state.json"),
+            state_path: PathBuf::from("/var/lib/cybex-james/state/manage-state.json"),
             sync_interval_seconds: 30,
             http_timeout_seconds: 30,
         }
@@ -878,9 +945,23 @@ mod tests {
 
     fn appliance_config() -> AppConfig {
         let mut config = AppConfig::default();
-        config.build.work_dir = PathBuf::from("/srv/cybex-pulse/build-work");
-        config.build.output_dir = PathBuf::from("/srv/cybex-pulse/build-outputs");
-        config.build.nix_binary = "/run/current-system/sw/bin/nix".to_string();
+        config.server.public_base_url = "http://192.0.2.20".to_string();
+        config.paths.data_dir = PathBuf::from("/var/lib/cybex-james/state/agent");
+        config.paths.database_path =
+            PathBuf::from("/var/lib/cybex-james/state/agent/cybex-james.sqlite");
+        config.paths.boot_assets_dir = PathBuf::from("/var/cache/cybex-james/www");
+        config.paths.static_dir = PathBuf::from("/var/cache/cybex-james/www/assets");
+        config.paths.tftp_dir = PathBuf::from("/var/cache/cybex-james/tftp");
+        config.build.work_dir = PathBuf::from("/var/cache/cybex-james/build");
+        config.build.output_dir = PathBuf::from("/var/cache/cybex-james/build-outputs");
+        config.build.nix_binary = "/usr/bin/nix".to_string();
+        config.cache.root_dir = PathBuf::from("/var/cache/cybex-james/www/cache");
+        config.cache.private_key_path =
+            PathBuf::from("/var/lib/cybex-james/state/agent/cache-private.pem");
+        config.cache.public_key_path =
+            PathBuf::from("/var/lib/cybex-james/state/agent/cache-public.pem");
+        config.manage.state_path =
+            PathBuf::from("/var/lib/cybex-james/state/agent/manage-state.json");
         config.update.trusted_public_key = STANDARD.encode(
             SigningKey::from_bytes(&[7u8; 32])
                 .verifying_key()
@@ -915,7 +996,7 @@ mod tests {
 
     #[test]
     fn cli_reports_the_exact_package_version() {
-        let result = Cli::try_parse_from(["cybex-pulse", "--version"]).unwrap_err();
+        let result = Cli::try_parse_from(["cybex-james", "--version"]).unwrap_err();
 
         assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(result.to_string().contains(env!("CARGO_PKG_VERSION")));
@@ -964,23 +1045,27 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.server.listen_addr, "127.0.0.1:8080");
-        assert_eq!(config.server.public_base_url, "http://CYBEX_PULSE_IP");
+        assert_eq!(config.server.public_base_url, "http://CYBEX_JAMES_IP");
         assert_eq!(
             config.paths.boot_assets_dir,
-            PathBuf::from("/srv/cybex-pulse/www")
+            PathBuf::from("/srv/cybex-james/www")
         );
         assert_eq!(
             config.paths.static_dir,
-            PathBuf::from("/srv/cybex-pulse/www/assets")
+            PathBuf::from("/srv/cybex-james/www/assets")
         );
         assert_eq!(
             config.paths.tftp_dir,
-            PathBuf::from("/srv/cybex-pulse/tftp")
+            PathBuf::from("/srv/cybex-james/tftp")
         );
         assert_eq!(config.manage.http_timeout_seconds, 30);
         assert_eq!(config.build.max_build_cores, 4);
         assert_eq!(config.build.minimum_memory_bytes, 16 * 1024 * 1024 * 1024);
         assert_eq!(config.build.minimum_swap_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.build.manage_source_url_template,
+            manage_source::MANAGE_SOURCE_URL_TEMPLATE
+        );
     }
 
     #[test]
@@ -994,12 +1079,22 @@ mod tests {
             .unwrap(),
             "74cc63f702f7d60a557e152a57b40fb1fd0f72ac"
         );
+        let target = governed_blueprint_build_target();
+        assert_eq!(target.artifact_type, "nixos_closure");
+        assert_eq!(target.target, "blueprint");
+        assert_eq!(target.system, "x86_64-linux");
+        assert_eq!(
+            pinned_nixpkgs_revision(&target.flake).unwrap(),
+            RELEASE_NIXPKGS_REVISION
+        );
+        assert_eq!(target.attr, "packages.x86_64-linux.desktop-experience");
+        assert!(AppConfig::default().build.targets.is_empty());
     }
 
     #[test]
     fn missing_config_loads_normalized_defaults() {
         let path = std::env::temp_dir().join(format!(
-            "cybex-pulse-missing-config-test-{}-{}.toml",
+            "cybex-james-missing-config-test-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1044,10 +1139,10 @@ organization_slug = " Default "
     #[test]
     fn config_rejects_removed_install_code_and_executable_updater_fields() {
         for raw in [
-            "[manage]\npulse_install_code = \"removed\"\n",
-            "[manage]\npulse_install_code_file = \"/run/removed\"\n",
+            "[manage]\njames_install_code = \"removed\"\n",
+            "[manage]\njames_install_code_file = \"/run/removed\"\n",
             "[update]\nenabled = true\n",
-            "[update]\nwork_dir = \"/var/lib/cybex-pulse/updates\"\n",
+            "[update]\nwork_dir = \"/var/lib/cybex-james/updates\"\n",
         ] {
             let path = write_temp_config(raw);
             let error = AppConfig::load(&path).unwrap_err();
@@ -1072,33 +1167,51 @@ organization_slug = " Default "
             |config| config.server.listen_addr = "127.0.0.1:9080".to_string(),
             "listen_addr",
         );
+        for invalid in [
+            "https://192.0.2.20",
+            "http://james.example",
+            "http://192.0.2.20:8080",
+            "http://127.0.0.1",
+        ] {
+            rejected(
+                |config| config.server.public_base_url = invalid.to_string(),
+                "public_base_url",
+            );
+        }
         rejected(
-            |config| config.paths.data_dir = PathBuf::from("/srv/cybex-pulse/data"),
+            |config| config.paths.data_dir = PathBuf::from("/srv/cybex-james/data"),
             "paths.data_dir",
         );
         rejected(
-            |config| config.paths.database_path = PathBuf::from("/tmp/pulse.sqlite"),
+            |config| config.paths.database_path = PathBuf::from("/tmp/james.sqlite"),
             "paths.database_path",
         );
         rejected(
-            |config| config.paths.tftp_dir = PathBuf::from("/srv/cybex-pulse/other-tftp"),
+            |config| config.paths.tftp_dir = PathBuf::from("/var/cache/cybex-james/other-tftp"),
             "paths.tftp_dir",
         );
         rejected(
-            |config| config.paths.boot_assets_dir = PathBuf::from("/var/www/pulse"),
+            |config| config.paths.boot_assets_dir = PathBuf::from("/var/www/james"),
             "paths.boot_assets_dir",
         );
         rejected(
-            |config| config.build.work_dir = PathBuf::from("/var/lib/cybex-pulse/build"),
+            |config| config.build.work_dir = PathBuf::from("/var/lib/cybex-james/build"),
             "build.work_dir",
         );
         rejected(
-            |config| config.cache.root_dir = PathBuf::from("/var/lib/cybex-pulse/cache-public"),
+            |config| config.cache.root_dir = PathBuf::from("/var/lib/cybex-james/cache-public"),
             "cache.root_dir",
         );
         rejected(
             |config| config.build.nix_binary = "/tmp/nix".to_string(),
             "build.nix_binary",
+        );
+        rejected(
+            |config| {
+                config.build.manage_source_url_template =
+                    "github:CybexHQ/manage/{revision}".to_string()
+            },
+            "manage_source_url_template",
         );
         rejected(
             |config| config.cache.private_key_path = PathBuf::from("/tmp/cache-private-key"),
@@ -1143,7 +1256,7 @@ public_base_url = "https://"
         let path = write_temp_config(
             r#"
 [server]
-public_base_url = "http://boot.example/pulse;chain"
+public_base_url = "http://boot.example/james;chain"
 "#,
         );
 
@@ -1283,7 +1396,7 @@ bootloader_filename = "{bootloader_filename}"
 public_base_url = "http://boot.example"
 
 [paths]
-data_dir = "../var/lib/cybex-pulse"
+data_dir = "../var/lib/cybex-james"
 "#,
             ),
             (
@@ -1293,7 +1406,7 @@ data_dir = "../var/lib/cybex-pulse"
 public_base_url = "http://boot.example"
 
 [paths]
-database_path = "/var/lib/../cybex-pulse.sqlite"
+database_path = "/var/lib/../cybex-james.sqlite"
 "#,
             ),
             (
@@ -1303,7 +1416,7 @@ database_path = "/var/lib/../cybex-pulse.sqlite"
 public_base_url = "http://boot.example"
 
 [paths]
-boot_assets_dir = "/srv/cybex-pulse//www"
+boot_assets_dir = "/srv/cybex-james//www"
 "#,
             ),
             (
@@ -1323,7 +1436,7 @@ tftp_dir = "/"
 public_base_url = "http://boot.example"
 
 [manage]
-state_path = "/var/lib/cybex-pulse/../manage-state.json"
+state_path = "/var/lib/cybex-james/../manage-state.json"
 "#,
             ),
         ] {
@@ -1460,7 +1573,7 @@ menu_timeout_ms = 42
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-pulse-config-test-{}-{unique}.toml",
+            "cybex-james-config-test-{}-{unique}.toml",
             std::process::id()
         ));
         fs::write(&path, contents).unwrap();
@@ -1473,7 +1586,7 @@ menu_timeout_ms = 42
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cybex-pulse-config-{label}-{}-{unique}",
+            "cybex-james-config-{label}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();

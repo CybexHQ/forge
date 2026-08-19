@@ -1,4 +1,4 @@
-name: Pulse Release
+name: James Release
 
 on:
   pull_request:
@@ -18,17 +18,26 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install native checks
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential ripgrep shellcheck
 
       - name: Bash syntax
-        run: bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-pulse/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        shell: bash
+        run: |
+          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' ubuntu-appliance/rootfs/usr/lib/cybex-james | sort)
+          bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/*.sh "${appliance_helpers[@]}" ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
 
       - name: Shellcheck
-        run: shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-pulse/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        shell: bash
+        run: |
+          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' ubuntu-appliance/rootfs/usr/lib/cybex-james | sort)
+          shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/*.sh "${appliance_helpers[@]}" ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+
+      - name: Python helper syntax
+        run: python3 -m py_compile ubuntu-appliance/rootfs/usr/lib/cybex-james/cybex-james-state-layout
 
       - name: Ubuntu appliance pinned-base contract
         run: |
-          test "$(jq -er '.schema' ubuntu-appliance/base-iso.json)" = cybex.pulse.ubuntu-base-iso.v1
+          test "$(jq -er '.schema' ubuntu-appliance/base-iso.json)" = cybex.james.ubuntu-base-iso.v1
           test "$(jq -er '.version' ubuntu-appliance/base-iso.json)" = 26.04
           test "$(jq -er '.architecture' ubuntu-appliance/base-iso.json)" = amd64
           test "$(jq -er '.sha256 | test("^[0-9a-f]{64}$")' ubuntu-appliance/base-iso.json)" = true
@@ -82,18 +91,30 @@ jobs:
     environment: production-release
     outputs:
       version: ${{ steps.release-version.outputs.version }}
+      manage_origin: ${{ steps.release-version.outputs.manage_origin }}
       artifact_id: ${{ steps.release-artifact.outputs.artifact_id }}
       artifact_digest: ${{ steps.release-artifact.outputs.artifact_digest }}
       artifact_name: ${{ steps.release-artifact.outputs.artifact_name }}
       workstation_bundle_name: ${{ steps.workstation-source.outputs.bundle_name }}
+      has_predecessor: ${{ steps.published-predecessor.outputs.exists }}
+      predecessor_identity_b64: ${{ steps.published-predecessor.outputs.identity_b64 }}
+      predecessor_identity_sha256: ${{ steps.published-predecessor.outputs.identity_sha256 }}
+      predecessor_release: ${{ steps.published-predecessor.outputs.release_id }}
+      predecessor_snapshot: ${{ steps.published-predecessor.outputs.snapshot_id }}
+      predecessor_update_contract: ${{ steps.published-predecessor.outputs.update_contract }}
     permissions:
       contents: read
       actions: read
     env:
-      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
-      CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS: ${{ vars.CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS }}
-      CYBEX_PULSE_UBUNTU_SNAPSHOT_ID: ${{ vars.CYBEX_PULSE_UBUNTU_SNAPSHOT_ID }}
-      CYBEX_PULSE_RELEASE_ARTIFACT: cybex-pulse-release-candidate-${{ github.run_id }}
+      CYBEX_JAMES_BUILD_MANAGE_ORIGIN: ${{ vars.CYBEX_JAMES_BUILD_MANAGE_ORIGIN }}
+      CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS: ${{ vars.CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS }}
+      CYBEX_JAMES_UBUNTU_SNAPSHOT_ID: ${{ vars.CYBEX_JAMES_UBUNTU_SNAPSHOT_ID }}
+      CYBEX_JAMES_LEGACY_BRIDGE_POLICY_B64: ${{ vars.CYBEX_JAMES_LEGACY_BRIDGE_POLICY_B64 }}
+      CYBEX_JAMES_LEGACY_BRIDGE_POLICY_SHA256: ${{ vars.CYBEX_JAMES_LEGACY_BRIDGE_POLICY_SHA256 }}
+      CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_B64: ${{ vars.CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_B64 }}
+      CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_SHA256: ${{ vars.CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_SHA256 }}
+      CYBEX_JAMES_RELEASE_ARTIFACT: cybex-james-release-candidate-${{ github.run_id }}
     steps:
       - name: Checkout exact tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -107,12 +128,14 @@ jobs:
           set -euo pipefail
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           test "v$version" = "$GITHUB_REF_NAME"
-          test -n "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
-          test -n "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS"
-          [[ "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-          python3 tools/pulse-release.py validate-public-key \
-            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          test -n "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
+          test -n "$CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS"
+          [[ "$CYBEX_JAMES_UBUNTU_SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+          python3 tools/james-release.py validate-manage-origin \
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN"
+          python3 tools/james-release.py validate-public-key \
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           test "${#provisioning_keys[@]}" -ge 1
           test "${#provisioning_keys[@]}" -le 8
           test "$(printf '%s\n' "${provisioning_keys[@]}" | LC_ALL=C sort -u | wc -l)" -eq "${#provisioning_keys[@]}"
@@ -120,9 +143,10 @@ jobs:
             <(printf '%s\n' "${provisioning_keys[@]}") \
             <(printf '%s\n' "${provisioning_keys[@]}" | LC_ALL=C sort)
           for key in "${provisioning_keys[@]}"; do
-            python3 tools/pulse-release.py validate-public-key --trusted-public-key "$key"
+            python3 tools/james-release.py validate-public-key --trusted-public-key "$key"
           done
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\nmanage_origin=%s\n' \
+            "$version" "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" >> "$GITHUB_OUTPUT"
 
       - name: Resolve pinned workstation source
         id: workstation-source
@@ -145,10 +169,11 @@ jobs:
       - name: Require repository immutable-release policy
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.CYBEX_PULSE_RELEASE_POLICY_TOKEN }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          GH_TOKEN: ${{ secrets.CYBEX_FORGE_RELEASE_POLICY_TOKEN }}
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?configure CYBEX_PULSE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
+          : "${GH_TOKEN:?configure CYBEX_JAMES_RELEASE_POLICY_TOKEN with repository Administration read permission}"
           immutable_enabled="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -166,11 +191,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          response="$RUNNER_TEMP/cybex-pulse-run-artifacts.json"
+          response="$RUNNER_TEMP/cybex-james-run-artifacts.json"
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$CYBEX_PULSE_RELEASE_ARTIFACT&per_page=100" \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$CYBEX_JAMES_RELEASE_ARTIFACT&per_page=100" \
             > "$response"
           count="$(jq '[.artifacts[] | select(.expired == false)] | length' "$response")"
           case "$count" in
@@ -186,7 +211,7 @@ jobs:
               artifact="$(jq -c '.artifacts[] | select(.expired == false)' "$response")"
               artifact_id="$(jq -r '.id' <<<"$artifact")"
               digest="$(jq -r '.digest' <<<"$artifact")"
-              test "$(jq -r '.name' <<<"$artifact")" = "$CYBEX_PULSE_RELEASE_ARTIFACT"
+              test "$(jq -r '.name' <<<"$artifact")" = "$CYBEX_JAMES_RELEASE_ARTIFACT"
               test "$(jq -r '.workflow_run.id' <<<"$artifact")" = "$GITHUB_RUN_ID"
               test "$(jq -r '.workflow_run.head_sha' <<<"$artifact")" = "${GITHUB_SHA,,}"
               [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
@@ -199,7 +224,7 @@ jobs:
               exit 1
               ;;
           esac
-          printf 'artifact_name=%s\n' "$CYBEX_PULSE_RELEASE_ARTIFACT" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$CYBEX_JAMES_RELEASE_ARTIFACT" >> "$GITHUB_OUTPUT"
 
       - name: Install Nix for a new candidate
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -214,7 +239,8 @@ jobs:
           path: manage-source
           fetch-depth: 0
           persist-credentials: false
-          ssh-key: ${{ secrets.CYBEX_PULSE_MANAGE_SOURCE_SSH_KEY }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          ssh-key: ${{ secrets.CYBEX_FORGE_MANAGE_SOURCE_SSH_KEY }}
 
       - name: Verify pinned Manage source and runtime version
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -224,8 +250,8 @@ jobs:
           test "$(git -C manage-source rev-parse HEAD)" = "${{ steps.workstation-source.outputs.revision }}"
           test -z "$(git -C manage-source status --porcelain)"
           test "$(tr -d '\n' < manage-source/deploy/nixos/workstation-netboot-version)" = "${{ steps.workstation-source.outputs.runtime_version }}"
-          python3 tools/pulse-release.py verify-component-compatibility \
-            --pulse-compatibility protocol/compatibility.json \
+          python3 tools/james-release.py verify-component-compatibility \
+            --james-compatibility protocol/compatibility.json \
             --manage-compatibility manage-source/protocol/compatibility.json
           test "$(jq -er '.workstation_runtime.compatibility_epoch' protocol/compatibility.json)" = 1
 
@@ -233,17 +259,25 @@ jobs:
         if: steps.release-candidate.outputs.reuse != 'true'
         shell: bash
         env:
-          CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64 }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          CYBEX_JAMES_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
-          test -n "$CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64"
+          test -n "$CYBEX_JAMES_RELEASE_PRIVATE_KEY_B64"
 
-      - name: Install Ubuntu appliance build tools for a new candidate
-        if: steps.release-candidate.outputs.reuse != 'true'
+      - name: Install Ubuntu appliance release tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            apt-utils dpkg-dev gpgv jq rsync ubuntu-keyring xorriso zstd
+            apt-utils dpkg-dev gpgv jq rsync squashfs-tools ubuntu-keyring xorriso zstd
+
+      - name: Download the immutable reused candidate for provenance verification
+        if: steps.release-candidate.outputs.reuse == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ steps.release-candidate.outputs.artifact_id }}
+          path: dist
+          merge-multiple: true
 
       - name: Build exact binaries, appliance media, and workstation runtime
         if: steps.release-candidate.outputs.reuse != 'true'
@@ -251,7 +285,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.release-version.outputs.version }}"
-          cargo build --release --locked --bin cybex-pulse --bin cybex-pulse-bootstrap
+          CYBEX_JAMES_BUILD_MANAGE_ORIGIN="$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" \
+            cargo build --release --locked --bin cybex-james --bin cybex-james-bootstrap
           source_epoch="$(git -C manage-source show -s --format=%ct HEAD)"
           [[ "$source_epoch" =~ ^[1-9][0-9]*$ ]]
           nix-build release/workstation-netboot.nix \
@@ -259,8 +294,10 @@ jobs:
             --arg sourceDateEpoch "$source_epoch" \
             --out-link result-workstation-netboot
           install -d -m 0755 dist
-          install -m 0755 target/release/cybex-pulse dist/cybex-pulse-x86_64-linux
-          install -m 0755 target/release/cybex-pulse-bootstrap "$RUNNER_TEMP/cybex-pulse-bootstrap"
+          install -m 0755 target/release/cybex-james dist/cybex-james-x86_64-linux
+          install -m 0755 target/release/cybex-james-bootstrap "$RUNNER_TEMP/cybex-james-bootstrap"
+          test "$("$RUNNER_TEMP/cybex-james-bootstrap" required-manage-origin)" = \
+            "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN"
           staging="$RUNNER_TEMP/cybex-workstation-netboot-tree"
           install -d -m 0755 "$staging"
           for component in manifest.json bzImage initrd nix-store.squashfs; do
@@ -272,97 +309,242 @@ jobs:
           bundle="dist/${{ steps.workstation-source.outputs.bundle_name }}"
           nix-shell release/release-tools.nix --run \
             "tar --format=ustar --sort=name --numeric-owner --owner=0 --group=0 --mode=u=rw,go=r --mtime=@$source_epoch -C '$staging' -cf - bzImage initrd manifest.json nix-store.squashfs | zstd -19 --threads=1 --no-progress --no-dictID -o '$bundle'"
-          python3 tools/pulse-release.py inspect-workstation-netboot \
+          python3 tools/james-release.py inspect-workstation-netboot \
             --workstation-netboot-bundle "$bundle" \
             --workstation-netboot-tree "$staging" \
             --workstation-netboot-url "https://github.invalid/$GITHUB_REF_NAME/${{ steps.workstation-source.outputs.bundle_name }}" \
             --workstation-netboot-runtime-version "${{ steps.workstation-source.outputs.runtime_version }}" \
             --workstation-netboot-manage-revision "${{ steps.workstation-source.outputs.revision }}" \
             --workstation-netboot-nixpkgs-revision "${{ steps.workstation-source.outputs.nixpkgs_revision }}"
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           template_args=()
           for key in "${provisioning_keys[@]}"; do
             template_args+=(--provisioning-public-key "$key")
           done
           ubuntu-appliance/build-package-snapshot.sh \
             --output-dir dist \
-            --pulse-binary dist/cybex-pulse-x86_64-linux \
-            --bootstrap-binary "$RUNNER_TEMP/cybex-pulse-bootstrap" \
+            --james-binary dist/cybex-james-x86_64-linux \
+            --bootstrap-binary "$RUNNER_TEMP/cybex-james-bootstrap" \
             --version "$version" \
-            --ubuntu-snapshot-id "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" \
-            --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --ubuntu-snapshot-id "$CYBEX_JAMES_UBUNTU_SNAPSHOT_ID" \
+            --manage-source-dir manage-source \
+            --manage-source-revision "${{ steps.workstation-source.outputs.revision }}" \
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" \
+            --release-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY" \
+            "${template_args[@]}"
           ubuntu-appliance/build-template.sh \
             --output-dir dist \
             --cache-dir "$RUNNER_TEMP/ubuntu-base-cache" \
-            --bootstrap-binary "$RUNNER_TEMP/cybex-pulse-bootstrap" \
+            --bootstrap-binary "$RUNNER_TEMP/cybex-james-bootstrap" \
             --version "$version" \
-            --ubuntu-snapshot-id "$CYBEX_PULSE_UBUNTU_SNAPSHOT_ID" \
-            --release-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY" \
+            --ubuntu-snapshot-id "$CYBEX_JAMES_UBUNTU_SNAPSHOT_ID" \
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" \
+            --release-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY" \
             "${template_args[@]}"
           mv \
-            "dist/cybex-pulse-appliance-template-$version-x86_64-linux.json" \
-            "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json"
+            "dist/cybex-james-appliance-template-$version-x86_64-linux.json" \
+            "$RUNNER_TEMP/cybex-james-appliance-template-metadata.json"
           mv \
-            "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.json" \
-            "$RUNNER_TEMP/cybex-pulse-appliance-packages-metadata.json"
-          test "$(dist/cybex-pulse-x86_64-linux --version)" = "cybex-pulse $version"
+            "dist/cybex-james-appliance-packages-$version-x86_64-linux.json" \
+            "$RUNNER_TEMP/cybex-james-appliance-packages-metadata.json"
+          test "$(dist/cybex-james-x86_64-linux --version)" = "cybex-james $version"
 
-      - name: Fetch latest previously published compatibility asset
-        if: steps.release-candidate.outputs.reuse != 'true'
+      - name: Resolve and authenticate latest published predecessor
+        id: published-predecessor
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          releases="$RUNNER_TEMP/cybex-pulse-published-releases.json"
+          releases="$RUNNER_TEMP/cybex-james-published-releases.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases"
           previous="$(jq -c --arg current "$GITHUB_REF_NAME" \
-            '[.[][] | select(.draft == false and .tag_name != $current)]
-             | sort_by(.published_at // .created_at) | last // empty' \
+            '[.[][] | select(
+               .draft == false and .tag_name != $current
+               and ([.assets[]?.name] | index("cybex-james-release.json") != null)
+               and ([.assets[]?.name] | index("cybex-james-release-compatibility.json") != null)
+             )]
+             | sort_by([(.published_at // .created_at), .id]) | last // empty' \
             "$releases")"
+          candidate_predecessor="dist/cybex-james-build-predecessor.json"
           if [ -z "$previous" ]; then
+            # The renamed repository can contain historical Forge releases, but
+            # only a signed James asset pair establishes a James predecessor.
+            printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+            if [ "${{ steps.release-candidate.outputs.reuse }}" = true ]; then
+              test ! -e "$candidate_predecessor"
+            else
+              rm -f -- "$candidate_predecessor"
+            fi
             exit 0
           fi
+          printf 'exists=true\n' >> "$GITHUB_OUTPUT"
           release_id="$(jq -er '.id' <<<"$previous")"
+          tag_name="$(jq -er '.tag_name' <<<"$previous")"
           [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          assets="$RUNNER_TEMP/cybex-pulse-previous-release-assets.json"
+          [[ "$tag_name" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]
+          remote_tag_commit="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/$tag_name" --jq '.sha')"
+          [[ "$remote_tag_commit" =~ ^[0-9a-fA-F]{40}$ ]]
+          test "$(jq -er '.target_commitish' <<<"$previous")" = "$remote_tag_commit"
+          assets="$RUNNER_TEMP/cybex-james-previous-release-assets.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
             > "$assets"
-          asset_count="$(jq \
-            '[.[][] | select(.name == "cybex-pulse-release-compatibility.json")] | length' \
+          for required_asset in \
+            cybex-james-release-compatibility.json \
+            cybex-james-release.json
+          do
+            test "$(jq --arg name "$required_asset" \
+              '[.[][] | select(.name == $name)] | length' "$assets")" -eq 1
+          done
+          compatibility_asset_id="$(jq -er \
+            '.[][] | select(.name == "cybex-james-release-compatibility.json") | .id' \
             "$assets")"
-          if [ "$asset_count" -ne 1 ]; then
-            echo "::error::The latest previous release must contain exactly one signed compatibility asset"
-            exit 1
-          fi
-          asset_id="$(jq -er \
-            '.[][] | select(.name == "cybex-pulse-release-compatibility.json") | .id' \
+          manifest_asset_id="$(jq -er \
+            '.[][] | select(.name == "cybex-james-release.json") | .id' \
             "$assets")"
-          [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
-          previous_asset="$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json"
+          [[ "$compatibility_asset_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$manifest_asset_id" =~ ^[1-9][0-9]*$ ]]
+          previous_asset="$RUNNER_TEMP/cybex-james-previous-release-compatibility.json"
           gh api \
             -H 'Accept: application/octet-stream' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$previous_asset"
+            "repos/$GITHUB_REPOSITORY/releases/assets/$compatibility_asset_id" \
+            > "$previous_asset"
           test -f "$previous_asset" && test ! -L "$previous_asset"
           test "$(stat -c %s "$previous_asset")" -gt 0
           test "$(stat -c %s "$previous_asset")" -le 1048576
+          predecessor_manifest="$RUNNER_TEMP/cybex-james-previous-release.json"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$manifest_asset_id" \
+            > "$predecessor_manifest"
+          test -f "$predecessor_manifest" && test ! -L "$predecessor_manifest"
+          test "$(stat -c %s "$predecessor_manifest")" -gt 0
+          test "$(stat -c %s "$predecessor_manifest")" -le 4194304
+          snapshot_name="$(jq -er '.appliance_release_v1.cybex_repository_snapshot.url | split("/") | last' \
+            "$predecessor_manifest")"
+          [[ "$snapshot_name" =~ ^cybex-james-appliance-packages-[0-9A-Za-z.+-]+-x86_64-linux\.tar\.zst$ ]]
+          test "$(jq --arg name "$snapshot_name" \
+            '[.[][] | select(.name == $name)] | length' "$assets")" -eq 1
+          snapshot_asset_id="$(jq -er --arg name "$snapshot_name" \
+            '.[][] | select(.name == $name) | .id' "$assets")"
+          snapshot_asset_size="$(jq -er --arg name "$snapshot_name" \
+            '.[][] | select(.name == $name) | .size' "$assets")"
+          signed_snapshot_size="$(jq -er \
+            '.appliance_release_v1.cybex_repository_snapshot.size_bytes' \
+            "$predecessor_manifest")"
+          [[ "$snapshot_asset_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$snapshot_asset_size" =~ ^[1-9][0-9]*$ ]]
+          test "$snapshot_asset_size" -le $((4 * 1024 * 1024 * 1024))
+          test "$snapshot_asset_size" = "$signed_snapshot_size"
+          snapshot_asset_digest="$(jq -r --arg name "$snapshot_name" \
+            '.[][] | select(.name == $name) | .digest // ""' "$assets")"
+          if [[ -n "$snapshot_asset_digest" ]]; then
+            test "$snapshot_asset_digest" = \
+              "sha256:$(jq -er '.appliance_release_v1.cybex_repository_snapshot.sha256' \
+                "$predecessor_manifest")"
+          fi
+          predecessor_snapshot="$RUNNER_TEMP/$snapshot_name"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$snapshot_asset_id" \
+            > "$predecessor_snapshot"
+          predecessor_identity="$RUNNER_TEMP/cybex-james-published-predecessor.json"
+          python3 -B ubuntu-appliance/qualification/legacy-bridge-gate.py \
+            identify-predecessor \
+            --compatibility "$previous_asset" \
+            --manifest "$predecessor_manifest" \
+            --package-snapshot "$predecessor_snapshot" \
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY" \
+            --release-verifier tools/james-release.py \
+            --github-release-id "$release_id" \
+            --tag-name "$tag_name" \
+            --output "$predecessor_identity"
+          identity_sha256="$(sha256sum "$predecessor_identity" | awk '{print $1}')"
+          identity_b64="$(base64 --wrap=0 "$predecessor_identity")"
+          predecessor_release="$(jq -er '.release_id' "$predecessor_identity")"
+          predecessor_snapshot_id="$(jq -er '.ubuntu_snapshot_id' "$predecessor_identity")"
+          update_contract="$(jq -er '.update_contract' "$predecessor_identity")"
+          printf 'identity_b64=%s\nidentity_sha256=%s\nrelease_id=%s\nsnapshot_id=%s\nupdate_contract=%s\n' \
+            "$identity_b64" "$identity_sha256" "$predecessor_release" \
+            "$predecessor_snapshot_id" "$update_contract" >> "$GITHUB_OUTPUT"
+          if [ "${{ steps.release-candidate.outputs.reuse }}" = true ]; then
+            test -f "$candidate_predecessor" && test ! -L "$candidate_predecessor"
+            cmp --silent -- "$predecessor_identity" "$candidate_predecessor" || {
+              echo '::error::The latest signed predecessor changed; rebuild and requalify the candidate'
+              exit 1
+            }
+          else
+            install -m 0444 "$predecessor_identity" "$candidate_predecessor"
+          fi
+          rm -f -- "$predecessor_snapshot"
+
+      - name: Require a monotone legacy-update bridge before signing
+        if: steps.release-candidate.outputs.reuse != 'true' && steps.published-predecessor.outputs.update_contract == 'legacy_all_debs'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${{ steps.release-version.outputs.version }}"
+          : "${CYBEX_JAMES_LEGACY_BRIDGE_POLICY_B64:?configure the reviewed clean-predecessor bridge policy}"
+          : "${CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_B64:?configure exact legacy solver evidence captured on the qualified predecessor}"
+          [[ "$CYBEX_JAMES_LEGACY_BRIDGE_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          policy="$RUNNER_TEMP/cybex-james-legacy-bridge-policy.json"
+          evidence="$RUNNER_TEMP/cybex-james-legacy-bridge-evidence.json"
+          predecessor_identity="$RUNNER_TEMP/cybex-james-published-predecessor.json"
+          package_tree="$RUNNER_TEMP/cybex-james-legacy-bridge-packages"
+          cleanup_bridge_inputs() {
+            rm -rf -- "$package_tree"
+            rm -f -- "$policy" "$evidence"
+          }
+          trap cleanup_bridge_inputs EXIT
+          umask 077
+          printf '%s' "$CYBEX_JAMES_LEGACY_BRIDGE_POLICY_B64" | base64 --decode > "$policy"
+          printf '%s' "$CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_B64" | base64 --decode > "$evidence"
+          test "$(stat -c %s "$policy")" -le 131072
+          test "$(stat -c %s "$evidence")" -le 524288
+          test "$(sha256sum "$predecessor_identity" | awk '{print $1}')" = \
+            "${{ steps.published-predecessor.outputs.identity_sha256 }}"
+          install -d -m 0700 "$package_tree"
+          tar --use-compress-program=unzstd --extract \
+            --file "dist/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --directory "$package_tree"
+          chmod -R a-w "$package_tree"
+          python3 -B ubuntu-appliance/qualification/legacy-bridge-gate.py verify \
+            --packages-dir "$package_tree" \
+            --snapshot-bundle "dist/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --snapshot-metadata "$RUNNER_TEMP/cybex-james-appliance-packages-metadata.json" \
+            --policy "$policy" \
+            --policy-sha256 "$CYBEX_JAMES_LEGACY_BRIDGE_POLICY_SHA256" \
+            --predecessor-identity "$predecessor_identity" \
+            --evidence "$evidence" \
+            --evidence-sha256 "$CYBEX_JAMES_LEGACY_BRIDGE_EVIDENCE_SHA256" \
+            --candidate-release "$version" \
+            --candidate-snapshot "$CYBEX_JAMES_UBUNTU_SNAPSHOT_ID"
+          cleanup_bridge_inputs
+          trap - EXIT
 
       - name: Sign and self-verify release manifests
         if: steps.release-candidate.outputs.reuse != 'true'
         shell: bash
         env:
-          CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64 }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          CYBEX_JAMES_RELEASE_PRIVATE_KEY_B64: ${{ secrets.CYBEX_FORGE_RELEASE_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
           version="${{ steps.release-version.outputs.version }}"
-          key_path="$RUNNER_TEMP/cybex-pulse-release-key.pem"
+          key_path="$RUNNER_TEMP/cybex-james-release-key.pem"
           cleanup_key() {
             if [ -f "$key_path" ]; then
               shred -u -n 1 -z -- "$key_path" || rm -f -- "$key_path"
@@ -370,44 +552,46 @@ jobs:
           }
           trap cleanup_key EXIT
           umask 077
-          printf '%s' "$CYBEX_PULSE_RELEASE_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
+          printf '%s' "$CYBEX_JAMES_RELEASE_PRIVATE_KEY_B64" | base64 --decode > "$key_path"
           chmod 0600 "$key_path"
-          derived_public_key="$(python3 tools/pulse-release.py public-key --private-key "$key_path")"
-          test "$derived_public_key" = "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+          derived_public_key="$(python3 tools/james-release.py public-key --private-key "$key_path")"
+          test "$derived_public_key" = "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
           release_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases"
           artifact_base="$release_base/download/$GITHUB_REF_NAME"
           published_at="$(date -u -d "@$(git show -s --format=%ct HEAD)" +'%Y-%m-%dT%H:%M:%SZ')"
-          personalization_offset="$(jq -er '.personalization_offset' "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json")"
-          package_delivery="$(jq -er '.package_delivery' "$RUNNER_TEMP/cybex-pulse-appliance-template-metadata.json")"
+          personalization_offset="$(jq -er '.personalization_offset' "$RUNNER_TEMP/cybex-james-appliance-template-metadata.json")"
+          package_delivery="$(jq -er '.package_delivery' "$RUNNER_TEMP/cybex-james-appliance-template-metadata.json")"
           test "$package_delivery" = network-snapshot-v1
-          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_PULSE_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
+          mapfile -t provisioning_keys < <(printf '%s\n' "$CYBEX_JAMES_PROVISIONING_PUBLIC_KEYS" | sed '/^[[:space:]]*$/d')
           previous_compatibility_args=()
-          if [ -s "$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json" ]; then
+          if [ -s "$RUNNER_TEMP/cybex-james-previous-release-compatibility.json" ]; then
             previous_compatibility_args=(
-              --previous-compatibility "$RUNNER_TEMP/cybex-pulse-previous-release-compatibility.json"
+              --previous-compatibility "$RUNNER_TEMP/cybex-james-previous-release-compatibility.json"
             )
           fi
           template_args=(
-            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso"
-            --installer-iso-template-url "$artifact_base/cybex-pulse-appliance-template-$version-x86_64-linux.iso"
+            --installer-iso-template "dist/cybex-james-appliance-template-$version-x86_64-linux.iso"
+            --installer-iso-template-url "$artifact_base/cybex-james-appliance-template-$version-x86_64-linux.iso"
+            --installer-iso-template-metadata "$RUNNER_TEMP/cybex-james-appliance-template-metadata.json"
             --installer-iso-template-personalization-offset "$personalization_offset"
             --installer-iso-template-package-delivery "$package_delivery"
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN"
           )
           for key in "${provisioning_keys[@]}"; do
             template_args+=(--provisioning-public-key "$key")
           done
-          python3 tools/pulse-release.py manifest \
-            --artifact dist/cybex-pulse-x86_64-linux \
-            --artifact-url "$artifact_base/cybex-pulse-x86_64-linux" \
+          python3 tools/james-release.py manifest \
+            --artifact dist/cybex-james-x86_64-linux \
+            --artifact-url "$artifact_base/cybex-james-x86_64-linux" \
             --version "$version" \
             --private-key "$key_path" \
-            --output dist/cybex-pulse-release.json \
+            --output dist/cybex-james-release.json \
             --release-url "$release_base/tag/$GITHUB_REF_NAME" \
             --notes-url "$release_base/tag/$GITHUB_REF_NAME" \
             "${template_args[@]}" \
-            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --appliance-package-snapshot-metadata "$RUNNER_TEMP/cybex-pulse-appliance-packages-metadata.json" \
-            --appliance-package-snapshot-url "$artifact_base/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --appliance-package-snapshot "dist/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --appliance-package-snapshot-metadata "$RUNNER_TEMP/cybex-james-appliance-packages-metadata.json" \
+            --appliance-package-snapshot-url "$artifact_base/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
             --workstation-netboot-bundle "dist/${{ steps.workstation-source.outputs.bundle_name }}" \
             --workstation-netboot-tree "$RUNNER_TEMP/cybex-workstation-netboot-tree" \
             --workstation-netboot-url "$artifact_base/${{ steps.workstation-source.outputs.bundle_name }}" \
@@ -415,30 +599,35 @@ jobs:
             --workstation-netboot-manage-revision "${{ steps.workstation-source.outputs.revision }}" \
             --workstation-netboot-nixpkgs-revision "${{ steps.workstation-source.outputs.nixpkgs_revision }}" \
             --published-at "$published_at"
-          python3 tools/pulse-release.py compatibility \
-            --manifest dist/cybex-pulse-release.json \
-            --manifest-url "$artifact_base/cybex-pulse-release.json" \
+          python3 tools/james-release.py compatibility \
+            --manifest dist/cybex-james-release.json \
+            --manifest-url "$artifact_base/cybex-james-release.json" \
             --compatibility protocol/compatibility.json \
             --private-key "$key_path" \
             "${previous_compatibility_args[@]}" \
-            --output dist/cybex-pulse-release-compatibility.json
-          python3 tools/pulse-release.py verify-compatibility \
-            --asset dist/cybex-pulse-release-compatibility.json \
-            --manifest dist/cybex-pulse-release.json \
-            --manifest-url "$artifact_base/cybex-pulse-release.json" \
+            --output dist/cybex-james-release-compatibility.json
+          python3 tools/james-release.py verify-compatibility \
+            --asset dist/cybex-james-release-compatibility.json \
+            --manifest dist/cybex-james-release.json \
+            --manifest-url "$artifact_base/cybex-james-release.json" \
             --compatibility protocol/compatibility.json \
             --trusted-public-key "$derived_public_key"
           cleanup_key
           trap - EXIT
           (
             cd dist
-            sha256sum -b \
-              cybex-pulse-x86_64-linux \
-              "cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
-              "cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
-              "${{ steps.workstation-source.outputs.bundle_name }}" \
-              cybex-pulse-release.json \
-              cybex-pulse-release-compatibility.json > SHA256SUMS
+            checksum_files=(
+              cybex-james-x86_64-linux
+              "cybex-james-appliance-template-$version-x86_64-linux.iso"
+              "cybex-james-appliance-packages-$version-x86_64-linux.tar.zst"
+              "${{ steps.workstation-source.outputs.bundle_name }}"
+              cybex-james-release.json
+              cybex-james-release-compatibility.json
+            )
+            if [ "${{ steps.published-predecessor.outputs.exists }}" = true ]; then
+              checksum_files+=(cybex-james-build-predecessor.json)
+            fi
+            sha256sum -b "${checksum_files[@]}" > SHA256SUMS
           )
 
       - name: Upload the one release candidate artifact
@@ -447,7 +636,7 @@ jobs:
         # actions/upload-artifact v4.6.2; rotate only after reviewing the official tag.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT }}
+          name: ${{ env.CYBEX_JAMES_RELEASE_ARTIFACT }}
           path: dist/
           if-no-files-found: error
           compression-level: 0
@@ -469,12 +658,12 @@ jobs:
           action_digest="${action_digest#sha256:}"
           [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
           [[ "$action_digest" =~ ^[0-9a-f]{64}$ ]]
-          metadata="$RUNNER_TEMP/cybex-pulse-candidate-artifact.json"
+          metadata="$RUNNER_TEMP/cybex-james-candidate-artifact.json"
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$metadata"
-          test "$(jq -r '.name' "$metadata")" = "$CYBEX_PULSE_RELEASE_ARTIFACT"
+          test "$(jq -r '.name' "$metadata")" = "$CYBEX_JAMES_RELEASE_ARTIFACT"
           test "$(jq -r '.expired' "$metadata")" = "false"
           test "$(jq -r '.workflow_run.id' "$metadata")" = "$GITHUB_RUN_ID"
           test "$(jq -r '.workflow_run.head_sha' "$metadata")" = "${GITHUB_SHA,,}"
@@ -482,14 +671,14 @@ jobs:
           [[ "$api_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "${api_digest#sha256:}" = "$action_digest"
           printf 'artifact_id=%s\nartifact_digest=%s\nartifact_name=%s\n' \
-            "$artifact_id" "$action_digest" "$CYBEX_PULSE_RELEASE_ARTIFACT" \
+            "$artifact_id" "$action_digest" "$CYBEX_JAMES_RELEASE_ARTIFACT" \
             >> "$GITHUB_OUTPUT"
 
   release_qualify:
     name: Boot, install, adopt, and reboot exact candidate
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release_build
-    runs-on: [self-hosted, linux, x64, cybex-pulse-lab]
+    runs-on: [self-hosted, linux, x64, cybex-james-lab]
     environment: production-release-qualification
     outputs:
       artifact_id: ${{ steps.upload-qualification.outputs.artifact-id }}
@@ -498,13 +687,23 @@ jobs:
       contents: read
       actions: read
     env:
-      CYBEX_PULSE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
-      CYBEX_PULSE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
-      CYBEX_PULSE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
-      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
-      CYBEX_PULSE_QUALIFICATION_BRIDGE: ${{ vars.CYBEX_PULSE_QUALIFICATION_BRIDGE }}
-      CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS: ${{ vars.CYBEX_PULSE_QUALIFICATION_PACKAGE_BIND_ADDRESS }}
-      CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR: ${{ vars.CYBEX_PULSE_QUALIFICATION_MANAGEMENT_CIDR }}
+      CYBEX_JAMES_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
+      CYBEX_JAMES_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
+      CYBEX_JAMES_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
+      CYBEX_JAMES_BUILD_MANAGE_ORIGIN: ${{ needs.release_build.outputs.manage_origin }}
+      CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_JAMES_HAS_PREDECESSOR: ${{ needs.release_build.outputs.has_predecessor }}
+      CYBEX_JAMES_QUALIFICATION_BRIDGE: ${{ vars.CYBEX_JAMES_QUALIFICATION_BRIDGE }}
+      CYBEX_JAMES_QUALIFICATION_PACKAGE_BIND_ADDRESS: ${{ vars.CYBEX_JAMES_QUALIFICATION_PACKAGE_BIND_ADDRESS }}
+      CYBEX_JAMES_QUALIFICATION_MANAGEMENT_CIDR: ${{ vars.CYBEX_JAMES_QUALIFICATION_MANAGEMENT_CIDR }}
+      CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_B64: ${{ vars.CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_B64 }}
+      CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_SHA256: ${{ vars.CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_SHA256 }}
+      CYBEX_JAMES_UPDATE_PREDECESSOR_DEVICE_ID: ${{ vars.CYBEX_JAMES_UPDATE_PREDECESSOR_DEVICE_ID }}
+      CYBEX_JAMES_PUBLISHED_PREDECESSOR_IDENTITY_B64: ${{ needs.release_build.outputs.predecessor_identity_b64 }}
+      CYBEX_JAMES_PUBLISHED_PREDECESSOR_IDENTITY_SHA256: ${{ needs.release_build.outputs.predecessor_identity_sha256 }}
+      CYBEX_JAMES_PUBLISHED_PREDECESSOR_RELEASE: ${{ needs.release_build.outputs.predecessor_release }}
+      CYBEX_JAMES_PUBLISHED_PREDECESSOR_SNAPSHOT: ${{ needs.release_build.outputs.predecessor_snapshot }}
+      CYBEX_JAMES_PUBLISHED_PREDECESSOR_UPDATE_CONTRACT: ${{ needs.release_build.outputs.predecessor_update_contract }}
     steps:
       - name: Checkout exact qualification source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -515,7 +714,7 @@ jobs:
       - name: Download build-once candidate by immutable artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_JAMES_RELEASE_ARTIFACT_ID }}
           path: dist
           merge-multiple: true
 
@@ -523,57 +722,192 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$CYBEX_PULSE_RELEASE_VERSION"
+          version="$CYBEX_JAMES_RELEASE_VERSION"
           (cd dist && sha256sum --check --strict SHA256SUMS)
           tree="$RUNNER_TEMP/workstation-netboot-qualification"
           install -d -m 0700 "$tree"
           tar --use-compress-program=unzstd \
-            -xf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" -C "$tree"
-          python3 -B tools/pulse-release.py verify \
-            --manifest dist/cybex-pulse-release.json \
-            --artifact dist/cybex-pulse-x86_64-linux \
-            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
-            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --workstation-netboot-bundle "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+            -xf "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" -C "$tree"
+          python3 -B tools/james-release.py verify \
+            --manifest dist/cybex-james-release.json \
+            --artifact dist/cybex-james-x86_64-linux \
+            --installer-iso-template "dist/cybex-james-appliance-template-$version-x86_64-linux.iso" \
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" \
+            --appliance-package-snapshot "dist/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --workstation-netboot-bundle "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$tree" \
-            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME"
-          python3 -B tools/pulse-release.py verify-compatibility \
-            --asset dist/cybex-pulse-release-compatibility.json \
-            --manifest dist/cybex-pulse-release.json \
-            --manifest-url "$artifact_base/cybex-pulse-release.json" \
+          python3 -B tools/james-release.py verify-compatibility \
+            --asset dist/cybex-james-release-compatibility.json \
+            --manifest dist/cybex-james-release.json \
+            --manifest-url "$artifact_base/cybex-james-release.json" \
             --compatibility protocol/compatibility.json \
-            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
 
       - name: Exercise Secure Boot provisioned-media lifecycle
         shell: bash
         env:
-          CYBEX_PULSE_QUALIFICATION_TOKEN: ${{ secrets.CYBEX_PULSE_QUALIFICATION_TOKEN }}
-          CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN: ${{ vars.CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          CYBEX_JAMES_QUALIFICATION_TOKEN: ${{ secrets.CYBEX_FORGE_QUALIFICATION_TOKEN }}
+          CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN: ${{ vars.CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN }}
         run: |
           set -Eeuo pipefail
-          test -n "$CYBEX_PULSE_QUALIFICATION_TOKEN"
-          [[ "$CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN" =~ ^https://[^/]+$ ]]
-          token_file="$RUNNER_TEMP/pulse-qualification-token"
+          test -n "$CYBEX_JAMES_QUALIFICATION_TOKEN"
+          python3 -B tools/james-release.py validate-manage-origin \
+            --expected-manage-origin "$CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN"
+          test "$CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN" = \
+            "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN"
+          token_file="$RUNNER_TEMP/james-qualification-token"
           cleanup_token() { shred -u -n 1 -z -- "$token_file" 2>/dev/null || rm -f -- "$token_file"; }
           trap cleanup_token EXIT
           umask 077
-          printf '%s' "$CYBEX_PULSE_QUALIFICATION_TOKEN" > "$token_file"
+          printf '%s' "$CYBEX_JAMES_QUALIFICATION_TOKEN" > "$token_file"
           ubuntu-appliance/qualification/run-lifecycle.sh \
-            --template "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
-            --manifest dist/cybex-pulse-release.json \
-            --manage-origin "$CYBEX_PULSE_QUALIFICATION_MANAGE_ORIGIN" \
+            --template "dist/cybex-james-appliance-template-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.iso" \
+            --manifest dist/cybex-james-release.json \
+            --manage-origin "$CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN" \
             --token-file "$token_file" \
-            --output "$RUNNER_TEMP/cybex-pulse-ubuntu-qualification.json"
+            --output "$RUNNER_TEMP/cybex-james-ubuntu-qualification.json"
           cleanup_token
+          trap - EXIT
+
+      - name: Exercise real installed predecessor to exact candidate update
+        if: needs.release_build.outputs.has_predecessor == 'true'
+        shell: bash
+        env:
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          CYBEX_JAMES_QUALIFICATION_TOKEN: ${{ secrets.CYBEX_FORGE_QUALIFICATION_TOKEN }}
+          CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN: ${{ vars.CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN }}
+        run: |
+          set -Eeuo pipefail
+          : "${CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_B64:?configure the clean installed predecessor qualification evidence}"
+          [[ "$CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CYBEX_JAMES_UPDATE_PREDECESSOR_DEVICE_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:-]{0,255}$ ]]
+          predecessor_evidence="$RUNNER_TEMP/cybex-james-predecessor-qualification.json"
+          predecessor_identity="$RUNNER_TEMP/cybex-james-qualified-predecessor.json"
+          token_file="$RUNNER_TEMP/james-update-qualification-token"
+          package_server_pid=""
+          cleanup_update_inputs() {
+            if [[ -n "$package_server_pid" ]]; then
+              kill "$package_server_pid" 2>/dev/null || true
+              wait "$package_server_pid" 2>/dev/null || true
+            fi
+            shred -u -n 1 -z -- "$token_file" 2>/dev/null || rm -f -- "$token_file"
+            rm -f -- "$predecessor_evidence" \
+              "$RUNNER_TEMP/cybex-james-legacy-canonical-package.tar.zst"
+          }
+          trap cleanup_update_inputs EXIT
+          umask 077
+          printf '%s' "$CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_B64" | base64 --decode > "$predecessor_evidence"
+          printf '%s' "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_IDENTITY_B64" | base64 --decode > "$predecessor_identity"
+          cmp --silent -- \
+            dist/cybex-james-build-predecessor.json "$predecessor_identity"
+          test "$(stat -c %s "$predecessor_evidence")" -le 1048576
+          test "$(sha256sum "$predecessor_evidence" | awk '{print $1}')" = \
+            "$CYBEX_JAMES_UPDATE_PREDECESSOR_EVIDENCE_SHA256"
+          test "$(sha256sum "$predecessor_identity" | awk '{print $1}')" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_IDENTITY_SHA256"
+          test "$(jq -er '.release_id' "$predecessor_identity")" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_RELEASE"
+          test "$(jq -er '.ubuntu_snapshot_id' "$predecessor_identity")" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_SNAPSHOT"
+          test "$(jq -er '.update_contract' "$predecessor_identity")" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_UPDATE_CONTRACT"
+          test "$(jq -er '.release_version' "$predecessor_evidence")" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_RELEASE"
+          test "$(jq -er '.ubuntu_snapshot_id' "$predecessor_evidence")" = \
+            "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_SNAPSHOT"
+          test "$(jq -er '.release_version' "$predecessor_evidence")" != \
+            "$CYBEX_JAMES_RELEASE_VERSION"
+          package_snapshot="dist/cybex-james-appliance-packages-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.tar.zst"
+          package_filename="$(basename "$package_snapshot")"
+          signed_package_url="$(jq -er '.appliance_release_v1.cybex_repository_snapshot.url' \
+            dist/cybex-james-release.json)"
+          test "$(stat -c %s "$package_snapshot")" = \
+            "$(jq -er '.appliance_release_v1.cybex_repository_snapshot.size_bytes' dist/cybex-james-release.json)"
+          test "$(sha256sum "$package_snapshot" | awk '{print $1}')" = \
+            "$(jq -er '.appliance_release_v1.cybex_repository_snapshot.sha256' dist/cybex-james-release.json)"
+          qualification_package_transport_url=""
+          case "$CYBEX_JAMES_PUBLISHED_PREDECESSOR_UPDATE_CONTRACT" in
+            legacy_all_debs)
+              # Frozen dev11 rejects any extra managed-update field. Prove that
+              # the exact signed URL is already readable before asking Manage
+              # to deliver the canonical three-field request.
+              canonical_download="$RUNNER_TEMP/cybex-james-legacy-canonical-package.tar.zst"
+              curl --fail --silent --show-error --location \
+                --proto '=https' --proto-redir '=https' --tlsv1.2 \
+                --max-filesize "$((4 * 1024 * 1024 * 1024))" \
+                --output "$canonical_download" "$signed_package_url"
+              test "$(stat -c %s "$canonical_download")" = \
+                "$(stat -c %s "$package_snapshot")"
+              test "$(sha256sum "$canonical_download" | awk '{print $1}')" = \
+                "$(sha256sum "$package_snapshot" | awk '{print $1}')"
+              rm -f -- "$canonical_download"
+              qualification_package_transport_url="$signed_package_url"
+              ;;
+            selective_roots_v2)
+              mapfile -t bridge_addresses < <(
+                ip -4 -o address show dev "$CYBEX_JAMES_QUALIFICATION_BRIDGE" scope global \
+                  | awk '{sub(/\/.*/, "", $4); print $4}'
+              )
+              package_bind_address="$CYBEX_JAMES_QUALIFICATION_PACKAGE_BIND_ADDRESS"
+              if [[ -n "$package_bind_address" ]]; then
+                printf '%s\n' "${bridge_addresses[@]}" | grep -Fx "$package_bind_address" >/dev/null
+              else
+                for candidate_address in "${bridge_addresses[@]}"; do
+                  if python3 -B -c \
+                    'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); raise SystemExit(not (a.version == 4 and a.is_private and not a.is_loopback))' \
+                    "$candidate_address"
+                  then
+                    package_bind_address="$candidate_address"
+                    break
+                  fi
+                done
+              fi
+              test -n "$package_bind_address"
+              package_port_file="$RUNNER_TEMP/james-update-package-server.port"
+              python3 -B ubuntu-appliance/qualification/serve-package-snapshot.py \
+                --bind "$package_bind_address" --file "$package_snapshot" \
+                --port-file "$package_port_file" &
+              package_server_pid=$!
+              for _attempt in $(seq 1 100); do
+                [[ -s "$package_port_file" ]] && break
+                kill -0 "$package_server_pid"
+                sleep 0.1
+              done
+              package_port="$(tr -d '\r\n' < "$package_port_file")"
+              [[ "$package_port" =~ ^[1-9][0-9]{0,4}$ ]] && ((package_port <= 65535))
+              qualification_package_transport_url="http://$package_bind_address:$package_port/$package_filename"
+              curl --fail --silent --show-error --proto '=http' --head \
+                "$qualification_package_transport_url" >/dev/null
+              ;;
+            *)
+              echo 'error: authenticated predecessor updater contract is unsupported' >&2
+              exit 1
+              ;;
+          esac
+          printf '%s' "$CYBEX_JAMES_QUALIFICATION_TOKEN" > "$token_file"
+          ubuntu-appliance/qualification/run-update-lifecycle.sh \
+            --predecessor-evidence "$predecessor_evidence" \
+            --candidate-manifest dist/cybex-james-release.json \
+            --qualification-package-transport-url "$qualification_package_transport_url" \
+            --manage-origin "$CYBEX_JAMES_QUALIFICATION_MANAGE_ORIGIN" \
+            --token-file "$token_file" \
+            --server-device-id "$CYBEX_JAMES_UPDATE_PREDECESSOR_DEVICE_ID" \
+            --output "$RUNNER_TEMP/cybex-james-ubuntu-update-qualification.json"
+          cleanup_update_inputs
           trap - EXIT
 
       - name: Upload bounded qualification evidence
         id: upload-qualification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cybex-pulse-qualified-${{ github.run_id }}
-          path: ${{ runner.temp }}/cybex-pulse-ubuntu-qualification.json
+          name: cybex-james-qualified-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/cybex-james-ubuntu-qualification.json
+            ${{ runner.temp }}/cybex-james-ubuntu-update-qualification.json
+            ${{ runner.temp }}/cybex-james-qualified-predecessor.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
@@ -588,7 +922,7 @@ jobs:
       # Predecessor verification and immutable publication are one
       # repository-wide critical section. Per-tag locking permits two tags to
       # sign from the same predecessor and publish in reverse order.
-      group: pulse-release-publish
+      group: james-release-publish
       cancel-in-progress: false
     permissions:
       contents: write
@@ -597,14 +931,16 @@ jobs:
       attestations: write
       artifact-metadata: write
     env:
-      CYBEX_PULSE_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
-      CYBEX_PULSE_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
-      CYBEX_PULSE_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
-      CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
-      CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID: ${{ needs.release_qualify.outputs.artifact_id }}
-      CYBEX_PULSE_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.release_qualify.outputs.artifact_digest }}
-      CYBEX_PULSE_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
-      CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_JAMES_RELEASE_VERSION: ${{ needs.release_build.outputs.version }}
+      CYBEX_JAMES_RELEASE_ARTIFACT: ${{ needs.release_build.outputs.artifact_name }}
+      CYBEX_JAMES_RELEASE_ARTIFACT_ID: ${{ needs.release_build.outputs.artifact_id }}
+      CYBEX_JAMES_RELEASE_ARTIFACT_DIGEST: ${{ needs.release_build.outputs.artifact_digest }}
+      CYBEX_JAMES_QUALIFICATION_ARTIFACT_ID: ${{ needs.release_qualify.outputs.artifact_id }}
+      CYBEX_JAMES_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.release_qualify.outputs.artifact_digest }}
+      CYBEX_JAMES_WORKSTATION_BUNDLE_NAME: ${{ needs.release_build.outputs.workstation_bundle_name }}
+      CYBEX_JAMES_BUILD_MANAGE_ORIGIN: ${{ needs.release_build.outputs.manage_origin }}
+      CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY: ${{ vars.CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY }}
+      CYBEX_JAMES_HAS_PREDECESSOR: ${{ needs.release_build.outputs.has_predecessor }}
     steps:
       - name: Checkout exact tag for independent verification
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -618,7 +954,7 @@ jobs:
           set -Eeuo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA,,}"
           test -z "$(git status --porcelain)"
-          test "v$CYBEX_PULSE_RELEASE_VERSION" = "$GITHUB_REF_NAME"
+          test "v$CYBEX_JAMES_RELEASE_VERSION" = "$GITHUB_REF_NAME"
 
       - name: Install independent archive verifier
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
@@ -648,27 +984,27 @@ jobs:
             test "$(jq -r '.digest' "$metadata")" = "sha256:$expected_digest"
           }
           validate_artifact \
-            "$CYBEX_PULSE_RELEASE_ARTIFACT_ID" \
-            "$CYBEX_PULSE_RELEASE_ARTIFACT" \
-            "$CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST" \
-            "$RUNNER_TEMP/cybex-pulse-candidate-artifact.json"
+            "$CYBEX_JAMES_RELEASE_ARTIFACT_ID" \
+            "$CYBEX_JAMES_RELEASE_ARTIFACT" \
+            "$CYBEX_JAMES_RELEASE_ARTIFACT_DIGEST" \
+            "$RUNNER_TEMP/cybex-james-candidate-artifact.json"
           validate_artifact \
-            "$CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID" \
-            "cybex-pulse-qualified-$GITHUB_RUN_ID" \
-            "$CYBEX_PULSE_QUALIFICATION_ARTIFACT_DIGEST" \
-            "$RUNNER_TEMP/cybex-pulse-qualification-artifact.json"
+            "$CYBEX_JAMES_QUALIFICATION_ARTIFACT_ID" \
+            "cybex-james-qualified-$GITHUB_RUN_ID" \
+            "$CYBEX_JAMES_QUALIFICATION_ARTIFACT_DIGEST" \
+            "$RUNNER_TEMP/cybex-james-qualification-artifact.json"
 
       - name: Download original release candidate independently by artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_PULSE_RELEASE_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_JAMES_RELEASE_ARTIFACT_ID }}
           path: dist
           merge-multiple: true
 
       - name: Download exact-candidate qualification evidence by artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: ${{ env.CYBEX_PULSE_QUALIFICATION_ARTIFACT_ID }}
+          artifact-ids: ${{ env.CYBEX_JAMES_QUALIFICATION_ARTIFACT_ID }}
           path: qualification
           merge-multiple: true
 
@@ -676,18 +1012,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$CYBEX_PULSE_RELEASE_VERSION"
-          expected="$RUNNER_TEMP/cybex-pulse-publish-expected"
-          actual="$RUNNER_TEMP/cybex-pulse-publish-actual"
-          printf '%s\n' \
-            SHA256SUMS \
-            cybex-pulse-release-compatibility.json \
-            cybex-pulse-release.json \
-            cybex-pulse-x86_64-linux \
-            "cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
-            "cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
-            "$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
-            | LC_ALL=C sort > "$expected"
+          version="$CYBEX_JAMES_RELEASE_VERSION"
+          expected="$RUNNER_TEMP/cybex-james-publish-expected"
+          actual="$RUNNER_TEMP/cybex-james-publish-actual"
+          expected_names=(
+            SHA256SUMS
+            cybex-james-release-compatibility.json
+            cybex-james-release.json
+            cybex-james-x86_64-linux
+            "cybex-james-appliance-template-$version-x86_64-linux.iso"
+            "cybex-james-appliance-packages-$version-x86_64-linux.tar.zst"
+            "$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME"
+          )
+          case "$CYBEX_JAMES_HAS_PREDECESSOR" in
+            true) expected_names+=(cybex-james-build-predecessor.json) ;;
+            false) test ! -e dist/cybex-james-build-predecessor.json ;;
+            *) echo 'error: invalid James predecessor state' >&2; exit 1 ;;
+          esac
+          printf '%s\n' "${expected_names[@]}" | LC_ALL=C sort > "$expected"
           find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$actual"
           diff -u "$expected" "$actual"
           while IFS= read -r name; do
@@ -699,35 +1041,38 @@ jobs:
           printf '%s\n' bzImage initrd manifest.json nix-store.squashfs \
             > "$RUNNER_TEMP/cybex-workstation-archive-expected"
           tar --use-compress-program=unzstd \
-            -tf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+            -tf "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" \
             > "$RUNNER_TEMP/cybex-workstation-archive-actual"
           diff -u \
             "$RUNNER_TEMP/cybex-workstation-archive-expected" \
             "$RUNNER_TEMP/cybex-workstation-archive-actual"
           test "$(tar --use-compress-program=unzstd -tvf \
-            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" | awk '$1 !~ /^-rw-r--r--$/ {bad=1} END {print bad+0}')" = 0
+            "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" | awk '$1 !~ /^-rw-r--r--$/ {bad=1} END {print bad+0}')" = 0
           install -d -m 0700 "$RUNNER_TEMP/cybex-workstation-netboot-verify"
           tar --use-compress-program=unzstd \
-            -xf "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+            -xf "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" \
             -C "$RUNNER_TEMP/cybex-workstation-netboot-verify"
-          python3 -B tools/pulse-release.py verify \
-            --manifest dist/cybex-pulse-release.json \
-            --artifact dist/cybex-pulse-x86_64-linux \
-            --installer-iso-template "dist/cybex-pulse-appliance-template-$version-x86_64-linux.iso" \
-            --appliance-package-snapshot "dist/cybex-pulse-appliance-packages-$version-x86_64-linux.tar.zst" \
-            --workstation-netboot-bundle "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
+          python3 -B tools/james-release.py verify \
+            --manifest dist/cybex-james-release.json \
+            --artifact dist/cybex-james-x86_64-linux \
+            --installer-iso-template "dist/cybex-james-appliance-template-$version-x86_64-linux.iso" \
+            --expected-manage-origin "$CYBEX_JAMES_BUILD_MANAGE_ORIGIN" \
+            --appliance-package-snapshot "dist/cybex-james-appliance-packages-$version-x86_64-linux.tar.zst" \
+            --workstation-netboot-bundle "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" \
             --workstation-netboot-tree "$RUNNER_TEMP/cybex-workstation-netboot-verify" \
-            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
           artifact_base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME"
-          python3 -B tools/pulse-release.py verify-compatibility \
-            --asset dist/cybex-pulse-release-compatibility.json \
-            --manifest dist/cybex-pulse-release.json \
-            --manifest-url "$artifact_base/cybex-pulse-release.json" \
+          python3 -B tools/james-release.py verify-compatibility \
+            --asset dist/cybex-james-release-compatibility.json \
+            --manifest dist/cybex-james-release.json \
+            --manifest-url "$artifact_base/cybex-james-release.json" \
             --compatibility protocol/compatibility.json \
-            --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
-          evidence=qualification/cybex-pulse-ubuntu-qualification.json
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
+          evidence=qualification/cybex-james-ubuntu-qualification.json
+          update_evidence=qualification/cybex-james-ubuntu-update-qualification.json
+          predecessor_identity=qualification/cybex-james-qualified-predecessor.json
           test -f "$evidence" && test ! -L "$evidence"
-          test "$(jq -er '.schema' "$evidence")" = cybex.pulse.ubuntu-appliance-qualification.v1
+          test "$(jq -er '.schema' "$evidence")" = cybex.james.ubuntu-appliance-qualification.v1
           test "$(jq -er '.ok' "$evidence")" = true
           test "$(jq -er '.final_state' "$evidence")" = ready
           test "$(jq -er '.secure_boot' "$evidence")" = true
@@ -735,21 +1080,60 @@ jobs:
           test "$(jq -er '.identity_rotation' "$evidence")" = true
           test "$(jq -er '.installed_media_left_attached' "$evidence")" = true
           test "$(jq -er '.appliance_projection_healthy' "$evidence")" = true
+          test "$(jq -er '.workstation_runtime_operational' "$evidence")" = true
+          test "$(jq -er '.workstation_runtime_converged' "$evidence")" = true
+          test "$(jq -er '.builtin_blueprints_source_free' "$evidence")" = true
+          test "$(jq -er '.builtin_blueprints_deliverable' "$evidence")" = true
+          test "$(jq -er '.builtin_blueprints_qualified_on_new_james' "$evidence")" = true
           test "$(jq -er '.two_phase_network_acknowledged' "$evidence")" = true
           test "$(jq -er '.exact_principal_ssh_certificate' "$evidence")" = true
+          test "$(jq -er '.release_version' "$evidence")" = "$version"
+          test "$(jq -er '.ubuntu_snapshot_id' "$evidence")" = \
+            "$(jq -er '.appliance_release_v1.ubuntu_snapshot_id' dist/cybex-james-release.json)"
+          test "$(jq -er '.root_generation | tostring' "$evidence")" = 0
           test "$(jq -er '.template_sha256' "$evidence")" = \
-            "$(jq -er '.installer_iso_template_v2.template_sha256' dist/cybex-pulse-release.json)"
-          install -m 0700 dist/cybex-pulse-x86_64-linux "$RUNNER_TEMP/cybex-pulse-release-verify"
-          test "$("$RUNNER_TEMP/cybex-pulse-release-verify" --version)" = "cybex-pulse $version"
-          rm -f -- "$RUNNER_TEMP/cybex-pulse-release-verify"
+            "$(jq -er '.installer_iso_template_v2.template_sha256' dist/cybex-james-release.json)"
+          if [ "$CYBEX_JAMES_HAS_PREDECESSOR" = true ]; then
+            test -f "$update_evidence" && test ! -L "$update_evidence"
+            test -f "$predecessor_identity" && test ! -L "$predecessor_identity"
+            test "$(sha256sum "$predecessor_identity" | awk '{print $1}')" = \
+              "${{ needs.release_build.outputs.predecessor_identity_sha256 }}"
+            test "$(jq -er '.release_id' "$predecessor_identity")" = \
+              "${{ needs.release_build.outputs.predecessor_release }}"
+            test "$(jq -er '.ubuntu_snapshot_id' "$predecessor_identity")" = \
+              "${{ needs.release_build.outputs.predecessor_snapshot }}"
+            test "$(jq -er '.schema' "$update_evidence")" = \
+              cybex.james.ubuntu-appliance-update-qualification.v1
+            test "$(jq -er '.ok' "$update_evidence")" = true
+            test "$(jq -er '.candidate_release' "$update_evidence")" = "$version"
+            test "$(jq -er '.predecessor_release' "$update_evidence")" = \
+              "$(jq -er '.release_id' "$predecessor_identity")"
+            test "$(jq -er '.predecessor_ubuntu_snapshot_id' "$update_evidence")" = \
+              "$(jq -er '.ubuntu_snapshot_id' "$predecessor_identity")"
+            test "$(jq -er '.candidate_manifest_sha256' "$update_evidence")" = \
+              "$(sha256sum dist/cybex-james-release.json | awk '{print $1}')"
+            test "$(jq -er '.real_update' "$update_evidence")" = true
+            test "$(jq -er '.reboot_observed' "$update_evidence")" = true
+            test "$(jq -er '.release_activated' "$update_evidence")" = true
+            test "$(jq -er '.appliance_projection_healthy' "$update_evidence")" = true
+            test "$(jq -er '.secure_boot' "$update_evidence")" = true
+            test "$(jq -er '.final_state' "$update_evidence")" = ready
+          else
+            test ! -e "$update_evidence"
+            test ! -e "$predecessor_identity"
+          fi
+          install -m 0700 dist/cybex-james-x86_64-linux "$RUNNER_TEMP/cybex-james-release-verify"
+          test "$("$RUNNER_TEMP/cybex-james-release-verify" --version)" = "cybex-james $version"
+          rm -f -- "$RUNNER_TEMP/cybex-james-release-verify"
 
       - name: Require repository immutable-release policy
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.CYBEX_PULSE_RELEASE_POLICY_TOKEN }}
+          # The sealed secret keeps its pre-rename storage key until it is rotated.
+          GH_TOKEN: ${{ secrets.CYBEX_FORGE_RELEASE_POLICY_TOKEN }}
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?configure CYBEX_PULSE_RELEASE_POLICY_TOKEN with repository Administration read permission}"
+          : "${GH_TOKEN:?configure CYBEX_JAMES_RELEASE_POLICY_TOKEN with repository Administration read permission}"
           immutable_enabled="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -761,14 +1145,23 @@ jobs:
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: |
-            dist/cybex-pulse-x86_64-linux
-            dist/cybex-pulse-appliance-template-${{ env.CYBEX_PULSE_RELEASE_VERSION }}-x86_64-linux.iso
-            dist/cybex-pulse-appliance-packages-${{ env.CYBEX_PULSE_RELEASE_VERSION }}-x86_64-linux.tar.zst
-            dist/${{ env.CYBEX_PULSE_WORKSTATION_BUNDLE_NAME }}
-            dist/cybex-pulse-release.json
-            dist/cybex-pulse-release-compatibility.json
+            dist/cybex-james-x86_64-linux
+            dist/cybex-james-appliance-template-${{ env.CYBEX_JAMES_RELEASE_VERSION }}-x86_64-linux.iso
+            dist/cybex-james-appliance-packages-${{ env.CYBEX_JAMES_RELEASE_VERSION }}-x86_64-linux.tar.zst
+            dist/${{ env.CYBEX_JAMES_WORKSTATION_BUNDLE_NAME }}
+            dist/cybex-james-release.json
+            dist/cybex-james-release-compatibility.json
             dist/SHA256SUMS
-            qualification/cybex-pulse-ubuntu-qualification.json
+            qualification/cybex-james-ubuntu-qualification.json
+
+      - name: Attest exact predecessor qualification
+        if: needs.release_build.outputs.has_predecessor == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            dist/cybex-james-build-predecessor.json
+            qualification/cybex-james-ubuntu-update-qualification.json
+            qualification/cybex-james-qualified-predecessor.json
 
       - name: Remove only a stale draft for this exact tag
         env:
@@ -784,13 +1177,13 @@ jobs:
           test "${remote_tag_commit,,}" = "${GITHUB_SHA,,}"
           owner_run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           owner_run_marker="Cybex-Release-Workflow: $owner_run"
-          owner_artifact_marker="Cybex-Candidate-Artifact-ID: $CYBEX_PULSE_RELEASE_ARTIFACT_ID"
-          owner_digest_marker="Cybex-Candidate-Artifact-SHA256: $CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST"
+          owner_artifact_marker="Cybex-Candidate-Artifact-ID: $CYBEX_JAMES_RELEASE_ARTIFACT_ID"
+          owner_digest_marker="Cybex-Candidate-Artifact-SHA256: $CYBEX_JAMES_RELEASE_ARTIFACT_DIGEST"
           expected_body="$(printf '%s\n%s\n%s' \
             "$owner_run_marker" \
             "$owner_artifact_marker" \
             "$owner_digest_marker")"
-          existing="$RUNNER_TEMP/cybex-pulse-existing-release.json"
+          existing="$RUNNER_TEMP/cybex-james-existing-release.json"
           if gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -800,33 +1193,36 @@ jobs:
             test "$(jq -r '.tag_name' "$existing")" = "$GITHUB_REF_NAME"
             test "$(jq -r '.draft' "$existing")" = "true"
             test "$(jq -r '.immutable' "$existing")" = "false"
-            test "$(jq -r '.name // ""' "$existing")" = "Cybex Pulse $GITHUB_REF_NAME"
+            test "$(jq -r '.name // ""' "$existing")" = "Cybex James $GITHUB_REF_NAME"
             test "$(jq -r '.body // ""' "$existing")" = "$expected_body"
             stale_id="$(jq -r '.id' "$existing")"
             [[ "$stale_id" =~ ^[1-9][0-9]*$ ]]
-            stale_assets="$RUNNER_TEMP/cybex-pulse-existing-release-assets.json"
+            stale_assets="$RUNNER_TEMP/cybex-james-existing-release-assets.json"
             gh api \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/$GITHUB_REPOSITORY/releases/$stale_id/assets?per_page=100" \
               > "$stale_assets"
             jq -e \
-              --arg binary "cybex-pulse-x86_64-linux" \
-              --arg template "cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
-              --arg packages "cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-              --arg netboot "$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
-              --arg manifest "cybex-pulse-release.json" \
-              --arg compatibility "cybex-pulse-release-compatibility.json" \
+              --arg binary "cybex-james-x86_64-linux" \
+              --arg template "cybex-james-appliance-template-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.iso" \
+              --arg packages "cybex-james-appliance-packages-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.tar.zst" \
+              --arg netboot "$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME" \
+              --arg manifest "cybex-james-release.json" \
+              --arg compatibility "cybex-james-release-compatibility.json" \
               --arg checksums "SHA256SUMS" \
-              --arg qualification "cybex-pulse-ubuntu-qualification.json" \
+              --arg qualification "cybex-james-ubuntu-qualification.json" \
+              --arg update_qualification "cybex-james-ubuntu-update-qualification.json" \
+              --arg predecessor_identity "cybex-james-build-predecessor.json" \
               'type == "array"
-               and length <= 8
+               and length <= 10
                and ((map(.name) | length) == (map(.name) | unique | length))
                and all(.[].name;
                  . == $binary or . == $manifest
                  or . == $compatibility
                  or . == $template or . == $packages or . == $netboot or . == $checksums
-                 or . == $qualification)' \
+                 or . == $qualification or . == $update_qualification
+                 or . == $predecessor_identity)' \
               "$stale_assets" >/dev/null
             gh api --method DELETE \
               -H 'Accept: application/vnd.github+json' \
@@ -843,21 +1239,29 @@ jobs:
           owner_run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           release_markers="$(printf '%s\n%s\n%s' \
             "Cybex-Release-Workflow: $owner_run" \
-            "Cybex-Candidate-Artifact-ID: $CYBEX_PULSE_RELEASE_ARTIFACT_ID" \
-            "Cybex-Candidate-Artifact-SHA256: $CYBEX_PULSE_RELEASE_ARTIFACT_DIGEST")"
+            "Cybex-Candidate-Artifact-ID: $CYBEX_JAMES_RELEASE_ARTIFACT_ID" \
+            "Cybex-Candidate-Artifact-SHA256: $CYBEX_JAMES_RELEASE_ARTIFACT_DIGEST")"
           gh release create "$GITHUB_REF_NAME" \
             --draft --verify-tag --target "$GITHUB_SHA" \
             --notes "$release_markers" \
-            --title "Cybex Pulse $GITHUB_REF_NAME"
-          gh release upload "$GITHUB_REF_NAME" \
-            dist/cybex-pulse-x86_64-linux \
-            "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
-            "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
-            dist/cybex-pulse-release.json \
-            dist/cybex-pulse-release-compatibility.json \
-            dist/SHA256SUMS \
-            qualification/cybex-pulse-ubuntu-qualification.json
+            --title "Cybex James $GITHUB_REF_NAME"
+          release_assets=(
+            dist/cybex-james-x86_64-linux
+            "dist/cybex-james-appliance-template-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.iso"
+            "dist/cybex-james-appliance-packages-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.tar.zst"
+            "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME"
+            dist/cybex-james-release.json
+            dist/cybex-james-release-compatibility.json
+            dist/SHA256SUMS
+            qualification/cybex-james-ubuntu-qualification.json
+          )
+          if [ "$CYBEX_JAMES_HAS_PREDECESSOR" = true ]; then
+            release_assets+=(
+              dist/cybex-james-build-predecessor.json
+              qualification/cybex-james-ubuntu-update-qualification.json
+            )
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${release_assets[@]}"
 
       - name: Verify remote draft assets and publish immutably
         env:
@@ -870,19 +1274,28 @@ jobs:
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
             --jq '.id')"
-          remote_assets="$RUNNER_TEMP/cybex-pulse-release-assets.json"
+          remote_assets="$RUNNER_TEMP/cybex-james-release-assets.json"
+          release_asset_paths=(
+            dist/cybex-james-x86_64-linux
+            "dist/cybex-james-appliance-template-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.iso"
+            "dist/cybex-james-appliance-packages-$CYBEX_JAMES_RELEASE_VERSION-x86_64-linux.tar.zst"
+            "dist/$CYBEX_JAMES_WORKSTATION_BUNDLE_NAME"
+            dist/cybex-james-release.json
+            dist/cybex-james-release-compatibility.json
+            dist/SHA256SUMS
+            qualification/cybex-james-ubuntu-qualification.json
+          )
+          if [ "$CYBEX_JAMES_HAS_PREDECESSOR" = true ]; then
+            release_asset_paths+=(
+              dist/cybex-james-build-predecessor.json
+              qualification/cybex-james-ubuntu-update-qualification.json
+            )
+          fi
+          expected_asset_count="${#release_asset_paths[@]}"
           remote_assets_match() {
-            jq -e 'length == 8' "$remote_assets" >/dev/null || return 1
-            for path in \
-              dist/cybex-pulse-x86_64-linux \
-              "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
-              "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-              "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
-              dist/cybex-pulse-release.json \
-              dist/cybex-pulse-release-compatibility.json \
-              dist/SHA256SUMS \
-              qualification/cybex-pulse-ubuntu-qualification.json
-              do
+            jq -e --argjson count "$expected_asset_count" 'length == $count' \
+              "$remote_assets" >/dev/null || return 1
+            for path in "${release_asset_paths[@]}"; do
               name="$(basename "$path")"
               digest="sha256:$(sha256sum "$path" | cut -d ' ' -f 1)"
               size="$(stat -c %s "$path")"
@@ -909,44 +1322,100 @@ jobs:
           done
           test "$matched" = "true"
           test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = "true"
-          releases="$RUNNER_TEMP/cybex-pulse-publish-predecessors.json"
+          releases="$RUNNER_TEMP/cybex-james-publish-predecessors.json"
           gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases"
           previous="$(jq -c --arg current "$GITHUB_REF_NAME" \
-            '[.[][] | select(.draft == false and .tag_name != $current)]
-             | sort_by(.published_at // .created_at) | last // empty' \
+            '[.[][] | select(
+               .draft == false and .tag_name != $current
+               and ([.assets[]?.name] | index("cybex-james-release.json") != null)
+               and ([.assets[]?.name] | index("cybex-james-release-compatibility.json") != null)
+             )]
+             | sort_by([(.published_at // .created_at), .id]) | last // empty' \
             "$releases")"
-          if [ -n "$previous" ]; then
-            previous_release_id="$(jq -er '.id' <<<"$previous")"
-            [[ "$previous_release_id" =~ ^[1-9][0-9]*$ ]]
-            previous_assets="$RUNNER_TEMP/cybex-pulse-publish-predecessor-assets.json"
-            gh api --paginate --slurp \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "repos/$GITHUB_REPOSITORY/releases/$previous_release_id/assets?per_page=100" \
-              > "$previous_assets"
-            test "$(jq \
-              '[.[][] | select(.name == "cybex-pulse-release-compatibility.json")] | length' \
-              "$previous_assets")" -eq 1
-            previous_asset_id="$(jq -er \
-              '.[][] | select(.name == "cybex-pulse-release-compatibility.json") | .id' \
-              "$previous_assets")"
-            [[ "$previous_asset_id" =~ ^[1-9][0-9]*$ ]]
-            previous_compatibility="$RUNNER_TEMP/cybex-pulse-publish-predecessor.json"
-            gh api \
-              -H 'Accept: application/octet-stream' \
-              -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "repos/$GITHUB_REPOSITORY/releases/assets/$previous_asset_id" \
-              > "$previous_compatibility"
-            test -f "$previous_compatibility" && test ! -L "$previous_compatibility"
-            test "$(stat -c %s "$previous_compatibility")" -gt 0
-            test "$(stat -c %s "$previous_compatibility")" -le 1048576
-            python3 -B tools/pulse-release.py verify-successor \
-              --previous-compatibility "$previous_compatibility" \
-              --current-compatibility dist/cybex-pulse-release-compatibility.json \
-              --trusted-public-key "$CYBEX_PULSE_UPDATE_TRUSTED_PUBLIC_KEY"
+          if [ "$CYBEX_JAMES_HAS_PREDECESSOR" = true ]; then
+          test -n "$previous"
+          previous_release_id="$(jq -er '.id' <<<"$previous")"
+          previous_tag_name="$(jq -er '.tag_name' <<<"$previous")"
+          [[ "$previous_release_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$previous_tag_name" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]
+          previous_assets="$RUNNER_TEMP/cybex-james-publish-predecessor-assets.json"
+          gh api --paginate --slurp \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$previous_release_id/assets?per_page=100" \
+            > "$previous_assets"
+          for required_asset in \
+            cybex-james-release-compatibility.json \
+            cybex-james-release.json
+          do
+            test "$(jq --arg name "$required_asset" \
+              '[.[][] | select(.name == $name)] | length' "$previous_assets")" -eq 1
+          done
+          previous_compatibility_id="$(jq -er \
+            '.[][] | select(.name == "cybex-james-release-compatibility.json") | .id' \
+            "$previous_assets")"
+          previous_manifest_id="$(jq -er \
+            '.[][] | select(.name == "cybex-james-release.json") | .id' \
+            "$previous_assets")"
+          [[ "$previous_compatibility_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$previous_manifest_id" =~ ^[1-9][0-9]*$ ]]
+          previous_compatibility="$RUNNER_TEMP/cybex-james-publish-predecessor-compatibility.json"
+          previous_manifest="$RUNNER_TEMP/cybex-james-publish-predecessor-manifest.json"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$previous_compatibility_id" \
+            > "$previous_compatibility"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$previous_manifest_id" \
+            > "$previous_manifest"
+          previous_snapshot_name="$(jq -er \
+            '.appliance_release_v1.cybex_repository_snapshot.url | split("/") | last' \
+            "$previous_manifest")"
+          [[ "$previous_snapshot_name" =~ ^cybex-james-appliance-packages-[0-9A-Za-z.+-]+-x86_64-linux\.tar\.zst$ ]]
+          test "$(jq --arg name "$previous_snapshot_name" \
+            '[.[][] | select(.name == $name)] | length' "$previous_assets")" -eq 1
+          previous_snapshot_size="$(jq -er --arg name "$previous_snapshot_name" \
+            '.[][] | select(.name == $name) | .size' "$previous_assets")"
+          previous_snapshot_digest="$(jq -er --arg name "$previous_snapshot_name" \
+            '.[][] | select(.name == $name) | .digest' "$previous_assets")"
+          [[ "$previous_snapshot_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$previous_snapshot_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$previous_snapshot_size" = "$(jq -er \
+            '.appliance_release_v1.cybex_repository_snapshot.size_bytes' \
+            "$previous_manifest")"
+          test "${previous_snapshot_digest#sha256:}" = "$(jq -er \
+            '.appliance_release_v1.cybex_repository_snapshot.sha256' \
+            "$previous_manifest")"
+          python3 -B ubuntu-appliance/qualification/legacy-bridge-gate.py \
+            recheck-predecessor \
+            --qualified-identity qualification/cybex-james-qualified-predecessor.json \
+            --compatibility "$previous_compatibility" \
+            --manifest "$previous_manifest" \
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY" \
+            --release-verifier tools/james-release.py \
+            --github-release-id "$previous_release_id" \
+            --tag-name "$previous_tag_name" \
+            --package-snapshot-sha256 "${previous_snapshot_digest#sha256:}" \
+            --package-snapshot-size "$previous_snapshot_size"
+          python3 -B tools/james-release.py verify-successor \
+            --previous-compatibility "$previous_compatibility" \
+            --current-compatibility dist/cybex-james-release-compatibility.json \
+            --trusted-public-key "$CYBEX_JAMES_UPDATE_TRUSTED_PUBLIC_KEY"
+          else
+            # The repository-wide publish lock makes this an atomic first-James
+            # release check. Any concurrent James publication invalidates a
+            # candidate that was built without a predecessor.
+            test "$CYBEX_JAMES_HAS_PREDECESSOR" = false
+            test -z "$previous"
+            test ! -e qualification/cybex-james-qualified-predecessor.json
+            test ! -e qualification/cybex-james-ubuntu-update-qualification.json
+            test ! -e dist/cybex-james-build-predecessor.json
           fi
           gh release edit "$GITHUB_REF_NAME" --draft=false
           immutable=false
@@ -967,15 +1436,6 @@ jobs:
           test "$immutable" = "true"
           test "$(jq -r '.tag_name' <<<"$published")" = "$GITHUB_REF_NAME"
           gh release verify "$GITHUB_REF_NAME"
-          for path in \
-            dist/cybex-pulse-x86_64-linux \
-            "dist/cybex-pulse-appliance-template-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.iso" \
-            "dist/cybex-pulse-appliance-packages-$CYBEX_PULSE_RELEASE_VERSION-x86_64-linux.tar.zst" \
-            "dist/$CYBEX_PULSE_WORKSTATION_BUNDLE_NAME" \
-            dist/cybex-pulse-release.json \
-            dist/cybex-pulse-release-compatibility.json \
-            dist/SHA256SUMS \
-            qualification/cybex-pulse-ubuntu-qualification.json
-          do
+          for path in "${release_asset_paths[@]}"; do
             gh release verify-asset "$GITHUB_REF_NAME" "$path"
           done

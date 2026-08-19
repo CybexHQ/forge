@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn stats_walks_up_to_existing_ancestor() {
-        let stats = stats(Path::new("/definitely/not/a/real/path/cybex-pulse-test"))
+        let stats = stats(Path::new("/definitely/not/a/real/path/cybex-james-test"))
             .expect("statvfs fallback");
         assert!(stats.total_bytes > 0);
     }

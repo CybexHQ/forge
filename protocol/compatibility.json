@@ -2,20 +2,20 @@
   "schema": "cybex.component-compatibility.v1",
   "protocol_version": 4,
   "manage": {
-    "minimum_pulse_protocol": 4,
-    "maximum_pulse_protocol": 4
+    "minimum_james_protocol": 4,
+    "maximum_james_protocol": 4
   },
-  "pulse": {
+  "james": {
     "minimum_manage_protocol": 4,
     "maximum_manage_protocol": 4
   },
   "workstation_runtime": {
     "compatibility_epoch": 1,
-    "descriptor_schema": "cybex.pulse.workstation-netboot.v1",
-    "manifest_schema": "cybex.pulse.workstation-netboot-manifest.v1",
+    "descriptor_schema": "cybex.james.workstation-netboot.v1",
+    "manifest_schema": "cybex.james.workstation-netboot-manifest.v1",
     "architecture": "x86_64-linux",
     "format": "split-squashfs-v1",
-    "required_pulse_protocol": 4,
+    "required_james_protocol": 4,
     "import_states": [
       "absent",
       "queued",

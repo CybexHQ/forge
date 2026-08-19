@@ -1,0 +1,52 @@
+[Unit]
+Description=Cybex James managed appliance service
+After=network-online.target nix-daemon.service nginx.service tftpd-hpa.service cybex-james-first-boot.service cybex-james-network-runtime.service
+Wants=network-online.target nginx.service tftpd-hpa.service
+Requires=cybex-james-first-boot.service cybex-james-network-runtime.service
+RequiresMountsFor=/var/lib/cybex-james/state /var/cache/cybex-james /nix
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=30s
+User=cybex-james
+Group=cybex-james
+ExecStart=/usr/bin/cybex-james --config /etc/cybex-james/config.toml serve
+WorkingDirectory=/var/lib/cybex-james
+Environment=HOME=/var/cache/cybex-james/agent/home
+Environment=XDG_CACHE_HOME=/var/cache/cybex-james/agent/cache
+Environment=XDG_CONFIG_HOME=/var/cache/cybex-james/agent/config
+Environment=XDG_STATE_HOME=/var/cache/cybex-james/agent/state
+Environment=TMPDIR=/var/cache/cybex-james/agent/tmp
+# Do not let writable per-service configuration relax the reviewed Nix client
+# policy. NIX_CONFIG and command-line options remain the only inputs.
+Environment=NIX_USER_CONF_FILES=/dev/null
+Restart=always
+RestartSec=3s
+UMask=0077
+ReadWritePaths=/var/lib/cybex-james /var/cache/cybex-james
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Commit a healthy Cybex James root generation
+After=network-online.target cybex-james.service nginx.service tftpd-hpa.service nix-daemon.service
+Wants=network-online.target cybex-james.service nginx.service tftpd-hpa.service nix-daemon.service
+ConditionPathExists=/var/lib/cybex-james/control/pending-root-generation.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-james/cybex-james-generation-commit
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

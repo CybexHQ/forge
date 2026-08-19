@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-james/state
+control_dir=/var/lib/cybex-james/control
+status_dir=/var/lib/cybex-james/status
+request="$state_dir/inbox/appliance-network-change-request.json"
+status="$status_dir/appliance-network-change-status.json"
+ack="$state_dir/inbox/netplan-acknowledgement.json"
+lock=/run/lock/cybex-james/appliance-network-change.lock
+if [[ ! -e "$lock" ]]; then (set -o noclobber; : > "$lock") 2>/dev/null || true; fi
+test "$(stat -c '%U:%G:%a:%h' "$lock")" = root:root:600:1
+exec 9>>"$lock"
+flock -n 9 || exit 0
+test -s "$request"
+
+change_id="$(jq -er '.id' "$request")"
+config_sha256="$(jq -er '.config_sha256' "$request")"
+[[ "$change_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+[[ "$config_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+# A crash after the root-owned terminal status commit but before inbox cleanup
+# must never replay Netplan or overwrite truthful acknowledgement/rollback.
+if [[ -s "$status" && ! -L "$status" ]] \
+  && [[ "$(stat -c '%U:%G:%a:%h' "$status")" = root:cybex-james:640:1 ]] \
+  && [[ "$(jq -er '.change_id' "$status")" = "$change_id" ]] \
+  && [[ "$(jq -er '.config_sha256' "$status")" = "$config_sha256" ]] \
+  && [[ "$(jq -er '.status' "$status")" =~ ^(acknowledged|rolled_back|failed)$ ]]; then
+  rm -f "$request" "$ack"
+  sync -f "$state_dir/inbox"
+  exit 0
+fi
+
+write_status() {
+  local result="$1" stage="$2" candidate="${3:-}" failure="${4:-}" temporary
+  temporary="$(mktemp "$status_dir/.appliance-network-change-status.XXXXXX")"
+  jq -n --arg status "$result" --arg stage "$stage" --arg change_id "$change_id" \
+    --arg config_sha256 "$config_sha256" --arg candidate_sha256 "$candidate" \
+    --arg failure_code "$failure" --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    '{status:$status,stage:$stage,change_id:$change_id,config_sha256:$config_sha256,
+      candidate_sha256:$candidate_sha256,failure_code:$failure_code,
+      reported_at:$reported_at}' > "$temporary"
+  chown root:cybex-james "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$status"
+  sync -f "$status_dir"
+}
+
+candidate=""
+failure_stage=preflight
+# If power was lost after the protected approved-plan rename but before the
+# outer terminal status, re-derive the exact signed candidate even after its
+# short live-change expiry. Exact bytes in root-owned CONTROL are durable
+# commit evidence; this recovery path never applies a new configuration.
+if candidate="$(/usr/bin/cybex-james verify-appliance-network-change-recovery 2>/dev/null)" \
+  && [[ "$candidate" = "/run/cybex-james-network-change/$change_id.yaml" ]] \
+  && cmp --silent -- "$candidate" "$control_dir/netplan-approved.json"; then
+  candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+  rm -f "$control_dir/netplan-pending.sha256" \
+    "$control_dir/netplan-before-change.yaml" \
+    "$control_dir/network-fallback-active"
+  sync -f "$control_dir"
+  write_status acknowledged recovered_commit "$candidate_sha256"
+  rm -f "$request" "$ack" "$candidate"
+  sync -f "$state_dir/inbox"
+  systemctl --no-block start cybex-james-network-runtime.service
+  exit 0
+fi
+[[ -z "$candidate" ]] || rm -f "$candidate"
+candidate=""
+rollback() {
+  local failure_status=$?
+  trap - ERR
+  candidate_sha256=""
+  [[ -s "$control_dir/netplan-pending.sha256" ]] \
+    && candidate_sha256="$(tr -d '\n' < "$control_dir/netplan-pending.sha256")"
+  if [[ "$failure_stage" = netplan && "$failure_status" -eq 70 ]]; then
+    write_status failed rollback "$candidate_sha256" network_rollback_failed
+  elif [[ "$failure_stage" = netplan && "$failure_status" -eq 71 ]]; then
+    write_status rolled_back rollback "$candidate_sha256" candidate_activation_failed
+  elif [[ "$failure_stage" = netplan && "$failure_status" -eq 72 ]]; then
+    write_status rolled_back rollback "$candidate_sha256" acknowledgement_timeout
+  else
+    write_status failed "$failure_stage" "$candidate_sha256" network_change_failed
+  fi
+  rm -f "$request" "$ack"
+  [[ -z "$candidate" ]] || rm -f "$candidate"
+  sync -f "$state_dir/inbox"
+}
+trap rollback ERR
+
+write_status applying preflight
+candidate="$(/usr/bin/cybex-james verify-appliance-network-change)"
+test "$candidate" = "/run/cybex-james-network-change/$change_id.yaml"
+candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+write_status applying netplan_try "$candidate_sha256"
+failure_stage=netplan
+/usr/lib/cybex-james/cybex-james-netplan-apply "$candidate" "$ack"
+failure_stage=commit
+write_status acknowledged committed "$candidate_sha256"
+rm -f "$request" "$ack" "$candidate"
+sync -f "$state_dir/inbox"
+systemctl --no-block start cybex-james-network-runtime.service
+trap - ERR

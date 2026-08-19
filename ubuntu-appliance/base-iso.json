@@ -1,12 +1,12 @@
 {
-  "schema": "cybex.pulse.ubuntu-base-iso.v1",
+  "schema": "cybex.james.ubuntu-base-iso.v1",
   "version": "26.04",
-  "build_id": "20260807",
+  "build_id": "20260809",
   "architecture": "amd64",
   "filename": "resolute-live-server-amd64.iso",
-  "url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/resolute-live-server-amd64.iso",
-  "size_bytes": 2926247936,
-  "sha256": "74b56b1dcec6c6d10576ad6677c511e9b2f452a62125d59aaf86b8281167316e",
-  "checksums_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/SHA256SUMS",
-  "checksums_signature_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260807/SHA256SUMS.gpg"
+  "url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260809/resolute-live-server-amd64.iso",
+  "size_bytes": 2926764032,
+  "sha256": "b5c64412241c6c90e1e43c8ffe3bf16b09d88d8b5bb2a34c627660934b96726f",
+  "checksums_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260809/SHA256SUMS",
+  "checksums_signature_url": "https://cdimage.ubuntu.com/ubuntu-server/resolute/daily-live/20260809/SHA256SUMS.gpg"
 }

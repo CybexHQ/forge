@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly install_plan=/var/lib/cybex-james/control/install-plan.json
+readonly refresh_interval_seconds=10
+readonly attention_after_checks=6
+
+appliance_state=starting
+non_ready_checks=0
+last_screen=
+
+unit_failed() {
+  systemctl is-failed --quiet "$1" >/dev/null 2>&1
+}
+
+unit_active() {
+  systemctl is-active --quiet "$1" >/dev/null 2>&1
+}
+
+fresh_health_ready() {
+  curl --fail --silent --max-time 5 --proto '=http' \
+    'http://127.0.0.1:8080/healthz?cybex_fresh=1' >/dev/null 2>&1
+}
+
+update_appliance_state() {
+  local unit
+  for unit in \
+    cybex-james-first-boot.service \
+    cybex-james-network-runtime.service \
+    cybex-james-firewall.service \
+    cybex-james.service \
+    nginx.service \
+    tftpd-hpa.service \
+    nix-daemon.service \
+    ssh.service
+  do
+    if unit_failed "$unit"; then
+      appliance_state=attention
+      return
+    fi
+  done
+
+  if ! unit_active cybex-james-first-boot.service; then
+    appliance_state=starting
+    non_ready_checks=0
+    return
+  fi
+
+  if unit_active cybex-james.service \
+    && unit_active cybex-james-firewall.service \
+    && unit_active nginx.service \
+    && unit_active tftpd-hpa.service \
+    && unit_active nix-daemon.service \
+    && unit_active ssh.service \
+    && fresh_health_ready
+  then
+    appliance_state=ready
+    non_ready_checks=0
+    return
+  fi
+
+  non_ready_checks=$((non_ready_checks + 1))
+  if ((non_ready_checks >= attention_after_checks)); then
+    appliance_state=attention
+  else
+    appliance_state=starting
+  fi
+}
+
+trusted_device_name() {
+  local candidate metadata
+  local safe_name_pattern='^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,63}$'
+
+  # First boot authenticates the durable plan and seals this root-owned copy.
+  # Until that boundary has succeeded, omit the optional name entirely.
+  unit_active cybex-james-first-boot.service || return 0
+  [[ -f "$install_plan" && ! -L "$install_plan" ]] || return 0
+  metadata="$(stat -c '%U:%G:%a:%h' "$install_plan" 2>/dev/null)" || return 0
+  [[ "$metadata" = root:cybex-james:640:1 ]] || return 0
+  candidate="$(jq -er '.display_name | strings' "$install_plan" 2>/dev/null)" || return 0
+  [[ "$candidate" =~ $safe_name_pattern ]] || return 0
+  printf '%s\n' "$candidate"
+}
+
+render_screen() {
+  local device_name screen state_lines
+  device_name="$(trusted_device_name)"
+  case "$appliance_state" in
+    ready)
+      state_lines=$'Ready\nManaged by Cybex Manage'
+      ;;
+    attention)
+      state_lines=$'Attention needed\nCheck Cybex Manage for status and next steps.\n\nManaged by Cybex Manage'
+      ;;
+    *)
+      state_lines=$'Starting\nCybex is getting ready.\n\nManaged by Cybex Manage'
+      ;;
+  esac
+
+  if [[ -n "$device_name" ]]; then
+    printf -v screen 'CYBEX JAMES\n\nDevice: %s\n\n%s' "$device_name" "$state_lines"
+  else
+    printf -v screen 'CYBEX JAMES\n\n%s' "$state_lines"
+  fi
+  if [[ "$screen" != "$last_screen" ]]; then
+    printf '\033[2J\033[H%s\n' "$screen"
+    last_screen="$screen"
+  fi
+}
+
+main() {
+  while true; do
+    update_appliance_state
+    render_screen
+    sleep "$refresh_interval_seconds"
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi

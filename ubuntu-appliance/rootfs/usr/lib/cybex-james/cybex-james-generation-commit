@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-james/state
+control_dir=/var/lib/cybex-james/control
+status_dir=/var/lib/cybex-james/status
+request="$state_dir/inbox/appliance-update-request.json"
+pending_file="$control_dir/pending-root-generation.json"
+source_clear_intent="$control_dir/source-pending-seal-clear-intent.json"
+status="$status_dir/appliance-update-status.json"
+bundle_dir="$state_dir/inbox/appliance-update-bundles"
+test -s "$pending_file" && test ! -L "$pending_file"
+test "$(stat -c '%U:%G:%a:%h' "$pending_file")" = root:cybex-james:640:1
+test "$(jq -er '.schema' "$pending_file")" = cybex.james.pending-root-generation.v1
+
+pending="$(jq -er '.generation' "$pending_file")"
+source_generation="$(jq -er '.source_generation' "$pending_file")"
+attempt_id="$(jq -er '.attempt_id' "$pending_file")"
+target_release="$(jq -er '.target_release' "$pending_file")"
+request_sha256="$(jq -er '.request_sha256' "$pending_file")"
+[[ "$pending" =~ ^[0-9]+$ ]]
+[[ "$source_generation" =~ ^[0-9]+$ ]] && ((source_generation < pending))
+[[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+[[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
+[[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
+test "$(findmnt -n -o FSROOT /)" = "/.cybex-root-generations/$pending"
+
+write_status() {
+  local result="$1" stage="$2" reason="${3:-}" temporary
+  temporary="$(mktemp "$status_dir/.appliance-update-status.XXXXXX")"
+  jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
+    --arg target_release "$target_release" --arg generation "$pending" \
+    --arg rollback_reason "$reason" --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      progress_percent:100,candidate_root_generation:$generation,
+      resulting_root_generation:(if $status == "succeeded" then $generation else "" end),
+      rollback_reason:$rollback_reason,reported_at:$reported_at}' \
+    > "$temporary"
+  chown root:cybex-james "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$status"
+  sync -f "$status_dir"
+}
+
+prune_root_generations() (
+  set -Eeuo pipefail
+  local root_uuid root_top generations generation kept_other
+  root_uuid="$(findmnt -n -o UUID /)"
+  [[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+  root_top="$(mktemp -d /run/cybex-root-prune.XXXXXX)"
+  trap 'umount "$root_top" 2>/dev/null || true; rmdir "$root_top" 2>/dev/null || true' EXIT
+  mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+  generations="$root_top/.cybex-root-generations"
+  kept_other=0
+  while IFS= read -r generation; do
+    [[ "$generation" =~ ^[0-9]+$ ]]
+    if [[ "$generation" = "$pending" || "$generation" = "$source_generation" ]]; then
+      continue
+    fi
+    if ((generation < pending && kept_other < 1)); then
+      kept_other=$((kept_other + 1))
+      continue
+    fi
+    btrfs subvolume delete "$generations/$generation"
+  done < <(find "$generations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | awk '/^[0-9]+$/' | sort -nr)
+)
+
+with_source_control() (
+  set -Eeuo pipefail
+  local operation="$1" root_uuid root_top source_root source_control source_seal
+  local source_status source_status_file temporary
+  root_uuid="$(findmnt -n -o UUID /)"
+  [[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+  root_top="$(mktemp -d /run/cybex-source-generation.XXXXXX)"
+  trap 'umount "$root_top" 2>/dev/null || true; rmdir "$root_top" 2>/dev/null || true' EXIT
+  mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+  source_root="$root_top/.cybex-root-generations/$source_generation"
+  btrfs subvolume show "$source_root" >/dev/null
+  source_control="$source_root/var/lib/cybex-james/control"
+  test -d "$source_control" && test ! -L "$source_control"
+  test "$(stat -c '%U:%G:%a' "$source_control")" = root:cybex-james:750
+  source_seal="$source_control/pending-root-generation.json"
+
+  if [[ -e "$source_seal" || -L "$source_seal" ]]; then
+    test -f "$source_seal" && test ! -L "$source_seal"
+    test "$(stat -c '%U:%G:%a:%h' "$source_seal")" = root:cybex-james:640:1
+    cmp --silent -- "$pending_file" "$source_seal"
+    if [[ "$operation" = clear ]]; then
+      source_status="$source_root/var/lib/cybex-james/status"
+      test -d "$source_status" && test ! -L "$source_status"
+      test "$(stat -c '%U:%G:%a' "$source_status")" = root:cybex-james:750
+      source_status_file="$source_status/appliance-update-status.json"
+      temporary="$(mktemp "$source_status/.appliance-update-status.XXXXXX")"
+      jq -n --arg attempt_id "$attempt_id" --arg target_release "$target_release" \
+        --arg generation "$pending" \
+        --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+        '{status:"succeeded",stage:"committed",attempt_id:$attempt_id,
+          target_release:$target_release,progress_percent:100,
+          candidate_root_generation:$generation,
+          resulting_root_generation:$generation,rollback_reason:"",
+          reported_at:$reported_at}' > "$temporary"
+      chown root:cybex-james "$temporary"
+      chmod 0640 "$temporary"
+      sync -f "$temporary"
+      mv -f "$temporary" "$source_status_file"
+      sync -f "$source_status"
+      rm -f "$source_seal"
+      sync -f "$source_control"
+    fi
+  else
+    # A missing source seal is accepted only on a resumed candidate after the
+    # candidate-local root-owned clear intent proves that this exact seal was
+    # already authorized and durably removed.
+    test -f "$source_clear_intent" && test ! -L "$source_clear_intent"
+    test "$(stat -c '%U:%G:%a:%h' "$source_clear_intent")" = root:cybex-james:640:1
+    cmp --silent -- "$pending_file" "$source_clear_intent"
+  fi
+)
+
+write_source_clear_intent() {
+  if [[ -e "$source_clear_intent" || -L "$source_clear_intent" ]]; then
+    test -f "$source_clear_intent" && test ! -L "$source_clear_intent"
+    test "$(stat -c '%U:%G:%a:%h' "$source_clear_intent")" = root:cybex-james:640:1
+    cmp --silent -- "$pending_file" "$source_clear_intent"
+    return
+  fi
+  local temporary
+  temporary="$(mktemp "$control_dir/.source-pending-seal-clear-intent.XXXXXX")"
+  install -m 0640 -o root -g cybex-james "$pending_file" "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$source_clear_intent"
+  sync -f "$control_dir"
+}
+
+rollback() {
+  trap - ERR
+  write_status rolled_back health_check_failed local_health_failed
+  # The source generation carries the same protected pending seal and will
+  # terminalize the rollback, remove the failed candidate, and clear the
+  # shared untrusted request. Explicitly restore its saved entry as defense in
+  # depth even though grub-reboot is one-shot.
+  grub-set-default "cybex-james-generation-$source_generation"
+  grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+  systemctl reboot
+  exit 1
+}
+trap rollback ERR
+
+resume_candidate() {
+  # Past the cross-generation clear point, falling back would lose the only
+  # protected source receipt. Keep the healthy candidate selected and retry
+  # the idempotent local commit on reboot instead.
+  trap - ERR
+  grub-set-default "cybex-james-generation-$pending" || true
+  systemctl reboot
+  exit 1
+}
+
+test "$(findmnt -n -o FSTYPE /)" = btrfs
+test -s /boot/vmlinuz
+sbverify --list "$(readlink -f /boot/vmlinuz)" >/dev/null
+nix --version >/dev/null
+
+health_deadline_seconds=210
+health_unit_timeout_seconds=5
+health_http_timeout_seconds=10
+health_retry_seconds=6
+health_stable_interval_seconds=5
+health_required_successes=3
+
+candidate_ready() {
+  local unit
+  for unit in cybex-james nginx tftpd-hpa nix-daemon; do
+    timeout --signal=TERM --kill-after=1s "${health_unit_timeout_seconds}s" \
+      systemctl is-active --quiet "$unit" || return 1
+  done
+  curl --fail --silent --show-error --noproxy '*' --proto '=http' \
+    --max-time "$health_http_timeout_seconds" \
+    'http://127.0.0.1:8080/healthz?cybex_fresh=1' >/dev/null
+}
+
+wait_for_stable_readiness() {
+  # SECONDS is measured from process start, so this deadline also accounts for
+  # the static candidate checks above and cannot slide past systemd's unit cap.
+  local deadline=$health_deadline_seconds
+  local consecutive_successes=0
+  while ((SECONDS < deadline)); do
+    if candidate_ready; then
+      consecutive_successes=$((consecutive_successes + 1))
+      if ((consecutive_successes >= health_required_successes)); then
+        return 0
+      fi
+      sleep "$health_stable_interval_seconds"
+    else
+      consecutive_successes=0
+      sleep "$health_retry_seconds"
+    fi
+  done
+  return 1
+}
+
+wait_for_stable_readiness
+
+with_source_control verify
+prune_root_generations
+grub-set-default "cybex-james-generation-$pending"
+write_source_clear_intent
+trap resume_candidate ERR
+with_source_control clear
+release_temporary="$(mktemp "$control_dir/.appliance-release.XXXXXX")"
+jq --arg generation "$pending" \
+  --arg release_id "$(jq -er '.release_id' /usr/share/cybex-james/appliance-release.json)" \
+  --arg ubuntu_snapshot_id "$(jq -er '.ubuntu_snapshot_id' /usr/share/cybex-james/appliance-release.json)" \
+  '.root_generation=$generation | .appliance_release=$release_id |
+   .ubuntu_snapshot_id=$ubuntu_snapshot_id' \
+  "$control_dir/appliance-release.json" > "$release_temporary"
+chown root:cybex-james "$release_temporary"
+chmod 0640 "$release_temporary"
+sync -f "$release_temporary"
+mv -f "$release_temporary" "$control_dir/appliance-release.json"
+generation_temporary="$(mktemp "$control_dir/.root-generation.XXXXXX")"
+printf '%s\n' "$pending" > "$generation_temporary"
+chown root:cybex-james "$generation_temporary"
+chmod 0640 "$generation_temporary"
+sync -f "$generation_temporary"
+mv -f "$generation_temporary" "$control_dir/root-generation"
+write_status succeeded committed
+rm -f "$request"
+sync -f "$state_dir/inbox"
+rm -f -- "$bundle_dir/$attempt_id.tar.zst"
+[[ ! -d "$bundle_dir" ]] || sync -f "$bundle_dir"
+sync -f "$state_dir/inbox"
+# The clear intent must outlive the pending seal.  Once the protected pending
+# seal is durably absent this generation is committed and the unit will not
+# re-enter; a crash may safely leave only the idempotent intent behind.
+rm -f "$pending_file"
+sync -f "$control_dir"
+rm -f "$source_clear_intent" "$state_dir/pending-root-generation" \
+  "$state_dir/appliance-update-request.json"
+sync -f "$control_dir"
+trap - ERR

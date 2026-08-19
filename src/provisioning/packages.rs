@@ -104,12 +104,12 @@ pub(crate) fn validate_plan_delivery(
             Ok(PackageDelivery::NetworkSnapshot)
         }
         (INSTALL_PLAN_SCHEMA_V1, MediaLayout::Thin) => {
-            bail!("thin Pulse media requires a signed network snapshot install plan")
+            bail!("thin James media requires a signed network snapshot install plan")
         }
         (INSTALL_PLAN_SCHEMA_V2, MediaLayout::Embedded) => {
-            bail!("embedded Pulse media cannot use network snapshot delivery")
+            bail!("embedded James media cannot use network snapshot delivery")
         }
-        _ => bail!("install plan package delivery does not match this Pulse media"),
+        _ => bail!("install plan package delivery does not match this James media"),
     }
 }
 
@@ -223,7 +223,7 @@ fn clear_repository_state(staging_root: &Path, repository: &Path) -> Result<()> 
 
 fn verified_marker(release: &SignedApplianceRelease) -> VerifiedSnapshotMarker {
     VerifiedSnapshotMarker {
-        schema: "cybex.pulse.verified-appliance-snapshot.v1".to_string(),
+        schema: "cybex.james.verified-appliance-snapshot.v1".to_string(),
         release_id: release.release_id.clone(),
         snapshot_sha256: release.cybex_repository_snapshot.sha256.clone(),
         snapshot_size_bytes: release.cybex_repository_snapshot.size_bytes,
@@ -356,7 +356,7 @@ fn validate_transport_url(transport: &str, release: &SignedApplianceRelease) -> 
         return Ok(parsed);
     }
     let expected_filename = format!(
-        "cybex-pulse-appliance-packages-{}-x86_64-linux.tar.zst",
+        "cybex-james-appliance-packages-{}-x86_64-linux.tar.zst",
         release.release_id
     );
     let private_address = parsed
@@ -473,7 +473,7 @@ mod tests {
 
     fn release(canonical_url: &str) -> SignedApplianceRelease {
         SignedApplianceRelease {
-            schema: "cybex.pulse.appliance-release.v1".into(),
+            schema: "cybex.james.appliance-release.v1".into(),
             release_id: "0.1.2".into(),
             ubuntu_snapshot_id: "20260801T120000Z".into(),
             cybex_repository_snapshot: crate::appliance::ApplianceRepositorySnapshot {
@@ -484,7 +484,7 @@ mod tests {
             required_package_versions: BTreeMap::new(),
             expected_kernel: String::new(),
             minimum_protocol: 4,
-            minimum_state_schema: 1,
+            minimum_state_schema: 2,
             rollback_compatible: true,
             release_notes: "https://releases.cybex.net/0.1.2".into(),
             signature: String::new(),
@@ -494,11 +494,11 @@ mod tests {
     #[test]
     fn production_transport_must_equal_the_release_signed_https_url() {
         let url =
-            "https://releases.cybex.net/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst";
+            "https://releases.cybex.net/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst";
         assert!(validate_transport_url(url, &release(url)).is_ok());
         assert!(
             validate_transport_url(
-                "https://mirror.example/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+                "https://mirror.example/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
                 &release(url)
             )
             .is_err()
@@ -508,29 +508,29 @@ mod tests {
     #[test]
     fn qualification_transport_is_an_explicit_private_ip_endpoint() {
         let release = release(
-            "https://releases.cybex.net/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "https://releases.cybex.net/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
         );
         assert!(
             validate_transport_url(
-                "http://192.168.122.1:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+                "http://192.168.122.1:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
                 &release
             )
             .is_ok()
         );
         assert!(
             validate_transport_url(
-                "http://[fd00::1]:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+                "http://[fd00::1]:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
                 &release
             )
             .is_ok()
         );
         for invalid in [
-            "http://example.test:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
-            "http://203.0.113.2:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
-            "http://127.0.0.1/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "http://example.test:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "http://203.0.113.2:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "http://127.0.0.1/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
             "http://127.0.0.1:8080/wrong.tar.zst",
-            "http://user@127.0.0.1:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
-            "http://127.0.0.1:8080/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst?token=x",
+            "http://user@127.0.0.1:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "http://127.0.0.1:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst?token=x",
         ] {
             assert!(
                 validate_transport_url(invalid, &release).is_err(),
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn staging_capacity_keeps_headroom_without_exceeding_expansion_cap() {
         let release = release(
-            "https://releases.cybex.net/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst",
+            "https://releases.cybex.net/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst",
         );
         assert_eq!(
             required_staging_capacity(&release).unwrap(),

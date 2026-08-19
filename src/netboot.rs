@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +18,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::Url;
@@ -31,15 +31,15 @@ use tracing::warn;
 use crate::{
     AppState, assets,
     error::{AppError, AppResult},
-    release_transport,
+    manage_source, release_transport,
 };
 
-pub const DESCRIPTOR_SCHEMA: &str = "cybex.pulse.workstation-netboot.v1";
-pub const MANIFEST_SCHEMA: &str = "cybex.pulse.workstation-netboot-manifest.v1";
-pub const SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-WORKSTATION-NETBOOT-V1";
+pub const DESCRIPTOR_SCHEMA: &str = "cybex.james.workstation-netboot.v1";
+pub const MANIFEST_SCHEMA: &str = "cybex.james.workstation-netboot-manifest.v1";
+pub const SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-WORKSTATION-NETBOOT-V1";
 pub const ARCHITECTURE: &str = "x86_64-linux";
 pub const FORMAT: &str = "split-squashfs-v1";
-pub const REQUIRED_PULSE_PROTOCOL: u32 = 4;
+pub const REQUIRED_JAMES_PROTOCOL: u32 = 4;
 #[cfg(not(feature = "resilience-qualification-epoch-2"))]
 pub const COMPATIBILITY_EPOCH: u32 = 1;
 #[cfg(feature = "resilience-qualification-epoch-2")]
@@ -64,7 +64,11 @@ const MAINTENANCE_INTERVAL_SECONDS: u64 = 60 * 60;
 const RECONCILE_RETRY_BASE_SECONDS: i64 = 30;
 const RECONCILE_RETRY_MAX_SECONDS: i64 = 30 * 60;
 const MAX_RECONCILE_ATTEMPT_ROWS: i64 = 128;
-const BOOT_GRANT_DOMAIN: &str = "CYBEX-PULSE-BOOT-GRANT-V1";
+// Progress is durable, but it must not turn a fast multi-GiB download into a
+// continuous SQLite writer. Persist each newly reached percentage and also a
+// heartbeat for very slow links; a forced exact checkpoint follows fsync.
+const DOWNLOAD_PROGRESS_MAX_INTERVAL: Duration = Duration::from_secs(5);
+const BOOT_GRANT_DOMAIN: &str = "CYBEX-JAMES-BOOT-GRANT-V1";
 const COMPONENT_NAMES: [&str; 3] = ["bzImage", "initrd", "nix-store.squashfs"];
 static RECONCILE_QUEUE: Mutex<RuntimeReconcileQueue> = Mutex::new(RuntimeReconcileQueue::new());
 
@@ -105,7 +109,7 @@ pub struct WorkstationNetbootDescriptor {
     pub nixpkgs_revision: String,
     pub architecture: String,
     pub format: String,
-    pub required_pulse_protocol: u32,
+    pub required_james_protocol: u32,
     pub url: String,
     pub sha256: String,
     pub size_bytes: u64,
@@ -121,7 +125,7 @@ struct WorkstationNetbootManifest {
     runtime_version: String,
     architecture: String,
     format: String,
-    required_pulse_protocol: u32,
+    required_james_protocol: u32,
     manage_source_revision: String,
     nixpkgs_revision: String,
     source_date_epoch: u64,
@@ -134,7 +138,7 @@ struct WorkstationNetbootManifest {
 #[derive(Clone, Debug, Serialize)]
 pub struct BootGrantClaims {
     pub schema: &'static str,
-    pub pulse_device_id: String,
+    pub james_device_id: String,
     pub organization_id: String,
     pub organization_slug: String,
     pub manage_api_url: String,
@@ -149,7 +153,7 @@ pub struct BootGrantClaims {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PulseBootGrant {
+struct JamesBootGrant {
     claims: BootGrantClaims,
     signature: String,
 }
@@ -161,7 +165,7 @@ struct BootContext {
     organization_slug: String,
     bundle_sha256: String,
     profile_id: Option<String>,
-    pulse_boot_grant: PulseBootGrant,
+    james_boot_grant: JamesBootGrant,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -257,6 +261,39 @@ struct CodedRuntimeFailure {
     detail: String,
 }
 
+#[derive(Debug)]
+struct DownloadProgressCheckpoint {
+    progress_percent: i64,
+    bytes_downloaded: u64,
+    persisted_at: Instant,
+}
+
+impl DownloadProgressCheckpoint {
+    fn new(persisted_at: Instant) -> Self {
+        Self {
+            // import_bundle has already persisted the initial 1%/zero-byte
+            // state immediately before entering the downloader.
+            progress_percent: 1,
+            bytes_downloaded: 0,
+            persisted_at,
+        }
+    }
+
+    fn due(&self, progress_percent: i64, bytes_downloaded: u64, now: Instant, force: bool) -> bool {
+        force
+            || (bytes_downloaded > self.bytes_downloaded
+                && (progress_percent > self.progress_percent
+                    || now.saturating_duration_since(self.persisted_at)
+                        >= DOWNLOAD_PROGRESS_MAX_INTERVAL))
+    }
+
+    fn commit(&mut self, progress_percent: i64, bytes_downloaded: u64, now: Instant) {
+        self.progress_percent = progress_percent;
+        self.bytes_downloaded = bytes_downloaded;
+        self.persisted_at = now;
+    }
+}
+
 impl std::fmt::Display for CodedRuntimeFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.detail)
@@ -278,7 +315,7 @@ fn validate_compatibility_epoch(compatibility_epoch: u32) -> Result<()> {
         return Err(coded_runtime_failure(
             FAILURE_COMPATIBILITY_EPOCH_UNSUPPORTED,
             format!(
-                "workstation runtime compatibility epoch {compatibility_epoch} is unsupported; this Pulse supports epoch {COMPATIBILITY_EPOCH}"
+                "workstation runtime compatibility epoch {compatibility_epoch} is unsupported; this James supports epoch {COMPATIBILITY_EPOCH}"
             ),
         ));
     }
@@ -318,7 +355,7 @@ pub fn signature_message(descriptor: &WorkstationNetbootDescriptor) -> String {
         descriptor.nixpkgs_revision,
         descriptor.architecture,
         descriptor.format,
-        descriptor.required_pulse_protocol,
+        descriptor.required_james_protocol,
         descriptor.components.bz_image.size_bytes,
         descriptor.components.bz_image.sha256,
         descriptor.components.initrd.size_bytes,
@@ -353,7 +390,7 @@ fn validate_descriptor_with_policy(
     validate_revision(&descriptor.nixpkgs_revision, "nixpkgs revision")?;
     if descriptor.architecture != ARCHITECTURE
         || descriptor.format != FORMAT
-        || descriptor.required_pulse_protocol != REQUIRED_PULSE_PROTOCOL
+        || descriptor.required_james_protocol != REQUIRED_JAMES_PROTOCOL
     {
         bail!("workstation netboot descriptor target contract is incompatible");
     }
@@ -390,6 +427,13 @@ fn validate_descriptor_with_policy(
         .is_none_or(|name| name != expected_name)
     {
         bail!("workstation netboot URL does not bind the canonical filename");
+    }
+
+    // This flag is available only for an explicitly configured development
+    // appliance. Integrity and compatibility checks above remain active, but
+    // the PoC path does not require an offline release-signing ceremony.
+    if allow_private_release_urls {
+        return Ok(());
     }
 
     let key_bytes = STANDARD
@@ -777,6 +821,15 @@ async fn reconcile_desired_inner(
         &state.config.update.trusted_public_key,
         state.config.workstation_netboot.allow_private_release_urls,
     )?;
+    let allow_private_manage_source = state.config.workstation_netboot.allow_private_release_urls
+        && state.config.build.manage_source_url_template
+            != manage_source::MANAGE_SOURCE_URL_TEMPLATE;
+    manage_source::verify_revision(
+        &state.config.build.manage_source_url_template,
+        &desired.descriptor.manage_source_revision,
+        allow_private_manage_source,
+    )
+    .context("verify packaged Manage source for workstation runtime")?;
     let descriptor_json = serde_json::to_string(&desired.descriptor)?;
     let descriptor_sha256 = sha256_bytes(descriptor_json.as_bytes());
     admit_reconcile_identity(
@@ -884,7 +937,10 @@ async fn admit_reconcile_identity(
             .decode(state.config.update.trusted_public_key.trim())
             .context("decode workstation netboot trust key")?,
     );
-    let mut transaction = state.db.begin().await?;
+    // Acquire SQLite's writer reservation before reading the causal ledgers.
+    // This bounded metadata-only transaction then cannot fail later while
+    // upgrading a stale DEFERRED snapshot under concurrent James writers.
+    let mut transaction = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let stored_generation: Option<(i64, String)> = sqlx::query_as(
         "SELECT reconcile_generation, descriptor_sha256
          FROM workstation_netboot_reconcile_watermarks
@@ -965,7 +1021,7 @@ async fn accept_reconcile_generation(
     generation: i64,
     descriptor_sha256: &str,
 ) -> Result<()> {
-    let mut transaction = state.db.begin().await?;
+    let mut transaction = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let stored: Option<(i64, String)> = sqlx::query_as(
         "SELECT reconcile_generation, descriptor_sha256
          FROM workstation_netboot_reconcile_watermarks
@@ -1227,6 +1283,7 @@ async fn download_bundle(
     descriptor: &WorkstationNetbootDescriptor,
     part: &Path,
 ) -> Result<()> {
+    let mut progress_checkpoint = DownloadProgressCheckpoint::new(Instant::now());
     let mut offset = match tokio_fs::symlink_metadata(part).await {
         Ok(metadata)
             if metadata.file_type().is_file()
@@ -1245,7 +1302,27 @@ async fn download_bundle(
         offset = 0;
     }
     if offset == descriptor.size_bytes {
+        persist_download_progress(
+            &mut progress_checkpoint,
+            state,
+            offset,
+            descriptor.size_bytes,
+            Instant::now(),
+            true,
+        )
+        .await?;
         return Ok(());
+    }
+    if offset > 0 {
+        persist_download_progress(
+            &mut progress_checkpoint,
+            state,
+            offset,
+            descriptor.size_bytes,
+            Instant::now(),
+            true,
+        )
+        .await?;
     }
     let mut response = send_release_request(
         &descriptor.url,
@@ -1258,6 +1335,18 @@ async fn download_bundle(
         && response.content_length() == Some(descriptor.size_bytes);
     if restart_from_zero {
         offset = 0;
+        // The origin ignored Range, so truthfully reset the durable byte count
+        // before truncating and restarting rather than showing stale resume
+        // progress until the new transfer catches up.
+        persist_download_progress(
+            &mut progress_checkpoint,
+            state,
+            0,
+            descriptor.size_bytes,
+            Instant::now(),
+            true,
+        )
+        .await?;
     }
     let expected_status = if offset > 0 {
         StatusCode::PARTIAL_CONTENT
@@ -1311,13 +1400,13 @@ async fn download_bundle(
             bail!("workstation netboot download exceeded its signed size");
         }
         file.write_all(&chunk).await?;
-        let progress = 1 + ((downloaded.saturating_mul(68) / descriptor.size_bytes) as i64);
-        set_runtime_state(
+        persist_download_progress(
+            &mut progress_checkpoint,
             state,
-            "downloading",
-            progress,
             downloaded,
             descriptor.size_bytes,
+            Instant::now(),
+            false,
         )
         .await?;
     }
@@ -1326,7 +1415,40 @@ async fn download_bundle(
     if downloaded != descriptor.size_bytes {
         bail!("workstation netboot download was truncated");
     }
+    // The final exact byte count is durable only after fsync. Force this
+    // checkpoint even when the last HTTP chunk already crossed 69%.
+    persist_download_progress(
+        &mut progress_checkpoint,
+        state,
+        downloaded,
+        descriptor.size_bytes,
+        Instant::now(),
+        true,
+    )
+    .await?;
     Ok(())
+}
+
+fn download_progress_percent(downloaded: u64, total: u64) -> i64 {
+    debug_assert!(total > 0);
+    1 + i64::try_from(downloaded.saturating_mul(68) / total).unwrap_or(68)
+}
+
+async fn persist_download_progress(
+    checkpoint: &mut DownloadProgressCheckpoint,
+    state: &AppState,
+    downloaded: u64,
+    total: u64,
+    now: Instant,
+    force: bool,
+) -> Result<bool> {
+    let progress = download_progress_percent(downloaded, total);
+    if !checkpoint.due(progress, downloaded, now, force) {
+        return Ok(false);
+    }
+    set_runtime_state(state, "downloading", progress, downloaded, total).await?;
+    checkpoint.commit(progress, downloaded, Instant::now());
+    Ok(true)
 }
 
 async fn send_release_request(
@@ -1507,7 +1629,7 @@ fn validate_manifest(
         || manifest.runtime_version != descriptor.runtime_version
         || manifest.architecture != descriptor.architecture
         || manifest.format != descriptor.format
-        || manifest.required_pulse_protocol != descriptor.required_pulse_protocol
+        || manifest.required_james_protocol != descriptor.required_james_protocol
         || manifest.manage_source_revision != descriptor.manage_source_revision
         || manifest.nixpkgs_revision != descriptor.nixpkgs_revision
         || manifest.components != descriptor.components
@@ -1577,7 +1699,7 @@ async fn promote_existing(
             .context("decode workstation netboot trust key")?,
     );
     let now = now();
-    let mut transaction = state.db.begin().await?;
+    let last_verified_at = runtime_verification_timestamp(Utc::now());
     let candidate: Option<(String,)> = sqlx::query_as(
         "SELECT root_path FROM workstation_netboot_bundles
          WHERE bundle_sha256 = ? AND compatibility_epoch = ?
@@ -1585,7 +1707,7 @@ async fn promote_existing(
     )
     .bind(&descriptor.sha256)
     .bind(compatibility_epoch)
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&state.db)
     .await?;
     let (root_path,) = candidate
         .ok_or_else(|| anyhow!("workstation netboot candidate is not a verified local bundle"))?;
@@ -1597,6 +1719,36 @@ async fn promote_existing(
         .join(&descriptor.sha256);
     if Path::new(&root_path) != expected_root || !expected_root.is_dir() {
         bail!("workstation netboot verified bundle path is inconsistent");
+    }
+    // Promotion is a bounded, metadata-only causal commit. Downloading,
+    // hashing, extraction, filesystem validation, fsync, and publication all
+    // completed before this writer reservation is acquired.
+    let mut transaction = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let accepted_identity: Option<(i64, String)> = sqlx::query_as(
+        "SELECT reconcile_generation, descriptor_sha256
+         FROM workstation_netboot_reconcile_watermarks
+         WHERE compatibility_epoch = ?",
+    )
+    .bind(compatibility_epoch)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if accepted_identity.as_ref() != Some(&(generation, descriptor_sha256.to_string())) {
+        bail!("workstation netboot promotion lost its accepted reconcile identity");
+    }
+    let candidate_still_verified: (i64,) = sqlx::query_as(
+        "SELECT EXISTS(
+             SELECT 1 FROM workstation_netboot_bundles
+             WHERE bundle_sha256 = ? AND compatibility_epoch = ?
+               AND retention_state = 'verified' AND root_path = ?
+         )",
+    )
+    .bind(&descriptor.sha256)
+    .bind(compatibility_epoch)
+    .bind(&root_path)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if candidate_still_verified.0 == 0 {
+        bail!("workstation netboot candidate changed before its causal promotion");
     }
     let old_active: (String,) = sqlx::query_as(
         "SELECT active_bundle_sha256 FROM workstation_netboot_runtime WHERE singleton_id = 1",
@@ -1675,7 +1827,7 @@ async fn promote_existing(
     .bind(&descriptor.runtime_version)
     .bind(compatibility_epoch)
     .bind(descriptor_sha256)
-    .bind(&now)
+    .bind(&last_verified_at)
     .bind(&now)
     .execute(&mut *transaction)
     .await?;
@@ -1743,7 +1895,7 @@ fn enforce_watermark_precedence(
 pub fn boot_grant_message(claims: &BootGrantClaims) -> String {
     format!(
         "{BOOT_GRANT_DOMAIN}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        claims.pulse_device_id,
+        claims.james_device_id,
         claims.organization_id,
         claims.organization_slug,
         claims.manage_api_url,
@@ -1813,9 +1965,9 @@ pub async fn create_boot_session(
     let manifest = parse_canonical_manifest(&manifest_body)?;
     validate_manifest(&manifest, &descriptor)?;
 
-    let identity = crate::manage::pulse_boot_identity(&state.config)?;
+    let identity = crate::manage::james_boot_identity(&state.config)?;
     if !is_safe_control_plane_id(&identity.device_id) {
-        bail!("adopted Pulse device identity is invalid");
+        bail!("adopted James device identity is invalid");
     }
     let issued_at = Utc::now().timestamp();
     let expires_at = issued_at + BOOT_GRANT_LIFETIME_SECONDS;
@@ -1827,8 +1979,8 @@ pub async fn create_boot_session(
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
     let session_id = URL_SAFE_NO_PAD.encode(session_bytes);
     let claims = BootGrantClaims {
-        schema: "cybex.pulse.boot-grant.v1",
-        pulse_device_id: identity.device_id,
+        schema: "cybex.james.boot-grant.v1",
+        james_device_id: identity.device_id,
         organization_id: state.config.manage.organization_id.clone(),
         organization_slug: state.config.manage.organization_slug.clone(),
         manage_api_url: state.config.manage.api_url.clone(),
@@ -1845,27 +1997,27 @@ pub async fn create_boot_session(
         .signing_key
         .sign(boot_grant_message(&claims).as_bytes());
     let context = BootContext {
-        schema: "cybex.pulse.boot-context.v1",
+        schema: "cybex.james.boot-context.v1",
         api_url: claims.manage_api_url.clone(),
         organization_slug: claims.organization_slug.clone(),
         bundle_sha256: bundle_sha256.clone(),
         profile_id: claims.profile_id.clone(),
-        pulse_boot_grant: PulseBootGrant {
+        james_boot_grant: JamesBootGrant {
             claims,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         },
     };
-    let context_body = serde_json::to_vec(&context).context("serialize Pulse boot context")?;
+    let context_body = serde_json::to_vec(&context).context("serialize James boot context")?;
     let context_archive = newc_context_archive(&context_body, issued_at)?;
     if context_archive.len() > BOOT_CONTEXT_MAX_BYTES {
-        bail!("Pulse boot context archive exceeded 64 KiB");
+        bail!("James boot context archive exceeded 64 KiB");
     }
 
     let sessions_root = state.config.paths.data_dir.join("netboot/sessions");
     let session_root = sessions_root.join(&session_id);
-    fs::create_dir_all(&sessions_root).context("create Pulse boot sessions root")?;
+    fs::create_dir_all(&sessions_root).context("create James boot sessions root")?;
     fs::set_permissions(&sessions_root, fs::Permissions::from_mode(0o700))?;
-    fs::create_dir(&session_root).context("create Pulse boot session directory")?;
+    fs::create_dir(&session_root).context("create James boot session directory")?;
     fs::set_permissions(&session_root, fs::Permissions::from_mode(0o700))?;
     let context_path = session_root.join("context.cpio");
     // iPXE's magic-initrd support wraps this bounded JSON body in the cpio
@@ -1878,7 +2030,7 @@ pub async fn create_boot_session(
     }
 
     let insert_result = sqlx::query(
-        "INSERT INTO pulse_boot_sessions
+        "INSERT INTO james_boot_sessions
          (session_id, nonce_sha256, normalized_mac, profile_id, managed_device_id,
           reinstall_request_id, bundle_sha256, context_path, issued_at, expires_at,
           cleanup_after)
@@ -1912,7 +2064,7 @@ pub async fn create_boot_session(
         .kernel_cmdline_template
         .replace("{squashfs_url}", &squashfs_url);
     Ok(BootSessionLaunch {
-        schema: "cybex.pulse.kexec.v1",
+        schema: "cybex.james.kexec.v1",
         bundle_sha256,
         kernel_url,
         initrd_url,
@@ -1934,7 +2086,7 @@ fn is_safe_control_plane_id(value: &str) -> bool {
 
 pub fn render_ipxe_launch(launch: &BootSessionLaunch) -> String {
     format!(
-        "#!ipxe\necho Cybex Pulse: loading signed workstation installer runtime\nkernel {} {} || goto failed\ninitrd {} || goto failed\ninitrd --name context.json {} /etc/cybex-installer/boot-context.json mode=600 mkdir=1 || goto failed\nboot || goto failed\n:failed\necho Cybex Pulse could not stage the installer runtime\nsleep 5\nexit 1\n",
+        "#!ipxe\necho Cybex James: loading signed workstation installer runtime\nkernel {} {} || goto failed\ninitrd {} || goto failed\ninitrd --name context.json {} /etc/cybex-installer/boot-context.json mode=600 mkdir=1 || goto failed\nboot || goto failed\n:failed\necho Cybex James could not stage the installer runtime\nsleep 5\nexit 1\n",
         launch.kernel_url, launch.command_line, launch.initrd_url, launch.context_url,
     )
 }
@@ -1948,7 +2100,7 @@ pub async fn serve_context(
         return Err(AppError::NotFound);
     }
     let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT context_path, expires_at FROM pulse_boot_sessions WHERE session_id = ?",
+        "SELECT context_path, expires_at FROM james_boot_sessions WHERE session_id = ?",
     )
     .bind(&session_id)
     .fetch_optional(&state.db)
@@ -1987,7 +2139,7 @@ pub async fn serve_context(
 pub async fn cleanup_expired_sessions(state: &AppState) -> Result<usize> {
     let now_unix = Utc::now().timestamp();
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT session_id, context_path FROM pulse_boot_sessions
+        "SELECT session_id, context_path FROM james_boot_sessions
          WHERE cleanup_after < ? ORDER BY cleanup_after LIMIT 256",
     )
     .bind(now_unix)
@@ -2005,13 +2157,13 @@ pub async fn cleanup_expired_sessions(state: &AppState) -> Result<usize> {
         }
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                fs::remove_dir_all(&root).context("remove expired Pulse boot session")?;
+                fs::remove_dir_all(&root).context("remove expired James boot session")?;
             }
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        sqlx::query("DELETE FROM pulse_boot_sessions WHERE session_id = ? AND cleanup_after < ?")
+        sqlx::query("DELETE FROM james_boot_sessions WHERE session_id = ? AND cleanup_after < ?")
             .bind(&session_id)
             .bind(now_unix)
             .execute(&state.db)
@@ -2319,7 +2471,7 @@ async fn prune_expired_bundles(state: &AppState) -> Result<usize> {
            AND bundle.bundle_sha256 <> runtime.active_bundle_sha256
            AND bundle.bundle_sha256 <> runtime.previous_bundle_sha256
            AND NOT EXISTS (
-             SELECT 1 FROM pulse_boot_sessions session
+             SELECT 1 FROM james_boot_sessions session
              WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
            )
          ORDER BY bundle.retained_until LIMIT 8",
@@ -2424,7 +2576,7 @@ fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
 
 fn newc_context_archive(body: &[u8], mtime: i64) -> Result<Vec<u8>> {
     if mtime < 0 || body.is_empty() {
-        bail!("Pulse boot context archive inputs are invalid");
+        bail!("James boot context archive inputs are invalid");
     }
     let mut archive = Vec::with_capacity(body.len() + 512);
     append_newc_entry(
@@ -2654,7 +2806,7 @@ pub async fn serve_component(
                    AND (bundle.bundle_sha256 = active_bundle_sha256
                         OR bundle.bundle_sha256 = previous_bundle_sha256)
                ) OR EXISTS(
-                 SELECT 1 FROM pulse_boot_sessions session
+                 SELECT 1 FROM james_boot_sessions session
                  WHERE session.bundle_sha256 = bundle.bundle_sha256 AND session.expires_at >= ?
                )
              )
@@ -2776,6 +2928,15 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn runtime_verification_timestamp(value: DateTime<Utc>) -> String {
+    // This evidence crosses the James/Manage boundary. Preserve PostgreSQL's
+    // microsecond precision so an older Manage release that still compares it
+    // with `desired_changed_at` does not misclassify a same-second successful
+    // reconciliation as stale. New Manage releases use causal generation and
+    // descriptor identity instead of cross-host wall-clock ordering.
+    value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
 fn retained_until() -> String {
     (Utc::now() + chrono::Duration::seconds(BUNDLE_RETENTION_SECONDS))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -2844,8 +3005,49 @@ mod tests {
     };
 
     #[test]
+    fn runtime_verification_evidence_preserves_subsecond_precision() {
+        let instant = DateTime::parse_from_rfc3339("2026-08-10T12:34:56.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            runtime_verification_timestamp(instant),
+            "2026-08-10T12:34:56.123456Z"
+        );
+    }
+
+    #[test]
+    fn download_progress_writes_are_bounded_and_keep_slow_link_heartbeats() {
+        let started = Instant::now();
+        let total = 1_416_000_000_u64;
+        let mut checkpoint = DownloadProgressCheckpoint::new(started);
+        let mut writes = 0usize;
+        for chunk in 1..=100_000_u64 {
+            let downloaded = total.saturating_mul(chunk) / 100_000;
+            let progress = download_progress_percent(downloaded, total);
+            if checkpoint.due(progress, downloaded, started, false) {
+                checkpoint.commit(progress, downloaded, started);
+                writes += 1;
+            }
+        }
+        // One write per newly reached 2..69% value, rather than one write per
+        // HTTP chunk. The forced post-fsync checkpoint is one additional write.
+        assert_eq!(writes, 68);
+        assert!(checkpoint.due(69, total, started, true));
+
+        let slow = DownloadProgressCheckpoint::new(started);
+        let same_percent_bytes = total / 1000;
+        assert!(!slow.due(1, same_percent_bytes, started, false));
+        assert!(slow.due(
+            1,
+            same_percent_bytes,
+            started + DOWNLOAD_PROGRESS_MAX_INTERVAL,
+            false
+        ));
+    }
+
+    #[test]
     fn boot_context_overlay_is_a_bounded_newc_member() {
-        let body = br#"{"schema":"cybex.pulse.boot-context.v1"}"#;
+        let body = br#"{"schema":"cybex.james.boot-context.v1"}"#;
         let cpio = newc_context_archive(body, 1_700_000_000).unwrap();
         assert!(cpio.len() <= BOOT_CONTEXT_MAX_BYTES);
         assert!(
@@ -2857,19 +3059,19 @@ mod tests {
     #[test]
     fn ipxe_launch_uses_magic_initrd_context_injection() {
         let launch = BootSessionLaunch {
-            schema: "cybex.pulse.kexec.v1",
+            schema: "cybex.james.kexec.v1",
             bundle_sha256: "a".repeat(64),
-            kernel_url: "http://pulse.test/kernel".to_string(),
-            initrd_url: "http://pulse.test/initrd".to_string(),
-            context_url: "http://pulse.test/context.cpio".to_string(),
-            squashfs_url: "http://pulse.test/rootfs".to_string(),
+            kernel_url: "http://james.test/kernel".to_string(),
+            initrd_url: "http://james.test/initrd".to_string(),
+            context_url: "http://james.test/context.cpio".to_string(),
+            squashfs_url: "http://james.test/rootfs".to_string(),
             command_line: "init=/nix/store/system/init".to_string(),
             expires_at: 1_700_000_600,
         };
         let script = render_ipxe_launch(&launch);
-        assert!(script.contains("initrd http://pulse.test/initrd"));
+        assert!(script.contains("initrd http://james.test/initrd"));
         assert!(script.contains(
-            "http://pulse.test/context.cpio /etc/cybex-installer/boot-context.json mode=600 mkdir=1"
+            "http://james.test/context.cpio /etc/cybex-installer/boot-context.json mode=600 mkdir=1"
         ));
     }
 
@@ -2877,9 +3079,19 @@ mod tests {
     fn signature_message_contract_is_exact() {
         let descriptor = fixture_descriptor();
         let message = signature_message(&descriptor);
-        assert!(message.starts_with("CYBEX-PULSE-WORKSTATION-NETBOOT-V1\n1.0.0\n"));
+        assert!(message.starts_with("CYBEX-JAMES-WORKSTATION-NETBOOT-V1\n1.0.0\n"));
         assert!(message.ends_with("https://releases.example.test/cybex-workstation-netboot-1.0.0-aaaaaaaaaaaa-x86_64-linux.tar.zst\n"));
         assert_eq!(message.lines().count(), 17);
+    }
+
+    #[test]
+    fn development_policy_accepts_unsigned_runtime_after_structural_validation() {
+        let mut descriptor = fixture_descriptor();
+        assert!(validate_descriptor(&descriptor, "not-a-key").is_err());
+        assert!(validate_descriptor_with_policy(&descriptor, "not-a-key", true).is_ok());
+
+        descriptor.components.initrd.size_bytes = 0;
+        assert!(validate_descriptor_with_policy(&descriptor, "not-a-key", true).is_err());
     }
 
     #[test]
@@ -3232,7 +3444,7 @@ mod tests {
             1,
             "http://127.0.0.1:9".to_string(),
         );
-        invalid.signature = STANDARD.encode([0_u8; 64]);
+        invalid.schema = "unsupported-development-runtime".to_string();
 
         let attempt = |generation| DesiredWorkstationNetboot {
             compatibility_epoch: COMPATIBILITY_EPOCH,
@@ -3361,6 +3573,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_download_does_not_block_build_boot_cache_or_report_lanes() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let body = vec![0x5a; 128 * 1024];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_chunk_sent = Arc::new(Notify::new());
+        let finish_response = Arc::new(Notify::new());
+        let server_body = body.clone();
+        let server_first_chunk_sent = first_chunk_sent.clone();
+        let server_finish_response = finish_response.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&server_body[..4096]).await.unwrap();
+            stream.flush().await.unwrap();
+            server_first_chunk_sent.notify_one();
+            server_finish_response.notified().await;
+            stream.write_all(&server_body[4096..]).await.unwrap();
+        });
+        let mut descriptor = fixture.signed_download_descriptor(
+            "2.0.0",
+            &sha256_bytes(&body),
+            body.len() as u64,
+            format!("http://{address}"),
+        );
+        descriptor.sha256 = sha256_bytes(&body);
+        fixture.sign_descriptor(&mut descriptor);
+        let part = fixture.root.join("concurrent-download.part");
+        let download_state = fixture.state.clone();
+        let download_part = part.clone();
+        let download = tokio::spawn(async move {
+            download_bundle(&download_state, &descriptor, &download_part).await
+        });
+
+        first_chunk_sent.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            crate::db::record_rejected_managed_build_job(
+                &fixture.state.db,
+                "11111111-1111-4111-8111-111111111111",
+                "nixos_closure",
+                Some("blueprint"),
+                Some("x86_64-linux"),
+                "runtime-contention-probe",
+                &"a".repeat(64),
+                "deterministic contention probe",
+            )
+            .await
+            .unwrap();
+            crate::db::insert_boot_event(
+                &fixture.state.db,
+                crate::models::NewBootEvent {
+                    device_id: None,
+                    mac: Some("02:ca:fe:00:04:02".to_string()),
+                    serial_number: None,
+                    ip_address: Some("192.0.2.30".to_string()),
+                    user_agent: Some("contention-probe".to_string()),
+                    selected_profile_id: None,
+                    selected_profile_name: None,
+                    known_device: false,
+                },
+            )
+            .await
+            .unwrap();
+            let protections = (1..=64_u64)
+                .map(|value| ("nixos_closure".to_string(), format!("{value:064x}")))
+                .collect::<Vec<_>>();
+            crate::db::replace_managed_cache_protections(&fixture.state.db, &protections, true)
+                .await
+                .unwrap();
+            let reports = crate::db::list_build_jobs_report_page(
+                &fixture.state.db,
+                None,
+                None,
+                None,
+                0,
+                8,
+                64 * 1024,
+            )
+            .await
+            .unwrap();
+            assert_eq!(reports.len(), 1);
+        })
+        .await
+        .expect("a runtime network wait blocked another SQLite evidence lane");
+        finish_response.notify_one();
+        download.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(fs::read(&part).unwrap(), body);
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
     async fn corrupt_active_runtime_falls_back_with_the_fallback_runtime_version() {
         let fixture = RuntimeFilesystemFixture::new().await;
         let fallback = fixture.install_bundle("1.0.0", &"b".repeat(64)).await;
@@ -3403,6 +3716,61 @@ mod tests {
         assert!(!stage.exists());
         let quarantine_root = public_root.parent().unwrap().join("netboot-quarantine");
         assert_eq!(fs::read_dir(quarantine_root).unwrap().count(), 1);
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn completed_old_import_cannot_promote_after_a_newer_identity_is_admitted() {
+        let fixture = RuntimeFilesystemFixture::new().await;
+        let old = fixture.install_bundle("1.0.0", &"a".repeat(64)).await;
+        let newer = fixture.install_bundle("2.0.0", &"b".repeat(64)).await;
+        let old_json = serde_json::to_string(&old).unwrap();
+        let old_identity = sha256_bytes(old_json.as_bytes());
+        let newer_json = serde_json::to_string(&newer).unwrap();
+        let newer_identity = sha256_bytes(newer_json.as_bytes());
+        accept_reconcile_generation(&fixture.state, COMPATIBILITY_EPOCH, 1, &old_identity)
+            .await
+            .unwrap();
+        accept_reconcile_generation(&fixture.state, COMPATIBILITY_EPOCH, 2, &newer_identity)
+            .await
+            .unwrap();
+
+        let error = promote_existing(
+            &fixture.state,
+            &old,
+            &old_json,
+            &old_identity,
+            COMPATIBILITY_EPOCH,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lost its accepted reconcile identity")
+        );
+        let active: (String,) = sqlx::query_as(
+            "SELECT active_bundle_sha256 FROM workstation_netboot_runtime WHERE singleton_id = 1",
+        )
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap();
+        assert!(active.0.is_empty());
+
+        promote_existing(
+            &fixture.state,
+            &newer,
+            &newer_json,
+            &newer_identity,
+            COMPATIBILITY_EPOCH,
+            2,
+        )
+        .await
+        .unwrap();
+        let report = report(&fixture.state).await.unwrap();
+        assert_eq!(report.active_bundle_sha256, newer.sha256);
+        assert_eq!(report.reconcile_generation, Some(2));
         fixture.cleanup();
     }
 
@@ -3734,15 +4102,15 @@ mod tests {
     impl RuntimeFilesystemFixture {
         async fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "cybex-pulse-netboot-runtime-test-{}",
+                "cybex-james-netboot-runtime-test-{}",
                 uuid::Uuid::new_v4().simple()
             ));
             fs::create_dir_all(&root).unwrap();
             let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
             let mut config = crate::config::AppConfig::default();
-            config.server.public_base_url = "http://pulse.test".to_string();
+            config.server.public_base_url = "http://james.test".to_string();
             config.paths.data_dir = root.join("data");
-            config.paths.database_path = root.join("cybex-pulse.sqlite");
+            config.paths.database_path = root.join("cybex-james.sqlite");
             config.paths.boot_assets_dir = root.join("www");
             config.paths.static_dir = root.join("static");
             config.paths.tftp_dir = root.join("tftp");
@@ -3751,6 +4119,26 @@ mod tests {
             config.manage.organization_slug = "test-org".to_string();
             config.manage.state_path = root.join("manage-state.json");
             config.workstation_netboot.allow_private_release_urls = true;
+            let manage_revision = "a".repeat(40);
+            let manage_source_dir = root.join("manage-source");
+            fs::create_dir(&manage_source_dir).unwrap();
+            fs::set_permissions(&manage_source_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let manage_archive_body = b"deterministic Manage source fixture";
+            let manage_archive = manage_source_dir.join(format!("{manage_revision}.tar"));
+            fs::write(&manage_archive, manage_archive_body).unwrap();
+            fs::set_permissions(&manage_archive, fs::Permissions::from_mode(0o444)).unwrap();
+            let manage_metadata = format!(
+                "{{\"filename\":\"{manage_revision}.tar\",\"revision\":\"{manage_revision}\",\"schema\":\"cybex.james.manage-source.v1\",\"sha256\":\"{}\",\"size_bytes\":{}}}\n",
+                sha256_bytes(manage_archive_body),
+                manage_archive_body.len()
+            );
+            let manage_metadata_path = manage_source_dir.join(format!("{manage_revision}.json"));
+            fs::write(&manage_metadata_path, manage_metadata).unwrap();
+            fs::set_permissions(&manage_metadata_path, fs::Permissions::from_mode(0o444)).unwrap();
+            config.build.manage_source_url_template = format!(
+                "tarball+file://{}/{{revision}}.tar",
+                manage_source_dir.display()
+            );
             config.update.trusted_public_key =
                 STANDARD.encode(signing_key.verifying_key().to_bytes());
             fs::write(
@@ -3758,14 +4146,13 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "private_key_b64": STANDARD.encode(signing_key.to_bytes()),
                     "public_key_b64": STANDARD.encode(signing_key.verifying_key().to_bytes()),
-                    "device_id": "pulse-runtime-test"
+                    "device_id": "james-runtime-test"
                 }))
                 .unwrap(),
             )
             .unwrap();
-            let pool = crate::db::connect_with_url("sqlite::memory:")
-                .await
-                .unwrap();
+            let database_url = format!("sqlite://{}", config.paths.database_path.display());
+            let pool = crate::db::connect_with_url(&database_url).await.unwrap();
             crate::db::migrate(&pool).await.unwrap();
             Self {
                 state: AppState::new(config, pool),
@@ -3805,7 +4192,7 @@ mod tests {
                 nixpkgs_revision: "c".repeat(40),
                 architecture: ARCHITECTURE.to_string(),
                 format: FORMAT.to_string(),
-                required_pulse_protocol: REQUIRED_PULSE_PROTOCOL,
+                required_james_protocol: REQUIRED_JAMES_PROTOCOL,
                 url: format!(
                     "http://127.0.0.1:9/cybex-workstation-netboot-{runtime_version}-aaaaaaaaaaaa-{ARCHITECTURE}.tar.zst"
                 ),
@@ -4008,7 +4395,7 @@ mod tests {
             runtime_version: descriptor.runtime_version.clone(),
             architecture: descriptor.architecture.clone(),
             format: descriptor.format.clone(),
-            required_pulse_protocol: descriptor.required_pulse_protocol,
+            required_james_protocol: descriptor.required_james_protocol,
             manage_source_revision: descriptor.manage_source_revision.clone(),
             nixpkgs_revision: descriptor.nixpkgs_revision.clone(),
             source_date_epoch: 1,
@@ -4039,7 +4426,7 @@ mod tests {
             nixpkgs_revision: "c".repeat(40),
             architecture: ARCHITECTURE.to_string(),
             format: FORMAT.to_string(),
-            required_pulse_protocol: REQUIRED_PULSE_PROTOCOL,
+            required_james_protocol: REQUIRED_JAMES_PROTOCOL,
             url: "https://releases.example.test/cybex-workstation-netboot-1.0.0-aaaaaaaaaaaa-x86_64-linux.tar.zst".to_string(),
             sha256: "d".repeat(64),
             size_bytes: 4,

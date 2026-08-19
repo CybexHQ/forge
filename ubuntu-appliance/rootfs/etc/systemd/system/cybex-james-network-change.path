@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for signed Cybex James Netplan changes
+
+[Path]
+PathExists=/var/lib/cybex-james/state/inbox/appliance-network-change-request.json
+Unit=cybex-james-network-change.service
+
+[Install]
+WantedBy=multi-user.target

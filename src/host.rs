@@ -1,4 +1,4 @@
-//! Host utilization sampling (/proc, /sys) for the periodic Pulse report.
+//! Host utilization sampling (/proc, /sys) for the periodic James report.
 //!
 //! Manage validates the reported bounds strictly and rejects the whole report
 //! on violation, so every value is clamped into the accepted ranges here.

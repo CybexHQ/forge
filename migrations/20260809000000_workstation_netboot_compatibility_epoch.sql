@@ -1,5 +1,5 @@
 -- Compatibility epochs are artifact/runtime identity, not an attribute of the
--- currently running Pulse binary. Existing rows predate the explicit field and
+-- currently running James binary. Existing rows predate the explicit field and
 -- therefore belong to the legacy epoch-one contract.
 ALTER TABLE workstation_netboot_runtime
     ADD COLUMN desired_compatibility_epoch INTEGER NOT NULL DEFAULT 1
