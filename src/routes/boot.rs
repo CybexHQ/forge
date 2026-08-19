@@ -157,7 +157,7 @@ pub async fn boot_kexec(
         .ok_or(AppError::NotFound)?;
     let profile_id = device.one_time_profile_id.ok_or(AppError::NotFound)?;
     let profile = db::get_profile(&state.db, profile_id).await?;
-    if !profile.enabled || profile.profile_type != BootProfileType::PulseInstaller {
+    if !profile.enabled || profile.profile_type != BootProfileType::JamesInstaller {
         return Err(AppError::NotFound);
     }
     let launch = create_installer_launch(&state, &profile, &device.mac, Some(&device)).await?;
@@ -202,14 +202,35 @@ async fn build_boot_script(
 
     let profiles = db::list_enabled_profiles(&state.db).await?;
     let selection_device = if known_device { device.as_ref() } else { None };
-    let selection = boot_logic::choose_profile(selection_device, &profiles);
+    // A first request from a new MAC may enter the sole default enrollment
+    // profile automatically. This only starts the signed installer runtime;
+    // destructive installation still requires explicit approval in Manage.
+    let allow_automatic_enrollment =
+        automatic_enrollment_allowed(checker, known_device, mac.as_deref());
+    let selection =
+        boot_logic::choose_profile(selection_device, &profiles, allow_automatic_enrollment);
 
     let selected_profile = selection.profile.cloned();
     let selected_script = if let Some(profile) = selected_profile.as_ref() {
         let selected_mac = mac
             .as_deref()
             .or_else(|| device.as_ref().map(|device| device.mac.as_str()));
-        Some(render_selected_profile(state, profile, selected_mac, device.as_ref()).await?)
+        match render_selected_profile(state, profile, selected_mac, device.as_ref()).await {
+            Ok(script) => Some(script),
+            Err(error) => {
+                if selection.source == boot_logic::SelectionSource::AutomaticEnrollment {
+                    if let Some(device) = device.as_ref() {
+                        // A transient runtime/session failure must not turn a
+                        // fresh MAC into a permanent manual-menu recovery. The
+                        // conditional delete preserves any row claimed by a
+                        // concurrent managed sync or operator assignment.
+                        let _ =
+                            db::remove_unclaimed_auto_discovered_device(&state.db, device.id).await;
+                    }
+                }
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -221,6 +242,9 @@ async fn build_boot_script(
                     db::consume_one_time_profile(&state.db, device.id, profile.id).await?;
                 }
                 boot_logic::SelectionSource::Assigned => {
+                    db::set_device_last_selected(&state.db, device.id, profile.id).await?;
+                }
+                boot_logic::SelectionSource::AutomaticEnrollment => {
                     db::set_device_last_selected(&state.db, device.id, profile.id).await?;
                 }
                 boot_logic::SelectionSource::Menu => {}
@@ -257,14 +281,33 @@ async fn build_boot_script(
         Ok(selected_script.expect("selected profile has a rendered script"))
     } else {
         let runtime = state.runtime_settings();
+        // James does not need to guess whether installation finished. A real,
+        // known MAC can safely probe its disk: sanboot transfers control only
+        // when it is bootable and otherwise falls through to the unchanged
+        // enrollment menu. Health checks and MAC-less requests never probe.
+        let try_bootable_local_disk_first =
+            automatic_local_disk_probe_allowed(checker, known_device, mac.as_deref());
         Ok(boot_logic::render_menu(
             &runtime.public_base_url,
             &profiles,
             mac.as_deref(),
             serial.as_deref(),
             runtime.menu_timeout_ms,
+            try_bootable_local_disk_first,
         ))
     }
+}
+
+fn automatic_enrollment_allowed(checker: bool, known_device: bool, mac: Option<&str>) -> bool {
+    !checker && !known_device && mac.is_some()
+}
+
+fn automatic_local_disk_probe_allowed(
+    checker: bool,
+    known_device: bool,
+    mac: Option<&str>,
+) -> bool {
+    !checker && known_device && mac.is_some()
 }
 
 async fn render_selected_profile(
@@ -273,12 +316,12 @@ async fn render_selected_profile(
     mac: Option<&str>,
     device: Option<&Device>,
 ) -> AppResult<String> {
-    if profile.profile_type != BootProfileType::PulseInstaller {
+    if profile.profile_type != BootProfileType::JamesInstaller {
         let runtime = state.runtime_settings();
         return boot_logic::render_profile_script(profile, &runtime.public_base_url);
     }
     let mac = mac.ok_or_else(|| {
-        AppError::Validation("a normalized MAC is required for Pulse installer boot".to_string())
+        AppError::Validation("a normalized MAC is required for James installer boot".to_string())
     })?;
     let launch = create_installer_launch(state, profile, mac, device).await?;
     Ok(crate::netboot::render_ipxe_launch(&launch))
@@ -291,7 +334,7 @@ async fn create_installer_launch(
     device: Option<&Device>,
 ) -> AppResult<crate::netboot::BootSessionLaunch> {
     let profile_id = profile.managed_profile_id.as_deref().ok_or_else(|| {
-        AppError::Config("Pulse installer profile has no managed identity".to_string())
+        AppError::Config("James installer profile has no managed identity".to_string())
     })?;
     let binding: Option<(Option<String>, Option<String>)> = if let Some(device) = device {
         sqlx::query_as("SELECT managed_device_id, reinstall_request_id FROM devices WHERE id = ?")
@@ -309,7 +352,7 @@ async fn create_installer_launch(
         binding.as_ref().and_then(|value| value.1.as_deref()),
     )
     .await
-    .map_err(|_| AppError::Config("could not create signed Pulse boot session".to_string()))
+    .map_err(|_| AppError::Config("could not create signed James boot session".to_string()))
 }
 
 fn normalized_optional_mac(mac: Option<String>) -> AppResult<Option<String>> {
@@ -410,9 +453,50 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     use super::{
-        BootQuery, boot_profile_id_from_path, clean_optional, ipxe_response,
-        is_local_checker_request, remote_ip, user_agent,
+        BootQuery, automatic_enrollment_allowed, automatic_local_disk_probe_allowed,
+        boot_profile_id_from_path, clean_optional, ipxe_response, is_local_checker_request,
+        remote_ip, user_agent,
     };
+
+    #[test]
+    fn automatic_enrollment_is_limited_to_a_real_first_mac_request() {
+        assert!(automatic_enrollment_allowed(
+            false,
+            false,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_enrollment_allowed(
+            true,
+            false,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_enrollment_allowed(
+            false,
+            true,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_enrollment_allowed(false, false, None));
+    }
+
+    #[test]
+    fn automatic_local_disk_probe_is_limited_to_a_real_known_mac_request() {
+        assert!(automatic_local_disk_probe_allowed(
+            false,
+            true,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_local_disk_probe_allowed(
+            true,
+            true,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_local_disk_probe_allowed(
+            false,
+            false,
+            Some("aa:bb:cc:dd:ee:ff")
+        ));
+        assert!(!automatic_local_disk_probe_allowed(false, true, None));
+    }
 
     #[test]
     fn ipxe_responses_are_not_cached() {

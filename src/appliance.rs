@@ -15,6 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
+    net::IpAddr,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::Mutex,
@@ -25,31 +26,41 @@ use tokio::process::Command;
 use crate::release_transport;
 
 pub const APPLIANCE_UPDATE_CAPABILITY: &str = "appliance_update_v1";
-const RELEASE_PATH: &str = "/usr/share/cybex-pulse/appliance-release.json";
-const INSTALLED_STATE_PATH: &str = "/var/lib/cybex-pulse/state/appliance-release.json";
-const UPDATE_STATUS_PATH: &str = "/var/lib/cybex-pulse/state/appliance-update-status.json";
-const UPDATE_REQUEST_PATH: &str = "/var/lib/cybex-pulse/state/appliance-update-request.json";
-const UPDATE_BUNDLE_ROOT: &str = "/var/lib/cybex-pulse/state/appliance-update-bundles";
-const UPDATE_ROOT: &str = "/var/lib/cybex-pulse/state/appliance-updates";
-const RELEASE_PUBLIC_KEY_PATH: &str = "/usr/share/cybex-pulse/release-public-key";
-const PROVISIONING_STATE_PATH: &str = "/var/lib/cybex-pulse/state/provisioning-state.json";
-const INSTALL_PLAN_PATH: &str = "/var/lib/cybex-pulse/state/install-plan.json";
+pub const APPLIANCE_UPDATE_CAPABILITY_V2: &str = "appliance_update_v2";
+/// Additive capability for an unsigned, exact-attempt qualification transport
+/// hint. Older strict wire decoders must never receive that optional field.
+pub const APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_CAPABILITY: &str =
+    "appliance_update_qualification_transport_v1";
+const RELEASE_PATH: &str = "/usr/share/cybex-james/appliance-release.json";
+const INSTALLED_STATE_PATH: &str = "/var/lib/cybex-james/control/appliance-release.json";
+const UPDATE_STATUS_PATH: &str = "/var/lib/cybex-james/status/appliance-update-status.json";
+const UPDATE_REQUEST_PATH: &str = "/var/lib/cybex-james/state/inbox/appliance-update-request.json";
+const UPDATE_BUNDLE_ROOT: &str = "/var/lib/cybex-james/state/inbox/appliance-update-bundles";
+const UPDATE_ROOT: &str = "/var/lib/cybex-james/control/appliance-updates";
+const RELEASE_PUBLIC_KEY_PATH: &str = "/usr/share/cybex-james/release-public-key";
+const PROVISIONING_STATE_PATH: &str = "/var/lib/cybex-james/control/provisioning-state.json";
+const INSTALL_PLAN_PATH: &str = "/var/lib/cybex-james/control/install-plan.json";
 const NETWORK_CHANGE_REQUEST_PATH: &str =
-    "/var/lib/cybex-pulse/state/appliance-network-change-request.json";
+    "/var/lib/cybex-james/state/inbox/appliance-network-change-request.json";
 const NETWORK_CHANGE_STATUS_PATH: &str =
-    "/var/lib/cybex-pulse/state/appliance-network-change-status.json";
-const NETWORK_PENDING_PATH: &str = "/var/lib/cybex-pulse/state/netplan-pending.sha256";
-const NETWORK_ACK_PATH: &str = "/var/lib/cybex-pulse/state/netplan-ack.sha256";
-const APPLIANCE_RELEASE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-APPLIANCE-RELEASE-V1";
-const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.pulse.appliance-release.v1";
-const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-NETWORK-CHANGE-V1";
-const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-NETWORK-ACK-V1";
+    "/var/lib/cybex-james/status/appliance-network-change-status.json";
+const NETWORK_PENDING_PATH: &str = "/var/lib/cybex-james/control/netplan-pending.sha256";
+const NETWORK_ACK_PATH: &str = "/var/lib/cybex-james/state/inbox/netplan-acknowledgement.json";
+const APPLIANCE_RELEASE_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-APPLIANCE-RELEASE-V1";
+const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.james.appliance-release.v1";
+const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-NETWORK-CHANGE-V1";
+const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-NETWORK-ACK-V1";
 const MAX_UPDATE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const SNAPSHOT_ID_MAX_BYTES: u64 = 64;
 const SNAPSHOT_CHECKSUMS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_PACKAGES_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const THIN_INSTALLER_BOOT_PACKAGES: [&str; 3] =
     ["grub-efi-amd64", "grub-efi-amd64-signed", "shim-signed"];
+const APPLIANCE_UPDATE_ROOT_PACKAGES: [&str; 3] = [
+    "cybex-james",
+    "cybex-james-appliance",
+    "cybex-james-bootstrap",
+];
 static UPDATE_QUEUE: Mutex<ApplianceUpdateQueue> = Mutex::new(ApplianceUpdateQueue::new());
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +102,10 @@ pub struct ManagedApplianceUpdate {
     pub attempt_id: uuid::Uuid,
     pub requested_at: DateTime<Utc>,
     pub release: SignedApplianceRelease,
+    /// Unsigned, exact-attempt transport hint used only by release qualification.
+    /// The signed release URL remains the artifact identity and production path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification_package_transport_url: Option<String>,
 }
 
 struct ApplianceUpdateQueue {
@@ -235,7 +250,7 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
         return Ok(());
     };
     if !is_managed_ubuntu() {
-        bail!("received an Ubuntu appliance update on a non-appliance Pulse host")
+        bail!("received an Ubuntu appliance update on a non-appliance James host")
     }
     // Manage continues advertising the desired attempt until it receives the
     // terminal report. Authenticate that replay, then accept the exact
@@ -264,9 +279,15 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
         .await
         .context("create appliance update bundle directory")?;
     let bundle_path = Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", update.attempt_id));
-    download_snapshot(&update.release.cybex_repository_snapshot, &bundle_path).await?;
+    let transport = appliance_update_transport(&update)?;
+    download_snapshot_from_transport(
+        &update.release.cybex_repository_snapshot,
+        &bundle_path,
+        transport,
+    )
+    .await?;
     let stored = StoredApplianceUpdate {
-        schema: "cybex.pulse.appliance-update-request.v1".to_string(),
+        schema: "cybex.james.appliance-update-request.v1".to_string(),
         attempt_id: update.attempt_id,
         requested_at: update.requested_at,
         release: update.release,
@@ -275,56 +296,96 @@ pub async fn store_update_request(update: Option<ManagedApplianceUpdate>) -> Res
             .ok_or_else(|| anyhow!("appliance update bundle path is invalid"))?
             .to_string(),
     };
-    write_atomic_json(Path::new(UPDATE_REQUEST_PATH), &stored, 0o600)?;
-    write_atomic_json(
-        Path::new(UPDATE_STATUS_PATH),
-        &json!({
-            "status": "waiting_window",
-            "stage": "downloaded",
-            "attempt_id": stored.attempt_id,
-            "target_release": stored.release.release_id,
-            "progress_percent": 5,
-            "candidate_root_generation": "",
-            "resulting_root_generation": "",
-            "rollback_reason": "",
-            "reported_at": Utc::now(),
-        }),
-        0o600,
-    )?;
-    Ok(())
+    // Inbox state is untrusted input for a privileged consumer. Only the root
+    // updater writes status after independently re-verifying this request and
+    // the exact signed bundle, so James never needs status-directory writes.
+    write_atomic_json(Path::new(UPDATE_REQUEST_PATH), &stored, 0o600)
 }
 
 /// Re-verify the offline-signed descriptor and exact archive as root, then
 /// extract the package snapshot into the root updater's private staging tree.
 pub fn verify_and_extract_stored_update() -> Result<PathBuf> {
+    verify_and_extract_stored_update_with_mode(false)
+}
+
+/// Re-authenticate a legacy flat-layout request after booting its candidate.
+/// Equality with the running signed release is required in this mode; this is
+/// intentionally separate from the pre-reboot strictly-newer verifier.
+pub fn verify_and_extract_candidate_update() -> Result<PathBuf> {
+    verify_and_extract_stored_update_with_mode(true)
+}
+
+fn verify_and_extract_stored_update_with_mode(candidate_boot: bool) -> Result<PathBuf> {
+    let request_body = read_bounded_snapshot_text(
+        Path::new(UPDATE_REQUEST_PATH),
+        256 * 1024,
+        "stored appliance update request",
+    )?;
+    let request_sha256 = hex::encode(Sha256::digest(request_body.as_bytes()));
     let request: StoredApplianceUpdate =
-        read_bounded_json(Path::new(UPDATE_REQUEST_PATH), 256 * 1024)?;
-    if request.schema != "cybex.pulse.appliance-update-request.v1" {
+        serde_json::from_str(&request_body).context("parse stored appliance update request")?;
+    if request.schema != "cybex.james.appliance-update-request.v1" {
         bail!("stored appliance update request schema is unsupported")
     }
-    validate_managed_update(&ManagedApplianceUpdate {
+    let managed = ManagedApplianceUpdate {
         attempt_id: request.attempt_id,
         requested_at: request.requested_at,
         release: request.release.clone(),
-    })?;
+        qualification_package_transport_url: None,
+    };
+    if candidate_boot {
+        validate_managed_update_identity(&managed)?;
+        let running: ApplianceRelease = read_bounded_json(Path::new(RELEASE_PATH), 64 * 1024)?;
+        if running.release_id != request.release.release_id {
+            bail!("candidate request does not match the running appliance release")
+        }
+    } else {
+        validate_managed_update(&managed)?;
+    }
     let expected_bundle =
         Path::new(UPDATE_BUNDLE_ROOT).join(format!("{}.tar.zst", request.attempt_id));
-    if Path::new(&request.bundle_path) != expected_bundle {
+    // dev.3 used the persistent mount root for downloads. Accept that one
+    // exact spelling during successor migration; either location remains
+    // untrusted and is authenticated before root-owned extraction.
+    let legacy_bundle = Path::new("/var/lib/cybex-james/state/appliance-update-bundles")
+        .join(format!("{}.tar.zst", request.attempt_id));
+    let request_bundle = Path::new(&request.bundle_path);
+    if request_bundle != expected_bundle && request_bundle != legacy_bundle {
         bail!("stored appliance update bundle path is not canonical")
     }
-    let mut bundle = fs::File::open(&expected_bundle).context("open appliance update bundle")?;
-    verify_bundle_reader(
-        &mut bundle,
+    fs::create_dir_all(UPDATE_ROOT).context("create appliance update root")?;
+    let update_root_metadata = fs::symlink_metadata(UPDATE_ROOT)?;
+    if !update_root_metadata.file_type().is_dir() || update_root_metadata.uid() != 0 {
+        bail!("appliance update root is unsafe")
+    }
+    let release_root = Path::new(UPDATE_ROOT).join(&request.release.release_id);
+    match fs::symlink_metadata(&release_root) {
+        Ok(metadata) if metadata.file_type().is_dir() && metadata.uid() == 0 => {
+            // Never reuse by release ID alone. Equal SemVer releases with a
+            // different signed descriptor/bundle identity must be re-pinned.
+            fs::remove_dir_all(&release_root)
+                .context("remove previous appliance release staging")?;
+            sync_directory(Path::new(UPDATE_ROOT))?;
+        }
+        Ok(_) => bail!("appliance release update directory is unsafe"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect appliance release update directory"),
+    }
+    fs::create_dir(&release_root).context("create appliance release update directory")?;
+    fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))?;
+    let pinned_bundle = release_root.join("bundle.tar.zst");
+    pin_untrusted_bundle(
+        request_bundle,
+        &pinned_bundle,
         request.release.cybex_repository_snapshot.size_bytes,
         &request.release.cybex_repository_snapshot.sha256,
     )?;
-
-    fs::create_dir_all(UPDATE_ROOT).context("create appliance update root")?;
-    let release_root = Path::new(UPDATE_ROOT).join(&request.release.release_id);
+    let mut bundle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&pinned_bundle)
+        .context("open pinned appliance update bundle")?;
     let packages = release_root.join("packages");
-    if prepare_appliance_release_root(&release_root, &packages, &request.release)? {
-        return Ok(packages);
-    }
     let temporary = release_root.join(format!(".packages.{}", request.attempt_id));
     fs::create_dir(&temporary).context("create appliance package staging directory")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
@@ -353,56 +414,97 @@ pub fn verify_and_extract_stored_update() -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&temporary);
     }
     extract_result?;
+    let descriptor_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&canonical_json(
+        serde_json::to_value(&request.release)?,
+    ))?));
+    let update_package_versions = update_root_package_versions(&request.release)?;
+    write_atomic_json(
+        &release_root.join("verified-update.json"),
+        &json!({
+            "schema":"cybex.james.verified-appliance-update.v1",
+            "attempt_id":request.attempt_id,
+            "target_release":request.release.release_id,
+            "request_sha256":request_sha256,
+            "descriptor_sha256":descriptor_sha256,
+            "bundle_sha256":request.release.cybex_repository_snapshot.sha256,
+            "bundle_size_bytes":request.release.cybex_repository_snapshot.size_bytes,
+            "update_package_versions":update_package_versions,
+        }),
+        0o600,
+    )?;
     Ok(packages)
 }
 
-fn prepare_appliance_release_root(
-    release_root: &Path,
-    packages: &Path,
+fn update_root_package_versions(
     release: &SignedApplianceRelease,
-) -> Result<bool> {
-    match fs::symlink_metadata(release_root) {
-        Ok(metadata)
-            if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {}
-        Ok(_) => bail!("appliance release update directory is unsafe"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(release_root).context("create appliance release update directory")?;
-        }
-        Err(error) => return Err(error).context("inspect appliance release update directory"),
+) -> Result<BTreeMap<String, String>> {
+    APPLIANCE_UPDATE_ROOT_PACKAGES
+        .into_iter()
+        .map(|package| {
+            release
+                .required_package_versions
+                .get(package)
+                .cloned()
+                .map(|version| (package.to_string(), version))
+                .ok_or_else(|| anyhow!("signed appliance update omitted a Cybex root package"))
+        })
+        .collect()
+}
+
+fn pin_untrusted_bundle(
+    source: &Path,
+    target: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<()> {
+    let mut source = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(source)
+        .context("open untrusted appliance update bundle")?;
+    let metadata = source.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 || metadata.len() != expected_size {
+        bail!("untrusted appliance update bundle is unsafe")
     }
-    fs::set_permissions(release_root, fs::Permissions::from_mode(0o700))?;
-    match fs::symlink_metadata(packages) {
-        Ok(metadata)
-            if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } =>
-        {
-            if verify_extracted_snapshot(packages, release).is_ok() {
-                return Ok(true);
+    let mut destination = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o400)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(target)
+        .context("create pinned appliance update bundle")?;
+    let result = (|| -> Result<()> {
+        let mut hasher = Sha256::new();
+        let mut copied = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
             }
-            fs::remove_dir_all(packages)
-                .context("remove corrupt extracted appliance package snapshot")?;
-            sync_directory(release_root)?;
+            copied = copied
+                .checked_add(read as u64)
+                .ok_or_else(|| anyhow!("appliance update bundle size overflow"))?;
+            if copied > expected_size {
+                bail!("appliance update bundle exceeded its signed size")
+            }
+            hasher.update(&buffer[..read]);
+            destination.write_all(&buffer[..read])?;
         }
-        Ok(_) => bail!("extracted appliance package snapshot path is unsafe"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("inspect extracted appliance package snapshot"),
+        if copied != expected_size || hex::encode(hasher.finalize()) != expected_sha256 {
+            bail!("appliance update bundle changed before it was pinned")
+        }
+        destination.sync_all()?;
+        sync_directory(
+            target
+                .parent()
+                .ok_or_else(|| anyhow!("pinned bundle has no parent"))?,
+        )
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(target);
     }
-    for entry in fs::read_dir(release_root)? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow!("appliance release update entry is not UTF-8"))?;
-        if !name.starts_with(".packages.") {
-            bail!("appliance release update directory contains an unexpected entry")
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-            bail!("appliance package staging directory is unsafe")
-        }
-        fs::remove_dir_all(entry.path()).context("remove stale appliance package staging")?;
-    }
-    sync_directory(release_root)?;
-    Ok(false)
+    result
 }
 
 fn validate_managed_update(update: &ManagedApplianceUpdate) -> Result<()> {
@@ -414,7 +516,9 @@ fn validate_managed_update_identity(update: &ManagedApplianceUpdate) -> Result<(
     if update.attempt_id.is_nil() {
         bail!("appliance update attempt ID is nil")
     }
-    validate_signed_release(&update.release)
+    validate_signed_release(&update.release)?;
+    appliance_update_transport(update)?;
+    Ok(())
 }
 
 fn validate_managed_update_transition(update: &ManagedApplianceUpdate) -> Result<()> {
@@ -470,7 +574,7 @@ fn validate_signed_release_with_policy(
 ) -> Result<()> {
     if release.schema != APPLIANCE_RELEASE_SCHEMA
         || release.minimum_protocol != 4
-        || release.minimum_state_schema != 1
+        || release.minimum_state_schema != 2
         || !release.rollback_compatible
         || !is_snapshot_id(&release.ubuntu_snapshot_id)
     {
@@ -484,7 +588,7 @@ fn validate_signed_release_with_policy(
     let snapshot = &release.cybex_repository_snapshot;
     let url = Url::parse(&snapshot.url).context("parse appliance package snapshot URL")?;
     let expected_filename = format!(
-        "cybex-pulse-appliance-packages-{}-x86_64-linux.tar.zst",
+        "cybex-james-appliance-packages-{}-x86_64-linux.tar.zst",
         release.release_id
     );
     if url.scheme() != "https"
@@ -505,12 +609,13 @@ fn validate_signed_release_with_policy(
         bail!("appliance package snapshot size is invalid")
     }
     let expected_packages = BTreeSet::from([
-        "cybex-pulse".to_string(),
-        "cybex-pulse-appliance".to_string(),
-        "cybex-pulse-bootstrap".to_string(),
+        "cybex-james".to_string(),
+        "cybex-james-appliance".to_string(),
+        "cybex-james-bootstrap".to_string(),
         "linux-firmware".to_string(),
         "linux-generic".to_string(),
         "nix-bin".to_string(),
+        "python3".to_string(),
     ]);
     if release
         .required_package_versions
@@ -584,14 +689,82 @@ fn validate_signed_release_with_policy(
         .context("verify appliance release signature")
 }
 
-async fn download_snapshot(snapshot: &ApplianceRepositorySnapshot, target: &Path) -> Result<()> {
-    download_snapshot_with_policy(snapshot, target, false).await
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplianceUpdateTransport<'a> {
+    url: &'a str,
+    allow_private_urls: bool,
+    follow_redirects: bool,
 }
 
-async fn download_snapshot_with_policy(
+fn appliance_update_transport(
+    update: &ManagedApplianceUpdate,
+) -> Result<ApplianceUpdateTransport<'_>> {
+    let snapshot = &update.release.cybex_repository_snapshot;
+    let Some(override_url) = update.qualification_package_transport_url.as_deref() else {
+        return Ok(ApplianceUpdateTransport {
+            url: &snapshot.url,
+            allow_private_urls: false,
+            follow_redirects: true,
+        });
+    };
+    validate_qualification_package_transport_url(override_url, snapshot)?;
+    Ok(ApplianceUpdateTransport {
+        url: override_url,
+        allow_private_urls: true,
+        follow_redirects: false,
+    })
+}
+
+fn validate_qualification_package_transport_url(
+    value: &str,
+    snapshot: &ApplianceRepositorySnapshot,
+) -> Result<()> {
+    if value.is_empty() || value.len() > 4096 || value.trim() != value {
+        bail!("appliance qualification transport URL is invalid")
+    }
+    let url = Url::parse(value).context("parse appliance qualification transport URL")?;
+    let ip = url
+        .host_str()
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok());
+    let expected_filename = Url::parse(&snapshot.url)
+        .context("parse signed appliance package snapshot URL")?
+        .path_segments()
+        .and_then(|mut segments| segments.next_back().map(str::to_string))
+        .ok_or_else(|| anyhow!("signed appliance package snapshot URL has no filename"))?;
+    let actual_filename = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back());
+    if url.scheme() != "http"
+        || url.as_str() != value
+        || !ip.is_some_and(qualification_transport_ip)
+        || url.port().is_none_or(|port| port == 0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || actual_filename != Some(expected_filename.as_str())
+    {
+        bail!(
+            "appliance qualification transport URL must be canonical private IP-literal HTTP for the exact signed archive filename"
+        )
+    }
+    Ok(())
+}
+
+fn qualification_transport_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+            || ip.is_unique_local() || ip.is_loopback(),
+            |ipv4| ipv4.is_private() || ipv4.is_loopback(),
+        ),
+    }
+}
+
+async fn download_snapshot_from_transport(
     snapshot: &ApplianceRepositorySnapshot,
     target: &Path,
-    allow_private_urls: bool,
+    transport: ApplianceUpdateTransport<'_>,
 ) -> Result<()> {
     match fs::symlink_metadata(target) {
         Ok(metadata)
@@ -630,9 +803,9 @@ async fn download_snapshot_with_policy(
         "appliance package snapshot download",
     )?;
     let mut response = release_transport::get(
-        &snapshot.url,
-        allow_private_urls,
-        true,
+        transport.url,
+        transport.allow_private_urls,
+        transport.follow_redirects,
         std::time::Duration::from_secs(4 * 60 * 60),
         None,
     )
@@ -1026,7 +1199,11 @@ pub(crate) fn verify_thin_installer_snapshot(
 
 fn read_bounded_snapshot_text(path: &Path, maximum_bytes: u64, label: &str) -> Result<String> {
     let metadata = fs::symlink_metadata(path).with_context(|| format!("inspect {label}"))?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum_bytes {
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > maximum_bytes
+    {
         bail!("{label} is invalid")
     }
     let mut file = fs::OpenOptions::new()
@@ -1038,6 +1215,7 @@ fn read_bounded_snapshot_text(path: &Path, maximum_bytes: u64, label: &str) -> R
         .metadata()
         .with_context(|| format!("inspect open {label}"))?;
     if !opened.file_type().is_file()
+        || opened.nlink() != 1
         || opened.dev() != metadata.dev()
         || opened.ino() != metadata.ino()
         || opened.len() != metadata.len()
@@ -1159,7 +1337,7 @@ pub fn store_network_change(change: Option<SignedApplianceNetworkChange>) -> Res
         return Ok(());
     };
     if !is_managed_ubuntu() {
-        bail!("received an appliance network change on a non-appliance Pulse host")
+        bail!("received an appliance network change on a non-appliance James host")
     }
     validate_network_change(&change, false)?;
     if read_optional_bounded_json::<Value>(Path::new(NETWORK_CHANGE_STATUS_PATH), 64 * 1024)
@@ -1182,35 +1360,37 @@ pub fn store_network_change(change: Option<SignedApplianceNetworkChange>) -> Res
         }
         bail!("another appliance network change is already durable")
     }
-    write_atomic_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), &change, 0o600)?;
-    write_atomic_json(
-        Path::new(NETWORK_CHANGE_STATUS_PATH),
-        &json!({
-            "status":"requested",
-            "stage":"queued",
-            "change_id":change.id,
-            "config_sha256":change.config_sha256,
-            "candidate_sha256":"",
-            "failure_code":"",
-            "reported_at":Utc::now(),
-        }),
-        0o600,
-    )
+    // The root network-change service creates status after re-verifying this
+    // signed request. Status remains read-only to James.
+    write_atomic_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), &change, 0o600)
 }
 
 pub fn verify_and_materialize_network_change() -> Result<PathBuf> {
+    verify_and_materialize_network_change_with_policy(false)
+}
+
+/// Re-derive an already root-committed candidate after a crash. Expiry and
+/// live-link/DAD checks are intentionally skipped only for exact byte
+/// comparison with the protected approved plan; this command never applies a
+/// network change by itself.
+pub fn verify_and_materialize_network_change_recovery() -> Result<PathBuf> {
+    verify_and_materialize_network_change_with_policy(true)
+}
+
+fn verify_and_materialize_network_change_with_policy(recovery: bool) -> Result<PathBuf> {
     let change: SignedApplianceNetworkChange =
         read_bounded_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), 128 * 1024)?;
-    validate_network_change(&change, false)?;
+    validate_network_change(&change, recovery)?;
     let (interface_name, mac) = resolve_wired_interface(&change.network.interface_id)?;
-    if fs::read_to_string(format!("/sys/class/net/{interface_name}/operstate"))
-        .unwrap_or_default()
-        .trim()
-        != "up"
+    if !recovery
+        && fs::read_to_string(format!("/sys/class/net/{interface_name}/operstate"))
+            .unwrap_or_default()
+            .trim()
+            != "up"
     {
         bail!("managed wired interface has no link")
     }
-    if change.network.mode == "static" {
+    if !recovery && change.network.mode == "static" {
         let address = change
             .network
             .address_cidr
@@ -1250,10 +1430,10 @@ pub fn verify_and_materialize_network_change() -> Result<PathBuf> {
         "network": {
             "version": 2,
             "renderer": "networkd",
-            "ethernets": {"cybex-pulse": Value::Object(device)},
+            "ethernets": {"cybex-james": Value::Object(device)},
         }
     }));
-    let output_root = Path::new("/run/cybex-pulse-network-change");
+    let output_root = Path::new("/run/cybex-james-network-change");
     fs::create_dir_all(output_root)?;
     fs::set_permissions(output_root, fs::Permissions::from_mode(0o700))?;
     let output = output_root.join(format!("{}.yaml", change.id));
@@ -1285,13 +1465,30 @@ pub fn pending_network_acknowledgement() -> Result<Option<PendingApplianceNetwor
 pub fn accept_network_acknowledgement(
     acknowledgement: &SignedApplianceNetworkAcknowledgement,
 ) -> Result<()> {
+    validate_network_acknowledgement(acknowledgement)?;
+    // Persist the complete signed acknowledgement. A bare candidate hash is
+    // not an authorization boundary: root re-verifies this exact object just
+    // before promoting the candidate.
+    write_atomic_json(Path::new(NETWORK_ACK_PATH), acknowledgement, 0o600)
+}
+
+pub fn verify_stored_network_acknowledgement() -> Result<String> {
+    let acknowledgement: SignedApplianceNetworkAcknowledgement =
+        read_bounded_json(Path::new(NETWORK_ACK_PATH), 128 * 1024)?;
+    validate_network_acknowledgement(&acknowledgement)?;
+    Ok(acknowledgement.candidate_sha256)
+}
+
+fn validate_network_acknowledgement(
+    acknowledgement: &SignedApplianceNetworkAcknowledgement,
+) -> Result<()> {
     let change: SignedApplianceNetworkChange =
         read_bounded_json(Path::new(NETWORK_CHANGE_REQUEST_PATH), 128 * 1024)?;
     validate_network_change(&change, false)?;
     let state = load_provisioning_state()?;
     let pending = pending_network_acknowledgement()?
         .ok_or_else(|| anyhow!("no Netplan candidate is awaiting acknowledgement"))?;
-    if acknowledgement.schema != "cybex.pulse.network-ack.v1"
+    if acknowledgement.schema != "cybex.james.network-ack.v1"
         || acknowledgement.change_id != change.id
         || acknowledgement.change_id != pending.change_id
         || acknowledgement.device_id != state.plan.reserved_device_id
@@ -1309,11 +1506,6 @@ pub fn accept_network_acknowledgement(
         &acknowledgement.signature,
         NETWORK_ACK_SIGNATURE_DOMAIN,
         &state.management_signing_public_key_b64,
-    )?;
-    write_atomic_bytes(
-        Path::new(NETWORK_ACK_PATH),
-        format!("{}\n", acknowledgement.candidate_sha256).as_bytes(),
-        0o600,
     )
 }
 
@@ -1322,7 +1514,7 @@ fn validate_network_change(
     allow_expired: bool,
 ) -> Result<()> {
     let state = load_provisioning_state()?;
-    if change.schema != "cybex.pulse.network-change.v1"
+    if change.schema != "cybex.james.network-change.v1"
         || change.id.is_nil()
         || change.device_incarnation_id.is_nil()
         || change.device_id != state.plan.reserved_device_id
@@ -1396,7 +1588,7 @@ fn canonical_url_base64(value: &str, expected_length: usize) -> Result<Vec<u8>> 
 fn load_provisioning_state() -> Result<crate::provisioning::DurableProvisioningState> {
     let state: crate::provisioning::DurableProvisioningState =
         read_bounded_json(Path::new(PROVISIONING_STATE_PATH), 512 * 1024)?;
-    if state.schema != "cybex.pulse.provisioning-state.v1"
+    if state.schema != "cybex.james.provisioning-state.v1"
         || state.management_signing_public_key_b64.is_empty()
         || !state.identity_active
     {
@@ -1505,35 +1697,12 @@ fn resolve_wired_interface(stable_id: &str) -> Result<(String, String)> {
     Ok(matches.remove(0))
 }
 
-fn write_atomic_bytes(path: &Path, body: &[u8], mode: u32) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("appliance state path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".network.{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(body)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-pub async fn report() -> Result<Option<ApplianceReport>> {
+pub async fn report(state: &crate::AppState) -> Result<Option<ApplianceReport>> {
     if !is_managed_ubuntu() {
         return Ok(None);
     }
     let release: ApplianceRelease = read_bounded_json(Path::new(RELEASE_PATH), 64 * 1024)?;
-    if release.schema != "cybex.pulse.appliance-release.v1"
+    if release.schema != "cybex.james.appliance-release.v1"
         || release.release_id.is_empty()
         || release.ubuntu_snapshot_id.is_empty()
     {
@@ -1560,15 +1729,18 @@ pub async fn report() -> Result<Option<ApplianceReport>> {
     let network = json!({
         "managed_interface_id": managed_interface_id,
         "interfaces": command_json("ip", &["-j", "address", "show"]).await,
-        "network_fallback_active": Path::new(
-            "/var/lib/cybex-pulse/state/network-fallback-active"
-        ).exists(),
+        // A marker is active only while it is bound to the exact approved plan
+        // that failed. If power is lost between promoting a new approved plan
+        // and unlinking the old marker, report and reconciliation both select
+        // the new approved plan instead of preserving a false fallback.
+        "network_fallback_active": crate::provisioning::network_fallback_active()
+            .unwrap_or(true),
         "network_change": read_optional_bounded_json::<Value>(
             Path::new(NETWORK_CHANGE_STATUS_PATH),
             64 * 1024,
         ).unwrap_or_else(|| json!({"status":"idle"})),
     });
-    let local_health = local_health().await;
+    let local_health = local_health(crate::readiness::probe(state).await).await;
     Ok(Some(ApplianceReport {
         base_os: "ubuntu".to_string(),
         base_os_version: "26.04".to_string(),
@@ -1596,7 +1768,7 @@ pub async fn report() -> Result<Option<ApplianceReport>> {
     }))
 }
 
-async fn local_health() -> Value {
+async fn local_health(readiness: crate::readiness::ApplianceReadiness) -> Value {
     let mut checks = serde_json::Map::new();
     for unit in ["nginx", "tftpd-hpa", "nix-daemon"] {
         let healthy = Command::new("systemctl")
@@ -1606,7 +1778,31 @@ async fn local_health() -> Value {
             .is_ok_and(|status| status.success());
         checks.insert(unit.to_string(), Value::Bool(healthy));
     }
-    let status = if checks.values().all(|value| value == &Value::Bool(true)) {
+    checks.insert(
+        "appliance_config".to_string(),
+        Value::Bool(readiness.appliance_config),
+    );
+    checks.insert(
+        "bootloader_asset".to_string(),
+        Value::Bool(readiness.bootloader_asset),
+    );
+    checks.insert(
+        "tftp_bootloader".to_string(),
+        Value::Bool(readiness.tftp_bootloader),
+    );
+    checks.insert(
+        "ipxe_chain_script_asset".to_string(),
+        Value::Bool(readiness.ipxe_chain_script_asset),
+    );
+    checks.insert(
+        "tftp_ipxe_chain_script".to_string(),
+        Value::Bool(readiness.tftp_ipxe_chain_script),
+    );
+    checks.insert(
+        "public_boot_url".to_string(),
+        Value::Bool(readiness.public_boot_url),
+    );
+    let status = if readiness.ready && checks.values().all(|value| value == &Value::Bool(true)) {
         "healthy"
     } else {
         "degraded"
@@ -1665,11 +1861,8 @@ fn read_trimmed(path: &str) -> String {
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path, max: u64) -> Result<T> {
-    let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() > max {
-        bail!("appliance state file is invalid")
-    }
-    serde_json::from_slice(&fs::read(path)?).with_context(|| format!("parse {}", path.display()))
+    let body = read_bounded_snapshot_text(path, max, "appliance state file")?;
+    serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
 }
 
 fn read_optional_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path, max: u64) -> Option<T> {
@@ -1688,31 +1881,32 @@ mod tests {
     fn signed_release_fixture() -> (SignedApplianceRelease, SigningKey) {
         let key = SigningKey::from_bytes(&[7; 32]);
         let required_package_versions = BTreeMap::from([
-            ("cybex-pulse".to_string(), "0.1.2-1".to_string()),
-            ("cybex-pulse-appliance".to_string(), "0.1.2-1".to_string()),
-            ("cybex-pulse-bootstrap".to_string(), "0.1.2-1".to_string()),
+            ("cybex-james".to_string(), "0.1.2-1".to_string()),
+            ("cybex-james-appliance".to_string(), "0.1.2-1".to_string()),
+            ("cybex-james-bootstrap".to_string(), "0.1.2-1".to_string()),
             (
                 "linux-firmware".to_string(),
                 "20260319.git217ca6e4.1ubuntu".to_string(),
             ),
             ("linux-generic".to_string(), "7.0.0-29.29".to_string()),
             ("nix-bin".to_string(), "2.34.3+dfsg-1".to_string()),
+            ("python3".to_string(), "3.13.5-1".to_string()),
         ]);
         let mut release = SignedApplianceRelease {
             schema: APPLIANCE_RELEASE_SCHEMA.to_string(),
             release_id: "0.1.2".to_string(),
             ubuntu_snapshot_id: "20260805T000000Z".to_string(),
             cybex_repository_snapshot: ApplianceRepositorySnapshot {
-                url: "https://github.com/CybexHQ/pulse/releases/download/v0.1.2/cybex-pulse-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
+                url: "https://github.com/CybexHQ/james/releases/download/v0.1.2/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
                 sha256: "a".repeat(64),
                 size_bytes: 1024 * 1024 * 1024,
             },
             required_package_versions,
             expected_kernel: "7.0.0-29.29".to_string(),
             minimum_protocol: 4,
-            minimum_state_schema: 1,
+            minimum_state_schema: 2,
             rollback_compatible: true,
-            release_notes: "https://github.com/CybexHQ/pulse/releases/tag/v0.1.2".to_string(),
+            release_notes: "https://github.com/CybexHQ/james/releases/tag/v0.1.2".to_string(),
             signature: String::new(),
         };
         let mut unsigned = serde_json::to_value(&release).unwrap();
@@ -1727,7 +1921,7 @@ mod tests {
 
     fn test_directory(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("cybex-pulse-{label}-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cybex-james-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
     }
@@ -1801,6 +1995,30 @@ mod tests {
     #[test]
     fn update_capability_is_versioned() {
         assert_eq!(APPLIANCE_UPDATE_CAPABILITY, "appliance_update_v1");
+        assert_eq!(APPLIANCE_UPDATE_CAPABILITY_V2, "appliance_update_v2");
+    }
+
+    #[test]
+    fn appliance_update_solver_receives_only_exact_signed_cybex_roots() {
+        let (mut release, _key) = signed_release_fixture();
+        assert_eq!(
+            update_root_package_versions(&release).unwrap(),
+            BTreeMap::from([
+                ("cybex-james".to_string(), "0.1.2-1".to_string()),
+                ("cybex-james-appliance".to_string(), "0.1.2-1".to_string(),),
+                ("cybex-james-bootstrap".to_string(), "0.1.2-1".to_string(),),
+            ])
+        );
+
+        release
+            .required_package_versions
+            .remove("cybex-james-bootstrap");
+        assert!(
+            update_root_package_versions(&release)
+                .unwrap_err()
+                .to_string()
+                .contains("omitted a Cybex root package")
+        );
     }
 
     #[test]
@@ -1810,6 +2028,7 @@ mod tests {
             attempt_id: uuid::Uuid::new_v4(),
             requested_at: Utc::now(),
             release,
+            qualification_package_transport_url: None,
         };
         let terminal = json!({
             "status": "succeeded",
@@ -1834,17 +2053,117 @@ mod tests {
     #[test]
     fn appliance_update_queue_keeps_only_the_latest_attempt() {
         let (release, _key) = signed_release_fixture();
-        let update = |attempt_id| ManagedApplianceUpdate {
+        let update = |attempt_id, qualification_package_transport_url| ManagedApplianceUpdate {
             attempt_id,
             requested_at: Utc::now(),
             release: release.clone(),
+            qualification_package_transport_url,
         };
         let first = uuid::Uuid::new_v4();
         let latest = uuid::Uuid::new_v4();
         let mut queue = ApplianceUpdateQueue::new();
-        assert!(queue.enqueue(update(first)));
-        assert!(!queue.enqueue(update(latest)));
-        assert_eq!(queue.pending.unwrap().attempt_id, latest);
+        assert!(queue.enqueue(update(
+            first,
+            Some(
+                "http://127.0.0.1:8080/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst"
+                    .to_string(),
+            ),
+        )));
+        assert!(!queue.enqueue(update(latest, None)));
+        let pending = queue.pending.unwrap();
+        assert_eq!(pending.attempt_id, latest);
+        assert_eq!(pending.qualification_package_transport_url, None);
+    }
+
+    #[test]
+    fn qualification_update_transport_is_private_ip_literal_and_attempt_local() {
+        let (release, _key) = signed_release_fixture();
+        let filename = "cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst";
+        for value in [
+            format!("http://10.20.30.40:8080/{filename}"),
+            format!("http://127.0.0.1:8080/{filename}"),
+            format!("http://[fd00::10]:8080/{filename}"),
+            format!("http://[::1]:8080/{filename}"),
+        ] {
+            let update = ManagedApplianceUpdate {
+                attempt_id: uuid::Uuid::new_v4(),
+                requested_at: Utc::now(),
+                release: release.clone(),
+                qualification_package_transport_url: Some(value.clone()),
+            };
+            assert_eq!(
+                appliance_update_transport(&update).unwrap(),
+                ApplianceUpdateTransport {
+                    url: value.as_str(),
+                    allow_private_urls: true,
+                    follow_redirects: false,
+                }
+            );
+        }
+
+        for value in [
+            format!("http://bridge.internal:8080/{filename}"),
+            format!("http://8.8.8.8:8080/{filename}"),
+            format!("http://169.254.169.254:8080/{filename}"),
+            format!("http://2130706433:8080/{filename}"),
+            format!("https://10.20.30.40:8080/{filename}"),
+            format!("http://127.0.0.1/{filename}"),
+            format!("http://127.0.0.1:0/{filename}"),
+            format!("http://user@10.20.30.40:8080/{filename}"),
+            format!("http://user:password@10.20.30.40:8080/{filename}"),
+            "http://10.20.30.40:8080/other.tar.zst".to_string(),
+            format!("http://10.20.30.40:8080/{filename}?token=secret"),
+            format!("http://10.20.30.40:8080/{filename}#debug"),
+            format!("http://10.20.30.40:8080/path/../{filename}"),
+            release.cybex_repository_snapshot.url.clone(),
+        ] {
+            let update = ManagedApplianceUpdate {
+                attempt_id: uuid::Uuid::new_v4(),
+                requested_at: Utc::now(),
+                release: release.clone(),
+                qualification_package_transport_url: Some(value.clone()),
+            };
+            assert!(
+                appliance_update_transport(&update).is_err(),
+                "unsafe qualification transport was accepted: {value}"
+            );
+        }
+
+        let ordinary = ManagedApplianceUpdate {
+            attempt_id: uuid::Uuid::new_v4(),
+            requested_at: Utc::now(),
+            release: release.clone(),
+            qualification_package_transport_url: None,
+        };
+        assert_eq!(
+            appliance_update_transport(&ordinary).unwrap(),
+            ApplianceUpdateTransport {
+                url: release.cybex_repository_snapshot.url.as_str(),
+                allow_private_urls: false,
+                follow_redirects: true,
+            }
+        );
+        assert!(
+            serde_json::to_value(&ordinary)
+                .unwrap()
+                .get("qualification_package_transport_url")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stored_update_never_persists_the_qualification_transport() {
+        let (release, _key) = signed_release_fixture();
+        let stored = StoredApplianceUpdate {
+            schema: "cybex.james.appliance-update-request.v1".to_string(),
+            attempt_id: uuid::Uuid::new_v4(),
+            requested_at: Utc::now(),
+            release,
+            bundle_path: "/var/lib/cybex-james/state/inbox/appliance-update-bundles/test.tar.zst"
+                .to_string(),
+        };
+        let value = serde_json::to_value(stored).unwrap();
+        assert!(value.get("qualification_package_transport_url").is_none());
     }
 
     #[tokio::test]
@@ -1876,15 +2195,76 @@ mod tests {
             size_bytes: body.len() as u64,
         };
 
-        download_snapshot_with_policy(&snapshot, &target, true)
-            .await
-            .unwrap();
+        download_snapshot_from_transport(
+            &snapshot,
+            &target,
+            ApplianceUpdateTransport {
+                url: &snapshot.url,
+                allow_private_urls: true,
+                follow_redirects: false,
+            },
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
         assert_eq!(fs::read(&target).unwrap(), body);
         assert_eq!(
             fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn qualification_transport_cannot_substitute_tampered_candidate_bytes() {
+        let root = test_directory("tampered-qualification-snapshot");
+        let target = root.join("snapshot.tar.zst");
+        let tampered = b"tampered".to_vec();
+        let expected = b"expected";
+        assert_eq!(tampered.len(), expected.len());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let filename = "cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst";
+        let transport_url = format!("http://{address}/{filename}");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with(&format!("GET /{filename}"))
+            );
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                tampered.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&tampered).await.unwrap();
+        });
+        let snapshot = ApplianceRepositorySnapshot {
+            url: format!("https://github.com/CybexHQ/james/releases/download/v0.1.2/{filename}"),
+            sha256: hex::encode(Sha256::digest(expected)),
+            size_bytes: expected.len() as u64,
+        };
+        let update = ManagedApplianceUpdate {
+            attempt_id: uuid::Uuid::new_v4(),
+            requested_at: Utc::now(),
+            release: SignedApplianceRelease {
+                cybex_repository_snapshot: snapshot.clone(),
+                ..signed_release_fixture().0
+            },
+            qualification_package_transport_url: Some(transport_url),
+        };
+        let error = download_snapshot_from_transport(
+            &snapshot,
+            &target,
+            appliance_update_transport(&update).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(error.to_string().contains("integrity check failed"));
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1905,12 +2285,13 @@ mod tests {
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                "cybex-pulse",
-                "cybex-pulse-appliance",
-                "cybex-pulse-bootstrap",
+                "cybex-james",
+                "cybex-james-appliance",
+                "cybex-james-bootstrap",
                 "linux-firmware",
                 "linux-generic",
                 "nix-bin",
+                "python3",
             ])
         );
         validate_install_release(&release, "0.1.2", &key_path, 4 * 1024 * 1024 * 1024).unwrap();
@@ -1926,7 +2307,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_update_snapshot_does_not_require_thin_installer_boot_packages() {
+    fn update_snapshot_does_not_require_thin_installer_boot_packages() {
         let (release, _key) = signed_release_fixture();
         let legacy_root = test_directory("legacy-six-package-snapshot");
         let legacy_packages = release
@@ -1953,29 +2334,25 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_partial_extracted_snapshot_is_reconciled_to_a_clean_root() {
-        let (release, _key) = signed_release_fixture();
-        let root = test_directory("extracted-snapshot-recovery");
-        let release_root = root.join("release");
-        let packages = release_root.join("packages");
-        fs::create_dir(&release_root).unwrap();
-        fs::create_dir(&packages).unwrap();
-        let package_names = release
-            .required_package_versions
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        write_test_repository(&packages, &release, &package_names);
-        assert!(prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
-
-        fs::write(packages.join("Packages"), b"corrupt\n").unwrap();
-        assert!(!prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
-        assert!(!packages.exists());
-
-        let stale = release_root.join(".packages.crashed-attempt");
-        fs::create_dir(&stale).unwrap();
-        assert!(!prepare_appliance_release_root(&release_root, &packages, &release).unwrap());
-        assert!(!stale.exists());
+    fn untrusted_update_bundle_is_pinned_before_later_consumption() {
+        let root = test_directory("pinned-update-bundle");
+        let source = root.join("inbox.tar.zst");
+        let target = root.join("root-owned.tar.zst");
+        let body = b"signed bundle bytes";
+        fs::write(&source, body).unwrap();
+        pin_untrusted_bundle(
+            &source,
+            &target,
+            body.len() as u64,
+            &hex::encode(Sha256::digest(body)),
+        )
+        .unwrap();
+        fs::write(&source, b"mutated after pin!").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), body);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -17,10 +17,14 @@ const MIN_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 const STATIC_PREFLIGHT_ROUTE_TABLE: &str = "42666";
 const STATIC_PREFLIGHT_RULE_PRIORITY: &str = "42666";
 const STATIC_PREFLIGHT_OUTPUT_LIMIT: usize = 16 * 1024;
+// `prepare` runs from the stock Ubuntu live filesystem, before the signed
+// appliance package snapshot (and its iputils-arping dependency) is installed.
+// The pinned live image ships this BusyBox applet; the ISO builder verifies it.
+const LIVE_INSTALLER_BUSYBOX: &str = "/usr/bin/busybox";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PulseProvisioningEthernetInterface {
+pub struct JamesProvisioningEthernetInterface {
     pub id: String,
     pub name: String,
     pub mac: String,
@@ -31,7 +35,7 @@ pub struct PulseProvisioningEthernetInterface {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PulseProvisioningDisk {
+pub struct JamesProvisioningDisk {
     pub id: String,
     pub path: String,
     pub model: String,
@@ -48,7 +52,7 @@ pub struct PulseProvisioningDisk {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PulseProvisioningInventory {
+pub struct JamesProvisioningInventory {
     pub manufacturer: String,
     pub model: String,
     pub serial_number: String,
@@ -62,17 +66,17 @@ pub struct PulseProvisioningInventory {
     pub secure_boot: bool,
     pub virtualization: String,
     #[serde(default)]
-    pub ethernet_interfaces: Vec<PulseProvisioningEthernetInterface>,
+    pub ethernet_interfaces: Vec<JamesProvisioningEthernetInterface>,
     #[serde(default)]
-    pub disks: Vec<PulseProvisioningDisk>,
+    pub disks: Vec<JamesProvisioningDisk>,
 }
 
-pub(crate) async fn collect_inventory() -> Result<PulseProvisioningInventory> {
+pub(crate) async fn collect_inventory() -> Result<JamesProvisioningInventory> {
     let mut ethernet_interfaces = collect_ethernet_interfaces().await?;
     ethernet_interfaces.sort_by(|left, right| left.id.cmp(&right.id));
     let mut disks = collect_disks().await?;
     disks.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(PulseProvisioningInventory {
+    Ok(JamesProvisioningInventory {
         manufacturer: clean(&read_trimmed("/sys/class/dmi/id/sys_vendor"), 256),
         model: clean(&read_trimmed("/sys/class/dmi/id/product_name"), 256),
         serial_number: clean(&read_trimmed("/sys/class/dmi/id/product_serial"), 256),
@@ -96,12 +100,12 @@ pub(crate) async fn collect_inventory() -> Result<PulseProvisioningInventory> {
     })
 }
 
-pub(crate) fn inventory_sha256(inventory: &PulseProvisioningInventory) -> Result<String> {
+pub(crate) fn inventory_sha256(inventory: &JamesProvisioningInventory) -> Result<String> {
     let bytes = serde_json::to_vec(inventory).context("serialize hardware inventory")?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-pub(crate) fn hardware_digest(inventory: &PulseProvisioningInventory) -> Result<String> {
+pub(crate) fn hardware_digest(inventory: &JamesProvisioningInventory) -> Result<String> {
     let value = canonical_json(json!({
         "manufacturer": inventory.manufacturer,
         "model": inventory.model,
@@ -127,7 +131,7 @@ pub(crate) fn hardware_digest(inventory: &PulseProvisioningInventory) -> Result<
 
 pub(crate) fn revalidate_plan_hardware(
     plan: &SignedInstallPlan,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
 ) -> Result<()> {
     if hardware_digest(inventory)? != plan.hardware_digest {
         bail!("stable hardware identity changed after approval")
@@ -159,7 +163,7 @@ pub(crate) fn revalidate_plan_hardware(
 
 pub(crate) fn revalidate_durable_plan_hardware(
     plan: &SignedInstallPlan,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
 ) -> Result<()> {
     if hardware_digest(inventory)? != plan.hardware_digest
         || inventory.boot_mode != "uefi"
@@ -188,7 +192,7 @@ pub(crate) fn revalidate_durable_plan_hardware(
 
 pub(crate) async fn preflight_network(
     plan: &SignedInstallPlan,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
     manage_origin: &str,
 ) -> Result<()> {
     let interface = inventory
@@ -235,9 +239,8 @@ pub(crate) async fn preflight_network(
             if dns_servers.is_empty() {
                 bail!("static DNS configuration is invalid")
             }
-            let manage_host = manage_https_host(manage_origin)?;
-            let duplicate_free = bounded_command_success(
-                "arping",
+            let (manage_host, manage_port) = manage_https_endpoint(manage_origin)?;
+            let duplicate_free = bounded_live_arping_success(
                 &[
                     "-D",
                     "-q",
@@ -250,7 +253,9 @@ pub(crate) async fn preflight_network(
                 Duration::from_secs(8),
             )
             .await
-            .context("run duplicate-address detection")?;
+            .context(
+                "James setup media cannot run its network safety check; create a new James ISO in Cybex Manage and try again",
+            )?;
             if !duplicate_free {
                 bail!("static address is already in use or duplicate detection failed")
             }
@@ -336,8 +341,7 @@ pub(crate) async fn preflight_network(
             .context("install candidate static source-policy rule")?;
             probe.rule_owned = true;
 
-            let gateway_reachable = bounded_command_success(
-                "arping",
+            let gateway_reachable = bounded_live_arping_success(
                 &[
                     "-q",
                     "-c",
@@ -351,7 +355,9 @@ pub(crate) async fn preflight_network(
                 Duration::from_secs(8),
             )
             .await
-            .context("probe approved static gateway")?;
+            .context(
+                "James setup media cannot run its network safety check; create a new James ISO in Cybex Manage and try again",
+            )?;
             if !gateway_reachable {
                 bail!("approved static gateway did not answer on the selected interface")
             }
@@ -394,7 +400,7 @@ pub(crate) async fn preflight_network(
             let mut https_reachable = false;
             for resolved in resolved_addresses {
                 let resolved = resolved.to_string();
-                let resolve = format!("{manage_host}:443:{resolved}");
+                let resolve = format!("{manage_host}:{manage_port}:{resolved}");
                 let reachable = bounded_command_success(
                     "curl",
                     &[
@@ -563,6 +569,13 @@ async fn bounded_command_success(
         .success())
 }
 
+async fn bounded_live_arping_success(arguments: &[&str], timeout: Duration) -> Result<bool> {
+    let mut busybox_arguments = Vec::with_capacity(arguments.len() + 1);
+    busybox_arguments.push("arping");
+    busybox_arguments.extend_from_slice(arguments);
+    bounded_command_success(LIVE_INSTALLER_BUSYBOX, &busybox_arguments, timeout).await
+}
+
 async fn bounded_command(program: &str, arguments: &[&str], timeout: Duration) -> Result<Output> {
     let mut command = Command::new(program);
     command.args(arguments).kill_on_drop(true);
@@ -578,22 +591,26 @@ async fn bounded_command(program: &str, arguments: &[&str], timeout: Duration) -
     Ok(output)
 }
 
-fn manage_https_host(manage_origin: &str) -> Result<String> {
+fn manage_https_endpoint(manage_origin: &str) -> Result<(String, u16)> {
     let url = reqwest::Url::parse(manage_origin).context("Management origin is not a valid URL")?;
     if url.scheme() != "https"
-        || url.port_or_known_default() != Some(443)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        bail!("Management origin must be an HTTPS origin on port 443")
+        bail!("Management origin must be a canonical HTTPS origin")
     }
-    url.host_str()
+    let host = url
+        .host_str()
         .filter(|host| !host.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("Management origin omitted its host"))
+        .ok_or_else(|| anyhow!("Management origin omitted its host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("Management origin omitted its HTTPS port"))?;
+    Ok((host, port))
 }
 
 fn ipv4_network(address: Ipv4Addr, prefix: u8) -> Ipv4Addr {
@@ -601,7 +618,7 @@ fn ipv4_network(address: Ipv4Addr, prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(address) & mask)
 }
 
-async fn collect_ethernet_interfaces() -> Result<Vec<PulseProvisioningEthernetInterface>> {
+async fn collect_ethernet_interfaces() -> Result<Vec<JamesProvisioningEthernetInterface>> {
     let mut interfaces = Vec::new();
     for entry in fs::read_dir("/sys/class/net").context("enumerate network interfaces")? {
         let entry = entry.context("read network interface")?;
@@ -660,7 +677,7 @@ async fn collect_ethernet_interfaces() -> Result<Vec<PulseProvisioningEthernetIn
             .and_then(|route| route.get("gateway"))
             .and_then(Value::as_str)
             .map(|value| clean(value, 128));
-        interfaces.push(PulseProvisioningEthernetInterface {
+        interfaces.push(JamesProvisioningEthernetInterface {
             id,
             name: clean(&name, 64),
             mac,
@@ -672,7 +689,7 @@ async fn collect_ethernet_interfaces() -> Result<Vec<PulseProvisioningEthernetIn
     Ok(interfaces)
 }
 
-async fn collect_disks() -> Result<Vec<PulseProvisioningDisk>> {
+async fn collect_disks() -> Result<Vec<JamesProvisioningDisk>> {
     let output = Command::new("lsblk")
         .args([
             "--json",
@@ -722,7 +739,7 @@ async fn collect_disks() -> Result<Vec<PulseProvisioningDisk>> {
             blocker_codes.push("disk_too_small".to_string());
         }
         let id = stable_disk_id(Path::new(path))?;
-        disks.push(PulseProvisioningDisk {
+        disks.push(JamesProvisioningDisk {
             id,
             path: clean(path, 256),
             model: clean(value_string(row.get("model")), 128),
@@ -933,8 +950,8 @@ fn canonical_json(value: Value) -> Value {
 mod tests {
     use super::*;
 
-    fn stable_inventory_fixture() -> PulseProvisioningInventory {
-        PulseProvisioningInventory {
+    fn stable_inventory_fixture() -> JamesProvisioningInventory {
+        JamesProvisioningInventory {
             manufacturer: "Cybex".into(),
             model: "Qualification VM".into(),
             serial_number: "vm-1".into(),
@@ -947,7 +964,7 @@ mod tests {
             boot_mode: "uefi".into(),
             secure_boot: true,
             virtualization: "kvm".into(),
-            ethernet_interfaces: vec![PulseProvisioningEthernetInterface {
+            ethernet_interfaces: vec![JamesProvisioningEthernetInterface {
                 id: "pci-0000:00:03.0".into(),
                 name: "enp0s3".into(),
                 mac: "52:54:00:12:34:56".into(),
@@ -955,7 +972,7 @@ mod tests {
                 addresses: vec!["10.62.52.76/24".into()],
                 gateway: Some("10.62.52.1".into()),
             }],
-            disks: vec![PulseProvisioningDisk {
+            disks: vec![JamesProvisioningDisk {
                 id: "scsi-qualification".into(),
                 path: "/dev/sda".into(),
                 model: "QEMU disk".into(),
@@ -1001,19 +1018,22 @@ mod tests {
     }
 
     #[test]
-    fn management_connectivity_probe_accepts_only_a_bare_https_origin() {
+    fn management_connectivity_probe_preserves_an_explicit_https_port() {
         assert_eq!(
-            manage_https_host("https://manage.cybex.net").unwrap(),
-            "manage.cybex.net"
+            manage_https_endpoint("https://manage.cybex.net").unwrap(),
+            ("manage.cybex.net".to_string(), 443)
+        );
+        assert_eq!(
+            manage_https_endpoint("https://manage.cybex.net:8443").unwrap(),
+            ("manage.cybex.net".to_string(), 8443)
         );
         for invalid in [
             "http://manage.cybex.net",
-            "https://manage.cybex.net:8443",
             "https://user@manage.cybex.net",
             "https://manage.cybex.net/path",
             "https://manage.cybex.net?query=yes",
         ] {
-            assert!(manage_https_host(invalid).is_err(), "{invalid}");
+            assert!(manage_https_endpoint(invalid).is_err(), "{invalid}");
         }
     }
 
@@ -1027,7 +1047,7 @@ mod tests {
 
     #[test]
     fn removable_or_small_disks_cannot_be_eligible() {
-        let disk = PulseProvisioningDisk {
+        let disk = JamesProvisioningDisk {
             id: "ata-test".into(),
             path: "/dev/sda".into(),
             model: String::new(),

@@ -1,0 +1,27 @@
+[Unit]
+Description=Cybex James appliance status console
+After=systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
+Before=getty.target rescue.service
+IgnoreOnIsolate=yes
+Conflicts=rescue.service
+ConditionPathExists=/dev/tty0
+
+[Service]
+# Match the normal virtual-console scheduling behavior so boot output settles
+# before the appliance screen is drawn.
+Type=idle
+ExecStart=/usr/lib/cybex-james/cybex-james-console
+Restart=always
+RestartSec=2s
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+
+[Install]
+WantedBy=getty.target

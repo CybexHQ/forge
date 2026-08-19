@@ -1,8 +1,8 @@
 use super::{
     DurableProvisioningState,
-    inventory::PulseProvisioningInventory,
+    inventory::JamesProvisioningInventory,
     packages::{PackageDelivery, STAGED_REPOSITORY_PATH},
-    protocol::{PulseProvisioningNetworkPlan, SignedInstallPlan},
+    protocol::{JamesProvisioningNetworkPlan, SignedInstallPlan},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -290,7 +290,7 @@ fn boot_installed_appliance() -> Result<()> {
     let body = String::from_utf8(output.stdout).context("UEFI boot entries are not UTF-8")?;
     let boot_number = body.lines().find_map(|line| {
         let lower = line.to_ascii_lowercase();
-        if !(lower.contains("ubuntu") || lower.contains("cybex pulse"))
+        if !(lower.contains("ubuntu") || lower.contains("cybex james"))
             || !line.starts_with("Boot")
             || line.len() < 8
         {
@@ -324,7 +324,7 @@ fn boot_installed_appliance() -> Result<()> {
 
 pub(crate) async fn create_state_partition_first(
     plan: &SignedInstallPlan,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
     state_mount: &Path,
 ) -> Result<PreparedStorage> {
     let disk = inventory
@@ -401,7 +401,7 @@ pub(crate) async fn create_state_partition_first(
 
 pub(crate) async fn resume_prepared_storage(
     plan: &SignedInstallPlan,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
     state_mount: &Path,
 ) -> Result<PreparedStorage> {
     let disk = inventory
@@ -608,7 +608,7 @@ pub(crate) fn load_durable_state(state_mount: &Path) -> Result<DurableProvisioni
     }
     let state: DurableProvisioningState =
         serde_json::from_slice(&bytes).context("parse durable provisioning state")?;
-    if state.schema != "cybex.pulse.provisioning-state.v1" {
+    if state.schema != "cybex.james.provisioning-state.v1" {
         bail!("durable provisioning state schema is unsupported")
     }
     Ok(state)
@@ -621,7 +621,7 @@ pub(crate) fn write_autoinstall(
     package_delivery: PackageDelivery,
 ) -> Result<()> {
     configure_live_offline_apt(Path::new("/"), package_delivery)?;
-    let hostname = format!("pulse-{}", device_id_suffix(&plan.reserved_device_id));
+    let hostname = format!("james-{}", device_id_suffix(&plan.reserved_device_id));
     let config = json!({
         "autoinstall": {
             "version": 1,
@@ -687,7 +687,7 @@ fn configure_live_offline_apt(root: &Path, package_delivery: PackageDelivery) ->
     let legacy_sources = root.join("etc/apt/sources.list");
     atomic_write(
         &legacy_sources,
-        b"# Cybex Pulse installation uses the verified offline package snapshot.\n",
+        b"# Cybex James installation uses the verified offline package snapshot.\n",
         0o644,
     )?;
     let repository = repository_path(package_delivery);
@@ -702,9 +702,9 @@ fn configure_live_offline_apt(root: &Path, package_delivery: PackageDelivery) ->
 
 fn offline_package_install_commands(package_delivery: PackageDelivery) -> Value {
     let packages = [
-        "cybex-pulse",
-        "cybex-pulse-bootstrap",
-        "cybex-pulse-appliance",
+        "cybex-james",
+        "cybex-james-bootstrap",
+        "cybex-james-appliance",
         "linux-generic",
         "linux-firmware",
         "intel-microcode",
@@ -745,10 +745,10 @@ fn offline_package_install_commands(package_delivery: PackageDelivery) -> Value 
     );
     json!([
         ["sh", "-ceu", install],
-        "/cdrom/cybex/bootstrap/cybex-pulse-bootstrap event --state-mount /run/cybex-state --stage installing_packages --status succeeded --progress-percent 80 --message 'Offline Ubuntu and Cybex packages installed'",
-        "/cdrom/cybex/bootstrap/cybex-pulse-bootstrap finalize-target --target /target --state-mount /run/cybex-state",
-        "/cdrom/cybex/bootstrap/cybex-pulse-bootstrap event --state-mount /run/cybex-state --stage installing_bootloader --status succeeded --progress-percent 95 --message 'Signed Ubuntu bootloader installed'",
-        "/cdrom/cybex/bootstrap/cybex-pulse-bootstrap event --state-mount /run/cybex-state --stage rebooting --status succeeded --progress-percent 99 --message 'Rebooting into the managed appliance'"
+        "/cdrom/cybex/bootstrap/cybex-james-bootstrap event --state-mount /run/cybex-state --stage installing_packages --status succeeded --progress-percent 80 --message 'Offline Ubuntu and Cybex packages installed'",
+        "/cdrom/cybex/bootstrap/cybex-james-bootstrap finalize-target --target /target --state-mount /run/cybex-state",
+        "/cdrom/cybex/bootstrap/cybex-james-bootstrap event --state-mount /run/cybex-state --stage installing_bootloader --status succeeded --progress-percent 95 --message 'Signed Ubuntu bootloader installed'",
+        "/cdrom/cybex/bootstrap/cybex-james-bootstrap event --state-mount /run/cybex-state --stage rebooting --status succeeded --progress-percent 99 --message 'Rebooting into the managed appliance'"
     ])
 }
 
@@ -791,8 +791,8 @@ fn storage_config(prepared: &PreparedStorage) -> Result<Value> {
         {"type":"format","id":"cache-format","volume":"cache-partition","fstype":"ext4","label":"CYBEX_CACHE"},
         {"type":"mount","id":"root-mount","device":"root-format","path":"/","options":"defaults"},
         {"type":"mount","id":"efi-mount","device":"efi-format","path":"/boot/efi","options":"umask=0077"},
-        {"type":"mount","id":"state-mount","device":"state-format","path":"/var/lib/cybex-pulse/state","options":"nodev,nosuid"},
-        {"type":"mount","id":"cache-mount","device":"cache-format","path":"/var/cache/cybex-pulse","options":"nodev,nosuid,exec"},
+        {"type":"mount","id":"state-mount","device":"state-format","path":"/var/lib/cybex-james/state","options":"nodev,nosuid"},
+        {"type":"mount","id":"cache-mount","device":"cache-format","path":"/var/cache/cybex-james","options":"nodev,nosuid,exec"},
         {"type":"mount","id":"swap-mount","device":"swap-format","path":"none"}
     ]))
 }
@@ -808,11 +808,21 @@ pub(crate) fn materialize_target(
     if state.plan.ssh_ca_public_keys.is_empty() {
         bail!("install plan contains no SSH CA trust key")
     }
-    let target_state = target.join("var/lib/cybex-pulse/state");
-    let target_etc = target.join("etc/cybex-pulse");
+    let target_state_root = target.join("var/lib/cybex-james/state");
+    let target_control = target.join("var/lib/cybex-james/control");
+    let target_agent = target_state_root.join("agent");
+    let target_inbox = target_state_root.join("inbox");
+    let target_etc = target.join("etc/cybex-james");
     let target_ssh = target.join("etc/ssh");
     let target_netplan = target.join("etc/netplan");
-    for directory in [&target_state, &target_etc, &target_ssh, &target_netplan] {
+    for directory in [
+        &target_control,
+        &target_agent,
+        &target_inbox,
+        &target_etc,
+        &target_ssh,
+        &target_netplan,
+    ] {
         fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
     }
     let transient_apt_source = target.join("etc/apt/sources.list.d/cybex-appliance.sources");
@@ -829,30 +839,35 @@ pub(crate) fn materialize_target(
         "last_reported_event_id": null
     });
     atomic_write(
-        &target_state.join("manage-state.json"),
+        &target_agent.join("manage-state.json"),
         &serde_json::to_vec_pretty(&managed_state)?,
         0o600,
     )?;
     atomic_write(
-        &target_state.join("install-plan.json"),
+        &target_control.join("provisioning-state.json"),
+        &serde_json::to_vec_pretty(state)?,
+        0o600,
+    )?;
+    atomic_write(
+        &target_control.join("install-plan.json"),
         &serde_json::to_vec_pretty(&state.plan)?,
         0o600,
     )?;
 
     let public_base_url = public_base_url(&state.plan);
-    let config = pulse_config(target, state, &public_base_url)?;
+    let config = james_config(target, state, &public_base_url)?;
     atomic_write(&target_etc.join("config.toml"), config.as_bytes(), 0o600)?;
     atomic_write(
-        &target_netplan.join("90-cybex-pulse.yaml"),
+        &target_netplan.join("90-cybex-james.yaml"),
         &serde_json::to_vec_pretty(&netplan(&state.plan.network, &state.plan))?,
         0o600,
     )?;
     atomic_write(
-        &target_state.join("netplan-approved.json"),
+        &target_control.join("netplan-approved.json"),
         &serde_json::to_vec_pretty(&netplan(&state.plan.network, &state.plan))?,
         0o600,
     )?;
-    let fallback = PulseProvisioningNetworkPlan {
+    let fallback = JamesProvisioningNetworkPlan {
         mode: "dhcp".to_string(),
         interface_id: state.plan.network.interface_id.clone(),
         address_cidr: None,
@@ -860,24 +875,24 @@ pub(crate) fn materialize_target(
         dns_servers: Vec::new(),
     };
     atomic_write(
-        &target_state.join("netplan-dhcp-fallback.json"),
+        &target_control.join("netplan-dhcp-fallback.json"),
         &serde_json::to_vec_pretty(&netplan(&fallback, &state.plan))?,
         0o600,
     )?;
     atomic_write(
-        &target_ssh.join("cybex-pulse-ca.pub"),
+        &target_ssh.join("cybex-james-ca.pub"),
         format!("{}\n", state.plan.ssh_ca_public_keys.join("\n")).as_bytes(),
         0o644,
     )?;
     atomic_write(
-        &target_ssh.join("cybex-pulse-principals"),
+        &target_ssh.join("cybex-james-principals"),
         format!("{}\n", state.plan.reserved_device_id).as_bytes(),
         0o644,
     )?;
     atomic_write(
-        &target_state.join("appliance-release.json"),
+        &target_control.join("appliance-release.json"),
         &serde_json::to_vec_pretty(&json!({
-            "schema": "cybex.pulse.installed-appliance.v1",
+            "schema": "cybex.james.installed-appliance.v1",
             "release": state.plan.release_version,
             "base_os": "ubuntu",
             "base_os_version": "26.04",
@@ -887,14 +902,14 @@ pub(crate) fn materialize_target(
         0o644,
     )?;
     atomic_write(
-        &target_state.join("management-cidrs.txt"),
+        &target_control.join("management-cidrs.txt"),
         format!("{}\n", state.plan.management_cidrs.join("\n")).as_bytes(),
         0o600,
     )?;
     stage_cache_backed_nix_store(target)?;
     append_unique_line(
         &target.join("etc/fstab"),
-        "/var/cache/cybex-pulse/nix /nix none bind,nodev,nosuid,exec 0 0",
+        "/var/cache/cybex-james/nix /nix none bind,nodev,nosuid,exec 0 0",
     )?;
     // The live and target paths are two mounts of the same CYBEX_STATE
     // filesystem. Flush the live file; it is already visible in the target.
@@ -904,7 +919,7 @@ pub(crate) fn materialize_target(
 
 fn stage_cache_backed_nix_store(target: &Path) -> Result<()> {
     let target_nix = target.join("nix");
-    let cache_nix = target.join("var/cache/cybex-pulse/nix");
+    let cache_nix = target.join("var/cache/cybex-james/nix");
     fs::create_dir_all(&target_nix).context("create installed Nix directory")?;
     fs::create_dir_all(&cache_nix).context("create cache-backed Nix store")?;
 
@@ -931,7 +946,7 @@ fn stage_cache_backed_nix_store(target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn netplan(network: &PulseProvisioningNetworkPlan, plan: &SignedInstallPlan) -> Value {
+pub(crate) fn netplan(network: &JamesProvisioningNetworkPlan, plan: &SignedInstallPlan) -> Value {
     let mut device = serde_json::Map::new();
     device.insert(
         "match".to_string(),
@@ -960,40 +975,54 @@ fn netplan(network: &PulseProvisioningNetworkPlan, plan: &SignedInstallPlan) -> 
         "network": {
             "version": 2,
             "renderer": "networkd",
-            "ethernets": {"cybex-pulse": Value::Object(device)}
+            "ethernets": {"cybex-james": Value::Object(device)}
         }
     })
 }
 
-fn pulse_config(
+fn james_config(
     target: &Path,
     state: &DurableProvisioningState,
     public_base_url: &str,
 ) -> Result<String> {
     let admin_token = super::protocol::sha256_hex(format!(
-        "CYBEX-PULSE-LOCAL-ADMIN-V1\0{}",
+        "CYBEX-JAMES-LOCAL-ADMIN-V1\0{}",
         state.device_private_key_b64
     ));
     let release_public_key =
-        fs::read_to_string(target.join("usr/share/cybex-pulse/release-public-key"))
-            .context("read installed Pulse release public key")?;
+        fs::read_to_string(target.join("usr/share/cybex-james/release-public-key"))
+            .context("read installed James release public key")?;
     let release_public_key = release_public_key.trim();
     if release_public_key.is_empty() {
-        bail!("installed Pulse release public key is empty")
+        bail!("installed James release public key is empty")
     }
+    let organization_slug = state
+        .plan
+        .organization_slug
+        .as_deref()
+        .context("install plan organization slug is missing")?;
+    let blueprint_target = crate::config::governed_blueprint_build_target();
     Ok(format!(
         "[server]\nlisten_addr = \"127.0.0.1:8080\"\npublic_base_url = {}\n\n\
-         [paths]\ndata_dir = \"/var/lib/cybex-pulse\"\ndatabase_path = \"/var/lib/cybex-pulse/state/cybex-pulse.sqlite\"\nboot_assets_dir = \"/var/cache/cybex-pulse/www\"\nstatic_dir = \"/var/cache/cybex-pulse/www/assets\"\ntftp_dir = \"/var/cache/cybex-pulse/tftp\"\n\n\
+         [paths]\ndata_dir = \"/var/lib/cybex-james/state/agent\"\ndatabase_path = \"/var/lib/cybex-james/state/agent/cybex-james.sqlite\"\nboot_assets_dir = \"/var/cache/cybex-james/www\"\nstatic_dir = \"/var/cache/cybex-james/www/assets\"\ntftp_dir = \"/var/cache/cybex-james/tftp\"\n\n\
          [auth]\nadmin_token = {}\n\n\
-         [build]\nwork_dir = \"/var/cache/cybex-pulse/build\"\noutput_dir = \"/var/cache/cybex-pulse/build-outputs\"\nnix_binary = \"/usr/bin/nix\"\n\n\
-         [cache]\nroot_dir = \"/var/cache/cybex-pulse/www/cache\"\nprivate_key_path = \"/var/lib/cybex-pulse/state/cache-private.pem\"\npublic_key_path = \"/var/lib/cybex-pulse/state/cache-public.pem\"\n\n\
+         [build]\nwork_dir = \"/var/cache/cybex-james/build\"\noutput_dir = \"/var/cache/cybex-james/build-outputs\"\nnix_binary = \"/usr/bin/nix\"\nmanage_source_url_template = {}\n\n\
+         [[build.targets]]\nartifact_type = {}\ntarget = {}\nsystem = {}\nflake = {}\nattr = {}\n\n\
+         [cache]\nroot_dir = \"/var/cache/cybex-james/www/cache\"\nprivate_key_path = \"/var/lib/cybex-james/state/agent/cache-private.pem\"\npublic_key_path = \"/var/lib/cybex-james/state/agent/cache-public.pem\"\n\n\
          [update]\ntrusted_public_key = {}\n\n\
-         [manage]\nenabled = true\napi_url = {}\norganization_id = {}\nstate_path = \"/var/lib/cybex-pulse/state/manage-state.json\"\nsync_interval_seconds = 30\nhttp_timeout_seconds = 30\n",
+         [manage]\nenabled = true\napi_url = {}\norganization_id = {}\norganization_slug = {}\nstate_path = \"/var/lib/cybex-james/state/agent/manage-state.json\"\nsync_interval_seconds = 30\nhttp_timeout_seconds = 30\n",
         toml_string(public_base_url),
         toml_string(&admin_token),
+        toml_string(crate::manage_source::MANAGE_SOURCE_URL_TEMPLATE),
+        toml_string(&blueprint_target.artifact_type),
+        toml_string(&blueprint_target.target),
+        toml_string(&blueprint_target.system),
+        toml_string(&blueprint_target.flake),
+        toml_string(&blueprint_target.attr),
         toml_string(release_public_key),
         toml_string(&state.manage_origin),
         toml_string(&state.plan.organization_id.to_string()),
+        toml_string(organization_slug),
     ))
 }
 
@@ -1014,7 +1043,7 @@ fn public_base_url(plan: &SignedInstallPlan) -> String {
         .map(|address| format!("http://{address}"))
         .unwrap_or_else(|| {
             format!(
-                "http://pulse-{}.local",
+                "http://james-{}.local",
                 device_id_suffix(&plan.reserved_device_id)
             )
         })
@@ -1161,13 +1190,16 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::SigningKey;
 
     fn durable_state_fixture() -> DurableProvisioningState {
         let now = Utc::now();
         let plan = serde_json::from_value(json!({
-            "schema": "cybex.pulse.install-plan.v1",
+            "schema": "cybex.james.install-plan.v1",
             "id": "11111111-1111-4111-8111-111111111111",
             "organization_id": "22222222-2222-4222-8222-222222222222",
+            "organization_slug": "acme-control",
             "plan_revision": 1,
             "session_id": "33333333-3333-4333-8333-333333333333",
             "session_revision": 2,
@@ -1175,7 +1207,7 @@ mod tests {
             "hardware_digest": "b".repeat(64),
             "provisioning_public_key_fingerprint": "c".repeat(64),
             "reserved_device_id": "dev_0123456789abcdef0123456789abcdef",
-            "display_name": "Recovery Pulse",
+            "display_name": "Recovery James",
             "target_disk_id": "disk-1",
             "target_disk": {
                 "id": "disk-1",
@@ -1224,7 +1256,7 @@ mod tests {
         }))
         .unwrap();
         DurableProvisioningState {
-            schema: "cybex.pulse.provisioning-state.v1".to_string(),
+            schema: "cybex.james.provisioning-state.v1".to_string(),
             session_id: uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
             plan,
             manage_origin: "https://manage.cybex.net".to_string(),
@@ -1237,6 +1269,61 @@ mod tests {
             installation_complete: false,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn fresh_config_accepts_standard_and_dock_blueprint_build_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-james-fresh-config-{}",
+            Uuid::new_v4().simple()
+        ));
+        let release_key_path = root.join("usr/share/cybex-james/release-public-key");
+        fs::create_dir_all(release_key_path.parent().unwrap()).unwrap();
+        let public_key = STANDARD.encode(
+            SigningKey::from_bytes(&[7_u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        fs::write(&release_key_path, format!("{public_key}\n")).unwrap();
+
+        let body = james_config(&root, &durable_state_fixture(), "http://192.0.2.20").unwrap();
+        let loaded = crate::config::AppConfig::from_toml_str(
+            &body,
+            &root.join("etc/cybex-james/config.toml"),
+        )
+        .unwrap();
+        loaded.validate_appliance_config().unwrap();
+        assert_eq!(loaded.manage.organization_slug, "acme-control");
+        assert_eq!(
+            loaded.build.manage_source_url_template,
+            crate::manage_source::MANAGE_SOURCE_URL_TEMPLATE
+        );
+        assert_eq!(loaded.build.targets.len(), 1);
+        let target = &loaded.build.targets[0];
+        assert_eq!(target.artifact_type, "nixos_closure");
+        assert_eq!(target.target, "blueprint");
+        assert_eq!(target.system, "x86_64-linux");
+        assert_eq!(
+            crate::config::pinned_nixpkgs_revision(&target.flake).unwrap(),
+            crate::config::RELEASE_NIXPKGS_REVISION
+        );
+        assert_eq!(target.attr, "packages.x86_64-linux.desktop-experience");
+        // Standard and Dock differ in their signed build_input, but both are
+        // governed by this same artifact/target/system admission tuple.
+        for blueprint in ["standard", "dock"] {
+            assert_eq!(target.artifact_type, "nixos_closure", "{blueprint}");
+            assert_eq!(target.target, "blueprint", "{blueprint}");
+            assert_eq!(target.system, "x86_64-linux", "{blueprint}");
+        }
+
+        let mut predecessor = durable_state_fixture();
+        predecessor.plan.organization_slug = None;
+        let error = james_config(&root, &predecessor, "http://192.0.2.20")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("install plan organization slug is missing"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1392,7 +1479,7 @@ mod tests {
     #[test]
     fn live_offline_apt_source_replaces_ubuntu_and_cdrom_sources() {
         let root =
-            std::env::temp_dir().join(format!("cybex-pulse-offline-apt-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("cybex-james-offline-apt-test-{}", Uuid::new_v4()));
         let sources_dir = root.join("etc/apt/sources.list.d");
         fs::create_dir_all(&sources_dir).unwrap();
         fs::write(sources_dir.join("cdrom.sources"), b"cdrom\n").unwrap();
@@ -1408,7 +1495,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(root.join("etc/apt/sources.list")).unwrap(),
-            "# Cybex Pulse installation uses the verified offline package snapshot.\n"
+            "# Cybex James installation uses the verified offline package snapshot.\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1442,9 +1529,9 @@ mod tests {
                 .success()
         );
         for package in [
-            "cybex-pulse",
-            "cybex-pulse-bootstrap",
-            "cybex-pulse-appliance",
+            "cybex-james",
+            "cybex-james-bootstrap",
+            "cybex-james-appliance",
             "linux-generic",
             "shim-signed",
             "openssh-server",
@@ -1550,7 +1637,7 @@ mod tests {
     #[test]
     fn cache_backed_nix_staging_preserves_installer_seeded_content() {
         let root =
-            std::env::temp_dir().join(format!("cybex-pulse-nix-stage-{}", Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("cybex-james-nix-stage-{}", Uuid::new_v4().simple()));
         let result = (|| -> Result<()> {
             let source = root.join("nix/store");
             fs::create_dir_all(&source)?;
@@ -1559,7 +1646,7 @@ mod tests {
             stage_cache_backed_nix_store(&root)?;
 
             assert_eq!(
-                fs::read(root.join("var/cache/cybex-pulse/nix/store/seeded-path"))?,
+                fs::read(root.join("var/cache/cybex-james/nix/store/seeded-path"))?,
                 b"seeded"
             );
             Ok(())

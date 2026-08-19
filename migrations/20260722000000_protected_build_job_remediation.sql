@@ -5,7 +5,7 @@
 -- bytes must never be copied into this ledger.
 CREATE TABLE protected_build_job_remediations (
     job_id INTEGER PRIMARY KEY
-        REFERENCES pulse_build_jobs(id) ON DELETE RESTRICT,
+        REFERENCES james_build_jobs(id) ON DELETE RESTRICT,
     managed_job_id TEXT,
     original_status TEXT NOT NULL
         CHECK (original_status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),

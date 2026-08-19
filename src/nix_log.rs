@@ -62,7 +62,7 @@ pub struct BuildProgressSnapshot {
 }
 
 impl BuildProgressSnapshot {
-    /// Percent within `range` (e.g. 25..=79 for the Pulse "building" phase)
+    /// Percent within `range` (e.g. 25..=79 for the James "building" phase)
     /// plus a status message, or `None` until the stream has produced
     /// something more informative than the static phase label.
     pub fn progress_update(&self, range_start: i32, range_end: i32) -> Option<(i32, String)> {

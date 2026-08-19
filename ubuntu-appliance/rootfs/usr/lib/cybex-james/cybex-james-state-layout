@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Create the candidate-root trust boundary and bridge dev.3 state safely."""
+
+from __future__ import annotations
+
+import grp
+import json
+import os
+import pwd
+import re
+import stat
+import tempfile
+from pathlib import Path
+
+ROOT = Path("/var/lib/cybex-james")
+STATE = ROOT / "state"
+CONTROL = ROOT / "control"
+STATUS = ROOT / "status"
+AGENT = STATE / "agent"
+INBOX = STATE / "inbox"
+LOCKS = Path("/run/lock/cybex-james")
+CONFIG = Path("/etc/cybex-james/config.toml")
+LEGACY = Path("/etc/cybex-james/legacy-state-layout")
+JAMES_UID = pwd.getpwnam("cybex-james").pw_uid
+JAMES_GID = grp.getgrnam("cybex-james").gr_gid
+ATTEMPT_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def directory(path: Path, uid: int, gid: int, mode: int) -> None:
+    try:
+        meta = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=mode)
+        meta = path.lstat()
+    if not stat.S_ISDIR(meta.st_mode) or stat.S_ISLNK(meta.st_mode):
+        raise RuntimeError(f"unsafe appliance directory: {path}")
+    os.chown(path, uid, gid, follow_symlinks=False)
+    os.chmod(path, mode, follow_symlinks=False)
+
+
+def read_file(path: Path, maximum: int, allow_empty: bool = False) -> bytes:
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid not in {0, JAMES_UID}
+            or (before.st_size == 0 and not allow_empty)
+            or before.st_size > maximum):
+        raise RuntimeError(f"unsafe appliance file: {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)):
+            raise RuntimeError(f"appliance file changed while opening: {path}")
+        body = bytearray()
+        while len(body) <= maximum:
+            chunk = os.read(fd, min(1024 * 1024, maximum + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        after = os.fstat(fd)
+        if len(body) != opened.st_size or len(body) > maximum or after.st_mtime_ns != opened.st_mtime_ns:
+            raise RuntimeError(f"appliance file changed while reading: {path}")
+        return bytes(body)
+    finally:
+        os.close(fd)
+
+
+def write_file(path: Path, body: bytes, uid: int, gid: int, mode: int) -> None:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(fd, mode)
+        os.fchown(fd, uid, gid)
+        view = memoryview(body)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def migrate(name: str, target: Path, maximum: int, uid: int, gid: int, mode: int) -> None:
+    destination = target / name
+    if destination.exists() or destination.is_symlink():
+        meta = destination.lstat()
+        if (not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1
+                or meta.st_uid != uid or meta.st_size > maximum):
+            raise RuntimeError(f"unsafe protected appliance file: {destination}")
+        os.chown(destination, uid, gid, follow_symlinks=False)
+        os.chmod(destination, mode, follow_symlinks=False)
+        return
+    source = STATE / name
+    if source.exists() or source.is_symlink():
+        write_file(destination, read_file(source, maximum), uid, gid, mode)
+
+
+def legacy_marker() -> bool:
+    if not LEGACY.exists() and not LEGACY.is_symlink():
+        return False
+    meta = LEGACY.lstat()
+    if (not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid != 0
+            or stat.S_IMODE(meta.st_mode) != 0o644):
+        raise RuntimeError("unsafe legacy-state bridge marker")
+    return True
+
+
+def cleanup_orphan_update_bundles(
+    directory_path: Path,
+    request_path: Path,
+    maximum_inspections: int = 65,
+) -> tuple[int, int]:
+    """Unlink a bounded batch of orphaned untrusted archives without globbing."""
+    try:
+        before = directory_path.lstat()
+    except FileNotFoundError:
+        return (0, 0)
+    if (not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != JAMES_UID
+            or stat.S_IMODE(before.st_mode) & 0o077):
+        raise RuntimeError("unsafe appliance update bundle directory")
+
+    active_basename: str | None = None
+    try:
+        request = json.loads(read_file(request_path, 256 * 1024))
+        if not isinstance(request, dict):
+            request = {}
+        attempt_id = request.get("attempt_id")
+        if (request.get("schema") == "cybex.james.appliance-update-request.v1"
+                and isinstance(attempt_id, str) and ATTEMPT_ID.fullmatch(attempt_id)
+                and request.get("bundle_path")
+                == str(directory_path / f"{attempt_id}.tar.zst")):
+            active_basename = f"{attempt_id}.tar.zst"
+    except (FileNotFoundError, json.JSONDecodeError, RuntimeError, UnicodeDecodeError):
+        # A malformed or absent object is not a canonical active request and
+        # therefore cannot pin multi-GiB archive debris forever.
+        pass
+
+    fd = os.open(
+        directory_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    removed = 0
+    inspected = 0
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISDIR(opened.st_mode)):
+            raise RuntimeError("appliance update bundle directory changed while opening")
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                if inspected >= maximum_inspections:
+                    break
+                inspected += 1
+                if entry.name == active_basename:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    continue
+                os.unlink(entry.name, dir_fd=fd)
+                removed += 1
+        if removed:
+            os.fsync(fd)
+            parent = os.open(
+                directory_path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+    finally:
+        os.close(fd)
+    return (removed, inspected)
+
+
+def main() -> None:
+    if not os.path.ismount(STATE):
+        raise RuntimeError("CYBEX_STATE is not mounted at its historical path")
+    legacy = legacy_marker()
+    directory(ROOT, 0, JAMES_GID, 0o750)
+    directory(CONTROL, 0, JAMES_GID, 0o750)
+    directory(STATUS, 0, JAMES_GID, 0o750)
+    directory(LOCKS, 0, JAMES_GID, 0o750)
+    if legacy:
+        # Do not alter this shared inode: an unplanned fallback must let dev.3
+        # start with its original flat DB/key/manage paths and permissions.
+        meta = STATE.lstat()
+        if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != JAMES_UID:
+            raise RuntimeError("legacy CYBEX_STATE ownership is incompatible")
+        os.chmod(STATE, 0o700, follow_symlinks=False)
+    else:
+        directory(STATE, 0, JAMES_GID, 0o750)
+        directory(AGENT, JAMES_UID, JAMES_GID, 0o700)
+    directory(INBOX, JAMES_UID, JAMES_GID, 0o700)
+    cleanup_orphan_update_bundles(
+        INBOX / "appliance-update-bundles",
+        INBOX / "appliance-update-request.json",
+    )
+
+    for name, maximum in (
+        ("provisioning-state.json", 512 * 1024),
+        ("install-plan.json", 1024 * 1024),
+        ("netplan-approved.json", 1024 * 1024),
+        ("netplan-dhcp-fallback.json", 1024 * 1024),
+        ("appliance-release.json", 64 * 1024),
+        ("management-cidrs.txt", 64 * 1024),
+        ("root-generation", 64),
+    ):
+        migrate(name, CONTROL, maximum, 0, JAMES_GID, 0o640)
+    for name, maximum in (
+        ("appliance-update-request.json", 256 * 1024),
+        ("appliance-network-change-request.json", 128 * 1024),
+    ):
+        migrate(name, INBOX, maximum, JAMES_UID, JAMES_GID, 0o600)
+    config = read_file(CONFIG, 2 * 1024 * 1024).decode()
+    if legacy:
+        config = config.replace('data_dir = "/var/lib/cybex-james"',
+                                'data_dir = "/var/lib/cybex-james/state"')
+        required = (
+            'data_dir = "/var/lib/cybex-james/state"',
+            'database_path = "/var/lib/cybex-james/state/cybex-james.sqlite"',
+            'private_key_path = "/var/lib/cybex-james/state/cache-private.pem"',
+            'public_key_path = "/var/lib/cybex-james/state/cache-public.pem"',
+            'state_path = "/var/lib/cybex-james/state/manage-state.json"',
+        )
+    else:
+        required = (
+            'data_dir = "/var/lib/cybex-james/state/agent"',
+            'database_path = "/var/lib/cybex-james/state/agent/cybex-james.sqlite"',
+            'private_key_path = "/var/lib/cybex-james/state/agent/cache-private.pem"',
+            'public_key_path = "/var/lib/cybex-james/state/agent/cache-public.pem"',
+            'state_path = "/var/lib/cybex-james/state/agent/manage-state.json"',
+        )
+    if any(value not in config for value in required):
+        raise RuntimeError("James config does not match its protected state layout")
+    write_file(CONFIG, config.encode(), 0, JAMES_GID, 0o640)
+
+
+if __name__ == "__main__":
+    main()

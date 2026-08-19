@@ -1,0 +1,23 @@
+#!ipxe
+# Cybex James second-stage handoff for the package-provided iPXE launchers.
+# The DHCP next-server is the James that served this immutable script.
+dhcp net0 || goto cybex_retry
+isset ${next-server} || goto cybex_failed
+isset ${net0/mac} || goto cybex_failed
+chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_retry
+goto cybex_end
+
+:cybex_retry
+sleep 2
+dhcp net0 || goto cybex_failed
+isset ${next-server} || goto cybex_failed
+isset ${net0/mac} || goto cybex_failed
+chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_failed
+goto cybex_end
+
+:cybex_failed
+echo Cybex James could not load this workstation boot request
+sleep 5
+exit 1
+
+:cybex_end

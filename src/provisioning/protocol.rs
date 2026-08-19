@@ -1,5 +1,5 @@
 use super::inventory::{
-    PulseProvisioningDisk, PulseProvisioningEthernetInterface, PulseProvisioningInventory,
+    JamesProvisioningDisk, JamesProvisioningEthernetInterface, JamesProvisioningInventory,
     hardware_digest, inventory_sha256,
 };
 use crate::appliance::SignedApplianceRelease;
@@ -19,16 +19,16 @@ use std::{fs, path::Path, time::Duration};
 use uuid::Uuid;
 
 const ENVELOPE_SIZE: usize = 8192;
-const ENVELOPE_SCHEMA: &str = "cybex.pulse.provisioning-envelope.v1";
-const ENVELOPE_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-PROVISIONING-ENVELOPE-V1";
-const KEY_DERIVATION_DOMAIN: &[u8] = b"CYBEX-PULSE-PROVISIONING-KEY-V1\0";
-const REQUEST_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-PROVISIONING-V1";
-pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "cybex.pulse.install-plan.v1";
-pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "cybex.pulse.install-plan.v2";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "CYBEX-PULSE-INSTALL-PLAN-V1";
-const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "CYBEX-PULSE-INSTALL-PLAN-V2";
+const ENVELOPE_SCHEMA: &str = "cybex.james.provisioning-envelope.v1";
+const ENVELOPE_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-PROVISIONING-ENVELOPE-V1";
+const KEY_DERIVATION_DOMAIN: &[u8] = b"CYBEX-JAMES-PROVISIONING-KEY-V1\0";
+const REQUEST_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-PROVISIONING-V1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V1: &str = "cybex.james.install-plan.v1";
+pub(crate) const INSTALL_PLAN_SCHEMA_V2: &str = "cybex.james.install-plan.v2";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V1: &str = "CYBEX-JAMES-INSTALL-PLAN-V1";
+const INSTALL_PLAN_SIGNATURE_DOMAIN_V2: &str = "CYBEX-JAMES-INSTALL-PLAN-V2";
 pub(crate) const NETWORK_SNAPSHOT_DELIVERY: &str = "network-snapshot-v1";
-const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "CYBEX-PULSE-IDENTITY-TRANSITION-V1";
+const IDENTITY_TRANSITION_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-IDENTITY-TRANSITION-V1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,7 @@ pub(crate) struct VerifiedEnvelope {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PulseProvisioningNetworkPlan {
+pub struct JamesProvisioningNetworkPlan {
     pub mode: String,
     pub interface_id: String,
     pub address_cidr: Option<String>,
@@ -63,7 +63,7 @@ pub struct PulseProvisioningNetworkPlan {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PulseMaintenanceWindowPlan {
+pub struct JamesMaintenanceWindowPlan {
     pub timezone: String,
     pub weekday: u8,
     pub start: String,
@@ -76,6 +76,11 @@ pub struct SignedInstallPlan {
     pub schema: String,
     pub id: Uuid,
     pub organization_id: Uuid,
+    /// Present on every newly issued plan. Optional decoding preserves the
+    /// exact signed bytes of installed predecessor plans during protected
+    /// state promotion; fresh-install verification below requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_slug: Option<String>,
     pub plan_revision: i64,
     pub session_id: Uuid,
     pub session_revision: i64,
@@ -85,10 +90,10 @@ pub struct SignedInstallPlan {
     pub reserved_device_id: String,
     pub display_name: String,
     pub target_disk_id: String,
-    pub target_disk: PulseProvisioningDisk,
-    pub network_interface: PulseProvisioningEthernetInterface,
-    pub network: PulseProvisioningNetworkPlan,
-    pub maintenance_window: PulseMaintenanceWindowPlan,
+    pub target_disk: JamesProvisioningDisk,
+    pub network_interface: JamesProvisioningEthernetInterface,
+    pub network: JamesProvisioningNetworkPlan,
+    pub maintenance_window: JamesMaintenanceWindowPlan,
     #[serde(default)]
     pub management_cidrs: Vec<String>,
     #[serde(default)]
@@ -115,7 +120,7 @@ struct ClaimRequest<'a> {
     provisioning_public_key: String,
     provisioning_public_key_fingerprint: String,
     hardware_digest: &'a str,
-    inventory: &'a PulseProvisioningInventory,
+    inventory: &'a JamesProvisioningInventory,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +268,7 @@ fn validate_envelope_fields(
     }
     let origin = reqwest::Url::parse(&envelope.manage_origin)
         .context("provisioning Management origin is invalid")?;
+    let canonical_origin = origin.as_str().strip_suffix('/').unwrap_or(origin.as_str());
     if origin.scheme() != "https"
         || origin.host_str().is_none()
         || origin.path() != "/"
@@ -270,6 +276,7 @@ fn validate_envelope_fields(
         || origin.fragment().is_some()
         || !origin.username().is_empty()
         || origin.password().is_some()
+        || canonical_origin != envelope.manage_origin
     {
         bail!("provisioning Management origin is not a canonical HTTPS origin")
     }
@@ -301,7 +308,7 @@ pub(crate) fn verify_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
     verify_install_plan_inner(value, signing_key, envelope, inventory, false)
 }
@@ -310,16 +317,122 @@ pub(crate) fn verify_durable_install_plan(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
 ) -> Result<SignedInstallPlan> {
     verify_install_plan_inner(value, signing_key, envelope, inventory, true)
+}
+
+/// Authenticate a previously installed plan during the one-time protected
+/// state migration. Unlike media preparation, the personalized media secret
+/// and original inventory are no longer available, so immutable installed
+/// identity files are bound separately by `validate_installed_state`.
+pub(crate) fn verify_promoted_install_plan(
+    value: Value,
+    trusted_keys: &[VerifyingKey],
+) -> Result<(SignedInstallPlan, VerifyingKey)> {
+    let plan: SignedInstallPlan =
+        serde_json::from_value(value.clone()).context("parse promoted signed install plan")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("promoted install plan must be a JSON object"))?;
+    let package_fields = [
+        "package_delivery",
+        "appliance_release",
+        "package_transport_url",
+    ];
+    let package_field_count = package_fields
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    let signature_domain = match plan.schema.as_str() {
+        INSTALL_PLAN_SCHEMA_V1
+            if package_field_count == 0
+                && plan.package_delivery.is_none()
+                && plan.appliance_release.is_none()
+                && plan.package_transport_url.is_none() =>
+        {
+            INSTALL_PLAN_SIGNATURE_DOMAIN_V1
+        }
+        INSTALL_PLAN_SCHEMA_V2
+            if package_field_count == package_fields.len()
+                && plan.package_delivery.as_deref() == Some(NETWORK_SNAPSHOT_DELIVERY)
+                && plan.appliance_release.is_some()
+                && plan.package_transport_url.is_some() =>
+        {
+            INSTALL_PLAN_SIGNATURE_DOMAIN_V2
+        }
+        _ => bail!("promoted install plan package-delivery contract is incompatible"),
+    };
+    if plan.organization_id.is_nil()
+        || plan.session_id.is_nil()
+        || plan.id.is_nil()
+        || plan.base_os != "ubuntu"
+        || plan.base_os_version != "26.04"
+        || plan.at_rest_protection != "none"
+        || plan.plan_revision <= 0
+        || plan.session_revision <= 0
+        || plan.target_disk_id != plan.target_disk.id
+        || plan.network.interface_id != plan.network_interface.id
+        || plan.reserved_device_id.len() < 16
+        || plan.reserved_device_id.len() > 96
+        || !plan.reserved_device_id.starts_with("dev_")
+        || !plan
+            .reserved_device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        || plan.expires_at <= plan.issued_at
+        || plan.expires_at - plan.issued_at > chrono::Duration::minutes(30)
+    {
+        bail!("promoted install plan invariants are invalid")
+    }
+    if let Some(organization_slug) = plan.organization_slug.as_deref() {
+        validate_organization_slug(organization_slug, "promoted install plan")?;
+    }
+    if plan.ssh_ca_public_keys.is_empty()
+        || plan.ssh_ca_public_keys.len() > 2
+        || plan.ssh_ca_public_keys.iter().any(|key| {
+            !key.starts_with("ssh-ed25519 ")
+                || key.len() > 1024
+                || key.chars().any(char::is_control)
+        })
+    {
+        bail!("promoted install plan SSH trust is invalid")
+    }
+    require_sha256(&plan.plan_sha256, "promoted install plan SHA-256")?;
+    let mut unsigned = value;
+    let unsigned_object = unsigned
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("promoted install plan must be a JSON object"))?;
+    unsigned_object.remove("signature");
+    unsigned_object.remove("plan_sha256");
+    let canonical = serde_json::to_vec(&canonical_json(unsigned))
+        .context("serialize promoted signed install plan")?;
+    if sha256_hex(&canonical) != plan.plan_sha256 {
+        bail!("promoted install plan digest does not match its exact body")
+    }
+    let signature = canonical_url_base64(&plan.signature, 64)?;
+    let signature = Signature::from_bytes(
+        signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("promoted install plan signature length is invalid"))?,
+    );
+    let mut payload = signature_domain.as_bytes().to_vec();
+    payload.push(b'\n');
+    payload.extend_from_slice(&canonical);
+    let signer = trusted_keys
+        .iter()
+        .find(|key| key.verify(&payload, &signature).is_ok())
+        .copied()
+        .ok_or_else(|| anyhow!("promoted install plan signer is not package-trusted"))?;
+    Ok((plan, signer))
 }
 
 fn verify_install_plan_inner(
     value: Value,
     signing_key: &VerifyingKey,
     envelope: &ProvisioningEnvelope,
-    inventory: &PulseProvisioningInventory,
+    inventory: &JamesProvisioningInventory,
     acknowledged_attempt: bool,
 ) -> Result<SignedInstallPlan> {
     let plan: SignedInstallPlan =
@@ -362,6 +475,11 @@ fn verify_install_plan_inner(
         }
         _ => bail!("install plan package-delivery contract is incompatible"),
     };
+    let organization_slug = plan
+        .organization_slug
+        .as_deref()
+        .ok_or_else(|| anyhow!("install plan organization slug is required"))?;
+    validate_organization_slug(organization_slug, "install plan")?;
     if plan.session_id != envelope.session_id
         || plan.organization_id.is_nil()
         || plan.release_version != envelope.release_version
@@ -433,6 +551,20 @@ fn verify_install_plan_inner(
     Ok(plan)
 }
 
+fn validate_organization_slug(value: &str, label: &str) -> Result<()> {
+    if value.len() < 2
+        || value.len() > 64
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("{label} organization slug is invalid")
+    }
+    Ok(())
+}
+
 pub(crate) struct ProvisioningClient {
     origin: String,
     session_id: Uuid,
@@ -445,7 +577,7 @@ impl ProvisioningClient {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(30))
             .https_only(true)
-            .user_agent(concat!("cybex-pulse-bootstrap/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("cybex-james-bootstrap/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build provisioning HTTP client")?;
         Ok(Self {
@@ -459,7 +591,7 @@ impl ProvisioningClient {
         &self,
         media_secret: &str,
         key: &SigningKey,
-        inventory: &PulseProvisioningInventory,
+        inventory: &JamesProvisioningInventory,
         hardware_digest: &str,
     ) -> Result<AgentSessionResponse> {
         let public = key.verifying_key().to_bytes();
@@ -473,7 +605,7 @@ impl ProvisioningClient {
         let response = self
             .signed_json(
                 Method::POST,
-                "/v1/agent/pulse/provisioning-sessions/claim",
+                "/v1/agent/james/provisioning-sessions/claim",
                 key,
                 Some(media_secret),
                 Some(&request),
@@ -484,7 +616,7 @@ impl ProvisioningClient {
 
     pub(crate) async fn poll_plan(&self, key: &SigningKey) -> Result<AgentSessionResponse> {
         let path = format!(
-            "/v1/agent/pulse/provisioning-sessions/{}/plan",
+            "/v1/agent/james/provisioning-sessions/{}/plan",
             self.session_id
         );
         let response = self
@@ -524,7 +656,7 @@ impl ProvisioningClient {
             payload: json!({}),
         };
         let path = format!(
-            "/v1/agent/pulse/provisioning-sessions/{}/events",
+            "/v1/agent/james/provisioning-sessions/{}/events",
             self.session_id
         );
         let response: EventResponse = self
@@ -566,7 +698,7 @@ impl ProvisioningClient {
                 .encode(device_key.sign(transition.as_bytes()).to_bytes()),
         };
         let path = format!(
-            "/v1/agent/pulse/provisioning-sessions/{}/activate-identity",
+            "/v1/agent/james/provisioning-sessions/{}/activate-identity",
             self.session_id
         );
         let first = self
@@ -632,7 +764,7 @@ impl ProvisioningClient {
             .header("x-cybex-timestamp", timestamp)
             .header("x-cybex-signature", signature);
         if let Some(secret) = media_secret {
-            request = request.header("x-cybex-pulse-provisioning-secret", secret);
+            request = request.header("x-cybex-james-provisioning-secret", secret);
         }
         if !body.is_empty() {
             request = request
@@ -677,7 +809,7 @@ fn safe_http_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
 
 fn deterministic_event_id(session_id: Uuid, plan_id: Uuid, sequence: i64) -> Uuid {
     let mut digest = Sha256::new();
-    digest.update(b"CYBEX-PULSE-PROVISIONING-EVENT-ID-V1\0");
+    digest.update(b"CYBEX-JAMES-PROVISIONING-EVENT-ID-V1\0");
     digest.update(session_id.as_bytes());
     digest.update(plan_id.as_bytes());
     digest.update(sequence.to_be_bytes());
@@ -774,7 +906,7 @@ mod tests {
     ) -> (
         Value,
         ProvisioningEnvelope,
-        PulseProvisioningInventory,
+        JamesProvisioningInventory,
         SigningKey,
     ) {
         let now = Utc::now();
@@ -791,7 +923,7 @@ mod tests {
             signature: URL_SAFE_NO_PAD.encode([0; 64]),
             zero_padding: String::new(),
         };
-        let disk = PulseProvisioningDisk {
+        let disk = JamesProvisioningDisk {
             id: "disk-1".to_string(),
             path: "/dev/sda".to_string(),
             model: "Disk".to_string(),
@@ -804,7 +936,7 @@ mod tests {
             eligible: true,
             blocker_codes: Vec::new(),
         };
-        let interface = PulseProvisioningEthernetInterface {
+        let interface = JamesProvisioningEthernetInterface {
             id: "pci-0000:00:03.0".to_string(),
             name: "enp0s3".to_string(),
             mac: "52:54:00:12:34:56".to_string(),
@@ -812,7 +944,7 @@ mod tests {
             addresses: vec!["192.0.2.10/24".to_string()],
             gateway: Some("192.0.2.1".to_string()),
         };
-        let inventory = PulseProvisioningInventory {
+        let inventory = JamesProvisioningInventory {
             manufacturer: "Cybex".to_string(),
             model: "Qualification VM".to_string(),
             serial_number: "vm-1".to_string(),
@@ -838,6 +970,7 @@ mod tests {
             "schema": schema,
             "id": Uuid::from_bytes([2; 16]),
             "organization_id": Uuid::from_bytes([4; 16]),
+            "organization_slug": "acme-control",
             "plan_revision": 1,
             "session_id": envelope.session_id,
             "session_revision": 2,
@@ -845,7 +978,7 @@ mod tests {
             "hardware_digest": hardware_digest(&inventory).unwrap(),
             "provisioning_public_key_fingerprint": provisioning_fingerprint,
             "reserved_device_id": "dev_0123456789abcdef0123456789abcdef",
-            "display_name": "Qualification Pulse",
+            "display_name": "Qualification James",
             "target_disk_id": disk.id,
             "target_disk": disk,
             "network_interface": interface,
@@ -880,18 +1013,18 @@ mod tests {
                 (
                     "appliance_release".to_string(),
                     json!({
-                        "schema": "cybex.pulse.appliance-release.v1",
+                        "schema": "cybex.james.appliance-release.v1",
                         "release_id": "1.2.3",
                         "ubuntu_snapshot_id": "20260801T120000Z",
                         "cybex_repository_snapshot": {
-                            "url": "https://releases.cybex.net/cybex-pulse-appliance-packages-1.2.3-x86_64-linux.tar.zst",
+                            "url": "https://releases.cybex.net/cybex-james-appliance-packages-1.2.3-x86_64-linux.tar.zst",
                             "sha256": "b".repeat(64),
                             "size_bytes": 1024
                         },
                         "required_package_versions": {},
                         "expected_kernel": "kernel",
                         "minimum_protocol": 4,
-                        "minimum_state_schema": 1,
+                        "minimum_state_schema": 2,
                         "rollback_compatible": true,
                         "release_notes": "https://releases.cybex.net/1.2.3",
                         "signature": STANDARD.encode([0; 64])
@@ -899,7 +1032,7 @@ mod tests {
                 ),
                 (
                     "package_transport_url".to_string(),
-                    json!("http://192.168.122.1:8080/cybex-pulse-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
+                    json!("http://192.168.122.1:8080/cybex-james-appliance-packages-1.2.3-x86_64-linux.tar.zst"),
                 ),
             ]);
         }
@@ -919,6 +1052,25 @@ mod tests {
         (plan, envelope, inventory, signing_key)
     }
 
+    fn resign_plan(mut plan: Value, signature_domain: &str, signing_key: &SigningKey) -> Value {
+        let object = plan.as_object_mut().unwrap();
+        object.remove("plan_sha256");
+        object.remove("signature");
+        let unsigned = canonical_json(plan);
+        let canonical = serde_json::to_vec(&unsigned).unwrap();
+        let plan_sha256 = sha256_hex(&canonical);
+        let mut payload = signature_domain.as_bytes().to_vec();
+        payload.push(b'\n');
+        payload.extend_from_slice(&canonical);
+        let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&payload).to_bytes());
+        let mut plan = unsigned;
+        plan.as_object_mut().unwrap().extend([
+            ("plan_sha256".to_string(), json!(plan_sha256)),
+            ("signature".to_string(), json!(signature)),
+        ]);
+        plan
+    }
+
     #[test]
     fn derived_media_key_is_domain_separated_and_stable() {
         let secret = URL_SAFE_NO_PAD.encode([9_u8; 32]);
@@ -926,6 +1078,26 @@ mod tests {
         let second = derive_provisioning_key(&secret).unwrap();
         assert_eq!(first.to_bytes(), second.to_bytes());
         assert_ne!(first.to_bytes(), [9_u8; 32]);
+    }
+
+    #[test]
+    fn management_origin_requires_the_same_canonical_https_form_as_release_signing() {
+        let (_plan, mut envelope, _inventory, _key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        envelope.manage_origin = "https://manage.example.test:8443".to_string();
+        assert!(validate_envelope_fields(&envelope, &envelope.manage_origin).is_ok());
+
+        for invalid in [
+            "https://manage.example.test:443",
+            "https://Manage.example.test",
+            "https://manage.example.test/",
+        ] {
+            envelope.manage_origin = invalid.to_string();
+            assert!(
+                validate_envelope_fields(&envelope, &envelope.manage_origin).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -969,6 +1141,40 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_requires_a_canonical_signed_organization_slug() {
+        let (mut missing, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        missing.as_object_mut().unwrap().remove("organization_slug");
+        let missing = resign_plan(missing, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+        let error = verify_install_plan(missing, &key.verifying_key(), &envelope, &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("organization slug is required"));
+
+        let (mut invalid, envelope, inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        invalid["organization_slug"] = json!("Acme_Control");
+        let invalid = resign_plan(invalid, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+        let error = verify_install_plan(invalid, &key.verifying_key(), &envelope, &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("organization slug is invalid"));
+    }
+
+    #[test]
+    fn signed_predecessor_plan_without_slug_remains_promotable() {
+        let (mut plan, _envelope, _inventory, key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V2, INSTALL_PLAN_SIGNATURE_DOMAIN_V2);
+        plan.as_object_mut().unwrap().remove("organization_slug");
+        let plan = resign_plan(plan, INSTALL_PLAN_SIGNATURE_DOMAIN_V2, &key);
+
+        let (plan, signer) = verify_promoted_install_plan(plan, &[key.verifying_key()]).unwrap();
+
+        assert!(plan.organization_slug.is_none());
+        assert_eq!(signer, key.verifying_key());
+    }
+
+    #[test]
     fn legacy_plan_rejects_even_null_network_delivery_fields() {
         let (mut legacy, envelope, inventory, key) =
             signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
@@ -981,5 +1187,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("package-delivery contract"));
+    }
+
+    #[test]
+    fn self_consistent_legacy_plan_from_untrusted_key_is_not_promoted() {
+        let (plan, _envelope, _inventory, attacker_key) =
+            signed_plan_fixture(INSTALL_PLAN_SCHEMA_V1, INSTALL_PLAN_SIGNATURE_DOMAIN_V1);
+        let governed_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
+
+        let error = verify_promoted_install_plan(plan, &[governed_key])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signer is not package-trusted"));
+        assert_ne!(attacker_key.verifying_key(), governed_key);
     }
 }

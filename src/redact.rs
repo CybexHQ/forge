@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn redacts_spaced_nix_assignments_and_bare_modular_hashes() {
-        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_JAMES_PROTECTED_SENTINEL_7f922a";
         let redacted = redact_sensitive_key_values(&format!(
             "users.users.alice.hashedPassword = \"{sentinel}\"; stray {PASSWORD_HASH} done"
         ));
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn redacts_json_credential_values() {
-        let sentinel = "CYBEX_PULSE_PROTECTED_SENTINEL_7f922a";
+        let sentinel = "CYBEX_JAMES_PROTECTED_SENTINEL_7f922a";
         let redacted = redact_sensitive_key_values(&format!(
             r#"{{"password":"{sentinel}","normal":"visible","access_token":"token-value"}}"#
         ));

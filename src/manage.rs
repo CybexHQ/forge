@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -47,8 +47,11 @@ const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_BLUEPRINT_BUILDER_V2: &str = "blueprint_builder_v2";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
-const CAPABILITY_PULSE_BOOT_GRANT_V1: &str = "pulse_boot_grant_v1";
+const CAPABILITY_JAMES_BOOT_GRANT_V1: &str = "james_boot_grant_v1";
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
+const CAPABILITY_APPLIANCE_UPDATE_V2: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY_V2;
+const CAPABILITY_APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_V1: &str =
+    crate::appliance::APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_CAPABILITY;
 const CYBEX_COMPONENT_PROTOCOL_VERSION: u32 = 4;
 const CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION: u32 = 4;
 const CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION: u32 = 4;
@@ -62,12 +65,13 @@ const MAX_REPORT_EVENTS: i64 = 500;
 const MAX_REPORT_BUILD_JOBS: usize = 500;
 const MAX_REPORT_CACHE_ARTIFACTS: usize = 2_000;
 const MAX_MANAGED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JAMES_REPORT_WARNING_RECEIPTS: usize = 32;
 const MAX_BOOT_REPORT_BODY_BYTES: usize = 3 * 1024 * 1024;
 // Closure-bearing cache metadata is bounded to 24 MiB. Leave
 // room for the remainder of the authenticated node report so a verified
 // manifest is never silently dropped solely because the transport cap is
 // smaller than the persistence contract.
-const MAX_PULSE_REPORT_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_JAMES_REPORT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEVICE_HOSTNAME_CHARS: usize = 253;
 const MAX_DEVICE_SERIAL_CHARS: usize = 128;
 const MAX_DEVICE_NOTES_CHARS: usize = 2_000;
@@ -75,7 +79,10 @@ const MAX_DEVICE_TAGS: usize = 50;
 const MAX_DEVICE_TAG_CHARS: usize = 64;
 const MAX_PROFILE_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_PROFILE_RAW_SCRIPT_BYTES: usize = 64 * 1024;
-const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-pulse/reliability-state.json";
+// Root-produced appliance health evidence belongs to the generation-local,
+// James-readable status boundary.  Keeping it out of the persistent agent
+// mount ensures it can never become a privileged trust input.
+const RELIABILITY_STATE_PATH: &str = "/var/lib/cybex-james/status/reliability-state.json";
 const MAX_RELIABILITY_STATE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -86,13 +93,21 @@ struct ManagedState {
     public_key_fingerprint: Option<String>,
     device_id: Option<String>,
     last_reported_event_id: Option<i64>,
+    james_active_report_cursor: Option<i64>,
+    james_terminal_report_cursor: Option<i64>,
+    james_rejection_report_cursor: Option<i64>,
+    james_cache_artifact_report_cursor: Option<i64>,
+    james_cache_report_instance_id: Option<String>,
+    james_cache_report_generation: Option<i64>,
+    james_report_rotation_round: u8,
+    james_report_warning_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ComponentCompatibilityContract {
     protocol_version: u32,
-    minimum_pulse_protocol: u32,
-    maximum_pulse_protocol: u32,
+    minimum_james_protocol: u32,
+    maximum_james_protocol: u32,
     manage_version: String,
     manage_release: String,
     #[serde(default)]
@@ -117,7 +132,7 @@ struct AgentBootConfigResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentPulseConfigResponse {
+struct AgentJamesConfigResponse {
     #[serde(default)]
     compatibility: Option<ComponentCompatibilityContract>,
     #[serde(default)]
@@ -141,10 +156,108 @@ struct AgentPulseConfigResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct PulseReportResponse {
+struct JamesReportResponse {
     status: String,
     #[serde(default)]
     workstation_netboot: Option<WorkstationNetbootReportReceipt>,
+    #[serde(default)]
+    warnings: JamesReportWarnings,
+}
+
+#[derive(Debug, Default)]
+struct JamesReportWarnings {
+    codes: Vec<JamesReportWarningCode>,
+    truncated: bool,
+}
+
+impl<'de> Deserialize<'de> for JamesReportWarnings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Warning receipts are additive advisory data. Decode them through a
+        // generic JSON value so null, future envelopes, malformed entries and
+        // non-string codes can never reject an otherwise accepted report.
+        // The HTTP response itself is already bounded to 8 MiB.
+        let value = Value::deserialize(deserializer)?;
+        let Some(receipts) = value.as_array() else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            codes: receipts
+                .iter()
+                .take(MAX_JAMES_REPORT_WARNING_RECEIPTS)
+                .map(|receipt| {
+                    JamesReportWarningCode::from_untrusted(
+                        receipt.get("diagnostic_code").and_then(Value::as_str),
+                    )
+                })
+                .collect(),
+            truncated: receipts.len() > MAX_JAMES_REPORT_WARNING_RECEIPTS,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum JamesReportWarningCode {
+    JamesApplianceReportInvalid,
+    JamesArtifactReportConflict,
+    JamesArtifactReportInvalid,
+    JamesBuildReportConflict,
+    JamesBuildReportInvalid,
+    JamesCacheReportInvalid,
+    JamesDiskReportInvalid,
+    JamesHostReportInvalid,
+    JamesReleaseJobIdentityMismatch,
+    JamesReleaseSourceContainsProtectedMaterial,
+    JamesReleaseSourceIdentityMismatch,
+    JamesReleaseSourceLockMissing,
+    #[default]
+    Unknown,
+}
+
+impl JamesReportWarningCode {
+    fn from_untrusted(value: Option<&str>) -> Self {
+        match value {
+            Some("james_appliance_report_invalid") => Self::JamesApplianceReportInvalid,
+            Some("james_artifact_report_conflict") => Self::JamesArtifactReportConflict,
+            Some("james_artifact_report_invalid") => Self::JamesArtifactReportInvalid,
+            Some("james_build_report_conflict") => Self::JamesBuildReportConflict,
+            Some("james_build_report_invalid") => Self::JamesBuildReportInvalid,
+            Some("james_cache_report_invalid") => Self::JamesCacheReportInvalid,
+            Some("james_disk_report_invalid") => Self::JamesDiskReportInvalid,
+            Some("james_host_report_invalid") => Self::JamesHostReportInvalid,
+            Some("james_release_job_identity_mismatch") => Self::JamesReleaseJobIdentityMismatch,
+            Some("james_release_source_contains_protected_material") => {
+                Self::JamesReleaseSourceContainsProtectedMaterial
+            }
+            Some("james_release_source_identity_mismatch") => {
+                Self::JamesReleaseSourceIdentityMismatch
+            }
+            Some("james_release_source_lock_missing") => Self::JamesReleaseSourceLockMissing,
+            _ => Self::Unknown,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::JamesApplianceReportInvalid => "james_appliance_report_invalid",
+            Self::JamesArtifactReportConflict => "james_artifact_report_conflict",
+            Self::JamesArtifactReportInvalid => "james_artifact_report_invalid",
+            Self::JamesBuildReportConflict => "james_build_report_conflict",
+            Self::JamesBuildReportInvalid => "james_build_report_invalid",
+            Self::JamesCacheReportInvalid => "james_cache_report_invalid",
+            Self::JamesDiskReportInvalid => "james_disk_report_invalid",
+            Self::JamesHostReportInvalid => "james_host_report_invalid",
+            Self::JamesReleaseJobIdentityMismatch => "james_release_job_identity_mismatch",
+            Self::JamesReleaseSourceContainsProtectedMaterial => {
+                "james_release_source_contains_protected_material"
+            }
+            Self::JamesReleaseSourceIdentityMismatch => "james_release_source_identity_mismatch",
+            Self::JamesReleaseSourceLockMissing => "james_release_source_lock_missing",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,12 +425,12 @@ struct BootAgentEventReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PulseAgentReportRequest {
+struct JamesAgentReportRequest {
     protocol_version: u32,
     capabilities: Vec<&'static str>,
     cache: crate::cache::CacheStatusReport,
-    build_jobs: Vec<PulseBuildJobReport>,
-    cache_artifacts: Vec<PulseCacheArtifactReport>,
+    build_jobs: Vec<JamesBuildJobReport>,
+    cache_artifacts: Vec<JamesCacheArtifactReport>,
     cache_inventory_instance_id: String,
     cache_inventory_generation: i64,
     cache_artifacts_complete: bool,
@@ -330,7 +443,7 @@ struct PulseAgentReportRequest {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PulseBuildJobReport {
+struct JamesBuildJobReport {
     local_id: i64,
     managed_job_id: Option<String>,
     requested_artifact_type: String,
@@ -345,10 +458,12 @@ struct PulseBuildJobReport {
     progress_message: Option<String>,
     logs: String,
     error: String,
-    /// Enumerated rejection reason, omitted when the job was not refused.
+    /// Enumerated rejection reason, explicitly null when the job was not
+    /// refused. Current Manage documents this canonical shape while retaining
+    /// additive compatibility with older James versions that omitted `None`.
+    ///
     /// Manage screens reported prose for credential-shaped words and blanks
     /// the whole field, so the reason has to travel as a code to survive.
-    #[serde(skip_serializing_if = "Option::is_none")]
     rejection_code: Option<String>,
     output_path: String,
     output_sha256: String,
@@ -363,7 +478,7 @@ struct PulseBuildJobReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PulseCacheArtifactReport {
+struct JamesCacheArtifactReport {
     local_id: i64,
     managed_artifact_id: Option<String>,
     artifact_type: String,
@@ -387,7 +502,7 @@ struct PulseCacheArtifactReport {
     updated_at: String,
 }
 
-impl From<BuildJob> for PulseBuildJobReport {
+impl From<BuildJob> for JamesBuildJobReport {
     fn from(job: BuildJob) -> Self {
         Self {
             local_id: job.id,
@@ -419,7 +534,7 @@ impl From<BuildJob> for PulseBuildJobReport {
     }
 }
 
-impl From<CacheArtifact> for PulseCacheArtifactReport {
+impl From<CacheArtifact> for JamesCacheArtifactReport {
     fn from(artifact: CacheArtifact) -> Self {
         Self {
             local_id: artifact.id,
@@ -470,15 +585,15 @@ pub enum SyncOnceDisposition {
 pub struct SyncOnceReport {
     pub schema: &'static str,
     pub outcome: SyncOnceDisposition,
-    /// True only after Manage accepted and returned JSON for the signed Pulse
+    /// True only after Manage accepted and returned JSON for the signed James
     /// report. Boot reports are intentionally not counted here.
     pub report_posted: bool,
 }
 
 impl SyncOnceReport {
-    fn synced(_receipt: PulseReportReceipt) -> Self {
+    fn synced(_receipt: JamesReportReceipt) -> Self {
         Self {
-            schema: "cybex.pulse.sync-once.v1",
+            schema: "cybex.james.sync-once.v1",
             outcome: SyncOnceDisposition::Synced,
             report_posted: true,
         }
@@ -486,7 +601,7 @@ impl SyncOnceReport {
 }
 
 #[derive(Debug)]
-struct PulseReportReceipt;
+struct JamesReportReceipt;
 
 #[derive(Clone, Debug)]
 struct NormalizedManagedSettings {
@@ -509,7 +624,7 @@ pub fn spawn(state: AppState) {
                             active_managed_sync_interval_seconds(normal_interval, active_builds > 0)
                         }
                         Err(err) => {
-                            warn!(error = %err, "failed to inspect active Pulse builds for managed sync cadence");
+                            warn!(error = %err, "failed to inspect active James builds for managed sync cadence");
                             normal_interval
                         }
                     }
@@ -553,10 +668,10 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     if let Err(error) = sync_boot_foundation(state, &mut managed).await {
         retain_sync_failure(&mut first_failure, "boot configuration and report", error);
     }
-    let pulse_report = match sync_pulse_foundation(state, &managed).await {
+    let james_report = match sync_james_foundation(state, &mut managed).await {
         Ok(report) => Some(report),
         Err(error) => {
-            retain_sync_failure(&mut first_failure, "Pulse configuration and report", error);
+            retain_sync_failure(&mut first_failure, "James configuration and report", error);
             None
         }
     };
@@ -566,8 +681,8 @@ async fn sync_once_with_outcome(state: &AppState) -> Result<SyncOnceReport> {
     if let Some(error) = first_failure {
         return Err(error);
     }
-    Ok(SyncOnceReport::synced(pulse_report.expect(
-        "successful Pulse sync returns its report receipt",
+    Ok(SyncOnceReport::synced(james_report.expect(
+        "successful James sync returns its report receipt",
     )))
 }
 
@@ -661,9 +776,9 @@ async fn current_boot_client_reports(pool: &SqlitePool) -> Result<Vec<BootAgentC
 
 fn require_activated_identity(managed: &ManagedState) -> Result<()> {
     managed_device_id(managed).context(
-        "Pulse has no V2-activated appliance identity; reinstall from personalized media",
+        "James has no V2-activated appliance identity; reinstall from personalized media",
     )?;
-    signing_key(managed).context("Pulse V2 appliance signing identity is incomplete")?;
+    signing_key(managed).context("James V2 appliance signing identity is incomplete")?;
     Ok(())
 }
 
@@ -759,42 +874,42 @@ async fn report_boot_state(state: &AppState, managed: &mut ManagedState) -> Resu
     Ok(())
 }
 
-async fn sync_pulse_foundation(
+async fn sync_james_foundation(
     state: &AppState,
-    managed: &ManagedState,
-) -> Result<PulseReportReceipt> {
+    managed: &mut ManagedState,
+) -> Result<JamesReportReceipt> {
     let mut first_failure = None;
     let mut peer_runtime_epoch = None;
-    match fetch_pulse_config(state, managed).await {
+    match fetch_james_config(state, managed).await {
         Ok(desired) => {
             peer_runtime_epoch = desired
                 .compatibility
                 .as_ref()
                 .and_then(|contract| contract.workstation_runtime_epoch);
-            apply_pulse_desired(state, desired, &mut first_failure).await;
+            apply_james_desired(state, desired, &mut first_failure).await;
         }
         Err(error) => retain_sync_failure(
             &mut first_failure,
-            "Pulse desired configuration fetch",
+            "James desired configuration fetch",
             error,
         ),
     }
-    let report = match report_pulse_state(state, managed, peer_runtime_epoch.is_some()).await {
+    let report = match report_james_state(state, managed, peer_runtime_epoch.is_some()).await {
         Ok(report) => Some(report),
         Err(error) => {
-            retain_sync_failure(&mut first_failure, "Pulse state report", error);
+            retain_sync_failure(&mut first_failure, "James state report", error);
             None
         }
     };
     if let Some(error) = first_failure {
         return Err(error);
     }
-    Ok(report.expect("successful Pulse report returns its receipt"))
+    Ok(report.expect("successful James report returns its receipt"))
 }
 
-async fn apply_pulse_desired(
+async fn apply_james_desired(
     state: &AppState,
-    desired: AgentPulseConfigResponse,
+    desired: AgentJamesConfigResponse,
     first_failure: &mut Option<anyhow::Error>,
 ) {
     if let Some(workstation_netboot) = desired.workstation_netboot {
@@ -836,7 +951,7 @@ async fn apply_pulse_desired(
         retain_sync_failure(
             first_failure,
             "managed build desired state",
-            anyhow!("managed pulse config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs"),
+            anyhow!("managed james config returned more than {MAX_MANAGED_BUILD_JOBS} build jobs"),
         );
     }
     let mut build_snapshot_applied = build_count_valid;
@@ -960,7 +1075,7 @@ async fn acknowledge_pending_appliance_network_change(
     };
     let device_id = managed_device_id(managed)?;
     let path = format!(
-        "/v1/agent/devices/{device_id}/pulse/network-changes/{}/acknowledge",
+        "/v1/agent/devices/{device_id}/james/network-changes/{}/acknowledge",
         pending.change_id
     );
     let body = serde_json::to_vec(&json!({
@@ -977,34 +1092,44 @@ async fn acknowledge_pending_appliance_network_change(
     crate::appliance::accept_network_acknowledgement(&acknowledgement)
 }
 
-async fn fetch_pulse_config(
+async fn fetch_james_config(
     state: &AppState,
     managed: &ManagedState,
-) -> Result<AgentPulseConfigResponse> {
+) -> Result<AgentJamesConfigResponse> {
     let device_id = managed_device_id(managed)?;
-    let path = format!("/v1/agent/devices/{device_id}/pulse/config");
+    let path = format!("/v1/agent/devices/{device_id}/james/config");
     let response = signed_request(state, managed, Method::GET, &path, Vec::new())
         .await?
         .send()
         .await
-        .context("fetch managed pulse config request failed")?;
-    let config: AgentPulseConfigResponse =
-        parse_success_json(response, "fetch managed pulse config").await?;
+        .context("fetch managed james config request failed")?;
+    let config: AgentJamesConfigResponse =
+        parse_success_json(response, "fetch managed james config").await?;
     validate_component_compatibility(config.compatibility.as_ref())?;
     Ok(config)
 }
 
-async fn report_pulse_state(
+async fn report_james_state(
     state: &AppState,
-    managed: &ManagedState,
+    managed: &mut ManagedState,
     peer_supports_runtime_fencing: bool,
-) -> Result<PulseReportReceipt> {
-    let (build_jobs, build_listing_valid) = match db::list_build_jobs(&state.db).await {
+) -> Result<JamesReportReceipt> {
+    let (build_jobs, build_listing_valid) = match db::list_build_jobs_report_page(
+        &state.db,
+        managed.james_active_report_cursor,
+        managed.james_rejection_report_cursor,
+        managed.james_terminal_report_cursor,
+        managed.james_report_rotation_round,
+        MAX_REPORT_BUILD_JOBS,
+        MAX_JAMES_REPORT_BODY_BYTES,
+    )
+    .await
+    {
         Ok(jobs) => (jobs, true),
         Err(_) => {
             warn!(
                 error_code = "build_report_storage_unavailable",
-                "could not read build reports; continuing independent Pulse report lanes"
+                "could not read build reports; continuing independent James report lanes"
             );
             (Vec::new(), false)
         }
@@ -1024,24 +1149,10 @@ async fn report_pulse_state(
             true
         }
         Err(err) => {
-            warn!(error = %err, "Pulse cache integrity scrub failed");
+            warn!(error = %err, "James cache integrity scrub failed");
             false
         }
     };
-    let (cache_artifacts, cache_listing_complete, cache_listing_valid) =
-        match db::list_cache_artifacts(&state.db).await {
-            Ok(artifacts) => {
-                let complete = artifacts.len() <= MAX_REPORT_CACHE_ARTIFACTS;
-                (artifacts, complete, true)
-            }
-            Err(_) => {
-                warn!(
-                    error_code = "cache_artifact_report_storage_unavailable",
-                    "could not read cache artifact reports; sending a non-authoritative cache lane"
-                );
-                (Vec::new(), false, false)
-            }
-        };
     let (cache_inventory_instance_id, cache_inventory_generation, cache_inventory_valid) =
         match db::cache_inventory_state(&state.db).await {
             Ok(inventory) => (inventory.instance_id, inventory.generation, true),
@@ -1051,6 +1162,30 @@ async fn report_pulse_state(
                     "could not read cache inventory generation; isolating the cache lane"
                 );
                 (String::new(), 0, false)
+            }
+        };
+    let cache_report_cursor = james_cache_report_cursor(
+        managed,
+        &cache_inventory_instance_id,
+        cache_inventory_generation,
+        cache_inventory_valid,
+    );
+    let (cache_artifacts, cache_listing_complete, cache_listing_valid) =
+        match db::list_cache_artifacts_report_page(
+            &state.db,
+            cache_report_cursor,
+            MAX_REPORT_CACHE_ARTIFACTS,
+            MAX_JAMES_REPORT_BODY_BYTES,
+        )
+        .await
+        {
+            Ok((artifacts, complete)) => (artifacts, complete, true),
+            Err(_) => {
+                warn!(
+                    error_code = "cache_artifact_report_storage_unavailable",
+                    "could not read cache artifact reports; sending a non-authoritative cache lane"
+                );
+                (Vec::new(), false, false)
             }
         };
     let cache_inventory_generation = cache_inventory_generation_for_peer(
@@ -1076,35 +1211,53 @@ async fn report_pulse_state(
             warn!(
                 error_code = crate::netboot::ERROR_RUNTIME_REPORT_STORAGE_UNAVAILABLE,
                 safe_detail = %crate::netboot::safe_failure_message(&error),
-                "workstation runtime report generation failed; sending null without blocking the Pulse report"
+                "workstation runtime report generation failed; sending null without blocking the James report"
             );
             None
         }
     };
-    let (appliance, appliance_report_error) = match crate::appliance::report().await {
+    let (appliance, appliance_report_error) = match crate::appliance::report(state).await {
         Ok(report) => (report, None),
         Err(error) => {
             warn!(
                 error = %safe_error(&error),
-                "appliance report generation failed; sending null without blocking independent Pulse state"
+                "appliance report generation failed; sending null without blocking independent James state"
             );
             (None, Some("local_state_unavailable"))
         }
     };
-    let body = PulseAgentReportRequest {
+    let report_priority = JamesReportPriority::from_round(managed.james_report_rotation_round);
+    let build_jobs = select_build_job_reports(
+        build_jobs
+            .into_iter()
+            .map(JamesBuildJobReport::from)
+            // Manage cannot correlate local-only jobs and deliberately ignores
+            // them. Do not let them consume the managed evidence budget.
+            .filter(|job| job.managed_job_id.is_some())
+            .collect(),
+        managed.james_active_report_cursor,
+        managed.james_rejection_report_cursor,
+        managed.james_terminal_report_cursor,
+        MAX_REPORT_BUILD_JOBS,
+        report_priority,
+    )?;
+    let cache_artifacts = rotate_report_items_after_cursor(
+        cache_artifacts
+            .into_iter()
+            .map(JamesCacheArtifactReport::from)
+            .collect(),
+        cache_report_cursor,
+        |artifact| artifact.local_id,
+    )
+    .into_iter()
+    .take(MAX_REPORT_CACHE_ARTIFACTS)
+    .collect();
+    let body = JamesAgentReportRequest {
         protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
-        capabilities: pulse_capabilities(&state.config),
+        capabilities: james_capabilities(&state.config),
         cache,
-        build_jobs: build_jobs
-            .into_iter()
-            .take(MAX_REPORT_BUILD_JOBS)
-            .map(PulseBuildJobReport::from)
-            .collect(),
-        cache_artifacts: cache_artifacts
-            .into_iter()
-            .take(MAX_REPORT_CACHE_ARTIFACTS)
-            .map(PulseCacheArtifactReport::from)
-            .collect(),
+        build_jobs,
+        cache_artifacts,
         cache_inventory_instance_id,
         cache_inventory_generation,
         cache_artifacts_complete,
@@ -1114,25 +1267,94 @@ async fn report_pulse_state(
         appliance,
         appliance_report_error,
     };
-    let (_body, body_bytes) = fit_pulse_report_body(body, MAX_PULSE_REPORT_BODY_BYTES)?;
+    let (body, body_bytes) =
+        fit_james_report_body(body, MAX_JAMES_REPORT_BODY_BYTES, report_priority)?;
     let device_id = managed_device_id(managed)?;
-    let path = format!("/v1/agent/devices/{device_id}/pulse/report");
+    let path = format!("/v1/agent/devices/{device_id}/james/report");
     let response = signed_request(state, managed, Method::POST, &path, body_bytes)
         .await?
         .header(CONTENT_TYPE, "application/json")
         .send()
         .await
-        .context("report managed pulse state request failed")?;
+        .context("report managed james state request failed")?;
     let response =
-        parse_success_json::<PulseReportResponse>(response, "report managed pulse state").await?;
-    validate_pulse_report_response(&response)?;
-    Ok(PulseReportReceipt)
+        parse_success_json::<JamesReportResponse>(response, "report managed james state").await?;
+    accept_james_report_response(&response, managed, &body)?;
+    Ok(JamesReportReceipt)
 }
 
-fn validate_pulse_report_response(response: &PulseReportResponse) -> Result<()> {
-    if response.status != "ok" {
-        bail!("Manage returned an invalid Pulse report status");
+fn accept_james_report_response(
+    response: &JamesReportResponse,
+    managed: &mut ManagedState,
+    body: &JamesAgentReportRequest,
+) -> Result<()> {
+    validate_james_report_status(response)?;
+    // Overall status=ok means Manage committed every independently valid
+    // lane, even when the isolated workstation runtime receipt below is a
+    // rejection. Advance those accepted pages before surfacing the runtime
+    // retry so a persistent runtime problem cannot pin build/cache prefixes.
+    advance_james_report_rotation(managed, body);
+    log_james_report_warnings(&response.warnings, managed);
+    validate_workstation_netboot_report_receipt(response)
+}
+
+fn log_james_report_warnings(warnings: &JamesReportWarnings, managed: &mut ManagedState) -> bool {
+    let fingerprint = james_report_warning_fingerprint(warnings);
+    if fingerprint.is_none() {
+        managed.james_report_warning_fingerprint = None;
+        return false;
     }
+    if managed.james_report_warning_fingerprint == fingerprint {
+        return false;
+    }
+    managed.james_report_warning_fingerprint = fingerprint;
+    if warnings.codes.is_empty() {
+        return false;
+    }
+    let mut diagnostic_codes = warnings
+        .codes
+        .iter()
+        .map(|code| code.as_str())
+        .collect::<Vec<_>>();
+    diagnostic_codes.sort_unstable();
+    diagnostic_codes.dedup();
+    warn!(
+        warning_count = warnings.codes.len(),
+        warning_receipts_truncated = warnings.truncated,
+        diagnostic_codes = ?diagnostic_codes,
+        "Manage isolated one or more invalid James report lanes; the accepted lanes remain healthy and rejected evidence will be reported again"
+    );
+    true
+}
+
+fn james_report_warning_fingerprint(warnings: &JamesReportWarnings) -> Option<String> {
+    if warnings.codes.is_empty() {
+        return None;
+    }
+    let mut codes = warnings
+        .codes
+        .iter()
+        .map(|code| code.as_str())
+        .collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes.dedup();
+    Some(format!("{}:{}", warnings.truncated, codes.join(",")))
+}
+
+#[cfg(test)]
+fn validate_james_report_response(response: &JamesReportResponse) -> Result<()> {
+    validate_james_report_status(response)?;
+    validate_workstation_netboot_report_receipt(response)
+}
+
+fn validate_james_report_status(response: &JamesReportResponse) -> Result<()> {
+    if response.status != "ok" {
+        bail!("Manage returned an invalid James report status");
+    }
+    Ok(())
+}
+
+fn validate_workstation_netboot_report_receipt(response: &JamesReportResponse) -> Result<()> {
     let Some(receipt) = response.workstation_netboot.as_ref() else {
         // Older Manage releases predate isolated runtime receipts.
         return Ok(());
@@ -1177,7 +1399,7 @@ fn cache_inventory_generation_for_peer(
         // A negative generation is rejected by Manage's isolated cache lane.
         // This prevents a best-effort empty snapshot (or an independently
         // optimistic cache status report) from refreshing cache health when
-        // Pulse could not read its authoritative local inventory.
+        // James could not read its authoritative local inventory.
         -1
     } else {
         generation
@@ -1201,67 +1423,320 @@ fn cache_status_for_local_state(
     report
 }
 
-fn fit_pulse_report_body(
-    mut body: PulseAgentReportRequest,
+fn rotate_report_items_after_cursor<T, F>(
+    mut items: Vec<T>,
+    cursor: Option<i64>,
+    local_id: F,
+) -> Vec<T>
+where
+    F: Fn(&T) -> i64,
+{
+    // Local ids are monotonic. Sorting here makes the cursor a durable
+    // watermark even when the exact row was deleted between accepted pages:
+    // older ids continue first, then the sequence wraps to newer rows.
+    items.sort_by_key(|item| std::cmp::Reverse(local_id(item)));
+    let Some(cursor) = cursor else {
+        return items;
+    };
+    let split = items.partition_point(|item| local_id(item) >= cursor);
+    if split < items.len() {
+        items.rotate_left(split);
+    }
+    items
+}
+
+fn james_cache_report_cursor(
+    managed: &ManagedState,
+    inventory_instance_id: &str,
+    inventory_generation: i64,
+    inventory_valid: bool,
+) -> Option<i64> {
+    (inventory_valid
+        && managed.james_cache_report_instance_id.as_deref() == Some(inventory_instance_id)
+        && managed.james_cache_report_generation == Some(inventory_generation))
+    .then_some(managed.james_cache_artifact_report_cursor)
+    .flatten()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JamesReportPriority {
+    ActiveBuilds,
+    TerminalBuilds,
+    RejectedBuilds,
+    CacheArtifacts,
+}
+
+impl JamesReportPriority {
+    fn from_round(round: u8) -> Self {
+        match round % 4 {
+            0 => Self::ActiveBuilds,
+            1 => Self::TerminalBuilds,
+            2 => Self::RejectedBuilds,
+            _ => Self::CacheArtifacts,
+        }
+    }
+
+    fn build_group_order(self) -> [usize; 3] {
+        // active, rejected, ordinary terminal
+        match self {
+            Self::ActiveBuilds => [0, 1, 2],
+            Self::TerminalBuilds => [2, 1, 0],
+            Self::RejectedBuilds => [1, 0, 2],
+            Self::CacheArtifacts => [0, 1, 2],
+        }
+    }
+}
+
+fn james_build_job_is_terminal(job: &JamesBuildJobReport) -> bool {
+    matches!(job.status.as_str(), "succeeded" | "failed" | "cancelled")
+}
+
+fn select_build_job_reports(
+    reports: Vec<JamesBuildJobReport>,
+    active_cursor: Option<i64>,
+    rejection_cursor: Option<i64>,
+    terminal_cursor: Option<i64>,
+    max_reports: usize,
+    priority: JamesReportPriority,
+) -> Result<Vec<JamesBuildJobReport>> {
+    let mut active = Vec::new();
+    let mut rejected = Vec::new();
+    let mut terminal = Vec::new();
+    for report in reports {
+        if !james_build_job_is_terminal(&report) {
+            active.push(report);
+        } else if report.rejection_code.is_some() {
+            rejected.push(report);
+        } else {
+            terminal.push(report);
+        }
+    }
+    let active = rotate_report_items_after_cursor(active, active_cursor, |job| job.local_id);
+    let rejected = rotate_report_items_after_cursor(rejected, rejection_cursor, |job| job.local_id);
+    let terminal = rotate_report_items_after_cursor(terminal, terminal_cursor, |job| job.local_id);
+    let lengths = [active.len(), rejected.len(), terminal.len()];
+    let mut take = [0usize; 3];
+    let mut selected = 0usize;
+    while selected < max_reports {
+        let mut progressed = false;
+        for group in priority.build_group_order() {
+            if selected == max_reports {
+                break;
+            }
+            if take[group] < lengths[group] {
+                take[group] += 1;
+                selected += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let mut selected = Vec::with_capacity(selected);
+    selected.extend(active.into_iter().take(take[0]));
+    selected.extend(rejected.into_iter().take(take[1]));
+    selected.extend(terminal.into_iter().take(take[2]));
+    Ok(selected)
+}
+
+fn advance_james_report_rotation(managed: &mut ManagedState, body: &JamesAgentReportRequest) {
+    if let Some(job) = body
+        .build_jobs
+        .iter()
+        .rev()
+        .find(|job| !james_build_job_is_terminal(job))
+    {
+        managed.james_active_report_cursor = Some(job.local_id);
+    }
+    if let Some(job) = body
+        .build_jobs
+        .iter()
+        .rev()
+        .find(|job| job.rejection_code.is_some())
+    {
+        managed.james_rejection_report_cursor = Some(job.local_id);
+    }
+    if let Some(job) = body
+        .build_jobs
+        .iter()
+        .rev()
+        .find(|job| james_build_job_is_terminal(job) && job.rejection_code.is_none())
+    {
+        managed.james_terminal_report_cursor = Some(job.local_id);
+    }
+    if body.cache_inventory_generation >= 0 && !body.cache_inventory_instance_id.is_empty() {
+        let same_generation = managed.james_cache_report_instance_id.as_deref()
+            == Some(body.cache_inventory_instance_id.as_str())
+            && managed.james_cache_report_generation == Some(body.cache_inventory_generation);
+        if !same_generation {
+            managed.james_cache_artifact_report_cursor = None;
+        }
+        managed.james_cache_report_instance_id = Some(body.cache_inventory_instance_id.clone());
+        managed.james_cache_report_generation = Some(body.cache_inventory_generation);
+        if body.cache_artifacts_complete {
+            // The next accepted report begins a fresh traversal of the same
+            // generation. The just-completed page is authoritative because
+            // every earlier page was stamped with this generation by Manage.
+            managed.james_cache_artifact_report_cursor = None;
+        } else if let Some(artifact) = body.cache_artifacts.last() {
+            managed.james_cache_artifact_report_cursor = Some(artifact.local_id);
+        }
+    }
+    managed.james_report_rotation_round = (managed.james_report_rotation_round + 1) % 4;
+}
+
+fn fit_james_report_body(
+    mut body: JamesAgentReportRequest,
     max_bytes: usize,
-) -> Result<(PulseAgentReportRequest, Vec<u8>)> {
+    priority: JamesReportPriority,
+) -> Result<(JamesAgentReportRequest, Vec<u8>)> {
     let original_jobs = body.build_jobs.len();
     let original_artifacts = body.cache_artifacts.len();
-    let mut body_bytes = serialize_pulse_report_body(&body)?;
-    if body_bytes.len() <= max_bytes {
+    if james_report_body_fits(&body, max_bytes) {
+        let body_bytes = serialize_james_report_body(&body)?;
         return Ok((body, body_bytes));
     }
 
     // Logs are diagnostic convenience; the managed job identity, state and
     // cache metadata are the durable evidence that Manage needs. Drop logs
-    // first so the newest active and terminal job reports remain intact.
+    // first so active and terminal job reports remain intact.
     for job in &mut body.build_jobs {
         job.logs.clear();
     }
-    body_bytes = serialize_pulse_report_body(&body)?;
-    while body_bytes.len() > max_bytes {
-        let Some(index) = body
-            .build_jobs
-            .iter()
-            .rposition(|job| matches!(job.status.as_str(), "succeeded" | "failed" | "cancelled"))
-        else {
-            break;
-        };
-        // list_build_jobs returns newest first, so rposition removes the
-        // oldest terminal evidence while preserving current work and the
-        // latest completed Blueprint inventory.
-        body.build_jobs.remove(index);
-        body_bytes = serialize_pulse_report_body(&body)?;
+
+    match priority {
+        JamesReportPriority::ActiveBuilds => {
+            trim_ordinary_terminal_reports(&mut body, max_bytes);
+            trim_cache_artifact_reports(&mut body, max_bytes);
+            trim_rejected_build_reports(&mut body, max_bytes);
+            trim_active_build_reports(&mut body, max_bytes);
+        }
+        JamesReportPriority::TerminalBuilds => {
+            trim_cache_artifact_reports(&mut body, max_bytes);
+            trim_active_build_reports(&mut body, max_bytes);
+            trim_rejected_build_reports(&mut body, max_bytes);
+            trim_ordinary_terminal_reports(&mut body, max_bytes);
+        }
+        JamesReportPriority::RejectedBuilds => {
+            trim_ordinary_terminal_reports(&mut body, max_bytes);
+            trim_cache_artifact_reports(&mut body, max_bytes);
+            trim_active_build_reports(&mut body, max_bytes);
+            trim_rejected_build_reports(&mut body, max_bytes);
+        }
+        JamesReportPriority::CacheArtifacts => {
+            trim_ordinary_terminal_reports(&mut body, max_bytes);
+            trim_active_build_reports(&mut body, max_bytes);
+            trim_rejected_build_reports(&mut body, max_bytes);
+            trim_cache_artifact_reports(&mut body, max_bytes);
+        }
     }
 
-    if body_bytes.len() > max_bytes && !body.cache_artifacts.is_empty() {
-        let fitting = max_fitting_prefix_len(body.cache_artifacts.len(), |count| {
-            let mut candidate = body.clone();
-            candidate.cache_artifacts.truncate(count);
-            candidate.cache_artifacts_complete = false;
-            serialize_pulse_report_body(&candidate).is_ok_and(|bytes| bytes.len() <= max_bytes)
-        });
-        body.cache_artifacts.truncate(fitting);
-        body.cache_artifacts_complete = false;
-        body_bytes = serialize_pulse_report_body(&body)?;
+    if !james_report_body_fits(&body, max_bytes) {
+        bail!("managed james report base body exceeded {max_bytes} bytes");
     }
-
-    if body_bytes.len() > max_bytes {
-        bail!("managed pulse report base body exceeded {max_bytes} bytes");
-    }
+    let body_bytes = serialize_james_report_body(&body)?;
     warn!(
         jobs_sent = body.build_jobs.len(),
         jobs_total = original_jobs,
         cache_artifacts_sent = body.cache_artifacts.len(),
         cache_artifacts_total = original_artifacts,
         max_bytes,
-        "managed pulse report trimmed to fit request budget"
+        "managed james report trimmed to fit request budget"
     );
     Ok((body, body_bytes))
 }
 
-fn serialize_pulse_report_body(body: &PulseAgentReportRequest) -> Result<Vec<u8>> {
-    serde_json::to_vec(body).context("serialize managed pulse report")
+fn terminal_build_job_removal_index(jobs: &[JamesBuildJobReport]) -> Option<usize> {
+    jobs.iter()
+        .rposition(|job| james_build_job_is_terminal(job) && job.rejection_code.is_none())
+}
+
+fn active_build_job_removal_index(jobs: &[JamesBuildJobReport]) -> Option<usize> {
+    jobs.iter()
+        .rposition(|job| !james_build_job_is_terminal(job))
+}
+
+fn rejected_build_job_removal_index(jobs: &[JamesBuildJobReport]) -> Option<usize> {
+    jobs.iter().rposition(|job| job.rejection_code.is_some())
+}
+
+fn trim_ordinary_terminal_reports(body: &mut JamesAgentReportRequest, max_bytes: usize) {
+    while !james_report_body_fits(body, max_bytes) {
+        let Some(index) = terminal_build_job_removal_index(&body.build_jobs) else {
+            break;
+        };
+        body.build_jobs.remove(index);
+    }
+}
+
+fn trim_active_build_reports(body: &mut JamesAgentReportRequest, max_bytes: usize) {
+    while !james_report_body_fits(body, max_bytes) {
+        let Some(index) = active_build_job_removal_index(&body.build_jobs) else {
+            break;
+        };
+        body.build_jobs.remove(index);
+    }
+}
+
+fn trim_rejected_build_reports(body: &mut JamesAgentReportRequest, max_bytes: usize) {
+    while !james_report_body_fits(body, max_bytes) {
+        let Some(index) = rejected_build_job_removal_index(&body.build_jobs) else {
+            break;
+        };
+        body.build_jobs.remove(index);
+    }
+}
+
+fn trim_cache_artifact_reports(body: &mut JamesAgentReportRequest, max_bytes: usize) {
+    if james_report_body_fits(body, max_bytes) || body.cache_artifacts.is_empty() {
+        return;
+    }
+    let fitting = max_fitting_prefix_len(body.cache_artifacts.len(), |count| {
+        let tail = body.cache_artifacts.split_off(count);
+        let complete = body.cache_artifacts_complete;
+        body.cache_artifacts_complete = false;
+        let fits = james_report_body_fits(body, max_bytes);
+        body.cache_artifacts.extend(tail);
+        body.cache_artifacts_complete = complete;
+        fits
+    });
+    body.cache_artifacts.truncate(fitting);
+    body.cache_artifacts_complete = false;
+}
+
+struct JamesReportSizeWriter {
+    written: usize,
+    max_bytes: usize,
+}
+
+impl Write for JamesReportSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.written.checked_add(bytes.len()) else {
+            return Err(io::Error::other("James report size overflow"));
+        };
+        if next > self.max_bytes {
+            return Err(io::Error::other("James report size limit exceeded"));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn james_report_body_fits(body: &JamesAgentReportRequest, max_bytes: usize) -> bool {
+    let mut writer = JamesReportSizeWriter {
+        written: 0,
+        max_bytes,
+    };
+    serde_json::to_writer(&mut writer, body).is_ok()
+}
+
+fn serialize_james_report_body(body: &JamesAgentReportRequest) -> Result<Vec<u8>> {
+    serde_json::to_vec(body).context("serialize managed james report")
 }
 
 fn fit_boot_report_body(
@@ -1699,16 +2174,18 @@ async fn signed_request_for_config(
     })
 }
 
-fn pulse_capabilities(_config: &AppConfig) -> Vec<&'static str> {
+fn james_capabilities(_config: &AppConfig) -> Vec<&'static str> {
     let mut capabilities = vec![
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
         CAPABILITY_BLUEPRINT_BUILDER_V2,
         CAPABILITY_CACHE_V1,
         CAPABILITY_WORKSTATION_NETBOOT_V1,
-        CAPABILITY_PULSE_BOOT_GRANT_V1,
+        CAPABILITY_JAMES_BOOT_GRANT_V1,
     ];
     capabilities.push(CAPABILITY_APPLIANCE_UPDATE_V1);
+    capabilities.push(CAPABILITY_APPLIANCE_UPDATE_V2);
+    capabilities.push(CAPABILITY_APPLIANCE_UPDATE_QUALIFICATION_TRANSPORT_V1);
     capabilities
 }
 
@@ -1739,7 +2216,7 @@ fn signing_key_from_b64(value: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
-pub(crate) struct PulseBootIdentity {
+pub(crate) struct JamesBootIdentity {
     pub device_id: String,
     pub signing_key: SigningKey,
 }
@@ -1747,11 +2224,11 @@ pub(crate) struct PulseBootIdentity {
 /// Load the already-adopted node identity for short-lived boot-grant signing.
 /// This never creates or rotates key material: PXE must fail closed until the
 /// same identity Manage has adopted is durable on disk.
-pub(crate) fn pulse_boot_identity(config: &AppConfig) -> Result<PulseBootIdentity> {
+pub(crate) fn james_boot_identity(config: &AppConfig) -> Result<JamesBootIdentity> {
     let managed = load_managed_state_from_config(config)?;
     let device_id = managed_device_id(&managed)?.to_string();
     let signing_key = signing_key(&managed)?;
-    Ok(PulseBootIdentity {
+    Ok(JamesBootIdentity {
         device_id,
         signing_key,
     })
@@ -2247,16 +2724,16 @@ fn validate_component_compatibility(
         contract.ok_or_else(|| anyhow!("managed protocol-4 compatibility is required"))?;
     if !(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION..=CYBEX_MAXIMUM_MANAGE_PROTOCOL_VERSION)
         .contains(&contract.protocol_version)
-        || !(contract.minimum_pulse_protocol..=contract.maximum_pulse_protocol)
+        || !(contract.minimum_james_protocol..=contract.maximum_james_protocol)
             .contains(&CYBEX_COMPONENT_PROTOCOL_VERSION)
         || contract.workstation_runtime_epoch == Some(0)
     {
         bail!(
-            "incompatible Manage protocol {} (Pulse protocol {}, supported Pulse range {} through {}, Manage version {}, release {})",
+            "incompatible Manage protocol {} (James protocol {}, supported James range {} through {}, Manage version {}, release {})",
             contract.protocol_version,
             CYBEX_COMPONENT_PROTOCOL_VERSION,
-            contract.minimum_pulse_protocol,
-            contract.maximum_pulse_protocol,
+            contract.minimum_james_protocol,
+            contract.maximum_james_protocol,
             clean_string(&contract.manage_version),
             clean_string(&contract.manage_release),
         );
@@ -2329,7 +2806,19 @@ fn normalize_managed_settings(
     settings: &ManagedBootSettings,
     config: &AppConfig,
 ) -> Result<NormalizedManagedSettings> {
-    let public_base_url = if settings.public_base_url.trim().is_empty() {
+    normalize_managed_settings_for_mode(settings, config, crate::appliance::is_managed_ubuntu())
+}
+
+fn normalize_managed_settings_for_mode(
+    settings: &ManagedBootSettings,
+    config: &AppConfig,
+    managed_appliance: bool,
+) -> Result<NormalizedManagedSettings> {
+    // The appliance itself owns this address: DHCP renewals and acknowledged
+    // Netplan changes can make a centrally remembered URL stale. Management
+    // still owns the remaining boot policy, while the reconciled local origin
+    // is authoritative on the managed Ubuntu appliance.
+    let public_base_url = if managed_appliance || settings.public_base_url.trim().is_empty() {
         config.public_base_url().to_string()
     } else {
         normalize_http_url(
@@ -2393,7 +2882,7 @@ fn validate_assignable_profile(profile: &ManagedBootProfile, field: &str) -> Res
 
 fn managed_profile_has_boot_action(profile: &ManagedBootProfile) -> bool {
     match profile.profile_type.as_str() {
-        "local_disk" | "pulse_installer" => true,
+        "local_disk" | "james_installer" => true,
         "custom_ipxe" => profile
             .raw_script
             .as_deref()
@@ -2462,7 +2951,7 @@ fn load_reliability_state() -> Option<Value> {
         warn!(
             path = RELIABILITY_STATE_PATH,
             bytes = bytes.len(),
-            "ignoring oversized Pulse reliability state"
+            "ignoring oversized James reliability state"
         );
         return None;
     }
@@ -2471,12 +2960,12 @@ fn load_reliability_state() -> Option<Value> {
         Ok(_) => {
             warn!(
                 path = RELIABILITY_STATE_PATH,
-                "ignoring non-object Pulse reliability state"
+                "ignoring non-object James reliability state"
             );
             None
         }
         Err(err) => {
-            warn!(path = RELIABILITY_STATE_PATH, error = %err, "ignoring invalid Pulse reliability state");
+            warn!(path = RELIABILITY_STATE_PATH, error = %err, "ignoring invalid James reliability state");
             None
         }
     }
@@ -2575,14 +3064,14 @@ mod tests {
     async fn signed_requests_canonicalize_the_final_prefixed_path_and_query() {
         let signing = SigningKey::from_bytes(&[11_u8; 32]);
         let managed = ManagedState {
-            device_id: Some("pulse-123".to_string()),
+            device_id: Some("james-123".to_string()),
             private_key_b64: Some(STANDARD.encode(signing.to_bytes())),
             ..ManagedState::default()
         };
         let mut config = AppConfig::default();
         config.manage.api_url = "https://manage.example.invalid/api".to_string();
         config.manage.organization_id = "org-123".to_string();
-        let relative = "/v1/agent/devices/pulse-123/config?cursor=a%2Fb";
+        let relative = "/v1/agent/devices/james-123/config?cursor=a%2Fb";
         let body = br#"{"status":"ready"}"#.to_vec();
         let request =
             signed_request_for_config(&config, &managed, Method::POST, relative, body.clone())
@@ -2593,7 +3082,7 @@ mod tests {
         let signed_path = request_path_and_query(request.url().as_str()).unwrap();
         assert_eq!(
             signed_path,
-            "/api/v1/agent/devices/pulse-123/config?cursor=a%2Fb"
+            "/api/v1/agent/devices/james-123/config?cursor=a%2Fb"
         );
         let timestamp = request.headers()["x-cybex-timestamp"].to_str().unwrap();
         let request_id = request.headers()["x-cybex-request-id"].to_str().unwrap();
@@ -2858,8 +3347,8 @@ mod tests {
         let settings = ManagedBootSettings {
             public_base_url: " http://boot.example/// ".to_string(),
             listen_addr: "127.0.0.1:9080".to_string(),
-            tftp_root: "/srv/cybex-pulse/tftp-managed".to_string(),
-            http_root: "/srv/cybex-pulse/www-managed".to_string(),
+            tftp_root: "/srv/cybex-james/tftp-managed".to_string(),
+            http_root: "/srv/cybex-james/www-managed".to_string(),
             bootloader_filename: " ipxe.efi ".to_string(),
             menu_timeout_ms: 1_000,
         };
@@ -2895,21 +3384,39 @@ mod tests {
     }
 
     #[test]
+    fn managed_appliance_keeps_its_reconciled_local_public_base_url() {
+        let mut app_config = AppConfig::default();
+        app_config.server.public_base_url = "http://192.0.2.20".to_string();
+        let settings = ManagedBootSettings {
+            public_base_url: "http://192.0.2.19".to_string(),
+            listen_addr: String::new(),
+            tftp_root: String::new(),
+            http_root: String::new(),
+            bootloader_filename: "snponly.efi".to_string(),
+            menu_timeout_ms: 10_000,
+        };
+
+        let normalized = normalize_managed_settings_for_mode(&settings, &app_config, true).unwrap();
+
+        assert_eq!(normalized.public_base_url, "http://192.0.2.20");
+    }
+
+    #[test]
     fn managed_settings_reject_invalid_runtime_values() {
         let app_config = AppConfig::default();
         let invalid_url = ManagedBootSettings {
             public_base_url: "http://boot.example/path?debug=true".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-pulse/tftp".to_string(),
-            http_root: "/srv/cybex-pulse/www".to_string(),
+            tftp_root: "/srv/cybex-james/tftp".to_string(),
+            http_root: "/srv/cybex-james/www".to_string(),
             bootloader_filename: "snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
         let invalid_loader = ManagedBootSettings {
             public_base_url: "http://boot.example".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            tftp_root: "/srv/cybex-pulse/tftp".to_string(),
-            http_root: "/srv/cybex-pulse/www".to_string(),
+            tftp_root: "/srv/cybex-james/tftp".to_string(),
+            http_root: "/srv/cybex-james/www".to_string(),
             bootloader_filename: "../snponly.efi".to_string(),
             menu_timeout_ms: 10_000,
         };
@@ -3594,20 +4101,625 @@ mod tests {
     }
 
     #[test]
-    fn pulse_capabilities_report_build_and_cache() {
+    fn james_capabilities_report_build_and_cache() {
         let config = AppConfig::default();
         assert_eq!(
-            pulse_capabilities(&config),
+            james_capabilities(&config),
             vec![
                 "boot_v1",
                 "builder_v1",
                 "blueprint_builder_v2",
                 "cache_v1",
                 "workstation_netboot_v1",
-                "pulse_boot_grant_v1",
-                "appliance_update_v1"
+                "james_boot_grant_v1",
+                "appliance_update_v1",
+                "appliance_update_v2",
+                "appliance_update_qualification_transport_v1"
             ]
         );
+    }
+
+    #[test]
+    fn james_build_reports_serialize_required_rejection_code_for_normal_and_rejected_jobs() {
+        let normal = serde_json::to_value(JamesBuildJobReport::from(sample_build_job(""))).unwrap();
+        let normal = normal.as_object().unwrap();
+        assert_eq!(normal.get("rejection_code"), Some(&Value::Null));
+
+        let rejected = serde_json::to_value(JamesBuildJobReport::from(sample_build_job(
+            "protected_material",
+        )))
+        .unwrap();
+        assert_eq!(rejected["rejection_code"], "protected_material");
+    }
+
+    #[test]
+    fn james_report_size_trimming_preserves_required_rejection_code_shape() {
+        let mut normal = JamesBuildJobReport::from(sample_build_job(""));
+        normal.logs = "normal build log".repeat(256);
+        let mut rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        rejected.logs = "rejected build log".repeat(256);
+        let report = sample_james_report(vec![normal, rejected]);
+        let original_bytes = serialize_james_report_body(&report).unwrap();
+
+        let (trimmed, trimmed_bytes) = fit_james_report_body(
+            report,
+            original_bytes.len() - 1,
+            JamesReportPriority::ActiveBuilds,
+        )
+        .unwrap();
+
+        assert_eq!(trimmed.build_jobs.len(), 2);
+        assert!(trimmed.build_jobs.iter().all(|job| job.logs.is_empty()));
+        let value: Value = serde_json::from_slice(&trimmed_bytes).unwrap();
+        let jobs = value["build_jobs"].as_array().unwrap();
+        assert_eq!(
+            jobs[0].as_object().unwrap().get("rejection_code"),
+            Some(&Value::Null)
+        );
+        assert_eq!(jobs[1]["rejection_code"], "protected_material");
+    }
+
+    #[test]
+    fn pathological_cache_inventory_cannot_starve_terminal_build_evidence() {
+        let mut succeeded = JamesBuildJobReport::from(sample_build_job(""));
+        succeeded.status = "succeeded".to_string();
+        succeeded.progress_percent = Some(100);
+        succeeded.completed_at = Some("2026-08-10T18:01:00Z".to_string());
+        let rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        let mut report = sample_james_report(vec![succeeded, rejected]);
+        report.cache_artifacts = vec![sample_cache_artifact("x".repeat(64 * 1024))];
+
+        let mut terminal_evidence_only = report.clone();
+        terminal_evidence_only.cache_artifacts.clear();
+        terminal_evidence_only.cache_artifacts_complete = false;
+        let terminal_evidence_bytes = serialize_james_report_body(&terminal_evidence_only).unwrap();
+
+        let (trimmed, trimmed_bytes) = fit_james_report_body(
+            report,
+            terminal_evidence_bytes.len(),
+            JamesReportPriority::TerminalBuilds,
+        )
+        .unwrap();
+
+        assert_eq!(trimmed.build_jobs.len(), 2);
+        assert!(trimmed.cache_artifacts.is_empty());
+        assert!(!trimmed.cache_artifacts_complete);
+        assert_eq!(trimmed_bytes, terminal_evidence_bytes);
+    }
+
+    #[test]
+    fn oversized_build_reports_drop_ordinary_terminal_evidence_before_rejections() {
+        let mut succeeded = JamesBuildJobReport::from(sample_build_job(""));
+        succeeded.status = "succeeded".to_string();
+        succeeded.progress_percent = Some(100);
+        succeeded.completed_at = Some("2026-08-10T18:01:00Z".to_string());
+        succeeded.cache_metadata = json!({"oversized": "x".repeat(64 * 1024)});
+        let rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        let rejection_only = sample_james_report(vec![rejected.clone()]);
+        let rejection_only_bytes = serialize_james_report_body(&rejection_only).unwrap();
+        let report = sample_james_report(vec![succeeded, rejected]);
+
+        let (trimmed, trimmed_bytes) = fit_james_report_body(
+            report,
+            rejection_only_bytes.len(),
+            JamesReportPriority::ActiveBuilds,
+        )
+        .unwrap();
+
+        assert_eq!(trimmed.build_jobs.len(), 1);
+        assert_eq!(
+            trimmed.build_jobs[0].rejection_code.as_deref(),
+            Some("protected_material")
+        );
+        assert_eq!(trimmed_bytes, rejection_only_bytes);
+    }
+
+    #[test]
+    fn accepted_oversized_reports_rotate_terminal_and_cache_evidence_to_convergence() {
+        let mut active = JamesBuildJobReport::from(sample_build_job(""));
+        active.local_id = 800;
+        active.status = "running".to_string();
+        let mut rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        rejected.local_id = 900;
+        let protected = vec![active.clone(), rejected.clone()];
+
+        let terminals = (1..=3)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job(""));
+                report.local_id = local_id;
+                report.status = "succeeded".to_string();
+                report.progress_percent = Some(100);
+                report.completed_at = Some("2026-08-10T18:01:00Z".to_string());
+                report.cache_metadata = json!({"padding": "t".repeat(64 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let artifacts = (11..=13)
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact("a".repeat(64 * 1024));
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect::<Vec<_>>();
+
+        let mut one_terminal = sample_james_report(
+            protected
+                .iter()
+                .cloned()
+                .chain(terminals.iter().take(1).cloned())
+                .collect(),
+        );
+        one_terminal.cache_artifacts_complete = false;
+        let terminal_budget = serialize_james_report_body(&one_terminal).unwrap().len();
+        let mut one_artifact = sample_james_report(protected.clone());
+        one_artifact.cache_artifacts = artifacts.iter().take(1).cloned().collect();
+        one_artifact.cache_artifacts_complete = false;
+        let artifact_budget = serialize_james_report_body(&one_artifact).unwrap().len();
+        let max_bytes = terminal_budget.max(artifact_budget);
+
+        let mut managed = ManagedState::default();
+        let mut seen_active = false;
+        let mut seen_rejected = false;
+        let mut seen_terminals = HashSet::new();
+        let mut seen_artifacts = HashSet::new();
+        for _ in 0..12 {
+            let build_jobs = select_build_job_reports(
+                protected
+                    .iter()
+                    .cloned()
+                    .chain(terminals.iter().cloned())
+                    .collect(),
+                managed.james_active_report_cursor,
+                managed.james_rejection_report_cursor,
+                managed.james_terminal_report_cursor,
+                MAX_REPORT_BUILD_JOBS,
+                JamesReportPriority::from_round(managed.james_report_rotation_round),
+            )
+            .unwrap();
+            let cache_artifacts = rotate_report_items_after_cursor(
+                artifacts.clone(),
+                managed.james_cache_artifact_report_cursor,
+                |artifact| artifact.local_id,
+            );
+            let mut report = sample_james_report(build_jobs);
+            report.cache_artifacts = cache_artifacts;
+            let (sent, _) = fit_james_report_body(
+                report,
+                max_bytes,
+                JamesReportPriority::from_round(managed.james_report_rotation_round),
+            )
+            .unwrap();
+
+            seen_active |= sent
+                .build_jobs
+                .iter()
+                .any(|job| job.local_id == active.local_id);
+            seen_rejected |= sent
+                .build_jobs
+                .iter()
+                .any(|job| job.local_id == rejected.local_id);
+            seen_terminals.extend(
+                sent.build_jobs
+                    .iter()
+                    .filter(|job| james_build_job_is_terminal(job) && job.rejection_code.is_none())
+                    .map(|job| job.local_id),
+            );
+            seen_artifacts.extend(
+                sent.cache_artifacts
+                    .iter()
+                    .map(|artifact| artifact.local_id),
+            );
+
+            // Cursors advance only after an accepted receipt and survive the
+            // managed-state save/load boundary between syncs.
+            advance_james_report_rotation(&mut managed, &sent);
+            managed = serde_json::from_value(serde_json::to_value(managed).unwrap()).unwrap();
+        }
+
+        assert!(seen_active);
+        assert!(seen_rejected);
+        assert_eq!(seen_terminals, HashSet::from([1, 2, 3]));
+        assert_eq!(seen_artifacts, HashSet::from([11, 12, 13]));
+    }
+
+    #[test]
+    fn repeated_over_budget_active_reports_expose_every_managed_job() {
+        let active = (1..=8)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job(""));
+                report.local_id = local_id;
+                report.status = "running".to_string();
+                report.build_spec = json!({"padding": "b".repeat(64 * 1024)});
+                report.cache_metadata = json!({"padding": "m".repeat(64 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let mut rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        rejected.local_id = 900;
+        let mut two_active =
+            sample_james_report(vec![active[0].clone(), active[1].clone(), rejected.clone()]);
+        two_active.cache_artifacts_complete = false;
+        let max_bytes = serialize_james_report_body(&two_active).unwrap().len();
+        let mut managed = ManagedState::default();
+        let mut seen_active = HashSet::new();
+        let mut seen_rejected = false;
+
+        for _ in 0..8 {
+            let priority = JamesReportPriority::from_round(managed.james_report_rotation_round);
+            let selected = select_build_job_reports(
+                active
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(rejected.clone()))
+                    .collect(),
+                managed.james_active_report_cursor,
+                managed.james_rejection_report_cursor,
+                managed.james_terminal_report_cursor,
+                MAX_REPORT_BUILD_JOBS,
+                priority,
+            )
+            .unwrap();
+            let mut report = sample_james_report(selected);
+            report.cache_artifacts_complete = false;
+            let (sent, _) = fit_james_report_body(report, max_bytes, priority).unwrap();
+
+            seen_rejected |= sent
+                .build_jobs
+                .iter()
+                .any(|job| job.local_id == rejected.local_id);
+            seen_active.extend(
+                sent.build_jobs
+                    .iter()
+                    .filter(|job| !james_build_job_is_terminal(job))
+                    .map(|job| job.local_id),
+            );
+            advance_james_report_rotation(&mut managed, &sent);
+        }
+
+        assert_eq!(seen_active, HashSet::from([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert!(seen_rejected);
+    }
+
+    #[test]
+    fn repeated_over_budget_rejection_reports_expose_every_refused_job() {
+        let rejected = (1..=8)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job("protected_material"));
+                report.local_id = local_id;
+                // A job accepted into an older queued row can retain these
+                // large fields when later converted into a rejection.
+                report.build_spec = json!({"padding": "b".repeat(64 * 1024)});
+                report.cache_metadata = json!({"padding": "m".repeat(64 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let mut two_rejections =
+            sample_james_report(vec![rejected[0].clone(), rejected[1].clone()]);
+        two_rejections.cache_artifacts_complete = false;
+        let max_bytes = serialize_james_report_body(&two_rejections).unwrap().len();
+        let mut managed = ManagedState::default();
+        let mut seen = HashSet::new();
+
+        for _ in 0..8 {
+            let priority = JamesReportPriority::from_round(managed.james_report_rotation_round);
+            let selected = select_build_job_reports(
+                rejected.clone(),
+                managed.james_active_report_cursor,
+                managed.james_rejection_report_cursor,
+                managed.james_terminal_report_cursor,
+                MAX_REPORT_BUILD_JOBS,
+                priority,
+            )
+            .unwrap();
+            let mut report = sample_james_report(selected);
+            report.cache_artifacts_complete = false;
+            let (sent, _) = fit_james_report_body(report, max_bytes, priority).unwrap();
+            assert!(!sent.build_jobs.is_empty());
+            assert!(
+                sent.build_jobs
+                    .iter()
+                    .all(|job| job.rejection_code.is_some())
+            );
+            seen.extend(sent.build_jobs.iter().map(|job| job.local_id));
+            advance_james_report_rotation(&mut managed, &sent);
+        }
+
+        assert_eq!(seen, HashSet::from([1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn missing_cursor_rows_continue_from_the_monotonic_id_watermark() {
+        let artifacts = [5, 3, 2]
+            .into_iter()
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact(String::new());
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect();
+        let rotated = rotate_report_items_after_cursor(artifacts, Some(4), |item| item.local_id);
+        assert_eq!(
+            rotated
+                .iter()
+                .map(|artifact| artifact.local_id)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 5]
+        );
+
+        let mut remaining = (1..=5)
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact(String::new());
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut sent = Vec::new();
+        while !remaining.is_empty() {
+            let page =
+                rotate_report_items_after_cursor(remaining.clone(), cursor, |item| item.local_id);
+            let next = page[0].local_id;
+            sent.push(next);
+            cursor = Some(next);
+            // Simulate retention deleting the exact acknowledged cursor row.
+            remaining.retain(|artifact| artifact.local_id != next);
+        }
+        assert_eq!(sent, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn one_build_report_slot_rotates_across_active_rejected_and_terminal_classes() {
+        let mut active = JamesBuildJobReport::from(sample_build_job(""));
+        active.local_id = 1;
+        let mut rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        rejected.local_id = 2;
+        let mut terminal = JamesBuildJobReport::from(sample_build_job(""));
+        terminal.local_id = 3;
+        terminal.status = "succeeded".to_string();
+        let source = vec![active, rejected, terminal];
+        let mut managed = ManagedState::default();
+        let mut selected_ids = Vec::new();
+
+        for _ in 0..3 {
+            let priority = JamesReportPriority::from_round(managed.james_report_rotation_round);
+            let selected = select_build_job_reports(
+                source.clone(),
+                managed.james_active_report_cursor,
+                managed.james_rejection_report_cursor,
+                managed.james_terminal_report_cursor,
+                1,
+                priority,
+            )
+            .unwrap();
+            selected_ids.push(selected[0].local_id);
+            let body = sample_james_report(selected);
+            advance_james_report_rotation(&mut managed, &body);
+        }
+
+        assert_eq!(selected_ids, vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn accepted_over_budget_reports_give_every_evidence_lane_a_turn() {
+        let active = (101..=104)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job(""));
+                report.local_id = local_id;
+                report.status = "running".to_string();
+                report.build_spec = json!({"padding": "a".repeat(192 * 1024)});
+                report.cache_metadata = json!({"padding": "a".repeat(192 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let terminal = (201..=204)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job(""));
+                report.local_id = local_id;
+                report.status = "succeeded".to_string();
+                report.progress_percent = Some(100);
+                report.completed_at = Some("2026-08-10T18:01:00Z".to_string());
+                report.build_spec = json!({"padding": "t".repeat(192 * 1024)});
+                report.cache_metadata = json!({"padding": "t".repeat(192 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let rejected = (301..=304)
+            .map(|local_id| {
+                let mut report = JamesBuildJobReport::from(sample_build_job("protected_material"));
+                report.local_id = local_id;
+                report.build_spec = json!({"padding": "r".repeat(192 * 1024)});
+                report.cache_metadata = json!({"padding": "r".repeat(192 * 1024)});
+                report
+            })
+            .collect::<Vec<_>>();
+        let artifacts = (401..=404)
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact("c".repeat(384 * 1024));
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect::<Vec<_>>();
+
+        let mut single_lane_reports = vec![
+            sample_james_report(vec![active[0].clone()]),
+            sample_james_report(vec![terminal[0].clone()]),
+            sample_james_report(vec![rejected[0].clone()]),
+        ];
+        let mut one_artifact = sample_james_report(Vec::new());
+        one_artifact.cache_artifacts = vec![artifacts[0].clone()];
+        single_lane_reports.push(one_artifact);
+        let max_bytes = single_lane_reports
+            .iter_mut()
+            .map(|report| {
+                report.cache_artifacts_complete = false;
+                serialize_james_report_body(report).unwrap().len()
+            })
+            .max()
+            .unwrap();
+
+        let all_jobs = active
+            .iter()
+            .chain(&terminal)
+            .chain(&rejected)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut managed = ManagedState::default();
+        let mut seen_active = HashSet::new();
+        let mut seen_terminal = HashSet::new();
+        let mut seen_rejected = HashSet::new();
+        let mut seen_artifacts = HashSet::new();
+        for _ in 0..20 {
+            let priority = JamesReportPriority::from_round(managed.james_report_rotation_round);
+            let build_jobs = select_build_job_reports(
+                all_jobs.clone(),
+                managed.james_active_report_cursor,
+                managed.james_rejection_report_cursor,
+                managed.james_terminal_report_cursor,
+                MAX_REPORT_BUILD_JOBS,
+                priority,
+            )
+            .unwrap();
+            let cache_artifacts = rotate_report_items_after_cursor(
+                artifacts.clone(),
+                managed.james_cache_artifact_report_cursor,
+                |artifact| artifact.local_id,
+            );
+            let mut report = sample_james_report(build_jobs);
+            report.cache_artifacts = cache_artifacts;
+            report.cache_artifacts_complete = false;
+            let (sent, _) = fit_james_report_body(report, max_bytes, priority).unwrap();
+
+            seen_active.extend(
+                sent.build_jobs
+                    .iter()
+                    .filter(|job| !james_build_job_is_terminal(job))
+                    .map(|job| job.local_id),
+            );
+            seen_rejected.extend(
+                sent.build_jobs
+                    .iter()
+                    .filter(|job| job.rejection_code.is_some())
+                    .map(|job| job.local_id),
+            );
+            seen_terminal.extend(
+                sent.build_jobs
+                    .iter()
+                    .filter(|job| james_build_job_is_terminal(job) && job.rejection_code.is_none())
+                    .map(|job| job.local_id),
+            );
+            seen_artifacts.extend(
+                sent.cache_artifacts
+                    .iter()
+                    .map(|artifact| artifact.local_id),
+            );
+            advance_james_report_rotation(&mut managed, &sent);
+        }
+
+        assert_eq!(seen_active, HashSet::from([101, 102, 103, 104]));
+        assert_eq!(seen_terminal, HashSet::from([201, 202, 203, 204]));
+        assert_eq!(seen_rejected, HashSet::from([301, 302, 303, 304]));
+        assert_eq!(seen_artifacts, HashSet::from([401, 402, 403, 404]));
+    }
+
+    #[test]
+    fn cache_inventory_generation_change_resets_an_incomplete_page_cursor() {
+        let mut managed = ManagedState::default();
+        let mut first_page = sample_james_report(Vec::new());
+        first_page.cache_inventory_instance_id = "inventory-a".to_string();
+        first_page.cache_inventory_generation = 7;
+        first_page.cache_artifacts_complete = false;
+        first_page.cache_artifacts = [5, 4]
+            .into_iter()
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact(String::new());
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect();
+        advance_james_report_rotation(&mut managed, &first_page);
+
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-a", 7, true),
+            Some(4)
+        );
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-a", 8, true),
+            None,
+            "a mutation generation must restart the authoritative traversal"
+        );
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-b", 7, true),
+            None,
+            "a replaced inventory instance must restart the traversal"
+        );
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-a", 7, false),
+            None,
+            "an invalid inventory read cannot reuse an authoritative cursor"
+        );
+
+        let mut final_page = sample_james_report(Vec::new());
+        final_page.cache_inventory_instance_id = "inventory-a".to_string();
+        final_page.cache_inventory_generation = 7;
+        final_page.cache_artifacts_complete = true;
+        final_page.cache_artifacts = vec![{
+            let mut artifact = sample_cache_artifact(String::new());
+            artifact.local_id = 3;
+            artifact
+        }];
+        advance_james_report_rotation(&mut managed, &final_page);
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-a", 7, true),
+            None,
+            "an accepted completing page starts a fresh traversal next time"
+        );
+
+        let mut renewal_page = sample_james_report(Vec::new());
+        renewal_page.cache_inventory_instance_id = "inventory-a".to_string();
+        renewal_page.cache_inventory_generation = 7;
+        renewal_page.cache_artifacts_complete = false;
+        renewal_page.cache_artifacts = [5, 4]
+            .into_iter()
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact(String::new());
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect();
+        advance_james_report_rotation(&mut managed, &renewal_page);
+        assert_eq!(
+            james_cache_report_cursor(&managed, "inventory-a", 7, true),
+            Some(4),
+            "the same generation begins another recovery traversal after completion"
+        );
+    }
+
+    #[test]
+    fn several_large_cache_artifacts_are_bounded_before_final_serialization() {
+        let mut report = sample_james_report(vec![]);
+        report.cache_artifacts = (1..=4)
+            .map(|local_id| {
+                let mut artifact = sample_cache_artifact("x".repeat(10 * 1024 * 1024));
+                artifact.local_id = local_id;
+                artifact
+            })
+            .collect();
+        assert!(!james_report_body_fits(
+            &report,
+            MAX_JAMES_REPORT_BODY_BYTES
+        ));
+
+        let (sent, bytes) = fit_james_report_body(
+            report,
+            MAX_JAMES_REPORT_BODY_BYTES,
+            JamesReportPriority::CacheArtifacts,
+        )
+        .unwrap();
+
+        assert!(!sent.cache_artifacts.is_empty());
+        assert!(sent.cache_artifacts.len() < 4);
+        assert!(!sent.cache_artifacts_complete);
+        assert!(bytes.len() <= MAX_JAMES_REPORT_BODY_BYTES);
     }
 
     #[test]
@@ -3678,8 +4790,8 @@ mod tests {
         AgentBootConfigResponse {
             compatibility: Some(ComponentCompatibilityContract {
                 protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
-                minimum_pulse_protocol: 1,
-                maximum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
+                minimum_james_protocol: 1,
+                maximum_james_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION,
                 manage_version: "0.1.0".to_string(),
                 manage_release: "test".to_string(),
                 workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
@@ -3687,8 +4799,8 @@ mod tests {
             settings: ManagedBootSettings {
                 public_base_url: "http://127.0.0.1".to_string(),
                 listen_addr: "127.0.0.1:8080".to_string(),
-                tftp_root: "/srv/cybex-pulse/tftp".to_string(),
-                http_root: "/srv/cybex-pulse/www".to_string(),
+                tftp_root: "/srv/cybex-james/tftp".to_string(),
+                http_root: "/srv/cybex-james/www".to_string(),
                 bootloader_filename: "ipxe.efi".to_string(),
                 menu_timeout_ms: 10_000,
             },
@@ -3710,7 +4822,7 @@ mod tests {
             Some(u64::from(CYBEX_COMPONENT_PROTOCOL_VERSION))
         );
         assert_eq!(
-            manifest["pulse"]["minimum_manage_protocol"].as_u64(),
+            manifest["james"]["minimum_manage_protocol"].as_u64(),
             Some(u64::from(CYBEX_MINIMUM_MANAGE_PROTOCOL_VERSION))
         );
         #[cfg(not(feature = "resilience-qualification-epoch-2"))]
@@ -3732,8 +4844,8 @@ mod tests {
 
         let incompatible = ComponentCompatibilityContract {
             protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
-            minimum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
-            maximum_pulse_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            minimum_james_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
+            maximum_james_protocol: CYBEX_COMPONENT_PROTOCOL_VERSION + 1,
             manage_version: "future".to_string(),
             manage_release: "future".to_string(),
             workstation_runtime_epoch: Some(crate::netboot::COMPATIBILITY_EPOCH),
@@ -3775,11 +4887,11 @@ mod tests {
     }
 
     #[test]
-    fn pulse_report_receipt_accepts_old_manage_and_retries_isolated_rejections() {
-        let legacy: PulseReportResponse = serde_json::from_value(json!({"status": "ok"})).unwrap();
-        validate_pulse_report_response(&legacy).unwrap();
+    fn james_report_receipt_accepts_old_manage_and_retries_isolated_rejections() {
+        let legacy: JamesReportResponse = serde_json::from_value(json!({"status": "ok"})).unwrap();
+        validate_james_report_response(&legacy).unwrap();
 
-        let rejected: PulseReportResponse = serde_json::from_value(json!({
+        let rejected: JamesReportResponse = serde_json::from_value(json!({
             "status": "ok",
             "workstation_netboot": {
                 "state": "rejected",
@@ -3787,11 +4899,150 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = validate_pulse_report_response(&rejected).unwrap_err();
+        let error = validate_james_report_response(&rejected).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Manage did not accept workstation runtime evidence (runtime_report_stale)"
         );
+    }
+
+    #[test]
+    fn isolated_runtime_rejection_advances_other_accepted_report_lanes() {
+        let mut active = JamesBuildJobReport::from(sample_build_job(""));
+        active.local_id = 41;
+        let mut rejected = JamesBuildJobReport::from(sample_build_job("protected_material"));
+        rejected.local_id = 42;
+        let mut body = sample_james_report(vec![active, rejected]);
+        let mut artifact = sample_cache_artifact(String::new());
+        artifact.local_id = 43;
+        body.cache_artifacts = vec![artifact];
+        body.cache_artifacts_complete = false;
+        let response: JamesReportResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "workstation_netboot": {
+                "state": "rejected",
+                "error_code": "runtime_report_stale"
+            }
+        }))
+        .unwrap();
+        let mut managed = ManagedState::default();
+
+        let error = accept_james_report_response(&response, &mut managed, &body).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Manage did not accept workstation runtime evidence (runtime_report_stale)"
+        );
+        assert_eq!(managed.james_active_report_cursor, Some(41));
+        assert_eq!(managed.james_rejection_report_cursor, Some(42));
+        assert_eq!(managed.james_cache_artifact_report_cursor, Some(43));
+        assert_eq!(managed.james_report_rotation_round, 1);
+    }
+
+    #[test]
+    fn james_report_receipt_bounds_and_classifies_safe_warning_codes() {
+        let mut warning_receipts = vec![
+            json!({
+                "diagnostic_code": "james_build_report_invalid",
+                "message": "untrusted top-secret remote prose",
+                "artifact_hash": "untrusted-artifact-identity"
+            }),
+            json!({
+                "diagnostic_code": "future_warning_with_untrusted_text",
+                "message": "more untrusted top-secret remote prose"
+            }),
+        ];
+        warning_receipts.extend(
+            (warning_receipts.len()..MAX_JAMES_REPORT_WARNING_RECEIPTS + 3)
+                .map(|_| json!({"diagnostic_code": "james_cache_report_invalid"})),
+        );
+        let response: JamesReportResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "warnings": warning_receipts
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response.warnings.codes.len(),
+            MAX_JAMES_REPORT_WARNING_RECEIPTS
+        );
+        assert!(response.warnings.truncated);
+        assert_eq!(
+            response.warnings.codes[0],
+            JamesReportWarningCode::JamesBuildReportInvalid
+        );
+        assert_eq!(response.warnings.codes[1], JamesReportWarningCode::Unknown);
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("top-secret"));
+        assert!(!debug.contains("untrusted-artifact-identity"));
+    }
+
+    #[test]
+    fn james_report_receipt_treats_null_and_malformed_warnings_as_advisory() {
+        for warnings in [
+            Value::Null,
+            json!({"diagnostic_code": "james_build_report_invalid"}),
+            json!("not-a-warning-list"),
+            json!(42),
+        ] {
+            let response: JamesReportResponse = serde_json::from_value(json!({
+                "status": "ok",
+                "warnings": warnings
+            }))
+            .unwrap();
+            validate_james_report_response(&response).unwrap();
+            assert!(response.warnings.codes.is_empty());
+        }
+
+        let response: JamesReportResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "warnings": [
+                null,
+                true,
+                {"diagnostic_code": 7},
+                {"diagnostic_code": "james_cache_report_invalid"}
+            ]
+        }))
+        .unwrap();
+        validate_james_report_response(&response).unwrap();
+        assert_eq!(
+            response.warnings.codes,
+            vec![
+                JamesReportWarningCode::Unknown,
+                JamesReportWarningCode::Unknown,
+                JamesReportWarningCode::Unknown,
+                JamesReportWarningCode::JamesCacheReportInvalid,
+            ]
+        );
+    }
+
+    #[test]
+    fn identical_james_report_warning_sets_log_only_on_transitions() {
+        let warnings = JamesReportWarnings {
+            codes: vec![
+                JamesReportWarningCode::JamesBuildReportInvalid,
+                JamesReportWarningCode::JamesCacheReportInvalid,
+            ],
+            truncated: false,
+        };
+        let mut managed = ManagedState::default();
+
+        assert!(log_james_report_warnings(&warnings, &mut managed));
+        assert!(!log_james_report_warnings(&warnings, &mut managed));
+
+        let changed = JamesReportWarnings {
+            codes: vec![JamesReportWarningCode::JamesDiskReportInvalid],
+            truncated: false,
+        };
+        assert!(log_james_report_warnings(&changed, &mut managed));
+        assert!(!log_james_report_warnings(&changed, &mut managed));
+
+        assert!(!log_james_report_warnings(
+            &JamesReportWarnings::default(),
+            &mut managed
+        ));
+        assert!(managed.james_report_warning_fingerprint.is_none());
+        assert!(log_james_report_warnings(&warnings, &mut managed));
     }
 
     #[test]
@@ -3812,11 +5063,11 @@ mod tests {
     }
 
     #[test]
-    fn pulse_report_inventory_failures_do_not_suppress_independent_lanes() {
+    fn james_report_inventory_failures_do_not_suppress_independent_lanes() {
         let source = include_str!("manage.rs");
-        let start = source.find("async fn report_pulse_state").unwrap();
+        let start = source.find("async fn report_james_state").unwrap();
         let end = source[start..]
-            .find("\nfn validate_pulse_report_response")
+            .find("\nfn validate_james_report_response")
             .map(|offset| start + offset)
             .unwrap();
         let body = &source[start..end];
@@ -3834,7 +5085,7 @@ mod tests {
             "build_listing_valid && cache_scrub_valid && cache_listing_valid && cache_inventory_valid"
         ));
         assert!(body.contains("crate::netboot::report(state).await"));
-        assert!(body.contains("crate::appliance::report().await"));
+        assert!(body.contains("crate::appliance::report(state).await"));
     }
 
     #[test]
@@ -3873,7 +5124,7 @@ mod tests {
             status: "ready".to_string(),
             public_key: "cache.example-1:public-key".to_string(),
             public_key_fingerprint: "sha256:fingerprint".to_string(),
-            base_url: "https://pulse.example/cache".to_string(),
+            base_url: "https://james.example/cache".to_string(),
             total_size_bytes: 1234,
             artifact_count: 3,
             error: String::new(),
@@ -3903,8 +5154,8 @@ mod tests {
     }
 
     #[test]
-    fn workstation_runtime_shape_is_isolated_from_the_pulse_config_envelope() {
-        let config: AgentPulseConfigResponse = serde_json::from_value(json!({
+    fn workstation_runtime_shape_is_isolated_from_the_james_config_envelope() {
+        let config: AgentJamesConfigResponse = serde_json::from_value(json!({
             "workstation_netboot": {
                 "future_runtime_contract": true
             }
@@ -3917,17 +5168,158 @@ mod tests {
         assert!(crate::netboot::decode_desired(runtime).is_err());
     }
 
+    #[test]
+    fn appliance_update_transport_override_is_optional_wire_data() {
+        let update = json!({
+            "attempt_id": "d4a17ec8-e854-4bc4-84c7-e490f51640c3",
+            "requested_at": "2026-08-12T12:00:00Z",
+            "release": {
+                "schema": "cybex.james.appliance-release.v1",
+                "release_id": "0.2.1-dev.13",
+                "ubuntu_snapshot_id": "20260813T120000Z",
+                "cybex_repository_snapshot": {
+                    "url": "https://releases.example/cybex-james-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size_bytes": 1024
+                },
+                "required_package_versions": {},
+                "expected_kernel": "7.0.0-1",
+                "minimum_protocol": 4,
+                "minimum_state_schema": 2,
+                "rollback_compatible": true,
+                "release_notes": "https://releases.example/notes",
+                "signature": "signature"
+            }
+        });
+
+        let legacy: AgentJamesConfigResponse =
+            serde_json::from_value(json!({"appliance_update": update.clone()})).unwrap();
+        assert_eq!(
+            legacy
+                .appliance_update
+                .unwrap()
+                .qualification_package_transport_url,
+            None
+        );
+
+        let mut qualified = update;
+        qualified["qualification_package_transport_url"] = json!(
+            "http://127.0.0.1:18080/cybex-james-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
+        );
+        let current: AgentJamesConfigResponse =
+            serde_json::from_value(json!({"appliance_update": qualified})).unwrap();
+        let current = current.appliance_update.unwrap();
+        assert_eq!(
+            current.qualification_package_transport_url.as_deref(),
+            Some(
+                "http://127.0.0.1:18080/cybex-james-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
+            )
+        );
+        assert_eq!(
+            current.release.cybex_repository_snapshot.url,
+            "https://releases.example/cybex-james-appliance-packages-0.2.1-dev.13-x86_64-linux.tar.zst"
+        );
+    }
+
     async fn managed_test_pool() -> sqlx::SqlitePool {
         let pool = db::connect_with_url("sqlite::memory:").await.unwrap();
         db::migrate(&pool).await.unwrap();
         pool
     }
 
+    fn sample_build_job(rejection_code: &str) -> BuildJob {
+        let rejected = !rejection_code.is_empty();
+        BuildJob {
+            id: 1,
+            managed_job_id: Some("5c3baab7-a204-4c21-a024-0f567d8cf41d".to_string()),
+            requested_artifact_type: "nixos_closure".to_string(),
+            build_spec: json!({"schema": "cybex.blueprint-build.v1"}),
+            target: "blueprint".to_string(),
+            system: "x86_64-linux".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_config_hash: "a".repeat(64),
+            status: if rejected { "failed" } else { "running" }.to_string(),
+            progress_percent: Some(if rejected { 100 } else { 25 }),
+            progress_stage: Some(if rejected { "failed" } else { "building" }.to_string()),
+            progress_message: Some("Build report fixture".to_string()),
+            logs: String::new(),
+            error: if rejected {
+                "James rejected this build job".to_string()
+            } else {
+                String::new()
+            },
+            rejection_code: rejection_code.to_string(),
+            output_path: String::new(),
+            output_sha256: String::new(),
+            output_size_bytes: 0,
+            exit_code: rejected.then_some(1),
+            cache_metadata: json!({}),
+            started_at: Some("2026-08-10T18:00:00Z".to_string()),
+            completed_at: rejected.then(|| "2026-08-10T18:01:00Z".to_string()),
+            cancel_requested_at: None,
+            created_at: "2026-08-10T18:00:00Z".to_string(),
+            updated_at: "2026-08-10T18:01:00Z".to_string(),
+        }
+    }
+
+    fn sample_james_report(build_jobs: Vec<JamesBuildJobReport>) -> JamesAgentReportRequest {
+        JamesAgentReportRequest {
+            protocol_version: CYBEX_COMPONENT_PROTOCOL_VERSION,
+            capabilities: vec![],
+            cache: crate::cache::CacheStatusReport {
+                enabled: false,
+                status: "disabled".to_string(),
+                public_key: String::new(),
+                public_key_fingerprint: String::new(),
+                base_url: String::new(),
+                total_size_bytes: 0,
+                artifact_count: 0,
+                error: String::new(),
+            },
+            build_jobs,
+            cache_artifacts: vec![],
+            cache_inventory_instance_id: "test-inventory".to_string(),
+            cache_inventory_generation: 1,
+            cache_artifacts_complete: true,
+            disk: None,
+            host: None,
+            workstation_netboot: None,
+            appliance: None,
+            appliance_report_error: None,
+        }
+    }
+
+    fn sample_cache_artifact(large_metadata: String) -> JamesCacheArtifactReport {
+        JamesCacheArtifactReport {
+            local_id: 1,
+            managed_artifact_id: Some("6e73fe6d-47c7-433b-bdb0-ccb8bce41baf".to_string()),
+            artifact_type: "nixos_closure".to_string(),
+            hash: "b".repeat(64),
+            size_bytes: 1024,
+            path: "/var/lib/cybex-james/cache/artifact.nar.zst".to_string(),
+            store_path: "/nix/store/test-workstation".to_string(),
+            narinfo_path: "test.narinfo".to_string(),
+            nar_url: "nar/test.nar.zst".to_string(),
+            file_hash: "sha256:".to_string() + &"c".repeat(52),
+            nar_hash: "sha256:".to_string() + &"d".repeat(52),
+            nar_size_bytes: 2048,
+            closure_size_bytes: 4096,
+            closure_file_size_bytes: 1024,
+            compression: "zstd".to_string(),
+            references: json!([]),
+            serving_url: "https://james.example/cache/test.narinfo".to_string(),
+            source_build_job_id: Some("5c3baab7-a204-4c21-a024-0f567d8cf41d".to_string()),
+            cache_metadata: json!({"path_info": large_metadata}),
+            created_at: "2026-08-10T18:00:00Z".to_string(),
+            updated_at: "2026-08-10T18:01:00Z".to_string(),
+        }
+    }
+
     fn temp_state_dir() -> PathBuf {
         let mut random = [0u8; 8];
         OsRng.fill_bytes(&mut random);
         let path = std::env::temp_dir().join(format!(
-            "cybex-pulse-managed-state-{}-{}",
+            "cybex-james-managed-state-{}-{}",
             std::process::id(),
             hex::encode(random)
         ));
@@ -3940,7 +5332,7 @@ mod tests {
             id: id.to_string(),
             name: "Installer".to_string(),
             description: String::new(),
-            profile_type: "pulse_installer".to_string(),
+            profile_type: "james_installer".to_string(),
             enabled: true,
             is_default: false,
             one_time: false,

@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+if (($# != 2)); then
+  echo "usage: $0 SIGNED-CANDIDATE ACK-FILE" >&2
+  exit 2
+fi
+candidate="$1"
+ack_file="$2"
+active=/etc/netplan/90-cybex-james.yaml
+control_dir=/var/lib/cybex-james/control
+backup="$control_dir/netplan-before-change.yaml"
+pending="$control_dir/netplan-pending.sha256"
+fallback_marker="$control_dir/network-fallback-active"
+test -f "$candidate" && test ! -L "$candidate"
+test "$(stat -c '%U:%G:%a' "$candidate")" = root:root:600
+test -f "$active" && test ! -L "$active"
+test "$(stat -c '%U:%G:%a:%h' "$active")" = root:root:600:1
+candidate_sha="$(sha256sum "$candidate" | awk '{print $1}')"
+
+secure_backup() {
+  test -f "$backup" && test ! -L "$backup"
+  test "$(stat -c '%U:%G:%a:%h' "$backup")" = root:root:600:1
+}
+
+replace_active() {
+  local source="$1" temporary
+  temporary="$(mktemp /etc/netplan/.90-cybex-james.XXXXXX)"
+  if ! install -m 0600 -o root -g root "$source" "$temporary" \
+    || ! sync -f "$temporary" \
+    || ! mv -f "$temporary" "$active" \
+    || ! sync -f /etc/netplan; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+# Establish the durable rollback record before the active profile changes. A
+# restart may observe either backup-only or backup+pending; both are safe to
+# resume only when they still bind the unchanged active profile or this exact
+# signed candidate respectively.
+if [[ -e "$pending" || -L "$pending" ]]; then
+  test -f "$pending" && test ! -L "$pending"
+  test "$(stat -c '%U:%G:%a:%h' "$pending")" = root:cybex-james:640:1
+  test "$(tr -d '\n' < "$pending")" = "$candidate_sha"
+  secure_backup
+else
+  if [[ -e "$backup" || -L "$backup" ]]; then
+    secure_backup
+    cmp --silent -- "$active" "$backup"
+  else
+    backup_temporary="$(mktemp "$control_dir/.netplan-before-change.XXXXXX")"
+    install -m 0600 -o root -g root "$active" "$backup_temporary"
+    sync -f "$backup_temporary"
+    mv -f "$backup_temporary" "$backup"
+    sync -f "$control_dir"
+  fi
+  pending_temporary="$(mktemp "$control_dir/.netplan-pending.XXXXXX")"
+  printf '%s\n' "$candidate_sha" > "$pending_temporary"
+  chown root:cybex-james "$pending_temporary"
+  chmod 0640 "$pending_temporary"
+  sync -f "$pending_temporary"
+  mv -f "$pending_temporary" "$pending"
+  sync -f "$control_dir"
+fi
+
+rollback_stage=candidate_activation
+rollback() {
+  trap - ERR
+  if ! replace_active "$backup" \
+    || ! /usr/lib/cybex-james/cybex-james-netplan-activate; then
+    echo "error: the previous managed network profile could not be reactivated" >&2
+    # Preserve the root-owned backup and pending digest for reboot recovery and
+    # diagnosis. The outer service maps this reserved status to failed instead
+    # of claiming that the change rolled back.
+    exit 70
+  fi
+  rm -f "$pending" "$backup"
+  sync -f "$control_dir"
+  case "$rollback_stage" in
+    candidate_activation) exit 71 ;;
+    acknowledgement) exit 72 ;;
+    *) exit 1 ;;
+  esac
+}
+trap rollback ERR
+replace_active "$candidate"
+/usr/lib/cybex-james/cybex-james-netplan-activate
+rollback_stage=acknowledgement
+
+for _attempt in $(seq 1 120); do
+  if [[ -f "$ack_file" ]] \
+    && verified_sha="$(/usr/bin/cybex-james verify-appliance-network-acknowledgement 2>/dev/null)" \
+    && [[ "$verified_sha" = "$candidate_sha" ]]; then
+    approved_temporary="$(mktemp "$control_dir/.netplan-approved.XXXXXX")"
+    install -m 0640 -o root -g cybex-james "$candidate" "$approved_temporary"
+    sync -f "$approved_temporary"
+    mv -f "$approved_temporary" "$control_dir/netplan-approved.json"
+    sync -f "$control_dir"
+    # Commit the approved plan and clear the fallback selector as one durable
+    # root-owned control transition. A crash after acknowledgement must not
+    # make the reconciler select an obsolete DHCP fallback.
+    rm -f "$pending" "$backup" "$fallback_marker"
+    sync -f "$control_dir"
+    trap - ERR
+    exit 0
+  fi
+  sleep 1
+done
+echo "error: Management did not acknowledge the network change; rolling back" >&2
+false

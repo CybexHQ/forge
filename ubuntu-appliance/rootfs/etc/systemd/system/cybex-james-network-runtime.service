@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile the Cybex James advertised boot address
+After=network-online.target cybex-james-first-boot.service
+Wants=network-online.target
+Requires=cybex-james-first-boot.service
+Before=cybex-james.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-james/cybex-james-network-runtime
+TimeoutStartSec=30s

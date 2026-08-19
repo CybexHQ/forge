@@ -1,15 +1,18 @@
 pub mod boot;
 pub mod files;
 
+use std::net::SocketAddr;
+
 use axum::{
     Router,
     body::Body,
-    extract::DefaultBodyLimit,
-    http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, header},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
+use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 
 use crate::{AppState, netboot};
@@ -65,8 +68,42 @@ fn request_trace_path(uri: &Uri) -> &str {
     }
 }
 
-async fn healthz() -> Response {
-    ([(header::CONTENT_TYPE, "text/plain")], "ok\n").into_response()
+#[derive(Deserialize)]
+struct HealthQuery {
+    cybex_fresh: Option<String>,
+}
+
+async fn healthz(
+    State(state): State<AppState>,
+    Query(query): Query<HealthQuery>,
+    headers: HeaderMap,
+    connect: Option<ConnectInfo<SocketAddr>>,
+) -> Response {
+    let fresh = matches!(query.cybex_fresh.as_deref(), Some("1"))
+        && is_direct_loopback_request(&headers, connect.map(|value| value.0));
+    let readiness = if fresh {
+        crate::readiness::probe_fresh(&state).await
+    } else {
+        crate::readiness::probe(&state).await
+    };
+    if readiness.ready {
+        ([(header::CONTENT_TYPE, "text/plain")], "ok\n").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "not ready\n",
+        )
+            .into_response()
+    }
+}
+
+fn is_direct_loopback_request(headers: &HeaderMap, connect: Option<SocketAddr>) -> bool {
+    connect
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
+        && !headers.contains_key("forwarded")
+        && !headers.contains_key("x-forwarded-for")
 }
 
 async fn add_security_headers(req: Request<Body>, next: Next) -> Response {
@@ -96,19 +133,26 @@ fn apply_security_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        net::SocketAddr,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use axum::{
         body::{Body, to_bytes},
-        http::{HeaderMap, Request, StatusCode},
+        extract::ConnectInfo,
+        http::{HeaderMap, HeaderValue, Request, StatusCode},
     };
     use tower::ServiceExt;
 
+    use crate::models::{BootProfileType, CreateBootProfileRequest, CreateDeviceRequest};
     use crate::{AppState, config::AppConfig, db};
 
     use super::{
         CONTENT_SECURITY_POLICY, REQUEST_BODY_LIMIT_BYTES, apply_security_headers,
-        request_trace_path, router,
+        is_direct_loopback_request, request_trace_path, router,
     };
 
     #[test]
@@ -139,6 +183,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(request_trace_path(&uri), "/boot.ipxe");
+    }
+
+    #[test]
+    fn uncached_health_probe_is_available_only_directly_from_loopback() {
+        let direct: SocketAddr = "127.0.0.1:50200".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.55:50200".parse().unwrap();
+        let mut headers = HeaderMap::new();
+
+        assert!(is_direct_loopback_request(&headers, Some(direct)));
+        assert!(!is_direct_loopback_request(&headers, Some(remote)));
+        assert!(!is_direct_loopback_request(&headers, None));
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        assert!(!is_direct_loopback_request(&headers, Some(direct)));
+        headers.remove("x-forwarded-for");
+        headers.insert("forwarded", HeaderValue::from_static("for=127.0.0.1"));
+        assert!(!is_direct_loopback_request(&headers, Some(direct)));
     }
 
     #[tokio::test]
@@ -211,6 +272,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_loopback_self_probe_does_not_record_a_boot_event() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let mut request = Request::builder()
+            .uri("/boot.ipxe?cybex_check=1")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50200".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            db::list_boot_events(&state.db, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_automatic_enrollment_keeps_the_mac_fresh_for_a_safe_retry() {
+        let state = test_state().await;
+        db::create_profile(
+            &state.db,
+            CreateBootProfileRequest {
+                name: "Default Enrollment".to_string(),
+                description: None,
+                profile_type: BootProfileType::JamesInstaller,
+                enabled: Some(true),
+                is_default: Some(true),
+                one_time: Some(false),
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        let app = router(state.clone());
+
+        // The test state intentionally has no verified installer bundle. The
+        // request therefore fails closed after choosing enrollment. Its
+        // discovery-only row must be rolled back so a later retry can recover
+        // automatically once the runtime becomes ready.
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/boot/aa-bb-cc-dd-ee-ff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            db::get_device_by_mac(&state.db, "aa:bb:cc:dd:ee:ff")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .uri("/boot/aa-bb-cc-dd-ee-ff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            db::get_device_by_mac(&state.db, "aa:bb:cc:dd:ee:ff")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn known_unassigned_mac_probes_local_disk_and_retains_the_menu_fallback() {
+        let state = test_state().await;
+        db::create_profile(
+            &state.db,
+            CreateBootProfileRequest {
+                name: "Default Enrollment".to_string(),
+                description: None,
+                profile_type: BootProfileType::JamesInstaller,
+                enabled: Some(true),
+                is_default: Some(true),
+                one_time: Some(false),
+                raw_script: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::create_device(
+            &state.db,
+            CreateDeviceRequest {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                hostname: None,
+                serial_number: None,
+                notes: None,
+                tags: None,
+                default_profile_id: None,
+                one_time_profile_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/boot/aa-bb-cc-dd-ee-ff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("sanboot --drive 0 || goto known_menu"));
+        assert!(body.contains("item profile_"));
+        assert!(body.contains("Default Enrollment"));
+    }
+
+    #[tokio::test]
     async fn cache_route_serves_only_static_binary_cache_members() {
         let state = test_state().await;
         let cache_root = state.config.cache.root_dir.clone();
@@ -268,7 +467,7 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        let root = temp_test_dir("cybex-pulse-router");
+        let root = temp_test_dir("cybex-james-router");
         let config_path = root.join("config.toml");
         let www = root.join("www");
         fs::create_dir_all(&www).unwrap();
@@ -283,7 +482,7 @@ public_base_url = "http://boot.example"
 
 [paths]
 data_dir = "{root}/data"
-database_path = "{root}/data/cybex-pulse.sqlite"
+database_path = "{root}/data/cybex-james.sqlite"
 boot_assets_dir = "{root}/www"
 static_dir = "{root}/www/assets"
 tftp_dir = "{root}/tftp"
@@ -312,16 +511,21 @@ state_path = "{root}/manage-state.json"
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for _ in 0..100 {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("{label}-{}-{unique}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create router test directory {}: {error}", path.display()),
+            }
+        }
+        panic!("failed to allocate a unique router test directory")
     }
 }

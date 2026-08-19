@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+state_dir=/var/lib/cybex-james/state
+control_dir=/var/lib/cybex-james/control
+status_dir=/var/lib/cybex-james/status
+request="$state_dir/inbox/appliance-update-request.json"
+status="$status_dir/appliance-update-status.json"
+pending_seal="$control_dir/pending-root-generation.json"
+source_clear_intent="$control_dir/source-pending-seal-clear-intent.json"
+lock=/run/lock/cybex-james/appliance-update.lock
+if [[ ! -e "$lock" ]]; then (set -o noclobber; : > "$lock") 2>/dev/null || true; fi
+chown root:cybex-james "$lock"
+chmod 0640 "$lock"
+test "$(stat -c '%U:%G:%a:%h' "$lock")" = root:cybex-james:640:1
+exec 9>>"$lock"
+flock -n 9 || exit 0
+test -s "$request"
+
+# A committed generation durably removes its pending seal before removing this
+# intent, so power loss may leave the intent behind.  Admit a later update only
+# after binding that orphan to the exact root-owned terminal receipt and the
+# currently committed generation/release; never overwrite ambiguous evidence.
+if [[ -e "$source_clear_intent" || -L "$source_clear_intent" ]]; then
+  test ! -e "$pending_seal" && test ! -L "$pending_seal"
+  test -f "$source_clear_intent" && test ! -L "$source_clear_intent"
+  test "$(stat -c '%U:%G:%a:%h' "$source_clear_intent")" = root:cybex-james:640:1
+  test -f "$status" && test ! -L "$status"
+  test "$(stat -c '%U:%G:%a:%h' "$status")" = root:cybex-james:640:1
+  test "$(jq -er '.status' "$status")" = succeeded
+  test "$(jq -er '.stage' "$status")" = committed
+  test "$(jq -er '.attempt_id' "$status")" = "$(jq -er '.attempt_id' "$source_clear_intent")"
+  test "$(jq -er '.target_release' "$status")" = "$(jq -er '.target_release' "$source_clear_intent")"
+  test "$(jq -er '.resulting_root_generation' "$status")" = "$(jq -er '.generation' "$source_clear_intent")"
+  test "$(cat "$control_dir/root-generation")" = "$(jq -er '.generation' "$source_clear_intent")"
+  test "$(jq -er '.release_id' /usr/share/cybex-james/appliance-release.json)" = "$(jq -er '.target_release' "$source_clear_intent")"
+  rm -f "$source_clear_intent"
+  sync -f "$control_dir"
+fi
+test ! -e "$pending_seal" && test ! -L "$pending_seal"
+
+attempt_id="$(jq -er '.attempt_id' "$request")"
+target_release="$(jq -er '.release.release_id' "$request")"
+[[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+[[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
+candidate=""
+candidate_path=""
+candidate_created=false
+root_top=""
+package_diagnostic_log=""
+bundle_dir="$state_dir/inbox/appliance-update-bundles"
+bundle="$bundle_dir/$attempt_id.tar.zst"
+
+write_status() {
+  local result="$1" stage="$2" progress="$3" candidate="${4:-}" resulting="${5:-}" reason="${6:-}" temporary
+  temporary="$(mktemp "$status_dir/.appliance-update-status.XXXXXX")"
+  jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
+    --arg target_release "$target_release" --arg candidate "$candidate" \
+    --arg resulting "$resulting" --arg rollback_reason "$reason" \
+    --argjson progress_percent "$progress" \
+    --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+    '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      progress_percent:$progress_percent,candidate_root_generation:$candidate,
+      resulting_root_generation:$resulting,rollback_reason:$rollback_reason,
+      reported_at:$reported_at}' \
+    > "$temporary"
+  chown root:cybex-james "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$status"
+  sync -f "$status_dir"
+}
+
+cleanup_mounts() {
+  if [[ "$candidate_created" = true && -n "$candidate_path" ]]; then
+    for target in \
+      "$candidate_path/run/cybex-update-packages" \
+      "$candidate_path/sys" \
+      "$candidate_path/proc" \
+      "$candidate_path/dev"
+    do
+      if mountpoint -q "$target" 2>/dev/null; then
+        umount "$target" 2>/dev/null || umount -l "$target" || true
+      fi
+    done
+  fi
+}
+
+cleanup_package_solver_state() {
+  if [[ "$candidate_created" = true && -n "$candidate_path" ]]; then
+    local solver_root="$candidate_path/run/cybex-update-apt"
+    if [[ -e "$solver_root" || -L "$solver_root" ]]; then
+      test -d "$solver_root" && test ! -L "$solver_root"
+      test "$(stat -c '%U:%h' "$solver_root")" = root:1
+      rm -rf --one-file-system -- "$solver_root"
+    fi
+    rmdir "$candidate_path/run/cybex-update-packages" 2>/dev/null || true
+  fi
+}
+
+cleanup_update_staging() {
+  local staging
+  remove_staging() {
+    staging="$1"
+    if [[ -e "$staging" || -L "$staging" ]]; then
+      test -d "$staging" && test ! -L "$staging"
+      test "$(stat -c '%U:%h' "$staging")" = root:1
+      rm -rf --one-file-system -- "$staging"
+    fi
+  }
+  remove_staging "$control_dir/appliance-updates/$target_release"
+  if [[ "$candidate_created" = true ]]; then
+    local candidate_staging_control="$candidate_path/var/lib/cybex-james/control"
+    remove_staging "$candidate_staging_control/appliance-updates/$target_release"
+    [[ ! -d "$candidate_staging_control" ]] || sync -f "$candidate_staging_control"
+  fi
+  sync -f "$control_dir"
+}
+
+remove_terminal_bundle() {
+  # This directory is untrusted James input. Unlink only the exact UUID-bound
+  # pathname; never follow, inspect, or recursively remove its target.
+  rm -f -- "$bundle"
+  [[ ! -d "$bundle_dir" ]] || sync -f "$bundle_dir"
+  sync -f "$state_dir/inbox"
+}
+
+cleanup() {
+  cleanup_mounts
+  cleanup_package_solver_state || true
+  cleanup_update_staging || true
+  if [[ -n "$root_top" ]]; then
+    if mountpoint -q "$root_top" 2>/dev/null; then
+      umount "$root_top" || true
+    fi
+    rmdir "$root_top" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+failure_stage=preflight
+failure_reason=validation_failed
+write_bounded_package_diagnostic() {
+  if [[ -n "$package_diagnostic_log" && -f "$package_diagnostic_log" ]]; then
+    # APT output is useful to an operator, but is deliberately absent from the
+    # normal Management status. Keep only a bounded tail in the root journal.
+    tail -c 8192 -- "$package_diagnostic_log" \
+      | systemd-cat -t cybex-james-appliance-update -p warning || true
+  fi
+}
+delete_candidate_generation() {
+  if [[ "$candidate_created" != true || -z "$candidate_path" ]]; then
+    return 0
+  fi
+  if ! btrfs subvolume show "$candidate_path" >/dev/null 2>&1; then
+    [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]]
+    candidate_created=false
+    return 0
+  fi
+  local deletion_attempt
+  for deletion_attempt in 1 2; do
+    : "$deletion_attempt"
+    cleanup_mounts
+    cleanup_package_solver_state || true
+    if btrfs subvolume delete "$candidate_path" >/dev/null 2>&1; then
+      candidate_created=false
+      return 0
+    fi
+    # A just-detached bind can keep the subvolume transiently busy. Sync the
+    # exact generation directory before one bounded retry; never hide a second
+    # failure as successful terminal cleanup.
+    sync -f "$generations" || true
+  done
+  return 1
+}
+fail_update() {
+  local exit_code=$?
+  trap - ERR
+  write_bounded_package_diagnostic
+  cleanup_mounts
+  cleanup_package_solver_state || true
+  grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+  if ! delete_candidate_generation; then
+    failure_stage=candidate_cleanup
+    failure_reason=validation_failed
+  fi
+  rm -f "$pending_seal"
+  sync -f "$control_dir" || true
+  write_status failed "$failure_stage" 0 "$candidate" "" "$failure_reason"
+  if [[ -e "$request" ]]; then
+    mv -f "$request" "$state_dir/inbox/appliance-update-request.failed.$attempt_id.json"
+  fi
+  sync -f "$state_dir/inbox"
+  remove_terminal_bundle
+  exit "$exit_code"
+}
+trap fail_update ERR
+
+write_status preparing preflight 10
+test "$(findmnt -n -o FSTYPE /)" = btrfs
+test "$(jq -er '.schema' "$request")" = cybex.james.appliance-update-request.v1
+test "$(jq -er '.release.schema' "$request")" = cybex.james.appliance-release.v1
+test "$(jq -er '.release.rollback_compatible' "$request")" = true
+
+timezone="$(jq -er '.maintenance_window.timezone' "$control_dir/install-plan.json")"
+weekday="$(jq -er '.maintenance_window.weekday' "$control_dir/install-plan.json")"
+start="$(jq -er '.maintenance_window.start' "$control_dir/install-plan.json")"
+duration="$(jq -er '.maintenance_window.duration_minutes' "$control_dir/install-plan.json")"
+[[ "$timezone" =~ ^[A-Za-z0-9_+/-]{1,128}$ ]]
+[[ "$start" =~ ^[0-2][0-9]:[0-5][0-9]$ ]]
+[[ "$duration" =~ ^[0-9]+$ ]] && ((duration >= 15 && duration <= 1440))
+[[ "$weekday" =~ ^[0-6]$ ]]
+approved_day="$weekday"
+current_day="$(TZ="$timezone" date +%w)"
+current_hour="$(TZ="$timezone" date +%H)"
+current_minute="$(TZ="$timezone" date +%M)"
+start_hour="${start%:*}"
+start_minute="${start#*:}"
+current_week_minute=$((10#$current_day * 1440 + 10#$current_hour * 60 + 10#$current_minute))
+start_week_minute=$((approved_day * 1440 + 10#$start_hour * 60 + 10#$start_minute))
+elapsed=$(((current_week_minute - start_week_minute + 10080) % 10080))
+if ((elapsed >= duration)); then
+  write_status waiting_window maintenance_window 5
+  trap - ERR
+  exit 0
+fi
+if pgrep -f '[n]ix.*build' >/dev/null; then
+  write_status waiting_window active_builds 5
+  trap - ERR
+  exit 0
+fi
+
+current="$(cat "$control_dir/root-generation")"
+[[ "$current" =~ ^[0-9]+$ ]]
+test "$(findmnt -n -o FSROOT /)" = "/.cybex-root-generations/$current"
+root_uuid="$(findmnt -n -o UUID /)"
+[[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+root_top="$(mktemp -d /run/cybex-root-top.XXXXXX)"
+mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+generations="$root_top/.cybex-root-generations"
+mkdir -p "$generations"
+maximum_generation="$current"
+generation_count=0
+while IFS= read -r existing_generation; do
+  generation_count=$((generation_count + 1))
+  ((generation_count <= 1024))
+  [[ "$existing_generation" =~ ^[0-9]+$ ]]
+  if ((existing_generation > maximum_generation)); then
+    maximum_generation="$existing_generation"
+  fi
+done < <(find "$generations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+candidate="$((maximum_generation + 1))"
+candidate_path="$generations/$candidate"
+test ! -e "$candidate_path"
+
+# The root-side verifier independently checks the offline Ed25519 signature,
+# exact archive digest and size, safe archive paths, checksum coverage, and
+# every signed required package version.
+failure_stage=verifying
+packages="$(/usr/bin/cybex-james verify-appliance-update)"
+test "$packages" = "$control_dir/appliance-updates/$target_release/packages"
+test -d "$packages"
+verified="$control_dir/appliance-updates/$target_release/verified-update.json"
+test -s "$verified" && test ! -L "$verified"
+test "$(stat -c '%U:%G:%a:%h' "$verified")" = root:root:600:1
+test "$(jq -er '.schema' "$verified")" = cybex.james.verified-appliance-update.v1
+attempt_id="$(jq -er '.attempt_id' "$verified")"
+target_release="$(jq -er '.target_release' "$verified")"
+request_sha256="$(jq -er '.request_sha256' "$verified")"
+[[ "$attempt_id" =~ ^[0-9a-f-]{36}$ ]]
+[[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
+test "$(jq -er '
+  .update_package_versions
+  | type == "object"
+    and length == 3
+    and has("cybex-james")
+    and has("cybex-james-appliance")
+    and has("cybex-james-bootstrap")
+' "$verified")" = true
+james_version="$(jq -er '.update_package_versions["cybex-james"]' "$verified")"
+appliance_version="$(jq -er '.update_package_versions["cybex-james-appliance"]' "$verified")"
+bootstrap_version="$(jq -er '.update_package_versions["cybex-james-bootstrap"]' "$verified")"
+for package_version in "$james_version" "$appliance_version" "$bootstrap_version"; do
+  [[ "$package_version" =~ ^[0-9A-Za-z._+:~-]{1,256}$ ]]
+done
+package_targets=(
+  "cybex-james=$james_version"
+  "cybex-james-appliance=$appliance_version"
+  "cybex-james-bootstrap=$bootstrap_version"
+)
+
+failure_stage=snapshot
+btrfs subvolume snapshot / "$candidate_path"
+candidate_created=true
+write_status applying snapshot_created 25 "$candidate"
+
+failure_stage=packages
+mount --bind /dev "$candidate_path/dev"
+mount -t proc proc "$candidate_path/proc"
+mount -t sysfs sys "$candidate_path/sys"
+mkdir -p "$candidate_path/run/cybex-update-packages"
+mount --bind "$packages" "$candidate_path/run/cybex-update-packages"
+mount -o remount,bind,ro "$candidate_path/run/cybex-update-packages"
+
+# The signed snapshot is a combined installer/update artifact. Most of its
+# packages exist only to install a fresh appliance; asking APT to install every
+# .deb would turn that closure into an unintended operating-system transition.
+# Isolate APT from every configured network repository and request only the
+# three exact signed Cybex roots. APT may add or upgrade their dependencies,
+# but removals, held-package changes, and downgrades are forbidden.
+solver_root="$candidate_path/run/cybex-update-apt"
+test ! -e "$solver_root" && test ! -L "$solver_root"
+test -x "$candidate_path/usr/lib/apt/methods/copy"
+install -d -m 0755 -o root -g root \
+  "$solver_root" "$solver_root/lists" "$solver_root/archives"
+install -d -m 0700 -o root -g root \
+  "$solver_root/lists/partial" "$solver_root/archives/partial"
+cat > "$solver_root/cybex-update.sources" <<'EOF'
+Types: deb
+URIs: copy:///run/cybex-update-packages
+Suites: ./
+Components:
+Trusted: yes
+EOF
+chmod 0644 "$solver_root/cybex-update.sources"
+chroot "$candidate_path" chown _apt:root \
+  /run/cybex-update-apt/lists/partial \
+  /run/cybex-update-apt/archives/partial
+
+apt_options=(
+  -o Dir::Etc::sourcelist=/run/cybex-update-apt/cybex-update.sources
+  -o Dir::Etc::sourceparts=-
+  -o Dir::State::lists=/run/cybex-update-apt/lists
+  -o Dir::Cache::archives=/run/cybex-update-apt/archives
+  -o Acquire::Languages=none
+  -o APT::Install-Recommends=false
+  -o APT::Install-Suggests=false
+)
+apt_safety_options=(
+  --no-remove
+  --no-allow-downgrades
+  --no-allow-change-held-packages
+  --no-install-recommends
+)
+run_bounded_package_command() {
+  local output="$1"
+  shift
+  # RLIMIT_FSIZE keeps signer-controlled diagnostics from consuming the
+  # candidate root. Bash expresses this limit in KiB, so 4096 is four MiB.
+  (ulimit -f 4096; "$@") >> "$output" 2>&1
+}
+capture_installed_versions() {
+  local output="$1"
+  chroot "$candidate_path" dpkg-query -W \
+    -f="\${binary:Package}\t\${Version}\t\${db:Status-Status}\n" \
+    | LC_ALL=C awk -F '\t' '$3 == "installed" {print $1 "\t" $2}' \
+    | LC_ALL=C sort -u > "$output"
+}
+capture_held_packages() {
+  local output="$1"
+  chroot "$candidate_path" dpkg-query -W \
+    -f="\${binary:Package}\t\${db:Status-Want}\t\${db:Status-Status}\n" \
+    | LC_ALL=C awk -F '\t' '$2 == "hold" && $3 == "installed" {print $1}' \
+    | LC_ALL=C sort -u > "$output"
+}
+verify_no_package_regression() {
+  local before="$1" after="$2" package before_version after_version
+  declare -A versions_after=()
+  while IFS=$'\t' read -r package after_version; do
+    [[ -n "$package" && -n "$after_version" ]]
+    versions_after["$package"]="$after_version"
+  done < "$after"
+  while IFS=$'\t' read -r package before_version; do
+    [[ -n "$package" && -n "$before_version" ]]
+    after_version="${versions_after[$package]-}"
+    [[ -n "$after_version" ]]
+    chroot "$candidate_path" dpkg --compare-versions \
+      "$after_version" ge "$before_version"
+  done < "$before"
+}
+
+installed_before="$solver_root/installed-before.tsv"
+installed_after_path="$solver_root/installed-after.tsv"
+held_before="$solver_root/held-before.txt"
+held_after="$solver_root/held-after.txt"
+capture_installed_versions "$installed_before"
+capture_held_packages "$held_before"
+
+failure_stage=package_plan
+failure_reason=package_plan_unsafe
+package_diagnostic_log="$solver_root/package-plan.log"
+: > "$package_diagnostic_log"
+chmod 0600 "$package_diagnostic_log"
+run_bounded_package_command "$package_diagnostic_log" \
+  chroot "$candidate_path" apt-get "${apt_options[@]}" update
+run_bounded_package_command "$package_diagnostic_log" \
+  chroot "$candidate_path" apt-get "${apt_options[@]}" \
+    --simulate --assume-yes "${apt_safety_options[@]}" \
+    install "${package_targets[@]}"
+
+# Materialize only that safe solution in the private candidate cache while the
+# authenticated snapshot is mounted read-only. The apply step below runs after
+# the repository is unmounted and forbids acquisition, binding every consumed
+# package byte to this completed APT verification pass.
+failure_stage=package_staging
+failure_reason=package_apply_failed
+package_diagnostic_log="$solver_root/package-staging.log"
+: > "$package_diagnostic_log"
+chmod 0600 "$package_diagnostic_log"
+run_bounded_package_command "$package_diagnostic_log" \
+  chroot "$candidate_path" apt-get "${apt_options[@]}" \
+    --yes --download-only "${apt_safety_options[@]}" \
+    install "${package_targets[@]}"
+umount "$candidate_path/run/cybex-update-packages"
+
+failure_stage=packages
+failure_reason=package_apply_failed
+package_diagnostic_log="$solver_root/package-apply.log"
+: > "$package_diagnostic_log"
+chmod 0600 "$package_diagnostic_log"
+run_bounded_package_command "$package_diagnostic_log" \
+  chroot "$candidate_path" env DEBIAN_FRONTEND=noninteractive \
+    apt-get "${apt_options[@]}" --yes --no-download \
+    "${apt_safety_options[@]}" \
+    install "${package_targets[@]}"
+
+# Treat APT's safety switches as one layer, not the invariant itself. Compare
+# the complete installed package set before accepting the candidate so a
+# removed or lower-version package always discards this generation.
+failure_stage=package_verification
+failure_reason=package_state_unsafe
+capture_installed_versions "$installed_after_path"
+verify_no_package_regression "$installed_before" "$installed_after_path"
+capture_held_packages "$held_after"
+cmp --silent -- "$held_before" "$held_after"
+for package_target in "${package_targets[@]}"; do
+  package_name="${package_target%%=*}"
+  expected_version="${package_target#*=}"
+  installed_version="$(chroot "$candidate_path" dpkg-query -W -f="\${Version}" "$package_name")"
+  test "$installed_version" = "$expected_version"
+done
+chroot "$candidate_path" dpkg --audit
+kernel="$(find "$candidate_path/boot" -maxdepth 1 -type f -name 'vmlinuz-*' -print \
+  | LC_ALL=C sort -V | tail -n 1)"
+test -s "$kernel"
+sbverify --list "$kernel" >/dev/null
+for unit in cybex-james nginx tftpd-hpa nix-daemon; do
+  test -f "$candidate_path/etc/systemd/system/$unit.service" \
+    || test -f "$candidate_path/lib/systemd/system/$unit.service" \
+    || test -f "$candidate_path/usr/lib/systemd/system/$unit.service"
+done
+chroot "$candidate_path" nix --version >/dev/null
+cleanup_mounts
+cleanup_package_solver_state
+package_diagnostic_log=""
+cleanup_update_staging
+
+candidate_control="$candidate_path/var/lib/cybex-james/control"
+test -d "$candidate_control" && test ! -L "$candidate_control"
+write_pending_seal() {
+  local destination="$1" seal
+  seal="$(mktemp "$destination/.pending-root-generation.XXXXXX")"
+  jq -n --arg generation "$candidate" --arg source_generation "$current" \
+    --arg attempt_id "$attempt_id" --arg target_release "$target_release" \
+    --arg request_sha256 "$request_sha256" \
+    '{schema:"cybex.james.pending-root-generation.v1",generation:$generation,
+      source_generation:$source_generation,attempt_id:$attempt_id,
+      target_release:$target_release,request_sha256:$request_sha256,
+      legacy_flat_layout:false}' > "$seal"
+  chown root:cybex-james "$seal"
+  chmod 0640 "$seal"
+  sync -f "$seal"
+  mv -f "$seal" "$destination/pending-root-generation.json"
+  sync -f "$destination"
+}
+# Seal the source first. Any power loss before the candidate is armed therefore
+# boots the source into a deterministic terminal rollback instead of leaving a
+# permanent rebooting status or retry loop. The candidate receives the exact
+# same identity without inheriting mutable inbox state as authorization.
+write_pending_seal "$control_dir"
+write_pending_seal "$candidate_control"
+update-grub
+grub-reboot "cybex-james-generation-$candidate"
+write_status rebooting reboot_pending 80 "$candidate"
+trap - ERR
+systemctl reboot

@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply a signed Cybex James Ubuntu root generation
+After=network-online.target cybex-james.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/cybex-james/state/inbox/appliance-update-request.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cybex-james/cybex-james-appliance-update
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=4h
