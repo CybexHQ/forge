@@ -724,7 +724,22 @@ class LegacyBridgeGateTests(unittest.TestCase):
         self.assertIn("cybex.james.ubuntu-appliance-update-qualification.v1", workflow)
         self.assertIn(".workstation_runtime_operational' \"$evidence\"", workflow)
         self.assertIn(".workstation_runtime_converged' \"$evidence\"", workflow)
+        self.assertIn(
+            ".workstation_runtime_prepublication_deferred' \"$evidence\"",
+            workflow,
+        )
         self.assertIn(".builtin_blueprints_deliverable' \"$evidence\"", workflow)
+
+        lifecycle = (
+            REPOSITORY / "ubuntu-appliance/qualification/run-lifecycle.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('has_predecessor="${CYBEX_JAMES_HAS_PREDECESSOR:', lifecycle)
+        self.assertIn("runtime_prepublication_deferred=true", lifecycle)
+        self.assertIn("'.state' \"$runtime_status\")\" = absent", lifecycle)
+        self.assertIn("--argjson workstation_runtime_operational", lifecycle)
+        self.assertIn("--argjson workstation_runtime_converged", lifecycle)
+        self.assertNotIn("workstation_runtime_operational:true", lifecycle)
+        self.assertNotIn("workstation_runtime_converged:true", lifecycle)
 
     def test_real_n_to_n_plus_one_harness_requires_activation_and_health(self) -> None:
         harness = (
@@ -1241,7 +1256,7 @@ class LocalPublishedPredecessorTests(unittest.TestCase):
         workflow = (REPOSITORY / ".github/workflows/release.yml").read_bytes()
         self.assertEqual(
             digest(workflow),
-            "1aa7d7a10656ed66c6cb0a61f4bcfeb0efe19ed68c3afa5f70e57cab67796831",
+            "ce67215745153d2f7d2bb3110cdafd02b050387aabeb1b32356fcf97d5b2019e",
         )
 
 

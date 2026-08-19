@@ -1080,8 +1080,19 @@ jobs:
           test "$(jq -er '.identity_rotation' "$evidence")" = true
           test "$(jq -er '.installed_media_left_attached' "$evidence")" = true
           test "$(jq -er '.appliance_projection_healthy' "$evidence")" = true
-          test "$(jq -er '.workstation_runtime_operational' "$evidence")" = true
-          test "$(jq -er '.workstation_runtime_converged' "$evidence")" = true
+          case "$CYBEX_JAMES_HAS_PREDECESSOR" in
+            true)
+              test "$(jq -er '.workstation_runtime_operational' "$evidence")" = true
+              test "$(jq -er '.workstation_runtime_converged' "$evidence")" = true
+              test "$(jq -er '.workstation_runtime_prepublication_deferred' "$evidence")" = false
+              ;;
+            false)
+              test "$(jq -er '.workstation_runtime_operational | not' "$evidence")" = true
+              test "$(jq -er '.workstation_runtime_converged | not' "$evidence")" = true
+              test "$(jq -er '.workstation_runtime_prepublication_deferred' "$evidence")" = true
+              ;;
+            *) echo 'error: invalid James predecessor state' >&2; exit 1 ;;
+          esac
           test "$(jq -er '.builtin_blueprints_source_free' "$evidence")" = true
           test "$(jq -er '.builtin_blueprints_deliverable' "$evidence")" = true
           test "$(jq -er '.builtin_blueprints_qualified_on_new_james' "$evidence")" = true
