@@ -1195,12 +1195,20 @@ jobs:
             "$owner_artifact_marker" \
             "$owner_digest_marker")"
           existing="$RUNNER_TEMP/cybex-james-existing-release.json"
-          if gh api \
+          existing_pages="$RUNNER_TEMP/cybex-james-existing-releases.json"
+          gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            > "$existing" 2>/dev/null
-          then
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$existing_pages"
+          existing_count="$(jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)] | length' \
+            "$existing_pages")"
+          test "$existing_count" -le 1
+          if [ "$existing_count" -eq 1 ]; then
+            jq -e --arg tag "$GITHUB_REF_NAME" \
+              '.[][] | select(.tag_name == $tag)' \
+              "$existing_pages" > "$existing"
             test "$(jq -r '.tag_name' "$existing")" = "$GITHUB_REF_NAME"
             test "$(jq -r '.draft' "$existing")" = "true"
             test "$(jq -r '.immutable' "$existing")" = "false"
@@ -1280,11 +1288,18 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          release_id="$(gh api \
+          current_releases="$RUNNER_TEMP/cybex-james-current-releases.json"
+          gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '.id')"
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$current_releases"
+          release_id="$(jq -er --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]
+             | if length == 1 then .[0].id
+               else error("expected exactly one release for tag")
+               end' \
+            "$current_releases")"
           remote_assets="$RUNNER_TEMP/cybex-james-release-assets.json"
           release_asset_paths=(
             dist/cybex-james-x86_64-linux

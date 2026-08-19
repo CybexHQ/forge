@@ -1256,7 +1256,7 @@ class LocalPublishedPredecessorTests(unittest.TestCase):
         workflow = (REPOSITORY / ".github/workflows/release.yml").read_bytes()
         self.assertEqual(
             digest(workflow),
-            "ce67215745153d2f7d2bb3110cdafd02b050387aabeb1b32356fcf97d5b2019e",
+            "c0db17d77cce125bf60f2ae6e50ae62316fc81071f019218dc76414a8663764b",
         )
 
 
