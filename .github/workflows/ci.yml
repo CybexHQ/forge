@@ -39,14 +39,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Install native checks
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep shellcheck
 
       - name: Bash syntax
-        run: bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-james/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        shell: bash
+        run: |
+          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' ubuntu-appliance/rootfs/usr/lib/cybex-james | sort)
+          bash -n ubuntu-appliance/*.sh ubuntu-appliance/qualification/*.sh "${appliance_helpers[@]}" ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
 
       - name: Shellcheck
-        run: shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/run-lifecycle.sh ubuntu-appliance/rootfs/usr/lib/cybex-james/* ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
+        shell: bash
+        run: |
+          mapfile -t appliance_helpers < <(rg -l '^#!.*(bash|/sh)$' ubuntu-appliance/rootfs/usr/lib/cybex-james | sort)
+          shellcheck ubuntu-appliance/*.sh ubuntu-appliance/qualification/*.sh "${appliance_helpers[@]}" ubuntu-appliance/rootfs/etc/grub.d/09_cybex_generations
 
       - name: Release tooling tests
         run: python3 -B -m unittest discover -s tools/tests -v
