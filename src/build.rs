@@ -3261,17 +3261,17 @@ const PINNED_STANDARD_USER_UNITS_FINGERPRINT: &str =
 const PINNED_STANDARD_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
     "3a9ac4beb722e6dc228fec93bbfef51f90f003c16df4120cf9bc82ed3ad74a74";
 const PINNED_STANDARD_SYSTEM_UNITS_FINGERPRINT: &str =
-    "82fd44dec38b45a5a86ff3f32e9ca99481adeb2849ce222b7465fad82d0ac954";
+    "e689970d6bca316a78f722f26d9e9df5bc42f867fd4a88029066e83419a4dbd2";
 const PINNED_STANDARD_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
-    "274335bbebf5ef49a42045f79c51691489437e876087d404a86f2ba70d17e937";
+    "ac8ed47e9f7b18b8bdf25ec5d4dbfe19534e5183bc9b66e4b2f2e89d72d90999";
 const PINNED_STANDARD_ETC_FINGERPRINT: &str =
-    "4767105ffdde658ccaf7462ee02dde479b982e99e60cb4779ca755e6c1adea0f";
+    "17316ac80d7016b976bf8edbf6975235694685a76898ea97cbfbcb8b45f16c07";
 const PINNED_STANDARD_ETC_EXECUTABLE_FINGERPRINT: &str =
-    "ef11903699d4c1fc0af0f26f7118a62a635119106c0f19a57d76d8b86880b28f";
+    "444bd98c3d88fea0a55c085f91f51fd85e212132e43cd0b60b9df8e99e511e0c";
 const PINNED_DOCK_SYSTEM_UNITS_FINGERPRINT: &str =
-    "7f9e27b1ad689e73e2fe71e74b14cfffa60f5b362e50aac3463cfefd9b1cf137";
+    "13f84405d4e8269ed404ea62a5b1c9315caec798a12ed373739bfef2e91ada27";
 const PINNED_DOCK_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
-    "9f7efa401593bd05762ea03b3c08682fe8045f2941b319f7dd78623b9a9878f2";
+    "0122f0253a385fbd2db898a0bbe4a372bf064a1e17c68020960787f8535fa789";
 const PINNED_DOCK_UDEV_RULES_FINGERPRINT: &str =
     "8c0fa3cca08bd5e0be9a797fcab74dabfc28163f9af2077d851a0e2fa4ef55bc";
 const PINNED_DOCK_UDEV_RULES_EXECUTABLE_FINGERPRINT: &str =
@@ -3281,9 +3281,9 @@ const PINNED_DOCK_USER_UNITS_FINGERPRINT: &str =
 const PINNED_DOCK_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
     "304c8459e90a7e78f2680fe06427fac3defd03880a3b25cb88bcefa975d46f17";
 const PINNED_DOCK_ETC_FINGERPRINT: &str =
-    "52cf635393b4ddeba8ea1335b68f8715a1a011a34120fa469aa8bcae8a980872";
+    "11ad8409c039bd278a7132ade2daa23aa1ae0f7fc4cfb634a464f37589e652d6";
 const PINNED_DOCK_ETC_EXECUTABLE_FINGERPRINT: &str =
-    "48dbdfea0e0232e9949cad2627facc12815d39dccb3a26217935bfd28ac7d324";
+    "fe2471e91f9d90f2531f1bf7b8010482c6da5d3bcefdecc9e9cbac27fc405d57";
 const PINNED_HYPRLAND_UDEV_RULES_FINGERPRINT: &str =
     "ca6cb4d2ea7130188608a324d2f580d304091a2334dc67b2ec2ba10f1b45a7b2";
 const PINNED_HYPRLAND_UDEV_RULES_EXECUTABLE_FINGERPRINT: &str =
@@ -3301,13 +3301,13 @@ const PINNED_HYPRLAND_USER_UNITS_FINGERPRINT: &str =
 const PINNED_HYPRLAND_USER_UNITS_EXECUTABLE_FINGERPRINT: &str =
     "837685f4f538928f90cf993d62135d209db19cdd3f8977313d596a3d27d71836";
 const PINNED_HYPRLAND_SYSTEM_UNITS_FINGERPRINT: &str =
-    "00f33c9b3568d9183d5b2673ec97ffad110f8d2aeb791f6aea4afe2403249d66";
+    "9c1f9d764dec8933fb8150666d735693dc0d70f5478f27509b5b445fe208d707";
 const PINNED_HYPRLAND_SYSTEM_UNITS_EXECUTABLE_FINGERPRINT: &str =
-    "d026d0482802f935164611b3d7b91f7788cc88426a6808f805fe444713ffe5d6";
+    "5cfbf1caee7c05ce1b471654d9931a8b7803508fc7bbc77b07480ac4016055c1";
 const PINNED_HYPRLAND_ETC_FINGERPRINT: &str =
-    "75b0534ec0b3ac8b033807df2eb7972fb23d24f53545f33c1aa15fb67216d469";
+    "33c1d5fe1881eec5030f23172a100099b82836bdf8cb5f4fb084a04e9c425bb2";
 const PINNED_HYPRLAND_ETC_EXECUTABLE_FINGERPRINT: &str =
-    "f9423240fde6ddb41962f097443a48474d8d1ea77ab67d447c4c74d9a058d609";
+    "b75be52f851f7c2f037e9cfd1c8d0feb5c0ae150eee45d62ff410d68a9ec4c74";
 
 // Exact 74cc63f fingerprints for native desktop/NixOS materializers reviewed
 // from real source-disabled KDE and Hyprland closures. They only write
@@ -6761,6 +6761,39 @@ sleep 5
             assert!(
                 !reviewed_generator_fingerprints_match(next.0, executable),
                 "an executable-provider fingerprint must not be combined with another reviewed script fingerprint"
+            );
+        }
+
+        let superseded_pairs = [
+            (
+                "82fd44dec38b45a5a86ff3f32e9ca99481adeb2849ce222b7465fad82d0ac954",
+                "274335bbebf5ef49a42045f79c51691489437e876087d404a86f2ba70d17e937",
+            ),
+            (
+                "4767105ffdde658ccaf7462ee02dde479b982e99e60cb4779ca755e6c1adea0f",
+                "ef11903699d4c1fc0af0f26f7118a62a635119106c0f19a57d76d8b86880b28f",
+            ),
+            (
+                "7f9e27b1ad689e73e2fe71e74b14cfffa60f5b362e50aac3463cfefd9b1cf137",
+                "9f7efa401593bd05762ea03b3c08682fe8045f2941b319f7dd78623b9a9878f2",
+            ),
+            (
+                "52cf635393b4ddeba8ea1335b68f8715a1a011a34120fa469aa8bcae8a980872",
+                "48dbdfea0e0232e9949cad2627facc12815d39dccb3a26217935bfd28ac7d324",
+            ),
+            (
+                "00f33c9b3568d9183d5b2673ec97ffad110f8d2aeb791f6aea4afe2403249d66",
+                "d026d0482802f935164611b3d7b91f7788cc88426a6808f805fe444713ffe5d6",
+            ),
+            (
+                "75b0534ec0b3ac8b033807df2eb7972fb23d24f53545f33c1aa15fb67216d469",
+                "f9423240fde6ddb41962f097443a48474d8d1ea77ab67d447c4c74d9a058d609",
+            ),
+        ];
+        for (normalized, executable) in superseded_pairs {
+            assert!(
+                !reviewed_generator_fingerprints_match(normalized, executable),
+                "superseded built-in glue must not remain trusted"
             );
         }
 
