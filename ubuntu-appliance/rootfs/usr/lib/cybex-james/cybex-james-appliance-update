@@ -32,6 +32,8 @@ if [[ -e "$source_clear_intent" || -L "$source_clear_intent" ]]; then
   test "$(jq -er '.stage' "$status")" = committed
   test "$(jq -er '.attempt_id' "$status")" = "$(jq -er '.attempt_id' "$source_clear_intent")"
   test "$(jq -er '.target_release' "$status")" = "$(jq -er '.target_release' "$source_clear_intent")"
+  test "$(jq -er '.source_revision' "$status")" = "$(jq -er '.source_revision' "$source_clear_intent")"
+  test "$(jq -er '.package_snapshot_sha256' "$status")" = "$(jq -er '.package_snapshot_sha256' "$source_clear_intent")"
   test "$(jq -er '.resulting_root_generation' "$status")" = "$(jq -er '.generation' "$source_clear_intent")"
   test "$(cat "$control_dir/root-generation")" = "$(jq -er '.generation' "$source_clear_intent")"
   test "$(jq -er '.release_id' /usr/share/cybex-james/appliance-release.json)" = "$(jq -er '.target_release' "$source_clear_intent")"
@@ -42,8 +44,18 @@ test ! -e "$pending_seal" && test ! -L "$pending_seal"
 
 attempt_id="$(jq -er '.attempt_id' "$request")"
 target_release="$(jq -er '.release.release_id' "$request")"
+release_schema="$(jq -er '.release.schema' "$request")"
+source_revision="$(jq -er '.release.source_revision // ""' "$request")"
+package_snapshot_sha256="$(jq -er '.release.cybex_repository_snapshot.sha256' "$request")"
 [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
 [[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
+[[ "$release_schema" =~ ^cybex\.james\.appliance-release\.v[12]$ ]]
+if [[ "$release_schema" = cybex.james.appliance-release.v2 ]]; then
+  [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]]
+else
+  test -z "$source_revision"
+fi
+[[ "$package_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]]
 candidate=""
 candidate_path=""
 candidate_created=false
@@ -58,9 +70,12 @@ write_status() {
   jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
     --arg target_release "$target_release" --arg candidate "$candidate" \
     --arg resulting "$resulting" --arg rollback_reason "$reason" \
+    --arg source_revision "$source_revision" \
+    --arg package_snapshot_sha256 "$package_snapshot_sha256" \
     --argjson progress_percent "$progress" \
     --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
     '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      source_revision:$source_revision,package_snapshot_sha256:$package_snapshot_sha256,
       progress_percent:$progress_percent,candidate_root_generation:$candidate,
       resulting_root_generation:$resulting,rollback_reason:$rollback_reason,
       reported_at:$reported_at}' \
@@ -200,7 +215,7 @@ trap fail_update ERR
 write_status preparing preflight 10
 test "$(findmnt -n -o FSTYPE /)" = btrfs
 test "$(jq -er '.schema' "$request")" = cybex.james.appliance-update-request.v1
-test "$(jq -er '.release.schema' "$request")" = cybex.james.appliance-release.v1
+test "$(jq -er '.release.schema' "$request")" = "$release_schema"
 test "$(jq -er '.release.rollback_compatible' "$request")" = true
 
 timezone="$(jq -er '.maintenance_window.timezone' "$control_dir/install-plan.json")"
@@ -268,6 +283,8 @@ test "$(jq -er '.schema' "$verified")" = cybex.james.verified-appliance-update.v
 attempt_id="$(jq -er '.attempt_id' "$verified")"
 target_release="$(jq -er '.target_release' "$verified")"
 request_sha256="$(jq -er '.request_sha256' "$verified")"
+test "$(jq -er '.source_revision // ""' "$verified")" = "$source_revision"
+test "$(jq -er '.package_snapshot_sha256' "$verified")" = "$package_snapshot_sha256"
 [[ "$attempt_id" =~ ^[0-9a-f-]{36}$ ]]
 [[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
 test "$(jq -er '
@@ -464,9 +481,12 @@ write_pending_seal() {
   jq -n --arg generation "$candidate" --arg source_generation "$current" \
     --arg attempt_id "$attempt_id" --arg target_release "$target_release" \
     --arg request_sha256 "$request_sha256" \
+    --arg source_revision "$source_revision" \
+    --arg package_snapshot_sha256 "$package_snapshot_sha256" \
     '{schema:"cybex.james.pending-root-generation.v1",generation:$generation,
       source_generation:$source_generation,attempt_id:$attempt_id,
       target_release:$target_release,request_sha256:$request_sha256,
+      source_revision:$source_revision,package_snapshot_sha256:$package_snapshot_sha256,
       legacy_flat_layout:false}' > "$seal"
   chown root:cybex-james "$seal"
   chmod 0640 "$seal"

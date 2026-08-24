@@ -1339,8 +1339,22 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
     }
     // Artifact rows only track top-level NARs while `nix copy` stores whole
     // closures, so both the threshold and the reclaim must work on disk state.
+    // The cache shares a filesystem with build work, runtime bundles, and
+    // /nix. Retention therefore preserves enough real free space for one
+    // maximum exact installer target as well as enforcing cache.max_bytes.
+    let minimum_available_bytes = config
+        .build
+        .max_artifact_size_bytes
+        .saturating_add(crate::disk::DISK_HEADROOM_BYTES);
     let mut total = cache_disk_usage(config).await;
-    if total <= config.cache.max_bytes {
+    let mut available_bytes = cache_available_bytes(config);
+    let mut reclaim_bytes = retention_reclaim_bytes(
+        total,
+        config.cache.max_bytes,
+        available_bytes,
+        minimum_available_bytes,
+    );
+    if reclaim_bytes == 0 {
         return Ok(());
     }
     let mut candidates = db::list_cache_artifacts(pool).await?;
@@ -1358,7 +1372,14 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
         .collect::<Vec<_>>();
     sweep_unreachable_locked(config, retained).await?;
     total = cache_disk_usage(config).await;
-    if total <= config.cache.max_bytes {
+    available_bytes = cache_available_bytes(config);
+    reclaim_bytes = retention_reclaim_bytes(
+        total,
+        config.cache.max_bytes,
+        available_bytes,
+        minimum_available_bytes,
+    );
+    if reclaim_bytes == 0 {
         return Ok(());
     }
 
@@ -1417,8 +1438,8 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
     // the expensive full-cache walks proportional to rounds (usually one),
     // not to the number of evicted artifacts.
     let mut next_index = 0;
-    while total > config.cache.max_bytes && next_index < eviction_order.len() {
-        let excess = total - config.cache.max_bytes;
+    while reclaim_bytes > 0 && next_index < eviction_order.len() {
+        let excess = reclaim_bytes;
         let mut estimated_freed: u64 = 0;
         let mut evicted_this_round = false;
         while next_index < eviction_order.len() && estimated_freed < excess {
@@ -1443,15 +1464,45 @@ async fn enforce_retention_locked(pool: &SqlitePool, config: &AppConfig) -> Resu
             .collect::<Vec<_>>();
         sweep_unreachable_locked(config, retained).await?;
         total = cache_disk_usage(config).await;
+        available_bytes = cache_available_bytes(config);
+        reclaim_bytes = retention_reclaim_bytes(
+            total,
+            config.cache.max_bytes,
+            available_bytes,
+            minimum_available_bytes,
+        );
     }
-    if total > config.cache.max_bytes {
+    if reclaim_bytes > 0 {
         tracing::warn!(
             total_size_bytes = total,
             max_size_bytes = config.cache.max_bytes,
-            "James Cache remains above max_bytes after evicting every eligible artifact"
+            available_disk_bytes = available_bytes.unwrap_or(0),
+            available_disk_evidence = available_bytes.is_some(),
+            minimum_available_disk_bytes = minimum_available_bytes,
+            remaining_reclaim_bytes = reclaim_bytes,
+            "James Cache cannot restore its size and installer-headroom invariants after evicting every eligible artifact"
         );
     }
     Ok(())
+}
+
+fn cache_available_bytes(config: &AppConfig) -> Option<u64> {
+    crate::disk::stats(&config.cache.root_dir)
+        .ok()
+        .map(|stats| stats.available_bytes)
+}
+
+fn retention_reclaim_bytes(
+    cache_size_bytes: u64,
+    maximum_cache_bytes: u64,
+    available_disk_bytes: Option<u64>,
+    minimum_available_disk_bytes: u64,
+) -> u64 {
+    let size_excess = cache_size_bytes.saturating_sub(maximum_cache_bytes);
+    let free_space_shortfall = available_disk_bytes
+        .map(|available| minimum_available_disk_bytes.saturating_sub(available))
+        .unwrap_or(0);
+    size_excess.max(free_space_shortfall)
 }
 
 /// Verify a bounded, oldest-verified-first cache batch. Healthy roots are due
@@ -3367,6 +3418,15 @@ CA: text:sha256:02ip8n5zbxc22shv5832dwhiaci5r9c306882a058savij6rnn7s\n";
             Some("active-job")
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn retention_uses_the_stricter_cache_size_or_installer_headroom_pressure() {
+        assert_eq!(retention_reclaim_bytes(80, 64, Some(100), 21), 16);
+        assert_eq!(retention_reclaim_bytes(40, 64, Some(10), 21), 11);
+        assert_eq!(retention_reclaim_bytes(80, 64, Some(10), 21), 16);
+        assert_eq!(retention_reclaim_bytes(40, 64, Some(100), 21), 0);
+        assert_eq!(retention_reclaim_bytes(80, 64, None, 21), 16);
     }
 
     #[tokio::test]

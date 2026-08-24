@@ -226,8 +226,10 @@ management firewall CIDRs, and release state into `/target`.
 Durable state records the session, signed plan, online Management public key,
 permanent key, event sequence, identity activation, and install completion.
 Booting the same media after a pre-completion power interruption validates and
-resumes exact geometry/events. A completed marker sets the installed Ubuntu
-UEFI entry as `BootNext` and reboots rather than replaying installation.
+resumes exact geometry/events. A completed marker inspects the kernel-provided
+UEFI variables directly, sets the active installed Ubuntu or Cybex James entry
+as `BootNext`, verifies it, and reboots rather than replaying installation. The
+live recovery handoff therefore has no undeclared dependency on `efibootmgr`.
 
 ## Installed services
 
@@ -283,10 +285,15 @@ certificate explicitly contains its permission extension. nftables drops SSH
 from outside the plan's management CIDRs.
 
 `/nix` is an executable `nodev,nosuid` bind mount backed by
-`CYBEX_CACHE`. Installer-seeded Nix content is copied there before the
-bind is activated; first boot verifies the mount identity/options and initializes
-the store before `nix-daemon`. The store remains root-owned while
-`cybex-james` receives daemon access through `nix-users`.
+`CYBEX_CACHE`. Appliance installation requires a fixed disk of at least
+160 GiB; the bootstrap also requires at least 80 GiB for this final shared
+partition after the fixed EFI, root, state, and swap partitions. Installer-seeded
+Nix content is copied there before the bind is activated; first boot verifies
+the mount identity/options and initializes the store before `nix-daemon`.
+The store remains root-owned while `cybex-james` receives daemon access through
+`nix-users`. Cache retention reacts to both its configured cache-size ceiling
+and real filesystem headroom, preserving space for one maximum exact workstation
+installer target whenever unprotected artifacts can be reclaimed.
 
 ## Root generations and package updates
 
@@ -453,9 +460,12 @@ with `CYBEX_JAMES_QUALIFICATION_PACKAGE_BIND_ADDRESS`; loopback and public
 addresses are rejected.
 
 The automated boot entry mirrors Ubuntu to the first serial port so early
-installer failures are visible in the protected job. Qualification stops after
-five minutes when an approved candidate has not acknowledged its plan or begun
-destructive work, and includes only bounded console and session diagnostics.
+installer failures are visible in the protected job, while keeping the
+physical display as the primary console. Ubuntu's remove-media prompt and
+installer failures therefore remain visible on the attached screen as well as
+in serial diagnostics. Qualification stops after five minutes when an approved
+candidate has not acknowledged its plan or begun destructive work, and includes
+only bounded console and session diagnostics.
 The protected VM uses a fixed virtual NIC address and disk serial so retries
 represent the same hardware. A failed pre-write qualification is revoked
 automatically, releasing its unused reserved device identity.

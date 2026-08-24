@@ -13,7 +13,11 @@ use std::{
 };
 use tokio::process::Command;
 
-const MIN_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+// Keep this synchronized with Manage's provisioning admission and the
+// bootstrap partition layout. The final partition is shared by /nix, runtime
+// bundles, build work, and the delivery cache; 128 GiB leaves too little
+// normal-operating headroom for exact workstation preparation.
+const MIN_DISK_BYTES: u64 = 160 * 1024 * 1024 * 1024;
 const STATIC_PREFLIGHT_ROUTE_TABLE: &str = "42666";
 const STATIC_PREFLIGHT_RULE_PRIORITY: &str = "42666";
 const STATIC_PREFLIGHT_OUTPUT_LIMIT: usize = 16 * 1024;
@@ -1061,5 +1065,10 @@ mod tests {
             blocker_codes: vec!["disk_too_small".into()],
         };
         assert!(!disk.eligible);
+    }
+
+    #[test]
+    fn appliance_disk_floor_matches_the_shared_cache_layout() {
+        assert_eq!(MIN_DISK_BYTES, 160 * 1024 * 1024 * 1024);
     }
 }

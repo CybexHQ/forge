@@ -19,11 +19,15 @@ source_generation="$(jq -er '.source_generation' "$pending_file")"
 attempt_id="$(jq -er '.attempt_id' "$pending_file")"
 target_release="$(jq -er '.target_release' "$pending_file")"
 request_sha256="$(jq -er '.request_sha256' "$pending_file")"
+source_revision="$(jq -er '.source_revision // ""' "$pending_file")"
+package_snapshot_sha256="$(jq -er '.package_snapshot_sha256 // ""' "$pending_file")"
 [[ "$pending" =~ ^[0-9]+$ ]]
 [[ "$source_generation" =~ ^[0-9]+$ ]] && ((source_generation < pending))
 [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
 [[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
 [[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
+[[ -z "$source_revision" || "$source_revision" =~ ^[0-9a-f]{40}$ ]]
+[[ -z "$package_snapshot_sha256" || "$package_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]]
 test "$(findmnt -n -o FSROOT /)" = "/.cybex-root-generations/$pending"
 
 write_status() {
@@ -31,8 +35,11 @@ write_status() {
   temporary="$(mktemp "$status_dir/.appliance-update-status.XXXXXX")"
   jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
     --arg target_release "$target_release" --arg generation "$pending" \
+    --arg source_revision "$source_revision" \
+    --arg package_snapshot_sha256 "$package_snapshot_sha256" \
     --arg rollback_reason "$reason" --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
     '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      source_revision:$source_revision,package_snapshot_sha256:$package_snapshot_sha256,
       progress_percent:100,candidate_root_generation:$generation,
       resulting_root_generation:(if $status == "succeeded" then $generation else "" end),
       rollback_reason:$rollback_reason,reported_at:$reported_at}' \
@@ -95,8 +102,11 @@ with_source_control() (
       temporary="$(mktemp "$source_status/.appliance-update-status.XXXXXX")"
       jq -n --arg attempt_id "$attempt_id" --arg target_release "$target_release" \
         --arg generation "$pending" \
+        --arg source_revision "$source_revision" \
+        --arg package_snapshot_sha256 "$package_snapshot_sha256" \
         --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
         '{status:"succeeded",stage:"committed",attempt_id:$attempt_id,
+          source_revision:$source_revision,package_snapshot_sha256:$package_snapshot_sha256,
           target_release:$target_release,progress_percent:100,
           candidate_root_generation:$generation,
           resulting_root_generation:$generation,rollback_reason:"",

@@ -217,7 +217,10 @@ mkdir -p -- "$grub_theme_dir"
 install -m 0644 "$repository_root/assets/pxe-menu.png" "$grub_theme_dir/background.png"
 install -m 0644 "$repository_root/ubuntu-appliance/grub-theme/theme.txt" "$grub_theme_dir/theme.txt"
 
-kernel_arguments='autoinstall ds=nocloud\\;s=/cdrom/nocloud/ console=tty0 console=ttyS0,115200n8'
+# Mirror boot output to the serial console used by qualification, but keep the
+# physical display as /dev/console. Casper writes its remove-media prompt to
+# /dev/console during reboot, so tty0 must be the final console argument.
+kernel_arguments='autoinstall ds=nocloud\\;s=/cdrom/nocloud/ console=ttyS0,115200n8 console=tty0'
 while IFS= read -r -d '' grub_config; do
   if ! grep -F 'ds=nocloud' "$grub_config" >/dev/null; then
     sed -i -E "s#([[:space:]]+---[[:space:]]*)\$# ${kernel_arguments} ---#" "$grub_config"

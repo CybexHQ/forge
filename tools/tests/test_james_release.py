@@ -278,6 +278,10 @@ class JamesReleaseToolTests(unittest.TestCase):
                 manage_revision,
                 "--workstation-netboot-nixpkgs-revision",
                 nixpkgs_revision,
+                "--workstation-netboot-manage-source-sha256",
+                "c" * 64,
+                "--workstation-netboot-manage-source-size-bytes",
+                "123",
             ],
             bundle,
             tree,
@@ -480,6 +484,8 @@ class JamesReleaseToolTests(unittest.TestCase):
         signed = self.run_tool(
             *self.manifest_arguments(output),
             *package_arguments,
+            "--appliance-source-revision",
+            "d" * 40,
         )
         self.assertEqual(signed.returncode, 0, signed.stderr.decode())
 
@@ -489,6 +495,13 @@ class JamesReleaseToolTests(unittest.TestCase):
             "network-snapshot-v1",
         )
         self.assertIn("appliance_release_v1", manifest)
+        self.assertEqual(
+            manifest["appliance_release_v1"]["schema"],
+            "cybex.james.appliance-release.v2",
+        )
+        self.assertEqual(
+            manifest["appliance_release_v1"]["source_revision"], "d" * 40
+        )
 
         verified_without_build_metadata = self.run_tool(
             *self.verify_arguments(output),

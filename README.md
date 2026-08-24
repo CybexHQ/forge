@@ -51,6 +51,19 @@ appliance reporting, or managed heartbeats. James keeps serving its verified
 active runtime while a newer candidate is retried; the candidate import state
 and current service availability are intentionally separate signals in Manage.
 
+James advertises `installer_target_build_v3` when it accepts the device-agnostic
+cohort identity `cybex.installer-target.build.v3` for exact installation jobs.
+That identity names only closure inputs — Blueprint revision and artifact
+hash, generated-Nix, expected-state, hardware-module and target-module digests,
+driver policy, Manage source revision, nixpkgs pin, and source lock — and James
+verifies every digest against the module text it evaluates before building, so
+the echoed identity proves the exact inputs of a closure Manage may reuse for
+every workstation in the same hardware cohort. James also still advertises
+`installer_target_build_v2` and accepts the per-device v1/v2 identity shapes so
+retained jobs from before the upgrade remain retryable; current Manage issues
+only v3 and refuses to prepare installations on a James without it
+(`james_installer_closure_unsupported`). Deploy James before Manage.
+
 Source-free Blueprint preparation classifies the exact evaluated derivation
 graph in an isolated store. Deterministic NixOS composition outputs and their
 qualified tool providers are admitted by strict fingerprints, while an

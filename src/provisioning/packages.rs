@@ -475,6 +475,7 @@ mod tests {
         SignedApplianceRelease {
             schema: "cybex.james.appliance-release.v1".into(),
             release_id: "0.1.2".into(),
+            source_revision: None,
             ubuntu_snapshot_id: "20260801T120000Z".into(),
             cybex_repository_snapshot: crate::appliance::ApplianceRepositorySnapshot {
                 url: canonical_url.into(),

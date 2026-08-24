@@ -94,16 +94,16 @@ pub fn render_menu(
     mac: Option<&str>,
     serial: Option<&str>,
     timeout_ms: u32,
-    try_bootable_local_disk_first: bool,
+    try_local_boot_first: bool,
 ) -> String {
     let menu_profiles = menu_profiles(profiles);
     let mut script = String::with_capacity(2048 + (menu_profiles.len() * 256));
     script.push_str("#!ipxe\n");
-    if try_bootable_local_disk_first {
+    if try_local_boot_first {
         // A previously seen workstation can return through PXE when network
-        // boot is ahead of its disk in firmware order. Prefer a genuinely
-        // bootable local disk, but fall through to the normal menu when the
-        // disk is still blank (for example, pending enrollment).
+        // boot is ahead of its disk in firmware order. UEFI must regain
+        // control so it can advance to the installed NixOS boot entry; BIOS
+        // can still probe the conventional local-disk drive directly.
         append_local_attempt(&mut script, "known_local", "known_menu");
         script.push_str("\n:known_menu\n");
     }
@@ -268,8 +268,21 @@ fn append_local_attempt(script: &mut String, label_prefix: &str, failure_label: 
         "iseq ${{platform}} efi && goto {label_prefix}_efi || goto {label_prefix}_bios"
     );
     let _ = writeln!(script, ":{label_prefix}_efi");
-    let _ = writeln!(script, "sanboot --drive 0 || goto {failure_label}");
+    // In UEFI, drive 0 means any matching disk and may resolve to the active
+    // network/SAN path. Drive 0x80 selects the first local disk. Firmware that
+    // cannot chain it cleanly gets the explicit BootOrder handoff fallback.
+    let _ = writeln!(
+        script,
+        "sanboot --no-describe --drive 0x80 || goto {label_prefix}_efi_handoff"
+    );
     script.push_str("goto end\n");
+    let _ = writeln!(script, ":{label_prefix}_efi_handoff");
+    // The handoff flag tells the immutable autoexec wrapper that this failure
+    // is intentional, so it returns immediately instead of retrying. UEFI then
+    // advances to the next BootOrder entry (normally NixOS-boot).
+    script.push_str("echo Returning control to UEFI for the next boot entry\n");
+    script.push_str("set cybex-local-handoff 1\n");
+    script.push_str("exit 1\n");
     let _ = writeln!(script, ":{label_prefix}_bios");
     let _ = writeln!(
         script,
@@ -537,7 +550,10 @@ mod tests {
         assert!(!script.contains("choose --timeout"));
         assert!(!script.contains("menu-timeout"));
         assert!(script.contains("iseq ${platform} efi && goto local_efi || goto local_bios"));
-        assert!(script.contains("sanboot --drive 0 || goto local_exit"));
+        assert!(script.contains(
+            ":local_efi\nsanboot --no-describe --drive 0x80 || goto local_efi_handoff\ngoto end\n:local_efi_handoff\necho Returning control to UEFI for the next boot entry\nset cybex-local-handoff 1\nexit 1"
+        ));
+        assert!(!script.contains("sanboot --drive 0"));
         assert!(script.contains("sanboot --no-describe --drive 0x80 || goto local_exit"));
         assert!(script.contains("exit 1"));
         let local_item = script.find("item --key l local Boot local disk").unwrap();
@@ -628,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn known_mac_menu_tries_a_bootable_local_disk_before_loading_menu_ui() {
+    fn known_mac_menu_tries_uefi_local_disk_before_loading_menu_ui() {
         let mut installer = profile(2, BootProfileType::JamesInstaller);
         installer.name = "Default Enrollment".to_string();
         installer.is_default = true;
@@ -643,11 +659,16 @@ mod tests {
             true,
         );
 
-        let local_probe = script.find("sanboot --drive 0 || goto known_menu").unwrap();
+        let local_handoff = script
+            .find(
+                ":known_local_efi\nsanboot --no-describe --drive 0x80 || goto known_local_efi_handoff\ngoto end\n:known_local_efi_handoff\necho Returning control to UEFI for the next boot entry\nset cybex-local-handoff 1\nexit 1",
+            )
+            .unwrap();
         let menu_picture = script.find("console --x 1024").unwrap();
         let menu = script.find("menu ${cybex-title}").unwrap();
-        assert!(local_probe < menu_picture);
+        assert!(local_handoff < menu_picture);
         assert!(menu_picture < menu);
+        assert!(!script.contains("sanboot --drive 0"));
         assert!(script.contains("sanboot --no-describe --drive 0x80 || goto known_menu"));
         assert!(script.contains(":known_menu\n"));
         assert!(script.contains("item profile_2 Default Enrollment"));

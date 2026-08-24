@@ -4,16 +4,27 @@
 dhcp net0 || goto cybex_retry
 isset ${next-server} || goto cybex_failed
 isset ${net0/mac} || goto cybex_failed
-chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_retry
+set cybex-local-handoff 0
+chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_first_chain_failed
 goto cybex_end
+
+:cybex_first_chain_failed
+iseq ${cybex-local-handoff} 1 && goto cybex_local_handoff || goto cybex_retry
 
 :cybex_retry
 sleep 2
 dhcp net0 || goto cybex_failed
 isset ${next-server} || goto cybex_failed
 isset ${net0/mac} || goto cybex_failed
-chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_failed
+set cybex-local-handoff 0
+chain --autofree http://${next-server}/boot/${net0/mac:hexhyp} || goto cybex_second_chain_failed
 goto cybex_end
+
+:cybex_second_chain_failed
+iseq ${cybex-local-handoff} 1 && goto cybex_local_handoff || goto cybex_failed
+
+:cybex_local_handoff
+exit 1
 
 :cybex_failed
 echo Cybex James could not load this workstation boot request

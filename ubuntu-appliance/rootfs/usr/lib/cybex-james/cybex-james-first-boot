@@ -235,9 +235,12 @@ write_update_status() {
   jq -n --arg status "$result" --arg stage "$stage" --arg attempt_id "$attempt_id" \
     --arg target_release "$target_release" --arg pending "$pending" \
     --arg resulting "$resulting" --arg rollback_reason "$reason" \
+    --arg source_revision "$source_revision" \
+    --arg package_snapshot_sha256 "$package_snapshot_sha256" \
     --argjson progress_percent "$progress" \
     --arg reported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
     '{status:$status,stage:$stage,attempt_id:$attempt_id,target_release:$target_release,
+      source_revision:$source_revision,package_snapshot_sha256:$package_snapshot_sha256,
       progress_percent:$progress_percent,candidate_root_generation:$pending,
       resulting_root_generation:$resulting,rollback_reason:$rollback_reason,
       reported_at:$reported_at}' > "$temporary"
@@ -272,14 +275,20 @@ if [[ ! -e "$pending_seal" && -s "$legacy_pending" ]]; then
   attempt_id="$(jq -er '.attempt_id' "$verified")"
   target_release="$(jq -er '.target_release' "$verified")"
   request_sha256="$(jq -er '.request_sha256' "$verified")"
+  source_revision="$(jq -er '.source_revision // ""' "$verified")"
+  package_snapshot_sha256="$(jq -er '.package_snapshot_sha256' "$verified")"
   temporary="$(mktemp "$control_dir/.pending-root-generation.XXXXXX")"
   jq -n --arg generation "$pending" --arg source_generation "$source_generation" \
     --arg attempt_id "$attempt_id" \
     --arg target_release "$target_release" --arg request_sha256 "$request_sha256" \
+    --arg source_revision "$source_revision" \
+    --arg package_snapshot_sha256 "$package_snapshot_sha256" \
     '{schema:"cybex.james.pending-root-generation.v1",generation:$generation,
       source_generation:$source_generation,
       attempt_id:$attempt_id,target_release:$target_release,
-      request_sha256:$request_sha256,legacy_flat_layout:true}' > "$temporary"
+      request_sha256:$request_sha256,source_revision:$source_revision,
+      package_snapshot_sha256:$package_snapshot_sha256,
+      legacy_flat_layout:true}' > "$temporary"
   chown root:cybex-james "$temporary"
   chmod 0640 "$temporary"
   sync -f "$temporary"
@@ -299,11 +308,15 @@ if [[ -e "$pending_seal" ]]; then
   attempt_id="$(jq -er '.attempt_id' "$pending_seal")"
   target_release="$(jq -er '.target_release' "$pending_seal")"
   request_sha256="$(jq -er '.request_sha256' "$pending_seal")"
+  source_revision="$(jq -er '.source_revision // ""' "$pending_seal")"
+  package_snapshot_sha256="$(jq -er '.package_snapshot_sha256 // ""' "$pending_seal")"
   [[ "$pending" =~ ^[0-9]+$ ]]
   [[ "$source_generation" =~ ^[0-9]+$ ]] && ((source_generation < pending))
   [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
   [[ "$target_release" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$ ]]
   [[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
+  [[ -z "$source_revision" || "$source_revision" =~ ^[0-9a-f]{40}$ ]]
+  [[ -z "$package_snapshot_sha256" || "$package_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]]
   fsroot="$(findmnt -n -o FSROOT /)"
   if [[ "$fsroot" = "/.cybex-root-generations/$pending" ]]; then
     generation="$pending"
@@ -316,6 +329,8 @@ if [[ -e "$pending_seal" ]]; then
       && [[ "$(jq -er '.status' "$status_file")" = succeeded ]] \
       && [[ "$(jq -er '.attempt_id' "$status_file")" = "$attempt_id" ]] \
       && [[ "$(jq -er '.target_release' "$status_file")" = "$target_release" ]] \
+      && [[ "$(jq -er '.source_revision' "$status_file")" = "$source_revision" ]] \
+      && [[ "$(jq -er '.package_snapshot_sha256' "$status_file")" = "$package_snapshot_sha256" ]] \
       && [[ "$(jq -er '.resulting_root_generation' "$status_file")" = "$pending" ]]; then
       # The healthy candidate crossed the durable success point before this
       # source was selected manually. Preserve it and only finish the exact

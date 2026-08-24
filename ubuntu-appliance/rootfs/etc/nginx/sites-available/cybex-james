@@ -17,6 +17,23 @@ server {
         alias /usr/share/cybex-james/assets/pxe-menu.png;
     }
 
+    # Runtime bootstrap uses the exact Manage source packaged into this James
+    # release. Restrict the route to immutable revision-addressed artifacts;
+    # never expose the package directory or permit caller-controlled paths.
+    location ~ "^/manage-source/(?<source_file>[0-9a-f]{40}\.(?:tar|json))$" {
+        alias /usr/share/cybex-james/manage-source/$source_file;
+        autoindex off;
+        disable_symlinks if_not_owner from=/usr/share/cybex-james/manage-source;
+        limit_except GET { deny all; }
+        types {
+            application/json json;
+            application/x-tar tar;
+        }
+        default_type application/octet-stream;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header X-Content-Type-Options "nosniff";
+    }
+
     location /assets/ {
         alias /var/cache/cybex-james/www/assets/;
         autoindex off;

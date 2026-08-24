@@ -68,8 +68,10 @@ MANAGE_SOURCE_INSTALLER_REQUIRED_PATHS = frozenset(
     }
 )
 JAMES_DEBIAN_PACKAGE_MAX_BYTES = 512 * 1024 * 1024
-APPLIANCE_RELEASE_SIGNATURE_DOMAIN = "CYBEX-JAMES-APPLIANCE-RELEASE-V1"
-APPLIANCE_RELEASE_SCHEMA = "cybex.james.appliance-release.v1"
+APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V1 = "CYBEX-JAMES-APPLIANCE-RELEASE-V1"
+APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V2 = "CYBEX-JAMES-APPLIANCE-RELEASE-V2"
+APPLIANCE_RELEASE_SCHEMA_V1 = "cybex.james.appliance-release.v1"
+APPLIANCE_RELEASE_SCHEMA_V2 = "cybex.james.appliance-release.v2"
 WORKSTATION_NETBOOT_SIGNATURE_DOMAIN = "CYBEX-JAMES-WORKSTATION-NETBOOT-V1"
 WORKSTATION_NETBOOT_SCHEMA = "cybex.james.workstation-netboot.v1"
 WORKSTATION_NETBOOT_MANIFEST_SCHEMA = "cybex.james.workstation-netboot-manifest.v1"
@@ -822,7 +824,14 @@ def _appliance_release_message(descriptor: dict[str, Any]) -> bytes:
     canonical = json.dumps(
         descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
-    return APPLIANCE_RELEASE_SIGNATURE_DOMAIN.encode() + b"\n" + canonical
+    schema = descriptor.get("schema")
+    if schema == APPLIANCE_RELEASE_SCHEMA_V1:
+        domain = APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V1
+    elif schema == APPLIANCE_RELEASE_SCHEMA_V2:
+        domain = APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V2
+    else:
+        _fail("appliance release schema is unsupported")
+    return domain.encode() + b"\n" + canonical
 
 
 def _appliance_release_inputs(
@@ -954,8 +963,17 @@ def _appliance_release_inputs(
         or metadata["expected_kernel"] != versions["linux-generic"]
     ):
         _fail("appliance required package versions are invalid")
+    source_revision = getattr(arguments, "appliance_source_revision", None)
+    if source_revision is not None:
+        source_revision = _validate_revision(
+            source_revision, "appliance source revision"
+        )
     descriptor = {
-        "schema": APPLIANCE_RELEASE_SCHEMA,
+        "schema": (
+            APPLIANCE_RELEASE_SCHEMA_V2
+            if source_revision is not None
+            else APPLIANCE_RELEASE_SCHEMA_V1
+        ),
         "release_id": version,
         "ubuntu_snapshot_id": metadata["ubuntu_snapshot_id"],
         "cybex_repository_snapshot": {
@@ -970,6 +988,8 @@ def _appliance_release_inputs(
         "rollback_compatible": True,
         "release_notes": notes_url,
     }
+    if source_revision is not None:
+        descriptor["source_revision"] = source_revision
     return descriptor, [
         (bundle, "appliance package snapshot"),
         (metadata_path, "appliance package snapshot metadata"),
@@ -1336,11 +1356,23 @@ def _validate_revision(value: str, label: str) -> str:
 
 def _workstation_netboot_message(descriptor: dict[str, Any]) -> bytes:
     components = descriptor["components"]
+    source_identity = ""
+    if "manage_source_sha256" in descriptor or "manage_source_size_bytes" in descriptor:
+        if not {
+            "manage_source_sha256",
+            "manage_source_size_bytes",
+        } <= descriptor.keys():
+            _fail("workstation netboot Manage source identity is incomplete")
+        source_identity = (
+            f"{descriptor['manage_source_size_bytes']}\n"
+            f"{descriptor['manage_source_sha256']}\n"
+        )
     return (
         f"{WORKSTATION_NETBOOT_SIGNATURE_DOMAIN}\n"
         f"{descriptor['runtime_version']}\n"
         f"{descriptor['manage_source_revision']}\n"
         f"{descriptor['nixpkgs_revision']}\n"
+        f"{source_identity}"
         f"{descriptor['architecture']}\n"
         f"{descriptor['format']}\n"
         f"{descriptor['required_james_protocol']}\n"
@@ -1359,7 +1391,7 @@ def _workstation_netboot_message(descriptor: dict[str, Any]) -> bytes:
 
 def _workstation_netboot_inputs(
     arguments: argparse.Namespace,
-) -> tuple[Path, Path, str, str, str, str] | None:
+) -> tuple[Path, Path, str, str, str, str, str | None, int | None] | None:
     values = (
         arguments.workstation_netboot_bundle,
         arguments.workstation_netboot_tree,
@@ -1385,6 +1417,23 @@ def _workstation_netboot_inputs(
         arguments.workstation_netboot_nixpkgs_revision,
         "workstation netboot nixpkgs revision",
     )
+    manage_source_sha256 = getattr(
+        arguments, "workstation_netboot_manage_source_sha256", None
+    )
+    manage_source_size_bytes = getattr(
+        arguments, "workstation_netboot_manage_source_size_bytes", None
+    )
+    if (manage_source_sha256 is None) != (manage_source_size_bytes is None):
+        _fail("workstation netboot Manage source digest and size must be supplied together")
+    if manage_source_sha256 is not None:
+        manage_source_sha256 = _require_sha256(
+            manage_source_sha256, "workstation netboot Manage source SHA-256"
+        )
+        manage_source_size_bytes = _require_positive_int(
+            manage_source_size_bytes,
+            "workstation netboot Manage source size",
+            maximum=MANAGE_SOURCE_ARCHIVE_MAX_BYTES,
+        )
     bundle = Path(arguments.workstation_netboot_bundle)
     expected_name = (
         f"cybex-workstation-netboot-{runtime_version}-{manage_revision[:12]}-"
@@ -1407,13 +1456,31 @@ def _workstation_netboot_inputs(
     expected_entries = {"manifest.json", *WORKSTATION_NETBOOT_COMPONENTS}
     if entries != expected_entries:
         _fail("workstation netboot tree must contain exactly the four release files")
-    return bundle, tree, url, runtime_version, manage_revision, nixpkgs_revision
+    return (
+        bundle,
+        tree,
+        url,
+        runtime_version,
+        manage_revision,
+        nixpkgs_revision,
+        manage_source_sha256,
+        manage_source_size_bytes,
+    )
 
 
 def _inspect_workstation_netboot(
-    inputs: tuple[Path, Path, str, str, str, str],
+    inputs: tuple[Path, Path, str, str, str, str, str | None, int | None],
 ) -> tuple[dict[str, Any], list[tuple[Path, str]]]:
-    bundle, tree, url, runtime_version, manage_revision, nixpkgs_revision = inputs
+    (
+        bundle,
+        tree,
+        url,
+        runtime_version,
+        manage_revision,
+        nixpkgs_revision,
+        manage_source_sha256,
+        manage_source_size_bytes,
+    ) = inputs
     bundle_sha256, bundle_size = _inspect_artifact(
         bundle,
         "workstation netboot bundle",
@@ -1531,6 +1598,9 @@ def _inspect_workstation_netboot(
         "manifest_sha256": hashlib.sha256(manifest_body).hexdigest(),
         "components": components,
     }
+    if manage_source_sha256 is not None and manage_source_size_bytes is not None:
+        descriptor["manage_source_sha256"] = manage_source_sha256
+        descriptor["manage_source_size_bytes"] = manage_source_size_bytes
     return descriptor, protected
 
 
@@ -2209,25 +2279,45 @@ def _release_manifest_artifact_identities(
 
     appliance_identity: dict[str, object] | None = None
     if "appliance_release_v1" in value:
+        appliance_value = value["appliance_release_v1"]
+        appliance_fields = {
+            "schema",
+            "release_id",
+            "ubuntu_snapshot_id",
+            "cybex_repository_snapshot",
+            "required_package_versions",
+            "expected_kernel",
+            "minimum_protocol",
+            "minimum_state_schema",
+            "rollback_compatible",
+            "release_notes",
+            "signature",
+        }
+        if isinstance(appliance_value, dict) and "source_revision" in appliance_value:
+            appliance_fields.add("source_revision")
         appliance = _require_exact_object_keys(
-            value["appliance_release_v1"],
-            {
-                "schema",
-                "release_id",
-                "ubuntu_snapshot_id",
-                "cybex_repository_snapshot",
-                "required_package_versions",
-                "expected_kernel",
-                "minimum_protocol",
-                "minimum_state_schema",
-                "rollback_compatible",
-                "release_notes",
-                "signature",
-            },
+            appliance_value,
+            appliance_fields,
             "appliance release descriptor",
         )
+        source_revision = appliance.get("source_revision")
         if (
-            appliance["schema"] != APPLIANCE_RELEASE_SCHEMA
+            (
+                appliance["schema"] == APPLIANCE_RELEASE_SCHEMA_V1
+                and source_revision is not None
+            )
+            or (
+                appliance["schema"] == APPLIANCE_RELEASE_SCHEMA_V2
+                and (
+                    not isinstance(source_revision, str)
+                    or _validate_revision(
+                        source_revision, "appliance source revision"
+                    )
+                    != source_revision
+                )
+            )
+            or appliance["schema"]
+            not in {APPLIANCE_RELEASE_SCHEMA_V1, APPLIANCE_RELEASE_SCHEMA_V2}
             or appliance["release_id"] != version
             or appliance["minimum_protocol"] != WORKSTATION_NETBOOT_REQUIRED_JAMES_PROTOCOL
             or appliance["minimum_state_schema"] != 2
@@ -2280,23 +2370,32 @@ def _release_manifest_artifact_identities(
 
     workstation_identity: dict[str, object] | None = None
     if "workstation_netboot" in value:
+        workstation_value = value["workstation_netboot"]
+        workstation_fields = {
+            "schema",
+            "runtime_version",
+            "manage_source_revision",
+            "nixpkgs_revision",
+            "architecture",
+            "format",
+            "required_james_protocol",
+            "url",
+            "sha256",
+            "size_bytes",
+            "manifest_sha256",
+            "components",
+            "signature",
+        }
+        if isinstance(workstation_value, dict) and (
+            "manage_source_sha256" in workstation_value
+            or "manage_source_size_bytes" in workstation_value
+        ):
+            workstation_fields.update(
+                {"manage_source_sha256", "manage_source_size_bytes"}
+            )
         workstation = _require_exact_object_keys(
-            value["workstation_netboot"],
-            {
-                "schema",
-                "runtime_version",
-                "manage_source_revision",
-                "nixpkgs_revision",
-                "architecture",
-                "format",
-                "required_james_protocol",
-                "url",
-                "sha256",
-                "size_bytes",
-                "manifest_sha256",
-                "components",
-                "signature",
-            },
+            workstation_value,
+            workstation_fields,
             "workstation netboot descriptor",
         )
         if (
@@ -2319,6 +2418,16 @@ def _release_manifest_artifact_identities(
             workstation["nixpkgs_revision"],
             "workstation netboot nixpkgs revision",
         )
+        if "manage_source_sha256" in workstation:
+            _require_sha256(
+                workstation["manage_source_sha256"],
+                "workstation netboot Manage source SHA-256",
+            )
+            _require_positive_int(
+                workstation["manage_source_size_bytes"],
+                "workstation netboot Manage source size",
+                maximum=MANAGE_SOURCE_ARCHIVE_MAX_BYTES,
+            )
         if not isinstance(workstation["url"], str):
             _fail("workstation netboot URL must be a string")
         workstation_url = _validate_url(
@@ -3035,26 +3144,44 @@ def _verify_command(arguments: argparse.Namespace) -> None:
     appliance_snapshot_sha = None
     packaged_manage_source: dict[str, object] | None = None
     if verify_appliance_release:
+        descriptor_value = manifest["appliance_release_v1"]
+        appliance_fields = {
+            "schema",
+            "release_id",
+            "ubuntu_snapshot_id",
+            "cybex_repository_snapshot",
+            "required_package_versions",
+            "expected_kernel",
+            "minimum_protocol",
+            "minimum_state_schema",
+            "rollback_compatible",
+            "release_notes",
+            "signature",
+        }
+        if isinstance(descriptor_value, dict) and "source_revision" in descriptor_value:
+            appliance_fields.add("source_revision")
         descriptor = _require_exact_object_keys(
-            manifest["appliance_release_v1"],
-            {
-                "schema",
-                "release_id",
-                "ubuntu_snapshot_id",
-                "cybex_repository_snapshot",
-                "required_package_versions",
-                "expected_kernel",
-                "minimum_protocol",
-                "minimum_state_schema",
-                "rollback_compatible",
-                "release_notes",
-                "signature",
-            },
+            descriptor_value,
+            appliance_fields,
             "appliance release descriptor",
         )
         signature_text = descriptor.pop("signature")
+        source_revision = descriptor.get("source_revision")
         if (
-            descriptor["schema"] != APPLIANCE_RELEASE_SCHEMA
+            (
+                descriptor["schema"] == APPLIANCE_RELEASE_SCHEMA_V1
+                and source_revision is not None
+            )
+            or (
+                descriptor["schema"] == APPLIANCE_RELEASE_SCHEMA_V2
+                and (
+                    not isinstance(source_revision, str)
+                    or _validate_revision(source_revision, "appliance source revision")
+                    != source_revision
+                )
+            )
+            or descriptor["schema"]
+            not in {APPLIANCE_RELEASE_SCHEMA_V1, APPLIANCE_RELEASE_SCHEMA_V2}
             or descriptor["release_id"] != version
             or descriptor["minimum_protocol"] != 4
             or descriptor["minimum_state_schema"] != 2
@@ -3095,6 +3222,7 @@ def _verify_command(arguments: argparse.Namespace) -> None:
                 ),
                 appliance_package_snapshot_url=snapshot_url,
                 expected_manage_origin=arguments.expected_manage_origin,
+                appliance_source_revision=source_revision,
                 workstation_netboot_manage_revision=(
                     manifest.get("workstation_netboot", {}).get(
                         "manage_source_revision"
@@ -3128,23 +3256,32 @@ def _verify_command(arguments: argparse.Namespace) -> None:
         appliance_snapshot_sha = actual_snapshot_sha
     workstation_sha = None
     if verify_workstation_netboot:
+        descriptor_value = manifest["workstation_netboot"]
+        workstation_fields = {
+            "schema",
+            "runtime_version",
+            "manage_source_revision",
+            "nixpkgs_revision",
+            "architecture",
+            "format",
+            "required_james_protocol",
+            "url",
+            "sha256",
+            "size_bytes",
+            "manifest_sha256",
+            "components",
+            "signature",
+        }
+        if isinstance(descriptor_value, dict) and (
+            "manage_source_sha256" in descriptor_value
+            or "manage_source_size_bytes" in descriptor_value
+        ):
+            workstation_fields.update(
+                {"manage_source_sha256", "manage_source_size_bytes"}
+            )
         descriptor = _require_exact_object_keys(
-            manifest["workstation_netboot"],
-            {
-                "schema",
-                "runtime_version",
-                "manage_source_revision",
-                "nixpkgs_revision",
-                "architecture",
-                "format",
-                "required_james_protocol",
-                "url",
-                "sha256",
-                "size_bytes",
-                "manifest_sha256",
-                "components",
-                "signature",
-            },
+            descriptor_value,
+            workstation_fields,
             "workstation netboot descriptor",
         )
         signature_text = descriptor.pop("signature")
@@ -3155,6 +3292,12 @@ def _verify_command(arguments: argparse.Namespace) -> None:
             workstation_netboot_runtime_version=descriptor["runtime_version"],
             workstation_netboot_manage_revision=descriptor["manage_source_revision"],
             workstation_netboot_nixpkgs_revision=descriptor["nixpkgs_revision"],
+            workstation_netboot_manage_source_sha256=descriptor.get(
+                "manage_source_sha256"
+            ),
+            workstation_netboot_manage_source_size_bytes=descriptor.get(
+                "manage_source_size_bytes"
+            ),
         )
         inputs = _workstation_netboot_inputs(inspection_arguments)
         if inputs is None:
@@ -3270,6 +3413,10 @@ def _parser() -> argparse.ArgumentParser:
         help="exact immutable HTTP(S) URL for --appliance-package-snapshot",
     )
     manifest.add_argument(
+        "--appliance-source-revision",
+        help="exact lowercase 40-hex James source revision; selects appliance release V2",
+    )
+    manifest.add_argument(
         "--workstation-netboot-bundle",
         help="optional deterministic workstation netboot tar.zst; requires all workstation-netboot options",
     )
@@ -3292,6 +3439,15 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument(
         "--workstation-netboot-nixpkgs-revision",
         help="exact lowercase 40-hex nixpkgs revision",
+    )
+    manifest.add_argument(
+        "--workstation-netboot-manage-source-sha256",
+        help="SHA-256 of the exact packaged Manage source archive",
+    )
+    manifest.add_argument(
+        "--workstation-netboot-manage-source-size-bytes",
+        type=int,
+        help="size of the exact packaged Manage source archive",
     )
     manifest.add_argument(
         "--published-at",
@@ -3442,6 +3598,10 @@ def _parser() -> argparse.ArgumentParser:
     inspect_netboot.add_argument("--workstation-netboot-runtime-version", required=True)
     inspect_netboot.add_argument("--workstation-netboot-manage-revision", required=True)
     inspect_netboot.add_argument("--workstation-netboot-nixpkgs-revision", required=True)
+    inspect_netboot.add_argument("--workstation-netboot-manage-source-sha256")
+    inspect_netboot.add_argument(
+        "--workstation-netboot-manage-source-size-bytes", type=int
+    )
     inspect_netboot.set_defaults(handler=_inspect_workstation_netboot_command)
 
     verify = commands.add_parser(

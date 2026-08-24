@@ -88,6 +88,7 @@ NETPLAN_APPLY = (
 )
 NETPLAN_ACTIVATE = NETPLAN_APPLY.with_name("cybex-james-netplan-activate")
 BUILD_TEMPLATE = REPOSITORY / "ubuntu-appliance" / "build-template.sh"
+AUTOINSTALL_USER_DATA = REPOSITORY / "ubuntu-appliance" / "nocloud" / "user-data"
 GRUB_THEME = REPOSITORY / "ubuntu-appliance" / "grub-theme" / "theme.txt"
 BUILD_PACKAGE_SNAPSHOT = (
     REPOSITORY / "ubuntu-appliance" / "build-package-snapshot.sh"
@@ -548,6 +549,23 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
                 pxe_nginx,
             )
             self.assertIn(
+                'location ~ "^/manage-source/(?<source_file>[0-9a-f]{40}\\.(?:tar|json))$" {',
+                pxe_nginx,
+            )
+            self.assertIn(
+                "alias /usr/share/cybex-james/manage-source/$source_file;",
+                pxe_nginx,
+            )
+            self.assertIn("limit_except GET { deny all; }", pxe_nginx)
+            self.assertNotIn(
+                "location /manage-source/",
+                pxe_nginx,
+            )
+            self.assertNotIn(
+                "alias /usr/share/cybex-james/manage-source/;",
+                pxe_nginx,
+            )
+            self.assertIn(
                 "10-netplan-cybex-james.network",
                 packaged_netplan_activate.read_text(encoding="utf-8"),
             )
@@ -781,6 +799,12 @@ class ApplianceFirstBootContractTests(unittest.TestCase):
         self.assertIn('set theme=/boot/grub/themes/cybex-james/theme.txt', template)
         self.assertIn('assets/pxe-menu.png', template)
         self.assertTrue(GRUB_THEME.is_file())
+
+        console_arguments = "console=ttyS0,115200n8 console=tty0"
+        self.assertIn(console_arguments, template)
+        self.assertNotIn("console=tty0 console=ttyS0,115200n8", template)
+        user_data = AUTOINSTALL_USER_DATA.read_text(encoding="utf-8")
+        self.assertIn("/dev/tty0 /dev/ttyS0", user_data)
 
         snapshot = BUILD_PACKAGE_SNAPSHOT.read_text(encoding="utf-8")
         self.assertIn("build-offline-repo.sh", snapshot)
@@ -1758,6 +1782,14 @@ printf '%s:%s\\n' "$appliance_state" "$non_ready_checks"
             ),
             2,
         )
+        self.assertEqual(autoexec.count("set cybex-local-handoff 0"), 2)
+        self.assertEqual(
+            autoexec.count(
+                "iseq ${cybex-local-handoff} 1 && goto cybex_local_handoff"
+            ),
+            2,
+        )
+        self.assertIn(":cybex_local_handoff\nexit 1", autoexec)
         self.assertIn("isset ${next-server}", autoexec)
         self.assertIn("isset ${net0/mac}", autoexec)
         self.assertNotIn("organization", autoexec)

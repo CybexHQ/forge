@@ -404,7 +404,10 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains("sanboot --drive 0 || goto known_menu"));
+        assert!(body.contains(
+            ":known_local_efi\nsanboot --no-describe --drive 0x80 || goto known_local_efi_handoff\ngoto end\n:known_local_efi_handoff\necho Returning control to UEFI for the next boot entry\nset cybex-local-handoff 1\nexit 1"
+        ));
+        assert!(!body.contains("sanboot --drive 0"));
         assert!(body.contains("item profile_"));
         assert!(body.contains("Default Enrollment"));
     }

@@ -34,7 +34,14 @@ use crate::{
 const BLUEPRINT_BUILD_INPUT_KIND: &str = "blueprint_nixos_module";
 const LEGACY_DESKTOP_EXPERIENCE_BUILD_INPUT_KIND: &str = "desktop_experience_nixos_module";
 const INSTALLER_TARGET_BUILD_INPUT_KIND: &str = "installer_target_nixos_module";
-const INSTALLER_TARGET_BUILD_SCHEMA: &str = "cybex.installer-target.build.v1";
+const INSTALLER_TARGET_BUILD_SCHEMA_V1: &str = "cybex.installer-target.build.v1";
+const INSTALLER_TARGET_BUILD_SCHEMA: &str = "cybex.installer-target.build.v2";
+/// Device-agnostic cohort identity: the closure is a function of the Blueprint
+/// revision artifact, the hardware module, the target module, the Manage source
+/// revision, and the nixpkgs pin only. Manage reuses the verified closure for
+/// every approval with the same inputs, so the identity must not name a
+/// device, preparation, disk, or boot session.
+const INSTALLER_TARGET_BUILD_SCHEMA_V3: &str = "cybex.installer-target.build.v3";
 const MAX_GENERATED_NIX_BYTES: usize = 1024 * 1024;
 const MAX_DESKTOP_MODULE_NIX_BYTES: usize = 1024 * 1024;
 const MAX_HARDWARE_MODULE_NIX_BYTES: usize = 1024 * 1024;
@@ -142,6 +149,22 @@ pub struct BlueprintBuildInput {
     pub manage_source_revision: Option<String>,
     #[serde(default)]
     pub installer_target: Option<Value>,
+    #[serde(default)]
+    pub wallpaper_asset: Option<BlueprintWallpaperAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlueprintWallpaperAsset {
+    pub schema: String,
+    pub id: String,
+    pub blueprint_revision_id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -173,12 +196,14 @@ struct ValidatedBlueprintBuildInput {
     target_module_nix: Option<String>,
     manage_source_revision: Option<String>,
     installer_target: Option<Value>,
+    wallpaper_asset: Option<BlueprintWallpaperAsset>,
 }
 
 #[derive(Clone, Debug)]
 struct NixBuildCommand {
     program: String,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     out_link: PathBuf,
     installable: String,
 }
@@ -978,6 +1003,11 @@ fn validate_installer_target_build_binding(
     {
         bail!("installer target provenance fields do not match");
     }
+    if identity.get("schema").and_then(Value::as_str) == Some(INSTALLER_TARGET_BUILD_SCHEMA_V3)
+        && blueprint_revision_config_hash != Some(identity_text("blueprint_revision_config_hash")?)
+    {
+        bail!("installer target provenance fields do not match");
+    }
     Ok(())
 }
 
@@ -1122,6 +1152,12 @@ fn validate_blueprint_build_input(
                 .as_ref()
                 .ok_or_else(|| anyhow!("installer target identity is required"))?,
             manage_source_revision,
+            InstallerTargetModuleDigests {
+                generated_nix: &input.generated_nix,
+                expected_state: input.expected_state.as_ref(),
+                hardware_module_nix,
+                target_module_nix,
+            },
         )?;
         let expected_revision = input
             .expected_state
@@ -1150,6 +1186,10 @@ fn validate_blueprint_build_input(
     {
         bail!("installer target fields require installer_target_nixos_module");
     }
+    let wallpaper_asset = input
+        .wallpaper_asset
+        .map(validate_blueprint_wallpaper_asset)
+        .transpose()?;
     Ok(ValidatedBlueprintBuildInput {
         kind: kind.to_string(),
         generated_nix: input.generated_nix,
@@ -1164,7 +1204,69 @@ fn validate_blueprint_build_input(
         target_module_nix: input.target_module_nix,
         manage_source_revision: input.manage_source_revision,
         installer_target: input.installer_target,
+        wallpaper_asset,
     })
+}
+
+pub(crate) fn validate_blueprint_wallpaper_asset(
+    mut asset: BlueprintWallpaperAsset,
+) -> Result<BlueprintWallpaperAsset> {
+    if asset.schema != "cybex.blueprint-wallpaper.v1" {
+        bail!("build_input.wallpaper_asset has an unsupported schema");
+    }
+    asset.id = normalize_optional_uuidish("wallpaper_asset.id", &asset.id)?;
+    asset.blueprint_revision_id = normalize_optional_uuidish(
+        "wallpaper_asset.blueprint_revision_id",
+        &asset.blueprint_revision_id,
+    )?;
+    asset.sha256 = normalize_sha256(&asset.sha256)?;
+    asset.name = bounded_metadata_text(&asset.name, 160);
+    if asset.name.is_empty() {
+        bail!("build_input.wallpaper_asset.name is required");
+    }
+    if asset.mime_type != "image/jpeg" {
+        bail!("build_input.wallpaper_asset must be image/jpeg");
+    }
+    if asset.size_bytes == 0 || asset.size_bytes > 4 * 1024 * 1024 {
+        bail!("build_input.wallpaper_asset size is invalid");
+    }
+    if asset.width == 0 || asset.height == 0 || asset.width > 3840 || asset.height > 2160 {
+        bail!("build_input.wallpaper_asset dimensions are invalid");
+    }
+    Ok(asset)
+}
+
+pub(crate) fn wallpaper_asset_cache_path(config: &AppConfig, sha256: &str) -> Result<PathBuf> {
+    let sha256 = normalize_sha256(sha256)?;
+    Ok(config
+        .build
+        .work_dir
+        .join("wallpaper-assets")
+        .join(format!("{sha256}.jpg")))
+}
+
+fn verify_cached_wallpaper_asset(
+    config: &AppConfig,
+    asset: &BlueprintWallpaperAsset,
+) -> Result<PathBuf> {
+    let path = wallpaper_asset_cache_path(config, &asset.sha256)?;
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect Blueprint wallpaper asset {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != asset.size_bytes
+    {
+        bail!("cached Blueprint wallpaper asset has an invalid file identity");
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("read Blueprint wallpaper asset {}", path.display()))?;
+    if !bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || !bytes.ends_with(&[0xff, 0xd9])
+        || hex::encode(Sha256::digest(&bytes)) != asset.sha256
+    {
+        bail!("cached Blueprint wallpaper asset failed its integrity check");
+    }
+    Ok(path)
 }
 
 fn validate_bounded_nix_input(field: &str, value: &str, max_bytes: usize) -> Result<()> {
@@ -1182,11 +1284,121 @@ fn validate_bounded_nix_input(field: &str, value: &str, max_bytes: usize) -> Res
     Ok(())
 }
 
-fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> Result<()> {
+struct InstallerTargetModuleDigests<'a> {
+    generated_nix: &'a str,
+    expected_state: Option<&'a Value>,
+    hardware_module_nix: &'a str,
+    target_module_nix: &'a str,
+}
+
+fn sha256_hex_text(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// v3: every digest in the identity must match the module text James actually
+/// evaluates, so a reported identity is proof of the exact closure inputs.
+fn validate_installer_target_cohort_identity(
+    object: &serde_json::Map<String, Value>,
+    manage_revision: &str,
+    digests: InstallerTargetModuleDigests<'_>,
+) -> Result<()> {
+    let expected = [
+        "schema",
+        "blueprint_id",
+        "blueprint_revision_id",
+        "blueprint_revision_config_hash",
+        "generated_nix_sha256",
+        "expected_state_sha256",
+        "hardware_driver_policy",
+        "hardware_module_sha256",
+        "target_module_sha256",
+        "manage_source_revision",
+        "nixpkgs_revision",
+        "source_lock_sha256",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let actual = object.keys().map(String::as_str).collect::<HashSet<_>>();
+    if actual != expected {
+        bail!("installer_target does not match its schema");
+    }
+    for field in ["blueprint_id", "blueprint_revision_id"] {
+        normalize_canonical_uuid(
+            field,
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("installer_target.{field} is required"))?,
+        )?;
+    }
+    let text = |field: &str| -> Result<&str> {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("installer_target.{field} is required"))
+    };
+    for field in [
+        "blueprint_revision_config_hash",
+        "generated_nix_sha256",
+        "expected_state_sha256",
+        "hardware_module_sha256",
+        "target_module_sha256",
+        "source_lock_sha256",
+    ] {
+        normalize_sha256(text(field)?)
+            .with_context(|| format!("normalize installer_target.{field}"))?;
+    }
+    if text("generated_nix_sha256")? != sha256_hex_text(digests.generated_nix) {
+        bail!("installer_target.generated_nix_sha256 does not match the Blueprint module");
+    }
+    if text("hardware_module_sha256")? != sha256_hex_text(digests.hardware_module_nix) {
+        bail!("installer_target.hardware_module_sha256 does not match the hardware module");
+    }
+    if text("target_module_sha256")? != sha256_hex_text(digests.target_module_nix) {
+        bail!("installer_target.target_module_sha256 does not match the target module");
+    }
+    let expected_state = digests
+        .expected_state
+        .ok_or_else(|| anyhow!("installer target expected state is required"))?;
+    if text("expected_state_sha256")? != canonical_json_sha256(expected_state)? {
+        bail!("installer_target.expected_state_sha256 does not match the expected state");
+    }
+    if normalize_nixpkgs_commit(text("manage_source_revision")?)? != manage_revision {
+        bail!("installer target Manage revision fields do not match");
+    }
+    normalize_nixpkgs_commit(text("nixpkgs_revision")?)?;
+    let policy = text("hardware_driver_policy")?;
+    if !matches!(
+        policy,
+        "auto" | "open_graphics" | "nvidia_open" | "nvidia_proprietary" | "disabled"
+    ) {
+        bail!("installer_target.hardware_driver_policy is invalid");
+    }
+    Ok(())
+}
+
+fn validate_installer_target_identity(
+    value: &Value,
+    manage_revision: &str,
+    digests: InstallerTargetModuleDigests<'_>,
+) -> Result<()> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("installer_target must be an object"))?;
-    let expected = [
+    let schema = object
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("installer_target.schema is required"))?;
+    if schema == INSTALLER_TARGET_BUILD_SCHEMA_V3 {
+        return validate_installer_target_cohort_identity(object, manage_revision, digests);
+    }
+    if !matches!(
+        schema,
+        INSTALLER_TARGET_BUILD_SCHEMA_V1 | INSTALLER_TARGET_BUILD_SCHEMA
+    ) {
+        bail!("unsupported installer_target schema");
+    }
+    let mut expected = [
         "schema",
         "preparation_id",
         "device_id",
@@ -1207,12 +1419,19 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
     ]
     .into_iter()
     .collect::<HashSet<_>>();
+    // v1 shipped before frozen execution configuration was part of the build
+    // identity. Accept its original exact shape and the briefly emitted
+    // additive shape so retained jobs remain retryable across rolling
+    // upgrades. Every newly issued v2 identity must carry the hash.
+    if schema == INSTALLER_TARGET_BUILD_SCHEMA
+        || (schema == INSTALLER_TARGET_BUILD_SCHEMA_V1
+            && object.contains_key("effective_config_sha256"))
+    {
+        expected.insert("effective_config_sha256");
+    }
     let actual = object.keys().map(String::as_str).collect::<HashSet<_>>();
     if actual != expected {
         bail!("installer_target does not match its schema");
-    }
-    if object.get("schema").and_then(Value::as_str) != Some(INSTALLER_TARGET_BUILD_SCHEMA) {
-        bail!("unsupported installer_target schema");
     }
     for field in [
         "preparation_id",
@@ -1269,6 +1488,13 @@ fn validate_installer_target_identity(value: &Value, manage_revision: &str) -> R
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("installer_target.{field} is required"))?,
         )?;
+    }
+    if let Some(effective_config_sha256) = object.get("effective_config_sha256") {
+        let effective_config_sha256 = effective_config_sha256.as_str().ok_or_else(|| {
+            anyhow!("installer_target.effective_config_sha256 must be a SHA-256 string")
+        })?;
+        normalize_sha256(effective_config_sha256)
+            .context("normalize installer_target.effective_config_sha256")?;
     }
     let identity_manage_revision = object
         .get("manage_source_revision")
@@ -1949,6 +2175,9 @@ async fn preflight_source_build_check_in_store(
         "--dry-run".to_string(),
         "--no-write-lock-file".to_string(),
     ]);
+    if command.args.iter().any(|arg| arg == "--impure") {
+        args.push("--impure".to_string());
+    }
     if let Some(position) = command.args.iter().position(|arg| arg == "--system") {
         if let Some(system) = command.args.get(position + 1) {
             args.extend(["--system".to_string(), system.clone()]);
@@ -1957,6 +2186,7 @@ async fn preflight_source_build_check_in_store(
     let mut dry_run = crate::nix_command::tokio_command(&command.program);
     dry_run
         .args(&args)
+        .envs(command.env.iter().map(|(key, value)| (key, value)))
         .current_dir(&config.build.work_dir)
         .env("LC_ALL", "C")
         .env("LANG", "C");
@@ -4700,6 +4930,7 @@ fn nix_build_command(
     Ok(NixBuildCommand {
         program: config.build.nix_binary.clone(),
         args,
+        env: Vec::new(),
         out_link,
         installable,
     })
@@ -4837,9 +5068,19 @@ fn blueprint_nix_build_command(
         "internal-json".to_string(),
         "--no-write-lock-file".to_string(),
     ]);
+    let mut env = Vec::new();
+    if let Some(asset) = build_input.wallpaper_asset.as_ref() {
+        let wallpaper_path = verify_cached_wallpaper_asset(config, asset)?;
+        args.push("--impure".to_string());
+        env.push((
+            "CYBEX_BLUEPRINT_WALLPAPER_PATH".to_string(),
+            wallpaper_path.display().to_string(),
+        ));
+    }
     Ok(NixBuildCommand {
         program: config.build.nix_binary.clone(),
         args,
+        env,
         out_link,
         installable,
     })
@@ -5104,6 +5345,7 @@ async fn run_nix_build(
         })?;
     let mut child = crate::nix_command::tokio_command(&command.program)
         .args(&command.args)
+        .envs(command.env.iter().map(|(key, value)| (key, value)))
         .current_dir(&config.build.work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5653,7 +5895,8 @@ esac
             "reinstall_request_id": null,
             "manage_source_revision": "4".repeat(40),
             "nixpkgs_revision": "5".repeat(40),
-            "source_lock_sha256": "66".repeat(32)
+            "source_lock_sha256": "66".repeat(32),
+            "effective_config_sha256": "77".repeat(32)
         })
     }
 
@@ -5796,41 +6039,218 @@ esac
         assert!(validate_build_spec(&config, &wrong_build_input_hash).is_err());
     }
 
+    fn legacy_identity_digests() -> InstallerTargetModuleDigests<'static> {
+        InstallerTargetModuleDigests {
+            generated_nix: "",
+            expected_state: None,
+            hardware_module_nix: "",
+            target_module_nix: "",
+        }
+    }
+
+    fn valid_cohort_identity(
+        generated_nix: &str,
+        expected_state: &Value,
+        hardware_module_nix: &str,
+        target_module_nix: &str,
+    ) -> Value {
+        json!({
+            "schema": INSTALLER_TARGET_BUILD_SCHEMA_V3,
+            "blueprint_id": "00000000-0000-4000-8000-000000000003",
+            "blueprint_revision_id": "00000000-0000-4000-8000-000000000004",
+            "blueprint_revision_config_hash": "7".repeat(64),
+            "generated_nix_sha256": sha256_hex_text(generated_nix),
+            "expected_state_sha256": canonical_json_sha256(expected_state).unwrap(),
+            "hardware_driver_policy": "auto",
+            "hardware_module_sha256": sha256_hex_text(hardware_module_nix),
+            "target_module_sha256": sha256_hex_text(target_module_nix),
+            "manage_source_revision": "4".repeat(40),
+            "nixpkgs_revision": "5".repeat(40),
+            "source_lock_sha256": "6".repeat(64),
+        })
+    }
+
+    #[test]
+    fn installer_target_cohort_identity_binds_every_module_digest() {
+        let config = AppConfig::default();
+        let mut job = valid_installer_target_build_job();
+        let build_input = job.build_spec["build_input"].clone();
+        let identity = valid_cohort_identity(
+            build_input["generated_nix"].as_str().unwrap(),
+            &build_input["expected_state"],
+            build_input["hardware_module_nix"].as_str().unwrap(),
+            build_input["target_module_nix"].as_str().unwrap(),
+        );
+        job.build_spec["build_input"]["installer_target"] = identity.clone();
+        refresh_installer_target_input_hash(&mut job);
+        validate_build_spec(&config, &job).unwrap();
+
+        for field in [
+            "generated_nix_sha256",
+            "expected_state_sha256",
+            "hardware_module_sha256",
+            "target_module_sha256",
+            "blueprint_revision_config_hash",
+        ] {
+            let mut changed = job.clone();
+            changed.build_spec["build_input"]["installer_target"][field] = json!("9".repeat(64));
+            refresh_installer_target_input_hash(&mut changed);
+            assert!(validate_build_spec(&config, &changed).is_err(), "{field}");
+        }
+        for forbidden in ["device_id", "preparation_id", "device_incarnation_id"] {
+            let mut changed = job.clone();
+            changed.build_spec["build_input"]["installer_target"][forbidden] = json!("x");
+            refresh_installer_target_input_hash(&mut changed);
+            assert!(
+                validate_build_spec(&config, &changed).is_err(),
+                "{forbidden}"
+            );
+        }
+        let mut wrong_manage = job.clone();
+        wrong_manage.build_spec["build_input"]["installer_target"]["manage_source_revision"] =
+            json!("8".repeat(40));
+        refresh_installer_target_input_hash(&mut wrong_manage);
+        assert!(validate_build_spec(&config, &wrong_manage).is_err());
+    }
+
     #[test]
     fn installer_target_identity_is_exact_and_bound_to_manage_source() {
         let valid = valid_installer_target_identity();
-        validate_installer_target_identity(&valid, &"4".repeat(40)).unwrap();
+        validate_installer_target_identity(&valid, &"4".repeat(40), legacy_identity_digests())
+            .unwrap();
+
+        let mut legacy = valid.clone();
+        legacy["schema"] = json!(INSTALLER_TARGET_BUILD_SCHEMA_V1);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_config_sha256");
+        validate_installer_target_identity(&legacy, &"4".repeat(40), legacy_identity_digests())
+            .unwrap();
+
+        let mut transitional = valid.clone();
+        transitional["schema"] = json!(INSTALLER_TARGET_BUILD_SCHEMA_V1);
+        validate_installer_target_identity(
+            &transitional,
+            &"4".repeat(40),
+            legacy_identity_digests(),
+        )
+        .unwrap();
+
+        let mut incomplete_v2 = valid.clone();
+        incomplete_v2
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_config_sha256");
+        assert!(
+            validate_installer_target_identity(
+                &incomplete_v2,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .is_err()
+        );
+
+        let mut invalid_effective_config = valid.clone();
+        invalid_effective_config["effective_config_sha256"] = json!("not-a-sha256");
+        assert!(
+            validate_installer_target_identity(
+                &invalid_effective_config,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .is_err()
+        );
+
+        let mut non_string_effective_config = valid.clone();
+        non_string_effective_config["effective_config_sha256"] = Value::Null;
+        assert!(
+            validate_installer_target_identity(
+                &non_string_effective_config,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .is_err()
+        );
 
         let mut wrong_manage = valid.clone();
         wrong_manage["manage_source_revision"] = json!("7".repeat(40));
         assert!(
-            validate_installer_target_identity(&wrong_manage, &"4".repeat(40))
-                .unwrap_err()
-                .to_string()
-                .contains("Manage revision fields do not match")
+            validate_installer_target_identity(
+                &wrong_manage,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Manage revision fields do not match")
         );
 
         let mut one_sided_reinstall = valid.clone();
         one_sided_reinstall["managed_device_id"] = json!("device_1");
         assert!(
-            validate_installer_target_identity(&one_sided_reinstall, &"4".repeat(40))
-                .unwrap_err()
-                .to_string()
-                .contains("reinstall bindings")
+            validate_installer_target_identity(
+                &one_sided_reinstall,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("reinstall bindings")
         );
 
         let mut unknown = valid;
         unknown["unexpected"] = json!(true);
         assert!(
-            validate_installer_target_identity(&unknown, &"4".repeat(40))
-                .unwrap_err()
-                .to_string()
-                .contains("does not match its schema")
+            validate_installer_target_identity(
+                &unknown,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its schema")
         );
 
         let mut noncanonical_uuid = valid_installer_target_identity();
         noncanonical_uuid["preparation_id"] = json!("00000000000040008000000000000001");
-        assert!(validate_installer_target_identity(&noncanonical_uuid, &"4".repeat(40)).is_err());
+        assert!(
+            validate_installer_target_identity(
+                &noncanonical_uuid,
+                &"4".repeat(40),
+                legacy_identity_digests()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn installer_target_build_accepts_retained_v1_jobs_but_requires_v2_execution_hash() {
+        let config = AppConfig::default();
+
+        let mut legacy = valid_installer_target_build_job();
+        legacy.build_spec["build_input"]["installer_target"]["schema"] =
+            json!(INSTALLER_TARGET_BUILD_SCHEMA_V1);
+        legacy.build_spec["build_input"]["installer_target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_config_sha256");
+        refresh_installer_target_input_hash(&mut legacy);
+        validate_build_spec(&config, &legacy).unwrap();
+
+        let mut transitional = valid_installer_target_build_job();
+        transitional.build_spec["build_input"]["installer_target"]["schema"] =
+            json!(INSTALLER_TARGET_BUILD_SCHEMA_V1);
+        refresh_installer_target_input_hash(&mut transitional);
+        validate_build_spec(&config, &transitional).unwrap();
+
+        let mut incomplete_v2 = valid_installer_target_build_job();
+        incomplete_v2.build_spec["build_input"]["installer_target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_config_sha256");
+        refresh_installer_target_input_hash(&mut incomplete_v2);
+        assert!(validate_build_spec(&config, &incomplete_v2).is_err());
     }
 
     fn import_from_derivation_is_disabled(args: &[String]) -> bool {
@@ -6126,6 +6546,35 @@ sleep 5
     }
 
     #[test]
+    fn blueprint_wallpaper_descriptor_is_exact_bounded_jpeg_metadata() {
+        let asset = BlueprintWallpaperAsset {
+            schema: "cybex.blueprint-wallpaper.v1".to_string(),
+            id: "c1ba1e3e-5cb6-4ad3-bf92-47534e9e79e8".to_string(),
+            blueprint_revision_id: "b1c5c356-9c4a-48d9-96a7-8a05c468c027".to_string(),
+            name: "Office wall".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 4096,
+            width: 1920,
+            height: 1080,
+        };
+        let validated = validate_blueprint_wallpaper_asset(asset.clone()).unwrap();
+        assert_eq!(validated.mime_type, "image/jpeg");
+
+        let mut png = asset.clone();
+        png.mime_type = "image/png".to_string();
+        assert!(validate_blueprint_wallpaper_asset(png).is_err());
+
+        let mut oversized = asset.clone();
+        oversized.size_bytes = 4 * 1024 * 1024 + 1;
+        assert!(validate_blueprint_wallpaper_asset(oversized).is_err());
+
+        let mut mismatched_dimensions = asset;
+        mismatched_dimensions.width = 3841;
+        assert!(validate_blueprint_wallpaper_asset(mismatched_dimensions).is_err());
+    }
+
+    #[test]
     fn installer_target_build_input_accepts_exact_local_account_reference_contract() {
         let revision = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
         let profile_generation = "b".repeat(64);
@@ -6174,6 +6623,7 @@ sleep 5
             target_module_nix: Some("{ ... }: {}".to_string()),
             manage_source_revision: Some("4".repeat(40)),
             installer_target: Some(valid_installer_target_identity()),
+            wallpaper_asset: None,
         })
         .unwrap();
 
@@ -6194,6 +6644,7 @@ sleep 5
             target_module_nix: None,
             manage_source_revision: None,
             installer_target: None,
+            wallpaper_asset: None,
         };
 
         let err = validate_blueprint_build_input(input).unwrap_err();
@@ -6317,6 +6768,7 @@ sleep 5
                 target_module_nix: None,
                 manage_source_revision: None,
                 installer_target: None,
+                wallpaper_asset: None,
             }),
             allow_source_builds: false,
         };
@@ -7957,6 +8409,7 @@ esac
         let command = NixBuildCommand {
             program: fake_nix.display().to_string(),
             args: Vec::new(),
+            env: Vec::new(),
             out_link: root.join("result"),
             installable: ".#test".to_string(),
         };
@@ -8047,6 +8500,7 @@ esac
         let command = NixBuildCommand {
             program: nix_wrapper.display().to_string(),
             args: vec!["--system".to_string(), "x86_64-linux".to_string()],
+            env: Vec::new(),
             out_link: root.join("result"),
             installable: format!("path:{}#default", flake_dir.display()),
         };
@@ -8081,6 +8535,7 @@ esac
         let command = NixBuildCommand {
             program: fake_nix.display().to_string(),
             args: Vec::new(),
+            env: Vec::new(),
             out_link: root.join("result"),
             installable: ".#test".to_string(),
         };
@@ -8350,8 +8805,9 @@ esac
                 blueprint_revision: Some(8),
                 hardware_module_nix: None,
                 target_module_nix: None,
-                manage_source_revision: None,
-                installer_target: None,
+            manage_source_revision: None,
+            installer_target: None,
+            wallpaper_asset: None,
             }),
             allow_source_builds: false,
         };
@@ -8506,6 +8962,7 @@ esac
             target_module_nix: Some("{ ... }: {}".to_string()),
             manage_source_revision: Some(revision.clone()),
             installer_target: Some(valid_installer_target_identity()),
+            wallpaper_asset: None,
         };
 
         blueprint_nix_build_command(&config, &target, &spec, &build_input, 44).unwrap();
@@ -8577,6 +9034,7 @@ esac
                 target_module_nix: None,
                 manage_source_revision: None,
                 installer_target: None,
+                wallpaper_asset: None,
             }),
             allow_source_builds: false,
         };

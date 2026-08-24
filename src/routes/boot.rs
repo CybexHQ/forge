@@ -282,18 +282,19 @@ async fn build_boot_script(
     } else {
         let runtime = state.runtime_settings();
         // James does not need to guess whether installation finished. A real,
-        // known MAC can safely probe its disk: sanboot transfers control only
-        // when it is bootable and otherwise falls through to the unchanged
-        // enrollment menu. Health checks and MAC-less requests never probe.
-        let try_bootable_local_disk_first =
-            automatic_local_disk_probe_allowed(checker, known_device, mac.as_deref());
+        // known MAC first boots local drive 0x80; UEFI falls back to its next
+        // BootOrder entry if direct chaining fails, while legacy BIOS falls
+        // through to the menu. Health checks and MAC-less requests never hand
+        // off automatically.
+        let try_local_boot_first =
+            automatic_local_handoff_allowed(checker, known_device, mac.as_deref());
         Ok(boot_logic::render_menu(
             &runtime.public_base_url,
             &profiles,
             mac.as_deref(),
             serial.as_deref(),
             runtime.menu_timeout_ms,
-            try_bootable_local_disk_first,
+            try_local_boot_first,
         ))
     }
 }
@@ -302,11 +303,7 @@ fn automatic_enrollment_allowed(checker: bool, known_device: bool, mac: Option<&
     !checker && !known_device && mac.is_some()
 }
 
-fn automatic_local_disk_probe_allowed(
-    checker: bool,
-    known_device: bool,
-    mac: Option<&str>,
-) -> bool {
+fn automatic_local_handoff_allowed(checker: bool, known_device: bool, mac: Option<&str>) -> bool {
     !checker && known_device && mac.is_some()
 }
 
@@ -453,7 +450,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     use super::{
-        BootQuery, automatic_enrollment_allowed, automatic_local_disk_probe_allowed,
+        BootQuery, automatic_enrollment_allowed, automatic_local_handoff_allowed,
         boot_profile_id_from_path, clean_optional, ipxe_response, is_local_checker_request,
         remote_ip, user_agent,
     };
@@ -479,23 +476,23 @@ mod tests {
     }
 
     #[test]
-    fn automatic_local_disk_probe_is_limited_to_a_real_known_mac_request() {
-        assert!(automatic_local_disk_probe_allowed(
+    fn automatic_local_handoff_is_limited_to_a_real_known_mac_request() {
+        assert!(automatic_local_handoff_allowed(
             false,
             true,
             Some("aa:bb:cc:dd:ee:ff")
         ));
-        assert!(!automatic_local_disk_probe_allowed(
+        assert!(!automatic_local_handoff_allowed(
             true,
             true,
             Some("aa:bb:cc:dd:ee:ff")
         ));
-        assert!(!automatic_local_disk_probe_allowed(
+        assert!(!automatic_local_handoff_allowed(
             false,
             false,
             Some("aa:bb:cc:dd:ee:ff")
         ));
-        assert!(!automatic_local_disk_probe_allowed(false, true, None));
+        assert!(!automatic_local_handoff_allowed(false, true, None));
     }
 
     #[test]

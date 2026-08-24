@@ -46,8 +46,10 @@ const NETWORK_CHANGE_STATUS_PATH: &str =
     "/var/lib/cybex-james/status/appliance-network-change-status.json";
 const NETWORK_PENDING_PATH: &str = "/var/lib/cybex-james/control/netplan-pending.sha256";
 const NETWORK_ACK_PATH: &str = "/var/lib/cybex-james/state/inbox/netplan-acknowledgement.json";
-const APPLIANCE_RELEASE_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-APPLIANCE-RELEASE-V1";
-const APPLIANCE_RELEASE_SCHEMA: &str = "cybex.james.appliance-release.v1";
+const APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V1: &str = "CYBEX-JAMES-APPLIANCE-RELEASE-V1";
+const APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V2: &str = "CYBEX-JAMES-APPLIANCE-RELEASE-V2";
+const APPLIANCE_RELEASE_SCHEMA_V1: &str = "cybex.james.appliance-release.v1";
+const APPLIANCE_RELEASE_SCHEMA_V2: &str = "cybex.james.appliance-release.v2";
 const NETWORK_CHANGE_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-NETWORK-CHANGE-V1";
 const NETWORK_ACK_SIGNATURE_DOMAIN: &str = "CYBEX-JAMES-NETWORK-ACK-V1";
 const MAX_UPDATE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -85,6 +87,8 @@ pub struct ApplianceRepositorySnapshot {
 pub struct SignedApplianceRelease {
     pub schema: String,
     pub release_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     pub ubuntu_snapshot_id: String,
     pub cybex_repository_snapshot: ApplianceRepositorySnapshot,
     pub required_package_versions: BTreeMap<String, String>,
@@ -424,9 +428,11 @@ fn verify_and_extract_stored_update_with_mode(candidate_boot: bool) -> Result<Pa
             "schema":"cybex.james.verified-appliance-update.v1",
             "attempt_id":request.attempt_id,
             "target_release":request.release.release_id,
+            "source_revision":request.release.source_revision.as_deref(),
             "request_sha256":request_sha256,
             "descriptor_sha256":descriptor_sha256,
-            "bundle_sha256":request.release.cybex_repository_snapshot.sha256,
+            "bundle_sha256":request.release.cybex_repository_snapshot.sha256.as_str(),
+            "package_snapshot_sha256":request.release.cybex_repository_snapshot.sha256.as_str(),
             "bundle_size_bytes":request.release.cybex_repository_snapshot.size_bytes,
             "update_package_versions":update_package_versions,
         }),
@@ -544,6 +550,17 @@ fn completed_update_matches(status: &Value, update: &ManagedApplianceUpdate) -> 
             status.get("status").and_then(Value::as_str),
             Some("succeeded" | "rolled_back" | "failed")
         )
+        && update
+            .release
+            .source_revision
+            .as_deref()
+            .is_none_or(|expected| {
+                status.get("source_revision").and_then(Value::as_str) == Some(expected)
+                    && status
+                        .get("package_snapshot_sha256")
+                        .and_then(Value::as_str)
+                        == Some(update.release.cybex_repository_snapshot.sha256.as_str())
+            })
 }
 
 fn validate_signed_release(release: &SignedApplianceRelease) -> Result<()> {
@@ -572,8 +589,21 @@ fn validate_signed_release_with_policy(
     public_key_path: &Path,
     maximum_bundle_bytes: u64,
 ) -> Result<()> {
-    if release.schema != APPLIANCE_RELEASE_SCHEMA
-        || release.minimum_protocol != 4
+    let signature_domain = match release.schema.as_str() {
+        APPLIANCE_RELEASE_SCHEMA_V1 if release.source_revision.is_none() => {
+            APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V1
+        }
+        APPLIANCE_RELEASE_SCHEMA_V2
+            if release
+                .source_revision
+                .as_deref()
+                .is_some_and(is_exact_source_revision) =>
+        {
+            APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V2
+        }
+        _ => bail!("appliance release contract is incompatible"),
+    };
+    if release.minimum_protocol != 4
         || release.minimum_state_schema != 2
         || !release.rollback_compatible
         || !is_snapshot_id(&release.ubuntu_snapshot_id)
@@ -680,13 +710,20 @@ fn validate_signed_release_with_policy(
         .ok_or_else(|| anyhow!("appliance release descriptor is not an object"))?
         .remove("signature");
     let body = serde_json::to_vec(&canonical_json(unsigned))?;
-    let mut payload = Vec::with_capacity(APPLIANCE_RELEASE_SIGNATURE_DOMAIN.len() + body.len() + 1);
-    payload.extend_from_slice(APPLIANCE_RELEASE_SIGNATURE_DOMAIN.as_bytes());
+    let mut payload = Vec::with_capacity(signature_domain.len() + body.len() + 1);
+    payload.extend_from_slice(signature_domain.as_bytes());
     payload.push(b'\n');
     payload.extend_from_slice(&body);
     verifying_key
         .verify_strict(&payload, &Signature::from_bytes(&signature))
         .context("verify appliance release signature")
+}
+
+fn is_exact_source_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1893,8 +1930,9 @@ mod tests {
             ("python3".to_string(), "3.13.5-1".to_string()),
         ]);
         let mut release = SignedApplianceRelease {
-            schema: APPLIANCE_RELEASE_SCHEMA.to_string(),
+            schema: APPLIANCE_RELEASE_SCHEMA_V1.to_string(),
             release_id: "0.1.2".to_string(),
+            source_revision: None,
             ubuntu_snapshot_id: "20260805T000000Z".to_string(),
             cybex_repository_snapshot: ApplianceRepositorySnapshot {
                 url: "https://github.com/CybexHQ/james/releases/download/v0.1.2/cybex-james-appliance-packages-0.1.2-x86_64-linux.tar.zst".to_string(),
@@ -1909,14 +1947,43 @@ mod tests {
             release_notes: "https://github.com/CybexHQ/james/releases/tag/v0.1.2".to_string(),
             signature: String::new(),
         };
-        let mut unsigned = serde_json::to_value(&release).unwrap();
+        sign_release_fixture(&mut release, &key);
+        (release, key)
+    }
+
+    fn sign_release_fixture(release: &mut SignedApplianceRelease, key: &SigningKey) {
+        let mut unsigned = serde_json::to_value(&*release).unwrap();
         unsigned.as_object_mut().unwrap().remove("signature");
         let body = serde_json::to_vec(&canonical_json(unsigned)).unwrap();
-        let mut payload = APPLIANCE_RELEASE_SIGNATURE_DOMAIN.as_bytes().to_vec();
+        let domain = match release.schema.as_str() {
+            APPLIANCE_RELEASE_SCHEMA_V1 => APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V1,
+            APPLIANCE_RELEASE_SCHEMA_V2 => APPLIANCE_RELEASE_SIGNATURE_DOMAIN_V2,
+            _ => panic!("unsupported fixture schema"),
+        };
+        let mut payload = domain.as_bytes().to_vec();
         payload.push(b'\n');
         payload.extend_from_slice(&body);
         release.signature = STANDARD.encode(key.sign(&payload).to_bytes());
-        (release, key)
+    }
+
+    #[test]
+    fn source_bound_v2_release_uses_its_own_domain_and_exact_revision() {
+        let root = test_directory("v2-release-signature");
+        let key_path = root.join("release-public-key");
+        let (mut release, key) = signed_release_fixture();
+        release.schema = APPLIANCE_RELEASE_SCHEMA_V2.to_string();
+        release.source_revision = Some("d".repeat(40));
+        sign_release_fixture(&mut release, &key);
+        fs::write(
+            &key_path,
+            format!("{}\n", STANDARD.encode(key.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        assert!(validate_signed_release_with_policy(&release, &key_path, u64::MAX).is_ok());
+
+        release.source_revision = Some("D".repeat(40));
+        assert!(validate_signed_release_with_policy(&release, &key_path, u64::MAX).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_directory(label: &str) -> PathBuf {

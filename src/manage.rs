@@ -45,7 +45,10 @@ use crate::{
 const CAPABILITY_BOOT_V1: &str = "boot_v1";
 const CAPABILITY_BUILDER_V1: &str = "builder_v1";
 const CAPABILITY_BLUEPRINT_BUILDER_V2: &str = "blueprint_builder_v2";
+const CAPABILITY_BLUEPRINT_WALLPAPER_V1: &str = "blueprint_wallpaper_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
+const CAPABILITY_INSTALLER_TARGET_BUILD_V2: &str = "installer_target_build_v2";
+const CAPABILITY_INSTALLER_TARGET_BUILD_V3: &str = "installer_target_build_v3";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
 const CAPABILITY_JAMES_BOOT_GRANT_V1: &str = "james_boot_grant_v1";
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
@@ -886,7 +889,7 @@ async fn sync_james_foundation(
                 .compatibility
                 .as_ref()
                 .and_then(|contract| contract.workstation_runtime_epoch);
-            apply_james_desired(state, desired, &mut first_failure).await;
+            apply_james_desired(state, managed, desired, &mut first_failure).await;
         }
         Err(error) => retain_sync_failure(
             &mut first_failure,
@@ -909,6 +912,7 @@ async fn sync_james_foundation(
 
 async fn apply_james_desired(
     state: &AppState,
+    managed: &ManagedState,
     desired: AgentJamesConfigResponse,
     first_failure: &mut Option<anyhow::Error>,
 ) {
@@ -959,6 +963,15 @@ async fn apply_james_desired(
     if build_count_valid {
         for job in desired.build_jobs {
             retained_job_ids.push(job.id.clone());
+            if let Err(error) = ensure_managed_build_wallpaper(state, managed, &job).await {
+                build_snapshot_applied = false;
+                retain_sync_failure(
+                    first_failure,
+                    "managed Blueprint wallpaper download",
+                    error.context(format!("prepare managed build job {} wallpaper", job.id)),
+                );
+                continue;
+            }
             let sync = db::upsert_managed_build_job(
                 &state.db,
                 &job.id,
@@ -2138,6 +2151,127 @@ async fn signed_request(
     signed_request_for_config(&state.config, managed, method, path, body).await
 }
 
+const MAX_BLUEPRINT_WALLPAPER_BYTES: usize = 4 * 1024 * 1024;
+
+fn verify_blueprint_wallpaper_bytes(
+    asset: &crate::build::BlueprintWallpaperAsset,
+    bytes: &[u8],
+) -> Result<()> {
+    if bytes.len() != usize::try_from(asset.size_bytes).unwrap_or(usize::MAX) {
+        bail!("Blueprint wallpaper size does not match its descriptor");
+    }
+    if !bytes.starts_with(&[0xff, 0xd8, 0xff]) || !bytes.ends_with(&[0xff, 0xd9]) {
+        bail!("Blueprint wallpaper is not a complete JPEG image");
+    }
+    if sha256_hex(bytes) != asset.sha256 {
+        bail!("Blueprint wallpaper failed its SHA-256 integrity check");
+    }
+    Ok(())
+}
+
+fn write_blueprint_wallpaper_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Blueprint wallpaper cache path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Blueprint wallpaper cache {}", parent.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let tmp = secure_json_tmp_path(path)?;
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("create temporary Blueprint wallpaper {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+async fn ensure_managed_build_wallpaper(
+    state: &AppState,
+    managed: &ManagedState,
+    job: &ManagedBuildJob,
+) -> Result<()> {
+    let Some(asset_value) = job
+        .build_spec
+        .as_ref()
+        .and_then(|spec| spec.pointer("/build_input/wallpaper_asset"))
+    else {
+        return Ok(());
+    };
+    let asset: crate::build::BlueprintWallpaperAsset = serde_json::from_value(asset_value.clone())
+        .context("managed build wallpaper descriptor does not match schema")?;
+    let asset = crate::build::validate_blueprint_wallpaper_asset(asset)?;
+    if asset.blueprint_revision_id != job.input_revision
+        || job
+            .build_spec
+            .as_ref()
+            .and_then(|spec| spec.get("blueprint_revision_id"))
+            .and_then(Value::as_str)
+            != Some(asset.blueprint_revision_id.as_str())
+    {
+        bail!("managed build wallpaper revision does not match the build job");
+    }
+    let path = crate::build::wallpaper_asset_cache_path(&state.config, &asset.sha256)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() == asset.size_bytes
+        {
+            let bytes = fs::read(&path)?;
+            if verify_blueprint_wallpaper_bytes(&asset, &bytes).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    let device_id = managed_device_id(managed)?;
+    let path_and_query = format!(
+        "/v1/agent/devices/{device_id}/blueprint-wallpapers/{}?blueprint_revision_id={}",
+        asset.id, asset.blueprint_revision_id
+    );
+    let mut response = signed_request(state, managed, Method::GET, &path_and_query, Vec::new())
+        .await?
+        .send()
+        .await
+        .context("download managed Blueprint wallpaper request failed")?;
+    if !response.status().is_success() {
+        bail!(
+            "download managed Blueprint wallpaper failed with HTTP {}",
+            response.status()
+        );
+    }
+    if response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("image/jpeg")
+    {
+        bail!("managed Blueprint wallpaper response has an invalid content type");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(asset.size_bytes).unwrap_or(0));
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_BLUEPRINT_WALLPAPER_BYTES {
+            bail!("managed Blueprint wallpaper response exceeded 4 MiB");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_blueprint_wallpaper_bytes(&asset, &bytes)?;
+    write_blueprint_wallpaper_atomic(&path, &bytes)
+}
+
 async fn signed_request_for_config(
     config: &AppConfig,
     managed: &ManagedState,
@@ -2179,7 +2313,10 @@ fn james_capabilities(_config: &AppConfig) -> Vec<&'static str> {
         CAPABILITY_BOOT_V1,
         CAPABILITY_BUILDER_V1,
         CAPABILITY_BLUEPRINT_BUILDER_V2,
+        CAPABILITY_BLUEPRINT_WALLPAPER_V1,
         CAPABILITY_CACHE_V1,
+        CAPABILITY_INSTALLER_TARGET_BUILD_V2,
+        CAPABILITY_INSTALLER_TARGET_BUILD_V3,
         CAPABILITY_WORKSTATION_NETBOOT_V1,
         CAPABILITY_JAMES_BOOT_GRANT_V1,
     ];
@@ -4109,7 +4246,10 @@ mod tests {
                 "boot_v1",
                 "builder_v1",
                 "blueprint_builder_v2",
+                "blueprint_wallpaper_v1",
                 "cache_v1",
+                "installer_target_build_v2",
+                "installer_target_build_v3",
                 "workstation_netboot_v1",
                 "james_boot_grant_v1",
                 "appliance_update_v1",

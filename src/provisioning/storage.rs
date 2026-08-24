@@ -25,7 +25,12 @@ const EFI_BYTES: u64 = GIB;
 const ROOT_BYTES: u64 = 48 * GIB;
 const STATE_BYTES: u64 = 16 * GIB;
 const SWAP_BYTES: u64 = 8 * GIB;
+const CACHE_BYTES: u64 = 80 * GIB;
 const EXT4_SUPER_MAGIC: i64 = 0xef53;
+const EFI_GLOBAL_VARIABLE_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+const EFIVARS_PATH: &str = "/sys/firmware/efi/efivars";
+const EFI_VARIABLE_ATTRIBUTES: u32 = 0x0000_0007;
+const EFI_LOAD_OPTION_ACTIVE: u32 = 0x0000_0001;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedStorage {
@@ -281,35 +286,7 @@ fn validate_recovered_state_transition(
 }
 
 fn boot_installed_appliance() -> Result<()> {
-    let output = StdCommand::new("efibootmgr")
-        .output()
-        .context("inspect UEFI boot entries")?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
-        bail!("installed appliance boot entry is unavailable")
-    }
-    let body = String::from_utf8(output.stdout).context("UEFI boot entries are not UTF-8")?;
-    let boot_number = body.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if !(lower.contains("ubuntu") || lower.contains("cybex james"))
-            || !line.starts_with("Boot")
-            || line.len() < 8
-        {
-            return None;
-        }
-        let number = &line[4..8];
-        number
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-            .then_some(number.to_string())
-    });
-    let number = boot_number.ok_or_else(|| anyhow!("installed appliance boot entry is missing"))?;
-    let status = StdCommand::new("efibootmgr")
-        .args(["--bootnext", &number])
-        .status()
-        .context("select installed appliance for next boot")?;
-    if !status.success() {
-        bail!("could not select installed appliance for next boot")
-    }
+    select_installed_boot_entry(Path::new(EFIVARS_PATH))?;
     let _ = StdCommand::new("sync").status();
     let status = StdCommand::new("systemctl")
         .args(["reboot", "--no-block"])
@@ -320,6 +297,109 @@ fn boot_installed_appliance() -> Result<()> {
     }
     std::thread::sleep(std::time::Duration::from_secs(30));
     Ok(())
+}
+
+fn select_installed_boot_entry(efivars: &Path) -> Result<u16> {
+    let metadata = fs::metadata(efivars).context("inspect UEFI variable filesystem")?;
+    if !metadata.is_dir() {
+        bail!("UEFI variable filesystem is unavailable")
+    }
+
+    let suffix = format!("-{EFI_GLOBAL_VARIABLE_GUID}");
+    let mut candidates = Vec::new();
+    for (index, entry) in fs::read_dir(efivars)
+        .context("read UEFI boot entries")?
+        .enumerate()
+    {
+        if index >= 4096 {
+            bail!("UEFI variable filesystem contains too many entries")
+        }
+        let entry = entry.context("read UEFI boot entry")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(number) = boot_variable_number(&name, &suffix) else {
+            continue;
+        };
+        let body = read_bounded_efi_variable(&entry.path())?;
+        let Some(description) = efi_load_option_description(&body)? else {
+            continue;
+        };
+        let lower = description.to_ascii_lowercase();
+        if lower.contains("ubuntu") || lower.contains("cybex james") {
+            candidates.push(number);
+        }
+    }
+    candidates.sort_unstable();
+    let number = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("installed appliance boot entry is missing"))?;
+
+    let boot_next = efivars.join(format!("BootNext-{EFI_GLOBAL_VARIABLE_GUID}"));
+    let mut body = Vec::with_capacity(6);
+    body.extend_from_slice(&EFI_VARIABLE_ATTRIBUTES.to_le_bytes());
+    body.extend_from_slice(&number.to_le_bytes());
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(&boot_next)
+        .context("open UEFI BootNext variable")?;
+    file.write_all(&body)
+        .context("select installed appliance for next boot")?;
+    drop(file);
+    if read_bounded_efi_variable(&boot_next)? != body {
+        bail!("UEFI BootNext verification failed")
+    }
+    Ok(number)
+}
+
+fn boot_variable_number(name: &str, suffix: &str) -> Option<u16> {
+    let number = name.strip_prefix("Boot")?.strip_suffix(suffix)?;
+    (number.len() == 4 && number.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| u16::from_str_radix(number, 16).ok())
+        .flatten()
+}
+
+fn read_bounded_efi_variable(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).context("inspect UEFI variable")?;
+    if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
+        bail!("UEFI variable has invalid file type or size")
+    }
+    let body = fs::read(path).context("read UEFI variable")?;
+    if body.len() > 64 * 1024 {
+        bail!("UEFI variable exceeds its size limit")
+    }
+    Ok(body)
+}
+
+fn efi_load_option_description(body: &[u8]) -> Result<Option<String>> {
+    if body.len() < 10 {
+        return Ok(None);
+    }
+    let attributes = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if attributes & EFI_LOAD_OPTION_ACTIVE == 0 {
+        return Ok(None);
+    }
+    let mut units = Vec::new();
+    let mut cursor = 10;
+    while cursor + 1 < body.len() {
+        let unit = u16::from_le_bytes([body[cursor], body[cursor + 1]]);
+        if unit == 0 {
+            return String::from_utf16(&units)
+                .context("UEFI boot entry description is not valid UTF-16")
+                .map(Some);
+        }
+        if units.len() >= 256 {
+            bail!("UEFI boot entry description exceeds its size limit")
+        }
+        units.push(unit);
+        cursor += 2;
+    }
+    Ok(None)
 }
 
 pub(crate) async fn create_state_partition_first(
@@ -1102,7 +1182,11 @@ fn calculate_layout(sector_size: u64, total_sectors: u64) -> Result<([u64; 5], [
             .checked_sub(alignment + 1)
             .ok_or_else(|| anyhow!("target disk is too small"))?,
     ];
-    if starts[4] >= ends[4] || ends[4] - starts[4] < length(40 * GIB) {
+    let cache_sectors = ends[4]
+        .checked_sub(starts[4])
+        .and_then(|sectors| sectors.checked_add(1))
+        .unwrap_or(0);
+    if cache_sectors < length(CACHE_BYTES) {
         bail!("target disk has insufficient cache capacity")
     }
     Ok((starts, ends))
@@ -1397,14 +1481,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_layout_preserves_state_and_cache_minimum() {
+    fn exact_layout_rejects_the_legacy_128_gib_appliance_floor() {
         let sectors = (128 * GIB) / 512;
+        assert!(calculate_layout(512, sectors).is_err());
+    }
+
+    #[test]
+    fn exact_layout_preserves_state_and_cache_minimum() {
+        let sectors = (160 * GIB) / 512;
         let (starts, ends) = calculate_layout(512, sectors).unwrap();
         assert_eq!((ends[0] - starts[0] + 1) * 512, EFI_BYTES);
         assert_eq!((ends[1] - starts[1] + 1) * 512, ROOT_BYTES);
         assert_eq!((ends[2] - starts[2] + 1) * 512, STATE_BYTES);
         assert_eq!((ends[3] - starts[3] + 1) * 512, SWAP_BYTES);
-        assert!((ends[4] - starts[4] + 1) * 512 >= 40 * GIB);
+        assert!((ends[4] - starts[4] + 1) * 512 >= CACHE_BYTES);
     }
 
     #[test]
@@ -1450,6 +1540,78 @@ mod tests {
                 .validate(1024, 2047, "8200", "CYBEX_STATE")
                 .is_err()
         );
+    }
+
+    fn write_boot_option(path: &Path, description: &str, active: bool) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&EFI_VARIABLE_ATTRIBUTES.to_le_bytes());
+        body.extend_from_slice(&(if active { EFI_LOAD_OPTION_ACTIVE } else { 0 }).to_le_bytes());
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        for unit in description.encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn completed_install_selects_active_appliance_uefi_entry_without_efibootmgr() {
+        let root =
+            std::env::temp_dir().join(format!("cybex-james-efivars-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        write_boot_option(
+            &root.join(format!("Boot0007-{EFI_GLOBAL_VARIABLE_GUID}")),
+            "UEFI PXEv4",
+            true,
+        );
+        write_boot_option(
+            &root.join(format!("Boot0004-{EFI_GLOBAL_VARIABLE_GUID}")),
+            "ubuntu",
+            true,
+        );
+        write_boot_option(
+            &root.join(format!("Boot0002-{EFI_GLOBAL_VARIABLE_GUID}")),
+            "Cybex James stale",
+            false,
+        );
+
+        assert_eq!(select_installed_boot_entry(&root).unwrap(), 4);
+        assert_eq!(
+            fs::read(root.join(format!("BootNext-{EFI_GLOBAL_VARIABLE_GUID}"))).unwrap(),
+            [
+                EFI_VARIABLE_ATTRIBUTES.to_le_bytes().as_slice(),
+                4_u16.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_install_rejects_missing_or_malformed_uefi_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "cybex-james-efivars-invalid-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        write_boot_option(
+            &root.join(format!("Boot0001-{EFI_GLOBAL_VARIABLE_GUID}")),
+            "UEFI DVD",
+            true,
+        );
+        fs::write(
+            root.join(format!("Boot0002-{EFI_GLOBAL_VARIABLE_GUID}")),
+            [0_u8; 9],
+        )
+        .unwrap();
+
+        assert!(select_installed_boot_entry(&root).is_err());
+        assert!(
+            !root
+                .join(format!("BootNext-{EFI_GLOBAL_VARIABLE_GUID}"))
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
