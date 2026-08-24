@@ -104,6 +104,7 @@ if [[ "$root_fsroot" = / ]]; then
   printf '%s\n' 0 > "$control_dir/root-generation"
   update-grub
   grub-set-default cybex-james-generation-0
+  grub-editenv /boot/grub/grubenv unset env_block next_entry prev_saved_entry
   sync
   systemctl reboot
   exit 0
@@ -228,6 +229,24 @@ delete_root_generation() (
     btrfs subvolume delete "$candidate"
   fi
 )
+set_shared_grub_default() (
+  set -Eeuo pipefail
+  local generation_id="$1" root_uuid root_top shared_grub_dir
+  [[ "$generation_id" =~ ^[0-9]+$ ]]
+  root_uuid="$(findmnt -n -o UUID /)"
+  [[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+  root_top="$(mktemp -d /run/cybex-shared-grub.XXXXXX)"
+  trap 'umount "$root_top" 2>/dev/null || true; rmdir "$root_top" 2>/dev/null || true' EXIT
+  mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+  shared_grub_dir="$root_top/boot/grub"
+  test -d "$shared_grub_dir" && test ! -L "$shared_grub_dir"
+  test -f "$shared_grub_dir/grubenv" && test ! -L "$shared_grub_dir/grubenv"
+  grub-set-default --boot-directory "$root_top/boot" \
+    "cybex-james-generation-$generation_id"
+  grub-editenv "$shared_grub_dir/grubenv" unset \
+    env_block next_entry prev_saved_entry
+  sync -f "$shared_grub_dir/grubenv"
+)
 write_update_status() {
   local result="$1" stage="$2" progress="$3" pending="$4" resulting="$5" reason="$6"
   local temporary
@@ -335,15 +354,14 @@ if [[ -e "$pending_seal" ]]; then
       # The healthy candidate crossed the durable success point before this
       # source was selected manually. Preserve it and only finish the exact
       # source-side handoff cleanup.
-      grub-set-default "cybex-james-generation-$pending"
+      set_shared_grub_default "$pending"
       rm -f "$request" "$pending_seal"
       sync -f "$inbox_dir"
       sync -f "$control_dir"
       remove_terminal_bundle
     else
       write_update_status rolled_back boot_fallback 100 "$pending" "$generation" candidate_boot_failed
-      grub-set-default "cybex-james-generation-$source_generation"
-      grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+      set_shared_grub_default "$source_generation"
       delete_root_generation "$pending"
       rm -f "$request" "$pending_seal"
       sync -f "$inbox_dir"

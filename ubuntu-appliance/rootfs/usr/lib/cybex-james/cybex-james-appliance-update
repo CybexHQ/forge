@@ -516,6 +516,19 @@ write_pending_seal() {
 write_pending_seal "$control_dir"
 write_pending_seal "$candidate_control"
 update-grub
+# The UEFI shim resolves /boot/grub from Btrfs subvolume ID 5, not from the
+# currently mounted root generation. Publish the newly generated menu there
+# and keep its OS-managed saved entry authoritative. GRUB cannot safely update
+# an environment block on Btrfs, so do not retain the installer-created raw
+# env_block indirection.
+shared_grub_dir="$root_top/boot/grub"
+test -d "$shared_grub_dir" && test ! -L "$shared_grub_dir"
+test -f "$shared_grub_dir/grubenv" && test ! -L "$shared_grub_dir/grubenv"
+install -m 0644 -o root -g root /boot/grub/grub.cfg "$shared_grub_dir/grub.cfg"
+grub-set-default --boot-directory "$root_top/boot" "cybex-james-generation-$candidate"
+grub-editenv "$shared_grub_dir/grubenv" unset env_block next_entry prev_saved_entry
+sync -f "$shared_grub_dir/grub.cfg"
+sync -f "$shared_grub_dir/grubenv"
 grub-reboot "cybex-james-generation-$candidate"
 write_status rebooting reboot_pending 80 "$candidate"
 trap - ERR

@@ -1634,7 +1634,7 @@ printf '%s:%s\\n' "$appliance_state" "$non_ready_checks"
         self.assertNotIn("appliance-updates/", commit)
         rollback = commit.index("rollback()")
         self.assertIn(
-            'grub-set-default "cybex-james-generation-$source_generation"',
+            'set_shared_grub_default "$source_generation"',
             commit[rollback:],
         )
         verify_source = commit.index("with_source_control verify")

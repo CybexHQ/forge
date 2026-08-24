@@ -144,6 +144,25 @@ write_source_clear_intent() {
   sync -f "$control_dir"
 }
 
+set_shared_grub_default() (
+  set -Eeuo pipefail
+  local generation="$1" root_uuid root_top shared_grub_dir
+  [[ "$generation" =~ ^[0-9]+$ ]]
+  root_uuid="$(findmnt -n -o UUID /)"
+  [[ "$root_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+  root_top="$(mktemp -d /run/cybex-shared-grub.XXXXXX)"
+  trap 'umount "$root_top" 2>/dev/null || true; rmdir "$root_top" 2>/dev/null || true' EXIT
+  mount -t btrfs -o subvolid=5 "UUID=$root_uuid" "$root_top"
+  shared_grub_dir="$root_top/boot/grub"
+  test -d "$shared_grub_dir" && test ! -L "$shared_grub_dir"
+  test -f "$shared_grub_dir/grubenv" && test ! -L "$shared_grub_dir/grubenv"
+  grub-set-default --boot-directory "$root_top/boot" \
+    "cybex-james-generation-$generation"
+  grub-editenv "$shared_grub_dir/grubenv" unset \
+    env_block next_entry prev_saved_entry
+  sync -f "$shared_grub_dir/grubenv"
+)
+
 rollback() {
   trap - ERR
   write_status rolled_back health_check_failed local_health_failed
@@ -151,8 +170,7 @@ rollback() {
   # terminalize the rollback, remove the failed candidate, and clear the
   # shared untrusted request. Explicitly restore its saved entry as defense in
   # depth even though grub-reboot is one-shot.
-  grub-set-default "cybex-james-generation-$source_generation"
-  grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+  set_shared_grub_default "$source_generation"
   systemctl reboot
   exit 1
 }
@@ -163,7 +181,7 @@ resume_candidate() {
   # protected source receipt. Keep the healthy candidate selected and retry
   # the idempotent local commit on reboot instead.
   trap - ERR
-  grub-set-default "cybex-james-generation-$pending" || true
+  set_shared_grub_default "$pending" || true
   systemctl reboot
   exit 1
 }
@@ -215,7 +233,7 @@ wait_for_stable_readiness
 
 with_source_control verify
 prune_root_generations
-grub-set-default "cybex-james-generation-$pending"
+set_shared_grub_default "$pending"
 write_source_clear_intent
 trap resume_candidate ERR
 with_source_control clear
