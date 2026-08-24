@@ -283,8 +283,17 @@ test "$(jq -er '.schema' "$verified")" = cybex.james.verified-appliance-update.v
 attempt_id="$(jq -er '.attempt_id' "$verified")"
 target_release="$(jq -er '.target_release' "$verified")"
 request_sha256="$(jq -er '.request_sha256' "$verified")"
-test "$(jq -er '.source_revision // ""' "$verified")" = "$source_revision"
-test "$(jq -er '.package_snapshot_sha256' "$verified")" = "$package_snapshot_sha256"
+verified_source_revision="$(jq -er '.source_revision // ""' "$verified")"
+verified_package_snapshot_sha256="$(jq -er '.package_snapshot_sha256 // ""' "$verified")"
+test "$verified_source_revision" = "$source_revision"
+if [[ "$release_schema" = cybex.james.appliance-release.v2 ]]; then
+  test "$verified_package_snapshot_sha256" = "$package_snapshot_sha256"
+elif [[ -n "$verified_package_snapshot_sha256" ]]; then
+  # A V1 predecessor may predate the redundant verified-receipt field. Its
+  # request is still bound to this snapshot by the signed V1 descriptor and
+  # the old root verifier's archive digest/size checks.
+  test "$verified_package_snapshot_sha256" = "$package_snapshot_sha256"
+fi
 [[ "$attempt_id" =~ ^[0-9a-f-]{36}$ ]]
 [[ "$request_sha256" =~ ^[0-9a-f]{64}$ ]]
 test "$(jq -er '
