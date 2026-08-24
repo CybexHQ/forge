@@ -45,6 +45,7 @@ pub const COMPATIBILITY_EPOCH: u32 = 1;
 #[cfg(feature = "resilience-qualification-epoch-2")]
 pub const COMPATIBILITY_EPOCH: u32 = 2;
 pub const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_MANAGE_SOURCE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 pub const FAILURE_INVALID_DESCRIPTOR: &str = "invalid_descriptor";
 pub const FAILURE_COMPATIBILITY_EPOCH_UNSUPPORTED: &str = "compatibility_epoch_unsupported";
 pub const FAILURE_INTEGRITY_MISMATCH: &str = "integrity_mismatch";
@@ -106,6 +107,10 @@ pub struct WorkstationNetbootDescriptor {
     pub schema: String,
     pub runtime_version: String,
     pub manage_source_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_source_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_source_size_bytes: Option<u64>,
     pub nixpkgs_revision: String,
     pub architecture: String,
     pub format: String,
@@ -348,8 +353,15 @@ pub fn decode_desired(value: serde_json::Value) -> Result<DesiredWorkstationNetb
 }
 
 pub fn signature_message(descriptor: &WorkstationNetbootDescriptor) -> String {
+    let manage_source_identity = match (
+        descriptor.manage_source_sha256.as_deref(),
+        descriptor.manage_source_size_bytes,
+    ) {
+        (Some(sha256), Some(size_bytes)) => format!("{size_bytes}\n{sha256}\n"),
+        _ => String::new(),
+    };
     format!(
-        "{SIGNATURE_DOMAIN}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{SIGNATURE_DOMAIN}\n{}\n{}\n{}\n{manage_source_identity}{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         descriptor.runtime_version,
         descriptor.manage_source_revision,
         descriptor.nixpkgs_revision,
@@ -387,6 +399,19 @@ fn validate_descriptor_with_policy(
     Version::parse(&descriptor.runtime_version)
         .context("workstation netboot runtime version is not canonical SemVer")?;
     validate_revision(&descriptor.manage_source_revision, "Manage source revision")?;
+    match (
+        descriptor.manage_source_sha256.as_deref(),
+        descriptor.manage_source_size_bytes,
+    ) {
+        (None, None) => {}
+        (Some(sha256), Some(size_bytes)) => {
+            validate_sha256(sha256, "Manage source SHA-256")?;
+            if size_bytes == 0 || size_bytes > MAX_MANAGE_SOURCE_ARCHIVE_BYTES {
+                bail!("Manage source archive size is outside its bound");
+            }
+        }
+        _ => bail!("Manage source archive identity is incomplete"),
+    }
     validate_revision(&descriptor.nixpkgs_revision, "nixpkgs revision")?;
     if descriptor.architecture != ARCHITECTURE
         || descriptor.format != FORMAT
@@ -3082,6 +3107,19 @@ mod tests {
         assert!(message.starts_with("CYBEX-JAMES-WORKSTATION-NETBOOT-V1\n1.0.0\n"));
         assert!(message.ends_with("https://releases.example.test/cybex-workstation-netboot-1.0.0-aaaaaaaaaaaa-x86_64-linux.tar.zst\n"));
         assert_eq!(message.lines().count(), 17);
+
+        let mut source_bound = descriptor;
+        source_bound.manage_source_sha256 = Some("f".repeat(64));
+        source_bound.manage_source_size_bytes = Some(24_453_120);
+        let message = signature_message(&source_bound);
+        assert!(message.contains(
+            "\ncccccccccccccccccccccccccccccccccccccccc\n24453120\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\nx86_64-linux\n"
+        ));
+        assert_eq!(message.lines().count(), 19);
+        assert!(validate_descriptor_with_policy(&source_bound, "not-a-key", true).is_ok());
+
+        source_bound.manage_source_size_bytes = None;
+        assert!(validate_descriptor_with_policy(&source_bound, "not-a-key", true).is_err());
     }
 
     #[test]
@@ -4189,6 +4227,8 @@ mod tests {
                 schema: DESCRIPTOR_SCHEMA.to_string(),
                 runtime_version: runtime_version.to_string(),
                 manage_source_revision: "a".repeat(40),
+                manage_source_sha256: None,
+                manage_source_size_bytes: None,
                 nixpkgs_revision: "c".repeat(40),
                 architecture: ARCHITECTURE.to_string(),
                 format: FORMAT.to_string(),
@@ -4423,6 +4463,8 @@ mod tests {
             schema: DESCRIPTOR_SCHEMA.to_string(),
             runtime_version: "1.0.0".to_string(),
             manage_source_revision: "a".repeat(40),
+            manage_source_sha256: None,
+            manage_source_size_bytes: None,
             nixpkgs_revision: "c".repeat(40),
             architecture: ARCHITECTURE.to_string(),
             format: FORMAT.to_string(),
