@@ -363,9 +363,15 @@ apt_safety_options=(
 run_bounded_package_command() {
   local output="$1"
   shift
-  # RLIMIT_FSIZE keeps signer-controlled diagnostics from consuming the
-  # candidate root. Bash expresses this limit in KiB, so 4096 is four MiB.
-  (ulimit -f 4096; "$@") >> "$output" 2>&1
+  local -a pipeline_status=()
+  # Drain the complete command output while retaining only its bounded tail.
+  # RLIMIT_FSIZE cannot be used here: it is inherited by APT's copy method and
+  # would also cap the signed package archives written below /var/cache/apt.
+  set +e
+  "$@" 2>&1 | tail -c 4194304 > "$output"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  ((pipeline_status[0] == 0 && pipeline_status[1] == 0))
 }
 capture_installed_versions() {
   local output="$1"

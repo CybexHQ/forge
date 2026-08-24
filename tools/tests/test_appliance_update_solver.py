@@ -246,7 +246,9 @@ class ApplianceUpdateSolverContractTests(unittest.TestCase):
         self.assertIn('cmp --silent -- "$held_before" "$held_after"', self.updater)
 
     def test_failure_evidence_is_bounded_and_reports_stable_codes(self) -> None:
-        self.assertIn("(ulimit -f 4096;", self.updater)
+        self.assertNotIn("ulimit -f", self.updater)
+        self.assertIn("tail -c 4194304", self.updater)
+        self.assertIn('pipeline_status=("${PIPESTATUS[@]}")', self.updater)
         self.assertIn("tail -c 8192", self.updater)
         self.assertIn("failure_reason=package_plan_unsafe", self.updater)
         self.assertIn("failure_reason=package_apply_failed", self.updater)
