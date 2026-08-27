@@ -124,6 +124,37 @@ pub struct BuildSpec {
     /// source (trivial per-system glue derivations are exempt).
     #[serde(default)]
     pub allow_source_builds: bool,
+    /// Copy the verified closure from an approved sibling James instead of
+    /// building it. Lives outside `build_input`, so the cohort identity
+    /// (`input_config_hash`) and the installer-target identity are unchanged;
+    /// Manage compares the resulting manifest with the origin's.
+    #[serde(default)]
+    pub closure_source: Option<ClosureSource>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosureSource {
+    pub kind: String,
+    pub server_device_id: String,
+    pub cache_base_url: String,
+    pub public_key: String,
+    pub toplevel_store_path: String,
+    pub closure_store_paths_sha256: String,
+    pub closure_member_count: u64,
+    #[serde(default)]
+    pub evaluated_derivation: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedClosureSource {
+    server_device_id: String,
+    cache_base_url: String,
+    public_key: String,
+    toplevel_store_path: String,
+    closure_store_paths_sha256: String,
+    closure_member_count: u64,
+    evaluated_derivation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -182,6 +213,7 @@ struct ValidatedBuildSpec {
     software_package_refs: Vec<String>,
     build_input: Option<ValidatedBlueprintBuildInput>,
     allow_source_builds: bool,
+    closure_source: Option<ValidatedClosureSource>,
 }
 
 #[derive(Clone, Debug)]
@@ -571,6 +603,9 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(source) = spec.closure_source.clone() {
+        return execute_replica_copy(state, &job, &spec, &target, &source).await;
+    }
     let command = nix_build_command(&state.config, &target, &spec, job.id)?;
     if !spec.allow_source_builds {
         db::update_build_job_progress(
@@ -852,6 +887,135 @@ async fn execute_claimed_job(state: &AppState, job: BuildJob) -> Result<()> {
     Ok(())
 }
 
+/// A replica copy mirrors a verified closure from an approved sibling James
+/// instead of building it. The cache module verifies every member against
+/// the origin's signature and file hash and re-verifies the mirrored closure
+/// under this node's key; the job then publishes exactly like a build.
+async fn execute_replica_copy(
+    state: &AppState,
+    job: &BuildJob,
+    spec: &ValidatedBuildSpec,
+    target: &BuildTargetConfig,
+    source: &ValidatedClosureSource,
+) -> Result<()> {
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(25),
+        "copying",
+        &format!(
+            "Mirroring the verified closure from James {}",
+            source.server_device_id
+        ),
+    )
+    .await?;
+    let imported = cache::import_replica_closure(
+        &state.db,
+        &state.config,
+        job,
+        cache::ReplicaClosureSource {
+            cache_base_url: &source.cache_base_url,
+            public_key: &source.public_key,
+            toplevel_store_path: &source.toplevel_store_path,
+            closure_store_paths_sha256: &source.closure_store_paths_sha256,
+            closure_member_count: source.closure_member_count,
+            evaluated_derivation: source.evaluated_derivation.as_deref(),
+        },
+    )
+    .await;
+    let (mut cached, summary) = match imported {
+        Ok(imported) => imported,
+        Err(err) => {
+            db::finish_build_job(
+                &state.db,
+                job.id,
+                "failed",
+                "",
+                &format!("replica copy failed: {}", safe_error(&err)),
+                "",
+                "",
+                0,
+                None,
+                Some(build_result_metadata(
+                    &state.config,
+                    job,
+                    Some(target),
+                    Some("replica_copy_failed"),
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if summary.output_size_bytes as u64 > state.config.build.max_artifact_size_bytes {
+        db::finish_build_job(
+            &state.db,
+            job.id,
+            "failed",
+            "",
+            "mirrored output exceeded max_artifact_size_bytes",
+            &source.toplevel_store_path,
+            &summary.output_sha256,
+            summary.output_size_bytes,
+            None,
+            Some(build_result_metadata(
+                &state.config,
+                job,
+                Some(target),
+                Some("artifact_too_large"),
+            )),
+        )
+        .await?;
+        return Ok(());
+    }
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(90),
+        "exporting",
+        "Verified mirrored closure in James cache",
+    )
+    .await?;
+    let software_inventory = evaluate_software_inventory(&state.config, spec).await;
+    merge_build_metadata(
+        &mut cached.metadata,
+        &success_result_metadata(&state.config, job, target, spec, &software_inventory),
+    );
+    db::update_build_job_progress(
+        &state.db,
+        job.id,
+        Some(96),
+        "publishing",
+        "Publishing cache artifact metadata",
+    )
+    .await?;
+    cache::record_cached_artifact(&state.db, &state.config, job, &spec.artifact_type, cached)
+        .await?;
+    db::finish_build_job(
+        &state.db,
+        job.id,
+        "succeeded",
+        &format!(
+            "mirrored {} closure members from {}\n",
+            summary.members, source.cache_base_url
+        ),
+        "",
+        &source.toplevel_store_path,
+        &summary.output_sha256,
+        summary.output_size_bytes,
+        Some(0),
+        Some(success_result_metadata(
+            &state.config,
+            job,
+            target,
+            spec,
+            &software_inventory,
+        )),
+    )
+    .await?;
+    Ok(())
+}
+
 fn capacity_meets_minimum(actual: u64, minimum: u64) -> bool {
     actual >= minimum.saturating_sub(CAPACITY_ACCOUNTING_TOLERANCE_BYTES)
 }
@@ -941,6 +1105,11 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
             })?,
         )?;
     }
+    let closure_source = spec
+        .closure_source
+        .as_ref()
+        .map(|source| validate_closure_source(source, &target))
+        .transpose()?;
     Ok(ValidatedBuildSpec {
         artifact_type,
         target,
@@ -955,6 +1124,94 @@ fn validate_build_spec(config: &AppConfig, job: &BuildJob) -> Result<ValidatedBu
         software_package_refs,
         build_input,
         allow_source_builds: spec.allow_source_builds,
+        closure_source,
+    })
+}
+
+const CLOSURE_SOURCE_KIND_JAMES_CACHE: &str = "james_cache";
+const MAX_CLOSURE_SOURCE_MEMBERS: u64 = 200_000;
+const MAX_CLOSURE_SOURCE_URL_BYTES: usize = 2048;
+
+fn valid_closure_source_store_path(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("/nix/store/") else {
+        return false;
+    };
+    let Some((hash, name)) = rest.split_once('-') else {
+        return false;
+    };
+    hash.len() == 32
+        && hash
+            .bytes()
+            .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
+        && !name.is_empty()
+        && name.len() <= 211
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
+        })
+}
+
+/// A replica copy is accepted only for exact installer-target closures, from
+/// an http(s) cache base URL without credentials, query, or fragment, with a
+/// parseable Nix cache public key and a bounded exact closure identity.
+fn validate_closure_source(source: &ClosureSource, target: &str) -> Result<ValidatedClosureSource> {
+    if target != "installer_target" {
+        bail!("closure_source is only accepted for installer_target builds");
+    }
+    if source.kind != CLOSURE_SOURCE_KIND_JAMES_CACHE {
+        bail!("unsupported closure_source kind");
+    }
+    let server_device_id = source.server_device_id.trim();
+    if server_device_id.is_empty()
+        || server_device_id.len() > 128
+        || server_device_id
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        bail!("closure_source server_device_id has an invalid shape");
+    }
+    let cache_base_url = source.cache_base_url.trim();
+    let parsed = reqwest::Url::parse(cache_base_url).context("closure_source cache_base_url")?;
+    if cache_base_url.len() > MAX_CLOSURE_SOURCE_URL_BYTES
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || cache_base_url.ends_with('/')
+    {
+        bail!("closure_source cache_base_url must be a plain http(s) cache base URL");
+    }
+    let public_key = source.public_key.trim();
+    crate::cache::parse_cache_public_key(public_key).context("closure_source public_key")?;
+    let toplevel_store_path = source.toplevel_store_path.trim();
+    if !valid_closure_source_store_path(toplevel_store_path) {
+        bail!("closure_source toplevel_store_path is not a store path");
+    }
+    let closure_store_paths_sha256 = normalize_sha256(&source.closure_store_paths_sha256)?;
+    if !(1..=MAX_CLOSURE_SOURCE_MEMBERS).contains(&source.closure_member_count) {
+        bail!("closure_source closure_member_count is out of range");
+    }
+    let evaluated_derivation = source
+        .evaluated_derivation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if !valid_closure_source_store_path(value) || !value.ends_with(".drv") {
+                bail!("closure_source evaluated_derivation must be a .drv store path");
+            }
+            Ok(value.to_string())
+        })
+        .transpose()?;
+    Ok(ValidatedClosureSource {
+        server_device_id: server_device_id.to_string(),
+        cache_base_url: cache_base_url.to_string(),
+        public_key: public_key.to_string(),
+        toplevel_store_path: toplevel_store_path.to_string(),
+        closure_store_paths_sha256,
+        closure_member_count: source.closure_member_count,
+        evaluated_derivation,
     })
 }
 
@@ -4798,6 +5055,16 @@ fn success_result_metadata(
         json!(spec.source_lock_sha256),
     );
     object.insert("software_inventory".to_string(), software_inventory.clone());
+    if let Some(source) = spec.closure_source.as_ref() {
+        object.insert(
+            "closure_source".to_string(),
+            json!({
+                "kind": CLOSURE_SOURCE_KIND_JAMES_CACHE,
+                "server_device_id": source.server_device_id,
+                "cache_base_url": source.cache_base_url,
+            }),
+        );
+    }
     metadata
 }
 
@@ -5220,6 +5487,7 @@ fn james_nixos_configuration(build_input: &ValidatedBlueprintBuildInput) -> Stri
     ./cybex-compat-options.nix
     (manageSource + "/deploy/nixos/cybex-blueprints.nix")
     (manageSource + "/deploy/nixos/cybex-agent-module.nix")
+    (manageSource + "/deploy/nixos/cybex-workstation-runtime.nix")
     ./blueprint.nix
     ./hardware.nix
     ./target.nix
@@ -6070,6 +6338,74 @@ esac
         })
     }
 
+    fn valid_closure_source() -> Value {
+        json!({
+            "kind": "james_cache",
+            "server_device_id": "dev_origin",
+            "cache_base_url": "http://10.0.0.5/cache",
+            "public_key": "cybex-james-cache:rRtA+N3tj2cIPfWQONIGcJBzdFSCPxJN2xRHg1hNhKU=",
+            "toplevel_store_path": "/nix/store/w3xanx4s88yziz926n9aykfjkzckdyr8-nixos-system-cybex-workstation-26.05",
+            "closure_store_paths_sha256": "a".repeat(64),
+            "closure_member_count": 2059,
+            "evaluated_derivation": "/nix/store/w3xanx4s88yziz926n9aykfjkzckdyr8-nixos-system-cybex-workstation-26.05.drv",
+        })
+    }
+
+    #[test]
+    fn replica_copy_source_is_validated_and_only_for_installer_targets() {
+        let config = AppConfig::default();
+        let mut job = valid_installer_target_build_job();
+        let build_input = job.build_spec["build_input"].clone();
+        let identity = valid_cohort_identity(
+            build_input["generated_nix"].as_str().unwrap(),
+            &build_input["expected_state"],
+            build_input["hardware_module_nix"].as_str().unwrap(),
+            build_input["target_module_nix"].as_str().unwrap(),
+        );
+        job.build_spec["build_input"]["installer_target"] = identity;
+        refresh_installer_target_input_hash(&mut job);
+        job.build_spec["closure_source"] = valid_closure_source();
+        let spec = validate_build_spec(&config, &job).expect("replica copy spec is valid");
+        let source = spec.closure_source.expect("closure source is retained");
+        assert_eq!(source.server_device_id, "dev_origin");
+        assert_eq!(source.closure_member_count, 2059);
+        // The copy hint lives outside build_input: the cohort identity is untouched.
+        assert_eq!(spec.input_config_hash, job.input_config_hash);
+
+        for (field, value) in [
+            ("kind", json!("rsync")),
+            ("cache_base_url", json!("ftp://10.0.0.5/cache")),
+            ("cache_base_url", json!("http://user:pw@10.0.0.5/cache")),
+            ("cache_base_url", json!("http://10.0.0.5/cache?priority=10")),
+            ("cache_base_url", json!("http://10.0.0.5/cache/")),
+            ("public_key", json!("not-a-key")),
+            ("toplevel_store_path", json!("/etc/passwd")),
+            ("closure_store_paths_sha256", json!("zz")),
+            ("closure_member_count", json!(0)),
+            ("closure_member_count", json!(200_001)),
+            ("server_device_id", json!("")),
+            (
+                "evaluated_derivation",
+                json!("/nix/store/w3xanx4s88yziz926n9aykfjkzckdyr8-not-a-derivation"),
+            ),
+        ] {
+            let mut changed = job.clone();
+            changed.build_spec["closure_source"][field] = value;
+            assert!(validate_build_spec(&config, &changed).is_err(), "{field}");
+        }
+        let mut extra = job.clone();
+        extra.build_spec["closure_source"]["device_id"] = json!("x");
+        assert!(validate_build_spec(&config, &extra).is_err());
+
+        let source: ClosureSource = serde_json::from_value(valid_closure_source()).unwrap();
+        assert!(
+            validate_closure_source(&source, "blueprint")
+                .unwrap_err()
+                .to_string()
+                .contains("only accepted for installer_target")
+        );
+    }
+
     #[test]
     fn installer_target_cohort_identity_binds_every_module_digest() {
         let config = AppConfig::default();
@@ -6296,6 +6632,7 @@ esac
             software_package_refs,
             build_input: None,
             allow_source_builds,
+            closure_source: None,
         }
     }
 
@@ -6709,6 +7046,7 @@ sleep 5
             software_package_refs: Vec::new(),
             build_input: None,
             allow_source_builds: false,
+            closure_source: None,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
@@ -6771,6 +7109,7 @@ sleep 5
                 wallpaper_asset: None,
             }),
             allow_source_builds: false,
+            closure_source: None,
         };
         assert!(build_target(&config, &spec).is_ok());
 
@@ -8810,6 +9149,7 @@ esac
             wallpaper_asset: None,
             }),
             allow_source_builds: false,
+            closure_source: None,
         };
 
         let command = nix_build_command(&config, &target, &spec, 42).unwrap();
@@ -8950,6 +9290,7 @@ esac
             software_package_refs: Vec::new(),
             build_input: None,
             allow_source_builds: false,
+            closure_source: None,
         };
         let build_input = ValidatedBlueprintBuildInput {
             kind: INSTALLER_TARGET_BUILD_INPUT_KIND.to_string(),
@@ -9037,6 +9378,7 @@ esac
                 wallpaper_asset: None,
             }),
             allow_source_builds: false,
+            closure_source: None,
         };
 
         let error = nix_build_command(&config, &target, &spec, 99)

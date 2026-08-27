@@ -147,7 +147,24 @@ pub async fn serve_binary_cache_member_from_root(
     if !is_binary_cache_member_path(requested_path) {
         return Err(AppError::NotFound);
     }
-    serve_file_from_root(root, requested_path, headers).await
+    let mut response = serve_file_from_root(root, requested_path, headers).await?;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(binary_cache_member_cache_control(requested_path)),
+    );
+    Ok(response)
+}
+
+/// NAR members are content-addressed by their file hash, so any intermediate
+/// proxy may keep them forever. `.narinfo` and `nix-cache-info` are mutable
+/// discovery records (a re-export can change compression or signatures) and
+/// only get a short shared lifetime.
+pub(crate) fn binary_cache_member_cache_control(requested_path: &str) -> &'static str {
+    if requested_path.starts_with("nar/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=60"
+    }
 }
 
 pub(crate) fn is_binary_cache_member_path(requested_path: &str) -> bool {

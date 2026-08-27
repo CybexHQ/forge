@@ -889,7 +889,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_concurrent_builds: 1,
+            max_concurrent_builds: 2,
             max_build_cores: 4,
             minimum_memory_bytes: 16 * 1024 * 1024 * 1024,
             minimum_swap_bytes: 8 * 1024 * 1024 * 1024,

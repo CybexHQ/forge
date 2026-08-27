@@ -29,6 +29,8 @@ use crate::{
 const CACHE_MUTATION_LOCK_FILENAME: &str = ".cybex-cache-mutation.lock";
 const CLOSURE_MANIFEST_SCHEMA: &str = "cybex.james.closure-manifest.v1";
 const CLOSURE_MANIFEST_VALIDATION_LEVEL: &str = "compressed_file_hash";
+/// NAR compression requested from `nix copy` for every new export.
+const CACHE_EXPORT_NAR_COMPRESSION: &str = "zstd";
 const CACHE_EXPORT_COPY_MAX_ATTEMPTS: usize = 2;
 const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
@@ -339,10 +341,16 @@ pub async fn export_output(
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
         prepare_quarantine_root(&cache_dir, &quarantine_dir)?;
+        // zstd NARs decompress several times faster than xz on the
+        // workstation side and export faster here; on a LAN cache the
+        // decompressor, not the wire, is the bottleneck. The serving allowlist
+        // already accepts `.nar.zst`, and earlier xz members stay valid because
+        // every narinfo names its own NAR URL.
         let destination = format!(
-            "file://{}?secret-key={}",
+            "file://{}?secret-key={}&compression={}",
             cache_dir.display(),
-            private_key_path.display()
+            private_key_path.display(),
+            CACHE_EXPORT_NAR_COMPRESSION
         );
         copy_store_path_to_cache(
             &nix_binary,
@@ -405,6 +413,424 @@ pub async fn export_output(
     })
     .await
     .context("join cache export task")?
+}
+
+/// A verified closure to mirror from an approved sibling James cache.
+pub struct ReplicaClosureSource<'a> {
+    pub cache_base_url: &'a str,
+    pub public_key: &'a str,
+    pub toplevel_store_path: &'a str,
+    pub closure_store_paths_sha256: &'a str,
+    pub closure_member_count: u64,
+    pub evaluated_derivation: Option<&'a str>,
+}
+
+/// What a mirrored closure reports in place of a build's `nix path-info`.
+#[derive(Clone, Debug)]
+pub struct ReplicaClosureSummary {
+    /// Hex NAR hash of the toplevel, exactly what `nix hash path` reports.
+    pub output_sha256: String,
+    pub output_size_bytes: i64,
+    pub closure_size_bytes: i64,
+    pub members: usize,
+}
+
+const REPLICA_NARINFO_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICA_NAR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const REPLICA_MAX_MEMBERS: usize = 200_000;
+
+/// Mirror a verified closure from an approved sibling James, member for
+/// member and byte for byte. Every NARInfo must carry a valid signature by
+/// the origin's key, every NAR file must match its NARInfo FileHash and
+/// FileSize, and this node appends its own signature so the mirrored records
+/// pass the same manifest verification a local export does. Nothing touches
+/// the local Nix store: no Nix trust configuration is involved, and because
+/// the compressed members are identical the resulting closure manifest is
+/// identical to the origin's, which is what Manage requires of a replica.
+pub async fn import_replica_closure(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    job: &BuildJob,
+    source: ReplicaClosureSource<'_>,
+) -> Result<(CachedNixArtifact, ReplicaClosureSummary)> {
+    if !config.cache.enabled {
+        bail!("James Cache is disabled");
+    }
+    let mutation_lock = acquire_cache_mutation_lock(config).await?;
+    if db::protected_build_job_remediation_exists(pool, job.id).await? {
+        bail!("build is quarantined by the protected-material boundary");
+    }
+    let public_key = ensure_signing_key(config).await?;
+    let signing_key = read_signing_key(&config.cache.private_key_path, &public_key)?;
+    let (origin_name, _) = parse_cache_public_key(source.public_key)?;
+    let (own_name, _) = parse_cache_public_key(&public_key)?;
+    if origin_name == own_name {
+        bail!("replica origin uses this node's own cache key name");
+    }
+    validate_store_path(source.toplevel_store_path).context("validate replica toplevel")?;
+    let cache_dir = config.cache.root_dir.clone();
+    let quarantine_dir = config.paths.data_dir.join("cache-quarantine");
+    fs::create_dir_all(cache_dir.join("nar"))
+        .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
+    prepare_quarantine_root(&cache_dir, &quarantine_dir)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("build replica HTTP client")?;
+
+    let mut queue = VecDeque::from([source.toplevel_store_path.to_string()]);
+    let mut visited = HashSet::new();
+    let mut members = Vec::new();
+    let mut closure_size_bytes = 0u64;
+    let mut root: Option<ParsedNarInfo> = None;
+    while let Some(store_path) = queue.pop_front() {
+        if !visited.insert(store_path.clone()) {
+            continue;
+        }
+        if visited.len() > REPLICA_MAX_MEMBERS || visited.len() as u64 > source.closure_member_count
+        {
+            bail!("replica closure has more members than the origin closure");
+        }
+        validate_store_path(&store_path).context("validate replica member")?;
+        let narinfo_filename = narinfo_filename_for_store_path(&store_path)?;
+        let raw = fetch_replica_narinfo(&client, source.cache_base_url, &narinfo_filename).await?;
+        let mut narinfo = parse_narinfo_strict(&raw)
+            .with_context(|| format!("parse origin NARInfo {narinfo_filename}"))?;
+        if narinfo.store_path != store_path {
+            bail!("origin NARInfo StorePath did not match the requested member");
+        }
+        let mut references = BTreeSet::new();
+        for reference in &narinfo.references {
+            validate_store_path(reference).context("validate origin NARInfo reference")?;
+            references.insert(reference.clone());
+        }
+        narinfo.references = references.into_iter().collect();
+        verify_narinfo_signature(&narinfo, source.public_key)
+            .context("origin NARInfo signature")?;
+        let nar_filename = validate_nar_url(&narinfo.url)?.to_string();
+        let expected_file_hash = parse_strong_sha256(&narinfo.file_hash, "FileHash")?;
+        let file_size = u64::try_from(narinfo.file_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| anyhow!("origin NARInfo FileSize was missing or invalid"))?;
+        let nar_size = u64::try_from(narinfo.nar_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| anyhow!("origin NARInfo NarSize was missing or invalid"))?;
+        if file_size > config.build.max_artifact_size_bytes {
+            bail!("origin NAR member exceeds max_artifact_size_bytes");
+        }
+        let already_present = match hash_safe_cache_member(&cache_dir, &narinfo.url) {
+            Ok((_, actual_size, actual_hash)) => {
+                actual_size == file_size && actual_hash == expected_file_hash
+            }
+            Err(_) => false,
+        };
+        if !already_present {
+            crate::disk::ensure_headroom(&cache_dir, file_size, "James replica copy")?;
+            fetch_replica_nar(
+                &client,
+                source.cache_base_url,
+                &cache_dir,
+                &nar_filename,
+                &narinfo.url,
+                file_size,
+                &expected_file_hash,
+                job.id,
+            )
+            .await?;
+        }
+        let signed = append_own_signature(&raw, &narinfo, &signing_key, own_name)?;
+        write_replica_narinfo(&cache_dir, &narinfo_filename, &signed)?;
+        closure_size_bytes = closure_size_bytes
+            .checked_add(nar_size)
+            .ok_or_else(|| anyhow!("replica closure NarSize total overflowed"))?;
+        for reference in &narinfo.references {
+            if !visited.contains(reference) {
+                queue.push_back(reference.clone());
+            }
+        }
+        if store_path == source.toplevel_store_path {
+            root = Some(narinfo.clone());
+        }
+        members.push(store_path);
+    }
+    members.sort();
+    members.dedup();
+    if members.len() as u64 != source.closure_member_count {
+        bail!(
+            "mirrored closure has {} members; the origin closure has {}",
+            members.len(),
+            source.closure_member_count
+        );
+    }
+    let digest = sha256_hex(&serde_json::to_vec(&members)?);
+    if digest != source.closure_store_paths_sha256 {
+        bail!("mirrored closure member list does not match the origin closure digest");
+    }
+    let root = root.ok_or_else(|| anyhow!("mirrored closure has no toplevel record"))?;
+
+    let cache_dir_for_verify = cache_dir.clone();
+    let quarantine_for_verify = quarantine_dir.clone();
+    let toplevel = source.toplevel_store_path.to_string();
+    let evaluated_derivation = source.evaluated_derivation.map(str::to_string);
+    let public_key_for_verify = public_key.clone();
+    let verified = task::spawn_blocking(move || {
+        build_or_quarantine_closure_manifest(
+            &cache_dir_for_verify,
+            &quarantine_for_verify,
+            &toplevel,
+            evaluated_derivation.as_deref(),
+            &public_key_for_verify,
+        )
+    })
+    .await
+    .context("join replica verification task")??;
+    let cache_info = read_nix_cache_info(&cache_dir)?;
+    let closure_file_size_bytes = i64::try_from(verified.total_file_size_bytes)
+        .context("verified closure compressed size exceeded reporting range")?;
+    let closure_size_bytes =
+        i64::try_from(closure_size_bytes).context("replica closure NarSize exceeded range")?;
+    let nar_len = u64::try_from(verified.root_narinfo.file_size)
+        .context("verified root NAR FileSize was negative")?;
+    let narinfo_name = verified
+        .root_narinfo_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("verified root NARInfo had no safe filename"))?
+        .to_string();
+    let narinfo = verified.root_narinfo;
+    let output_sha256 = hex::encode(parse_strong_sha256(&root.nar_hash, "NarHash")?);
+    let metadata = json!({
+        "cache_schema": "cybex.james.cache.v1",
+        "public_key_fingerprint": public_key_fingerprint(&public_key),
+        "nix_cache_info": cache_info,
+        "narinfo": narinfo_name,
+        "signatures": narinfo.signatures,
+        "file_size": narinfo.file_size,
+        "nar_size": narinfo.nar_size,
+        "closure_size": closure_size_bytes,
+        "closure_file_size": closure_file_size_bytes,
+        "source_build_job_id": job.managed_job_id.clone(),
+        "closure_manifest": verified.manifest,
+        "closure_manifest_sha256": verified.manifest_sha256,
+        "replica_source": {
+            "cache_base_url": source.cache_base_url,
+            "public_key_fingerprint": public_key_fingerprint(source.public_key),
+        },
+    });
+    let summary = ReplicaClosureSummary {
+        output_sha256: output_sha256.clone(),
+        output_size_bytes: root.nar_size,
+        closure_size_bytes,
+        members: members.len(),
+    };
+    Ok((
+        CachedNixArtifact {
+            artifact_hash: output_sha256,
+            size_bytes: nar_len as i64,
+            nar_path: verified.root_nar_path,
+            narinfo_path: verified.root_narinfo_path,
+            nar_url: narinfo.url,
+            store_path: source.toplevel_store_path.to_string(),
+            file_hash: narinfo.file_hash,
+            nar_hash: narinfo.nar_hash,
+            nar_size_bytes: narinfo.nar_size,
+            closure_size_bytes,
+            closure_file_size_bytes,
+            compression: narinfo.compression,
+            references: narinfo.references,
+            metadata,
+            _mutation_lock: mutation_lock,
+        },
+        summary,
+    ))
+}
+
+async fn fetch_replica_narinfo(
+    client: &reqwest::Client,
+    cache_base_url: &str,
+    narinfo_filename: &str,
+) -> Result<String> {
+    let url = format!("{cache_base_url}/{narinfo_filename}");
+    let response = client
+        .get(&url)
+        .timeout(REPLICA_NARINFO_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("fetch origin NARInfo {narinfo_filename}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "origin does not serve NARInfo {narinfo_filename} (HTTP {})",
+            response.status().as_u16()
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_NARINFO_BYTES)
+    {
+        bail!("origin NARInfo {narinfo_filename} exceeds the bounded size");
+    }
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("read origin NARInfo {narinfo_filename}"))?;
+    if body.len() as u64 > MAX_NARINFO_BYTES {
+        bail!("origin NARInfo {narinfo_filename} exceeds the bounded size");
+    }
+    String::from_utf8(body.to_vec()).context("origin NARInfo was not UTF-8")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_replica_nar(
+    client: &reqwest::Client,
+    cache_base_url: &str,
+    cache_dir: &Path,
+    nar_filename: &str,
+    nar_url: &str,
+    expected_size: u64,
+    expected_hash: &[u8; 32],
+    job_id: i64,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let url = format!("{cache_base_url}/{nar_url}");
+    let response = client
+        .get(&url)
+        .timeout(REPLICA_NAR_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("fetch origin NAR {nar_filename}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "origin does not serve NAR {nar_filename} (HTTP {})",
+            response.status().as_u16()
+        );
+    }
+    let final_path = cache_dir.join("nar").join(nar_filename);
+    let partial_path = cache_dir
+        .join("nar")
+        .join(format!(".{nar_filename}.replica-{job_id}.part"));
+    let mut file = tokio::fs::File::create(&partial_path)
+        .await
+        .with_context(|| format!("create partial NAR {}", partial_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("stream origin NAR {nar_filename}"))?
+    {
+        written = written
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow!("origin NAR size overflowed"))?;
+        if written > expected_size {
+            let _ = tokio::fs::remove_file(&partial_path).await;
+            bail!("origin NAR {nar_filename} is larger than its NARInfo FileSize");
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("write partial NAR {}", partial_path.display()))?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    let actual: [u8; 32] = hasher.finalize().into();
+    if written != expected_size || &actual != expected_hash {
+        let _ = tokio::fs::remove_file(&partial_path).await;
+        bail!("origin NAR {nar_filename} did not match its NARInfo FileHash/FileSize");
+    }
+    tokio::fs::set_permissions(&partial_path, fs::Permissions::from_mode(0o644))
+        .await
+        .with_context(|| format!("set permissions on {}", partial_path.display()))?;
+    tokio::fs::rename(&partial_path, &final_path)
+        .await
+        .with_context(|| format!("publish mirrored NAR {}", final_path.display()))?;
+    Ok(())
+}
+
+/// The Nix secret key file is `name:base64(secret || public)`; the name must
+/// be the one this node advertises so the appended signature is the one the
+/// manifest verification expects.
+fn read_signing_key(path: &Path, public_key: &str) -> Result<ed25519_dalek::SigningKey> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read cache private key {}", path.display()))?;
+    let (name, encoded) = raw
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| anyhow!("cache private key has an invalid shape"))?;
+    let (public_name, verifying_key) = parse_cache_public_key(public_key)?;
+    if name != public_name {
+        bail!("cache private key name does not match the public key");
+    }
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .context("cache private key is not base64")?;
+    let keypair: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("cache private key is not a 64-byte Nix key pair"))?;
+    let signing_key = ed25519_dalek::SigningKey::from_keypair_bytes(&keypair)
+        .map_err(|_| anyhow!("cache private key is not a valid ed25519 key pair"))?;
+    if signing_key.verifying_key() != verifying_key {
+        bail!("cache private key does not match the advertised public key");
+    }
+    Ok(signing_key)
+}
+
+/// Nix's signed fingerprint of a store path record.
+fn narinfo_fingerprint(narinfo: &ParsedNarInfo) -> Result<String> {
+    let nar_hash = encode_nix_base32_sha256(&parse_strong_sha256(&narinfo.nar_hash, "NarHash")?);
+    Ok(format!(
+        "1;{};sha256:{};{};{}",
+        narinfo.store_path,
+        nar_hash,
+        narinfo.nar_size,
+        narinfo.references.join(",")
+    ))
+}
+
+/// The origin's record with this node's signature appended, so the mirrored
+/// NARInfo is trusted by both the origin's clients and this node's.
+fn append_own_signature(
+    raw: &str,
+    narinfo: &ParsedNarInfo,
+    signing_key: &ed25519_dalek::SigningKey,
+    key_name: &str,
+) -> Result<String> {
+    use ed25519_dalek::Signer;
+    let signature = signing_key.sign(narinfo_fingerprint(narinfo)?.as_bytes());
+    let own = format!(
+        "{key_name}:{}",
+        BASE64_STANDARD.encode(signature.to_bytes())
+    );
+    let mut signed = String::with_capacity(raw.len() + own.len() + 8);
+    for line in raw.lines() {
+        if let Some(existing) = line.strip_prefix("Sig: ") {
+            if existing.starts_with(&format!("{key_name}:")) {
+                continue;
+            }
+        }
+        signed.push_str(line);
+        signed.push('\n');
+    }
+    signed.push_str("Sig: ");
+    signed.push_str(&own);
+    signed.push('\n');
+    Ok(signed)
+}
+
+fn write_replica_narinfo(cache_dir: &Path, narinfo_filename: &str, content: &str) -> Result<()> {
+    if narinfo_filename.contains('/') || !narinfo_filename.ends_with(".narinfo") {
+        bail!("NARInfo filename was not a safe cache-root member");
+    }
+    let path = cache_dir.join(narinfo_filename);
+    let staged = cache_dir.join(format!(".{narinfo_filename}.replica.tmp"));
+    fs::write(&staged, content).with_context(|| format!("write {}", staged.display()))?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("set permissions on {}", staged.display()))?;
+    fs::rename(&staged, &path).with_context(|| format!("publish {}", path.display()))?;
+    Ok(())
 }
 
 fn copy_store_path_to_cache(
@@ -895,7 +1321,7 @@ fn verify_narinfo_signature(narinfo: &ParsedNarInfo, public_key: &str) -> Result
     Ok(())
 }
 
-fn parse_cache_public_key(public_key: &str) -> Result<(&str, VerifyingKey)> {
+pub(crate) fn parse_cache_public_key(public_key: &str) -> Result<(&str, VerifyingKey)> {
     let (key_name, encoded_key) = public_key
         .split_once(':')
         .filter(|(name, encoded)| !name.is_empty() && !encoded.is_empty())
@@ -2185,6 +2611,84 @@ fn bounded_command_error(stderr: &[u8], private_key: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replica_test_keys() -> (ed25519_dalek::SigningKey, String, String) {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[42_u8; 32]);
+        let public = format!(
+            "replica-test:{}",
+            BASE64_STANDARD.encode(signing.verifying_key().to_bytes())
+        );
+        let secret = format!(
+            "replica-test:{}",
+            BASE64_STANDARD.encode(signing.to_keypair_bytes())
+        );
+        (signing, public, secret)
+    }
+
+    fn origin_narinfo() -> (String, ParsedNarInfo) {
+        let origin = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let origin_public = format!(
+            "origin:{}",
+            BASE64_STANDARD.encode(origin.verifying_key().to_bytes())
+        );
+        let narinfo = ParsedNarInfo {
+            store_path: "/nix/store/w3xanx4s88yziz926n9aykfjkzckdyr8-nixos-system".into(),
+            url: "nar/abc.nar.zst".into(),
+            compression: "zstd".into(),
+            file_hash: format!("sha256:{}", "a".repeat(64)),
+            file_size: 10,
+            nar_hash: format!("sha256:{}", "b".repeat(64)),
+            nar_size: 20,
+            references: vec![
+                "/nix/store/00000000000000000000000000000000-dep".into(),
+                "/nix/store/w3xanx4s88yziz926n9aykfjkzckdyr8-nixos-system".into(),
+            ],
+            signatures: Vec::new(),
+        };
+        use ed25519_dalek::Signer;
+        let signature = origin.sign(narinfo_fingerprint(&narinfo).unwrap().as_bytes());
+        let mut signed = narinfo.clone();
+        signed.signatures = vec![format!(
+            "origin:{}",
+            BASE64_STANDARD.encode(signature.to_bytes())
+        )];
+        (origin_public, signed)
+    }
+
+    #[test]
+    fn replica_mirror_appends_this_nodes_signature_and_keeps_the_origins() {
+        let (signing, public, secret) = replica_test_keys();
+        let dir = std::env::temp_dir().join(format!("cybex-james-replica-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("secret");
+        fs::write(&key_path, &secret).unwrap();
+        let loaded = read_signing_key(&key_path, &public).unwrap();
+        assert_eq!(loaded.to_bytes(), signing.to_bytes());
+        let (origin_public, narinfo) = origin_narinfo();
+        verify_narinfo_signature(&narinfo, &origin_public).unwrap();
+        assert!(verify_narinfo_signature(&narinfo, &public).is_err());
+        let raw = format!(
+            "StorePath: {}\nURL: {}\nCompression: zstd\nFileHash: {}\nFileSize: 10\nNarHash: {}\nNarSize: 20\nReferences: 00000000000000000000000000000000-dep w3xanx4s88yziz926n9aykfjkzckdyr8-nixos-system\nSig: {}\n",
+            narinfo.store_path,
+            narinfo.url,
+            narinfo.file_hash,
+            narinfo.nar_hash,
+            narinfo.signatures[0]
+        );
+        let signed = append_own_signature(&raw, &narinfo, &loaded, "replica-test").unwrap();
+        let reparsed = parse_narinfo_strict(&signed).unwrap();
+        assert_eq!(reparsed.signatures.len(), 2);
+        verify_narinfo_signature(&reparsed, &origin_public).unwrap();
+        verify_narinfo_signature(&reparsed, &public).unwrap();
+        // Re-signing replaces a stale own signature instead of stacking it.
+        let resigned = append_own_signature(&signed, &narinfo, &loaded, "replica-test").unwrap();
+        assert_eq!(parse_narinfo_strict(&resigned).unwrap().signatures.len(), 2);
+        // A key file whose name or key differs from the advertised public key is refused.
+        assert!(read_signing_key(&key_path, &origin_public).is_err());
+        fs::write(&key_path, secret.replace("replica-test:", "other:")).unwrap();
+        assert!(read_signing_key(&key_path, &public).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
     use ed25519_dalek::{Signer, SigningKey, Verifier};
     use std::{
         sync::mpsc,

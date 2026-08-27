@@ -49,6 +49,9 @@ const CAPABILITY_BLUEPRINT_WALLPAPER_V1: &str = "blueprint_wallpaper_v1";
 const CAPABILITY_CACHE_V1: &str = "cache_v1";
 const CAPABILITY_INSTALLER_TARGET_BUILD_V2: &str = "installer_target_build_v2";
 const CAPABILITY_INSTALLER_TARGET_BUILD_V3: &str = "installer_target_build_v3";
+/// This James copies verified exact closures from an approved sibling cache
+/// (`closure_source` in a build spec) instead of rebuilding them.
+const CAPABILITY_CACHE_REPLICA_V1: &str = "cache_replica_v1";
 const CAPABILITY_WORKSTATION_NETBOOT_V1: &str = "workstation_netboot_v1";
 const CAPABILITY_JAMES_BOOT_GRANT_V1: &str = "james_boot_grant_v1";
 const CAPABILITY_APPLIANCE_UPDATE_V1: &str = crate::appliance::APPLIANCE_UPDATE_CAPABILITY;
@@ -2317,6 +2320,7 @@ fn james_capabilities(_config: &AppConfig) -> Vec<&'static str> {
         CAPABILITY_CACHE_V1,
         CAPABILITY_INSTALLER_TARGET_BUILD_V2,
         CAPABILITY_INSTALLER_TARGET_BUILD_V3,
+        CAPABILITY_CACHE_REPLICA_V1,
         CAPABILITY_WORKSTATION_NETBOOT_V1,
         CAPABILITY_JAMES_BOOT_GRANT_V1,
     ];
@@ -4250,6 +4254,7 @@ mod tests {
                 "cache_v1",
                 "installer_target_build_v2",
                 "installer_target_build_v3",
+                "cache_replica_v1",
                 "workstation_netboot_v1",
                 "james_boot_grant_v1",
                 "appliance_update_v1",

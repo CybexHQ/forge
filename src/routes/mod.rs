@@ -429,18 +429,21 @@ mod tests {
         fs::write(cache_root.join("cache-priv-key.pem"), b"private-key").unwrap();
         let app = router(state);
 
-        for (path, expected) in [
+        for (path, expected, cache_control) in [
             (
                 "/cache/nix-cache-info".to_string(),
                 b"cache-info".as_slice(),
+                "public, max-age=60",
             ),
             (
                 format!("/cache/{store_hash}.narinfo"),
                 b"narinfo".as_slice(),
+                "public, max-age=60",
             ),
             (
                 format!("/cache/nar/{file_hash}.nar.xz"),
                 b"compressed-nar".as_slice(),
+                "public, max-age=31536000, immutable",
             ),
         ] {
             let response = app
@@ -449,6 +452,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("cache-control").unwrap(),
+                cache_control
+            );
             assert_eq!(
                 &to_bytes(response.into_body(), 1024).await.unwrap()[..],
                 expected
